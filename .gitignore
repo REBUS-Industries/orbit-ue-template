@@ -1,0 +1,30 @@
+# Unreal Engine generated / per-machine artefacts
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# Visual Studio / Rider / Xcode IDE files
+*.VC.db
+*.opensdf
+*.sdf
+*.sln
+*.suo
+*.xcodeproj
+*.xcworkspace
+.vs/
+.idea/
+.vscode/
+
+# Build outputs
+Build/
+*.opendb
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local CI / packaging
+dist/
+RELEASE_NOTES.md

@@ -1,0 +1,50 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Zip template
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist
+          # Exclude .git, .github, dist itself from the zip.
+          # Run from the parent so the archive contains a single top-level folder
+          # named after the workspace directory.
+          ( cd .. && zip -r "$GITHUB_WORKSPACE/dist/orbit-ue-template-$TAG.zip" \
+              "$(basename "$GITHUB_WORKSPACE")" \
+              -x "$(basename "$GITHUB_WORKSPACE")/.git/*" \
+                 "$(basename "$GITHUB_WORKSPACE")/.github/*" \
+                 "$(basename "$GITHUB_WORKSPACE")/dist/*" )
+          ls -lh dist/
+
+      - name: Extract release notes
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          awk -v tag="$TAG" '
+            $0 ~ "^## " tag " " || $0 == "## " tag { found=1; next }
+            found && /^## v/ { exit }
+            found { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          [[ -s RELEASE_NOTES.md ]] || echo "Initial release." > RELEASE_NOTES.md
+          echo "--- RELEASE_NOTES.md ---"
+          cat RELEASE_NOTES.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: "ORBIT UE Template ${{ github.ref_name }}"
+          body_path: RELEASE_NOTES.md
+          files: dist/*.zip
+          fail_on_unmatched_files: true

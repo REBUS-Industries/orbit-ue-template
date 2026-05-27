@@ -1,0 +1,18 @@
+# Treat Unreal binary asset formats as Git LFS objects.
+# Artists are expected to use Git LFS when they drop the placeholder
+# .uasset / .umap files in Content/REBUS/{Maps,BP,Materials}/.
+*.uasset filter=lfs diff=lfs merge=lfs -text
+*.umap   filter=lfs diff=lfs merge=lfs -text
+
+# Common DCC / texture binaries shipped alongside Unreal content.
+*.fbx filter=lfs diff=lfs merge=lfs -text
+*.png filter=lfs diff=lfs merge=lfs -text
+*.tga filter=lfs diff=lfs merge=lfs -text
+*.exr filter=lfs diff=lfs merge=lfs -text
+
+# Normalise text files to LF for cross-platform sanity.
+*.ini       text eol=lf
+*.uproject  text eol=lf
+*.md        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
