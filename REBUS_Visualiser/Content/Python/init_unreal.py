@@ -11,6 +11,8 @@ Idempotent: if the level already exists this does nothing -- the EditorStartupMa
 entry in Config/DefaultEngine.ini loads it. It only generates (and then opens)
 the level on the first launch, or after the asset has been deleted.
 """
+import re
+
 import unreal
 
 try:
@@ -20,6 +22,33 @@ except Exception as exc:  # noqa: BLE001
     base = None
 
 _post_tick_handle = None
+
+
+def _is_editor_authoring_context():
+    """True only in a real editor session that can author/save levels + assets.
+
+    The Python plug-in runs this start-up script in *any* launch that enables
+    Python -- including the product's runtime launch, which runs the editor
+    binary in `-game` mode (no editor world, GEditor == null). Calling the
+    editor-scripting libraries (EditorAssetLibrary / EditorActorSubsystem /
+    LevelEditorSubsystem / MaterialEditingLibrary) in that context dereferences
+    a null editor world and crashes the process with an access violation
+    (observed: -game Pixel Streaming launch). The C++
+    URebusVisualiserSubsystem::EnsureSceneEnvironment() already backstops the
+    scene at runtime, so the authoring step must simply no-op outside the editor.
+    """
+    try:
+        cmd = unreal.SystemLibrary.get_command_line() or ""
+    except Exception:  # noqa: BLE001
+        cmd = ""
+    # Runtime / non-authoring launches: -game, dedicated/listen -server, commandlets.
+    if re.search(r"(?:^|\s)-(game|server)(?:\s|=|$)", cmd, re.IGNORECASE):
+        return False
+    # Need a live editor (GEditor); absent in -game even though the class exists.
+    try:
+        return unreal.get_editor_subsystem(unreal.LevelEditorSubsystem) is not None
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _ensure_and_load():
@@ -46,10 +75,15 @@ def _on_post_tick(delta_seconds):
     _ensure_and_load()
 
 
+# Only author the base level in a real editor session. In the product's -game
+# runtime launch GEditor is null, so running the editor-scripting libraries here
+# crashes the process -- skip it (the C++ subsystem backstops the scene instead).
+if not _is_editor_authoring_context():
+    unreal.log("RebusBaseLevel: non-editor (runtime) launch; skipping level authoring.")
 # At init_unreal time the editor world / asset subsystems may not be ready to
 # create + save a level, so defer one Slate tick when running the full editor.
 # Fall back to running inline (e.g. a headless commandlet with no Slate loop).
-if hasattr(unreal, "register_slate_post_tick_callback"):
+elif hasattr(unreal, "register_slate_post_tick_callback"):
     try:
         _post_tick_handle = unreal.register_slate_post_tick_callback(_on_post_tick)
     except Exception:  # noqa: BLE001
