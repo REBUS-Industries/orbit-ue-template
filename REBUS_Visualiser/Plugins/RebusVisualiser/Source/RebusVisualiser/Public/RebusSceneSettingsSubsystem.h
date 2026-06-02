@@ -49,6 +49,10 @@ private:
 	// Swap the floor plane's material to the generated MI_RebusGround_<Preset> instance.
 	void SetGroundSurface(const FString& Preset);
 
+	// Draw (or clear) a persistent world-origin XYZ axis gizmo for orientation checks.
+	// X=red, Y=green, Z=blue (Unreal convention). Toggled by the bShowOrigin scene property.
+	void SetOriginGizmo(bool bShow);
+
 	void SetScalabilityBucket(const TCHAR* Group, int32 Bucket);
 	void SetCVarFloat(const TCHAR* CVar, float Value);
 	void SetCVarInt(const TCHAR* CVar, int32 Value);

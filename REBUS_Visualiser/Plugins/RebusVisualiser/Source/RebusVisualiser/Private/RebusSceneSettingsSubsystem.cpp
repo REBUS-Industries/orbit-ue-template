@@ -7,6 +7,7 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "HAL/IConsoleManager.h"
+#include "DrawDebugHelpers.h"
 
 #include "Engine/DirectionalLight.h"
 #include "Engine/SkyLight.h"
@@ -27,6 +28,7 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// round-trips the ground controls before the portal pushes its first value.
 	Values.Add(TEXT("GroundSurface"), FRebusPropertyValue::MakeString(TEXT("Concrete")));
 	Values.Add(TEXT("bGroundVisible"), FRebusPropertyValue::MakeBool(true));
+	Values.Add(TEXT("bShowOrigin"), FRebusPropertyValue::MakeBool(false));
 }
 
 // ---- Actor lookups (cached) -----------------------------------------------------------
@@ -114,6 +116,30 @@ void URebusSceneSettingsSubsystem::SetGroundSurface(const FString& Preset)
 	{
 		UE_LOG(LogRebusVisualiser, Warning, TEXT("Ground material not found: %s"), *AssetPath);
 	}
+}
+
+void URebusSceneSettingsSubsystem::SetOriginGizmo(bool bShow)
+{
+#if ENABLE_DRAW_DEBUG
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	// Persistent debug draw renders into the game viewport (and so into the Pixel Streaming
+	// frame) in Development builds. Clear first so repeated toggles don't stack.
+	FlushPersistentDebugLines(World);
+	if (!bShow) return;
+
+	const float Len = 500.f;   // 5 m arms
+	const float Thick = 6.f;
+	const float Head = 40.f;
+	DrawDebugDirectionalArrow(World, FVector::ZeroVector, FVector(Len, 0.f, 0.f), Head, FColor::Red,   true, -1.f, 0, Thick); // +X
+	DrawDebugDirectionalArrow(World, FVector::ZeroVector, FVector(0.f, Len, 0.f), Head, FColor::Green, true, -1.f, 0, Thick); // +Y
+	DrawDebugDirectionalArrow(World, FVector::ZeroVector, FVector(0.f, 0.f, Len), Head, FColor::Blue,  true, -1.f, 0, Thick); // +Z
+	DrawDebugSphere(World, FVector::ZeroVector, 15.f, 12, FColor::White, true, -1.f, 0, 3.f);
+	UE_LOG(LogRebusVisualiser, Log, TEXT("Origin gizmo enabled (X=red, Y=green, Z=blue)."));
+#else
+	UE_LOG(LogRebusVisualiser, Warning, TEXT("Origin gizmo unavailable: debug draw is compiled out in this build."));
+#endif
 }
 
 void URebusSceneSettingsSubsystem::SetScalabilityBucket(const TCHAR* Group, int32 Bucket)
@@ -244,6 +270,11 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 			Floor->SetIsTemporarilyHiddenInEditor(bHidden);
 #endif
 		}
+	}
+	// --- Debug: world-origin XYZ gizmo (orientation check) ---
+	else if (Name == TEXT("bShowOrigin"))
+	{
+		SetOriginGizmo(Value.bBool);
 	}
 	// --- Stream Quality (Pixel Streaming encoder params) ---
 	else if (Name == TEXT("StreamStartBitrateMbps"))
