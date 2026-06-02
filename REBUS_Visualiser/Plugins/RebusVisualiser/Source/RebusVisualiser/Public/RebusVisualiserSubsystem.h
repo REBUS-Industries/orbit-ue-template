@@ -26,6 +26,7 @@ class FRebusDataChannel;
 class URebusFixtureControlSubsystem;
 class URebusSceneSettingsSubsystem;
 class ARebusFixtureActor;
+class FJsonObject;
 
 UCLASS()
 class REBUSVISUALISER_API URebusVisualiserSubsystem : public UGameInstanceSubsystem
@@ -47,6 +48,14 @@ private:
 	void OnMeshesFetched(const FString& LibraryId, bool bOk, const FRebusMeshBundle& Meshes);
 	void TrySpawnFixtures();
 	void SpawnAllFixtures();
+
+	// Destroy + unregister every fixture spawned so far (used before a re-load).
+	void ClearSpawnedFixtures();
+
+	// Portal-pushed scene/fixture definition over the data channel (alternative to the
+	// /api/ue/scene REST contract when the portal can't be reached). Parses the same payload
+	// shapes the REST endpoints serve, then (re)spawns fixtures and refreshes the handshake.
+	void HandleSceneDefinition(const FString& Type, const TSharedPtr<FJsonObject>& Msg);
 
 	void OnChannelReady();
 	void TrySendReady();

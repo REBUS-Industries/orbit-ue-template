@@ -25,6 +25,9 @@ class FJsonObject;
 
 DECLARE_DELEGATE(FRebusOnChannelReady); // fired once when the data channel first opens
 DECLARE_DELEGATE(FRebusOnViewerConnected); // fired each time a viewer's data track opens
+// Portal pushes scene/fixture definitions over the channel (data-channel alternative to the
+// /api/ue/scene REST contract). Carries the descriptor type + parsed JSON object.
+DECLARE_DELEGATE_TwoParams(FRebusOnSceneDefinition, const FString& /*Type*/, const TSharedPtr<FJsonObject>& /*Msg*/);
 
 class FRebusDataChannel : public TSharedFromThis<FRebusDataChannel>
 {
@@ -51,6 +54,9 @@ public:
 	// beat AFTER the channel binds, so the one-shot Ready broadcast can be missed; the session
 	// re-broadcasts the handshake on this so every (re)connecting viewer becomes controllable.
 	FRebusOnViewerConnected OnViewerConnected;
+
+	// Fired (game thread) when the portal pushes a scene/fixture definition over the channel.
+	FRebusOnSceneDefinition OnSceneDefinition;
 
 	// ---- UE -> portal read-back (§6) ----
 	void SendReady(const FString& UeVersion, const FString& ProjectVersion,

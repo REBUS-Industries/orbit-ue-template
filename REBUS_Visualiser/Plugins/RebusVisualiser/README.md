@@ -79,6 +79,46 @@ never hardcoded), `-OrbitProject` (portal doc id), `-OrbitModel`, `-OrbitVersion
    the live selection. The portal then sends `RequestSceneState` → we answer `SceneState`.
 5. Periodic `FrameStats` while live.
 
+## Scene push over the data channel (REST-free fixtures)
+
+When the portal cannot serve `/api/ue/scene` to the running instance (e.g. the instance has no
+route to the portal API, or the REST call 404s), the **portal can push the same data over the
+already-open Pixel Streaming data channel** instead. The plugin parses the identical payload
+shapes the REST endpoints return and spawns/drives fixtures exactly as if they had been fetched.
+
+Send these as normal `UIInteraction` descriptors (same envelope as `SetFixturePanTilt`/`Ping`):
+
+```jsonc
+// One-shot push (preferred when the whole scene fits in one data-channel message):
+{
+  "type": "LoadScene",
+  "scene":    { /* identical body to GET /api/ue/scene */ },
+  "profiles": { "<libraryFixtureId>": { /* identical body to GET /api/ue/fixtures/{id} */ } },  // optional
+  "meshes":   { "<libraryFixtureId>": { /* identical body to GET /api/ue/fixtures/{id}/meshes */ } } // optional
+}
+
+// Incremental (for larger scenes, to stay under the per-message size limit):
+{ "type": "RegisterFixtureProfile", "libraryId": "<id>", "profile": { ... }, "meshes": { ... } } // repeat per profile
+{ "type": "LoadScene", "scene": { ... } }   // spawns using whatever profiles were cached above
+
+// Remove all pushed fixtures:
+{ "type": "ClearScene" }
+```
+
+Behaviour:
+- `LoadScene` clears any previously spawned fixtures, spawns one `ARebusFixtureActor` per
+  `scene.fixtures[]` at its `matrixZUpMeters` placement, registers it under the **Speckle node
+  id** (`fixtures[].id`) — the same key `SetFixture*` uses — and re-broadcasts `Ready` +
+  `FixtureRegistered`.
+- `profiles`/`meshes` are optional. Without a profile a fixture is **light-only** (no custom
+  geometry, no GDTF motion rig) — pan/tilt parity needs the profile's motion rig, so include it.
+- Profiles can be sent inline in `LoadScene` or ahead of time via `RegisterFixtureProfile`.
+- IES/gobo images are still fetched lazily via REST; if the portal is unreachable they simply
+  don't load, but dimmer/colour/pan-tilt/zoom still work.
+
+This is purely additive: the REST path (§Lifecycle 2) still runs, and a `LoadScene` push
+overrides it.
+
 ## Compile-time touch-points to verify (Pixel Streaming 2)
 
 PS2's C++ surface shifted across 5.5→5.7 and was not compiler-checked on the authoring

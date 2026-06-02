@@ -12,6 +12,10 @@
 #include "Engine/World.h"
 #include "Engine/Engine.h"
 #include "EngineUtils.h"
+#include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
+#include "Serialization/JsonWriter.h"
+#include "Serialization/JsonSerializer.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/Pawn.h"
 #include "Misc/CommandLine.h"
@@ -50,6 +54,7 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	Channel->Initialize(StreamerId, GetControl(), GetSceneSettings());
 	Channel->OnChannelReady.BindUObject(this, &URebusVisualiserSubsystem::OnChannelReady);
 	Channel->OnViewerConnected.BindUObject(this, &URebusVisualiserSubsystem::OnViewerConnected);
+	Channel->OnSceneDefinition.BindUObject(this, &URebusVisualiserSubsystem::HandleSceneDefinition);
 
 	TickHandle = FTSTicker::GetCoreTicker().AddTicker(
 		FTickerDelegate::CreateUObject(this, &URebusVisualiserSubsystem::Tick), 0.f);
@@ -364,7 +369,143 @@ void URebusVisualiserSubsystem::SpawnAllFixtures()
 	}
 
 	UE_LOG(LogRebusVisualiser, Log, TEXT("Spawned %d fixtures."), SpawnedFixtures.Num());
-	TrySendReady();
+
+	// First load completes the handshake; a re-load (e.g. portal re-push) re-broadcasts it so
+	// the new FixtureRegistered set reaches viewers.
+	if (bReadySent)
+	{
+		BroadcastHandshake();
+	}
+	else
+	{
+		TrySendReady();
+	}
+}
+
+void URebusVisualiserSubsystem::ClearSpawnedFixtures()
+{
+	for (ARebusFixtureActor* F : SpawnedFixtures)
+	{
+		if (F) F->Destroy();
+	}
+	SpawnedFixtures.Reset();
+	if (URebusFixtureControlSubsystem* Ctl = GetControl())
+	{
+		Ctl->Reset();
+	}
+	bFixturesSpawned = false;
+}
+
+void URebusVisualiserSubsystem::HandleSceneDefinition(const FString& Type, const TSharedPtr<FJsonObject>& Msg)
+{
+	if (!Msg.IsValid()) return;
+
+	// Serialize a JSON object back to a string so we can reuse the REST payload parsers (the
+	// portal sends the exact bodies /api/ue/scene + /api/ue/fixtures/{id} would return).
+	auto ObjectToString = [](const TSharedPtr<FJsonObject>& Obj) -> FString
+	{
+		FString Out;
+		const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
+		FJsonSerializer::Serialize(Obj.ToSharedRef(), Writer);
+		return Out;
+	};
+	auto FieldToString = [&ObjectToString](const TSharedPtr<FJsonObject>& Obj, const TCHAR* Field) -> FString
+	{
+		const TSharedPtr<FJsonObject>* Sub = nullptr;
+		if (!Obj->TryGetObjectField(Field, Sub) || !Sub) return FString();
+		return ObjectToString(*Sub);
+	};
+
+	// Merge any inline profiles/meshes maps (keyed by libraryFixtureId) into the caches.
+	auto IngestProfileMaps = [this, &ObjectToString](const TSharedPtr<FJsonObject>& Obj)
+	{
+		const TSharedPtr<FJsonObject>* ProfilesObj = nullptr;
+		if (Obj->TryGetObjectField(TEXT("profiles"), ProfilesObj) && ProfilesObj)
+		{
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*ProfilesObj)->Values)
+			{
+				const TSharedPtr<FJsonObject> PObj = Pair.Value.IsValid() ? Pair.Value->AsObject() : nullptr;
+				if (!PObj.IsValid()) continue;
+				FRebusFixtureProfile Profile;
+				if (RebusJson::ParseFixtureProfile(ObjectToString(PObj), Profile) && Profile.bValid)
+				{
+					ProfileCache.Add(Pair.Key, Profile);
+				}
+			}
+		}
+		const TSharedPtr<FJsonObject>* MeshesObj = nullptr;
+		if (Obj->TryGetObjectField(TEXT("meshes"), MeshesObj) && MeshesObj)
+		{
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*MeshesObj)->Values)
+			{
+				const TSharedPtr<FJsonObject> MObj = Pair.Value.IsValid() ? Pair.Value->AsObject() : nullptr;
+				if (!MObj.IsValid()) continue;
+				FRebusMeshBundle Bundle;
+				if (RebusJson::ParseMeshBundle(ObjectToString(MObj), Bundle))
+				{
+					MeshCache.Add(Pair.Key, Bundle);
+				}
+			}
+		}
+	};
+
+	if (Type == TEXT("ClearScene"))
+	{
+		ClearSpawnedFixtures();
+		UE_LOG(LogRebusVisualiser, Log, TEXT("ClearScene: removed all pushed fixtures."));
+		if (bReadySent) BroadcastHandshake();
+		return;
+	}
+
+	if (Type == TEXT("RegisterFixtureProfile"))
+	{
+		// Single profile (+ optional meshes), for incremental pushes that stay under the
+		// data-channel message size. { libraryId, profile, meshes? }
+		FString LibraryId;
+		RebusJson::TryGetString(Msg, TEXT("libraryId"), LibraryId);
+		const FString ProfileJson = FieldToString(Msg, TEXT("profile"));
+		if (LibraryId.IsEmpty() || ProfileJson.IsEmpty())
+		{
+			UE_LOG(LogRebusVisualiser, Warning, TEXT("RegisterFixtureProfile missing libraryId/profile; ignoring."));
+			return;
+		}
+		FRebusFixtureProfile Profile;
+		if (RebusJson::ParseFixtureProfile(ProfileJson, Profile) && Profile.bValid)
+		{
+			ProfileCache.Add(LibraryId, Profile);
+			const FString MeshJson = FieldToString(Msg, TEXT("meshes"));
+			if (!MeshJson.IsEmpty())
+			{
+				FRebusMeshBundle Bundle;
+				if (RebusJson::ParseMeshBundle(MeshJson, Bundle)) MeshCache.Add(LibraryId, Bundle);
+			}
+			UE_LOG(LogRebusVisualiser, Log, TEXT("Cached pushed profile '%s'."), *LibraryId);
+		}
+		return;
+	}
+
+	// LoadScene: { scene, profiles?, meshes? } -> (re)spawn fixtures from the pushed scene.
+	const FString SceneJson = FieldToString(Msg, TEXT("scene"));
+	if (SceneJson.IsEmpty())
+	{
+		UE_LOG(LogRebusVisualiser, Warning, TEXT("LoadScene missing 'scene'; ignoring."));
+		return;
+	}
+	FRebusScene Scene;
+	if (!RebusJson::ParseScene(SceneJson, Scene))
+	{
+		UE_LOG(LogRebusVisualiser, Warning, TEXT("LoadScene 'scene' failed to parse; ignoring."));
+		return;
+	}
+
+	IngestProfileMaps(Msg);
+
+	ClearSpawnedFixtures();
+	SceneData = Scene;
+	bSceneLoaded = true;
+	UE_LOG(LogRebusVisualiser, Log, TEXT("LoadScene: %d fixture(s) pushed over the data channel."),
+		SceneData.Fixtures.Num());
+	SpawnAllFixtures();
 }
 
 void URebusVisualiserSubsystem::OnChannelReady()
