@@ -1,0 +1,54 @@
+// Copyright REBUS Industries.
+//
+// Applies SetSceneProperty / SetSceneProperties (ue-plugin-build-guide.md §5.4 / §9) by
+// switching on the catalogue `name` and pushing `value` onto the matching scene-actor
+// property, Pixel Streaming encoder param, or engine scalability command. Treats each as the
+// new authoritative value (fire-and-forget; unknown names ignored). Owns the SceneState the
+// plugin reports back on RequestSceneState (§6.3) so the portal hydrates from live values.
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Subsystems/WorldSubsystem.h"
+#include "RebusPropertyValue.h"
+#include "RebusSceneSettingsSubsystem.generated.h"
+
+class ADirectionalLight;
+class ASkyLight;
+class AExponentialHeightFog;
+class APostProcessVolume;
+class FJsonObject;
+
+UCLASS()
+class REBUSVISUALISER_API URebusSceneSettingsSubsystem : public UWorldSubsystem
+{
+	GENERATED_BODY()
+
+public:
+	// Apply a single catalogue property; stores the value for SceneState read-back.
+	// Returns false for an unknown name (the caller may surface a Notice).
+	bool ApplySceneProperty(const FString& Name, const FRebusPropertyValue& Value);
+
+	// Route a SetSceneProperty / SetSceneProperties descriptor. Returns true if handled.
+	bool HandleSceneDescriptor(const FString& Type, const TSharedPtr<FJsonObject>& Msg);
+
+	// Snapshot every owned property for a SceneState reply.
+	const TMap<FString, FRebusPropertyValue>& GetSceneState() const { return Values; }
+
+private:
+	ADirectionalLight* GetSun();
+	ASkyLight* GetSkyLight();
+	AExponentialHeightFog* GetFog();
+	APostProcessVolume* GetPostProcess();
+
+	void SetScalabilityBucket(const TCHAR* Group, int32 Bucket);
+	void SetCVarFloat(const TCHAR* CVar, float Value);
+	void SetCVarInt(const TCHAR* CVar, int32 Value);
+
+private:
+	TMap<FString, FRebusPropertyValue> Values;
+
+	TWeakObjectPtr<ADirectionalLight> CachedSun;
+	TWeakObjectPtr<ASkyLight> CachedSky;
+	TWeakObjectPtr<AExponentialHeightFog> CachedFog;
+	TWeakObjectPtr<APostProcessVolume> CachedPostProcess;
+};

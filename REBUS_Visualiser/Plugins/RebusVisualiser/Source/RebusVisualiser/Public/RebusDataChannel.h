@@ -1,0 +1,70 @@
+// Copyright REBUS Industries.
+//
+// Pixel Streaming 2 data-channel transport (ue-plugin-build-guide.md §5/§6/§10).
+//
+// Receive: registers a message handler for the "UIInteraction" opcode on the streamer's
+// input handler (PS2 removed the C++ UPixelStreamingInput component; you register handlers on
+// the streamer's IPixelStreaming2InputHandler instead). Each descriptor arrives as a string,
+// is parsed to JSON, and routed by `type`.
+//
+// Send: UE->portal events go back via IPixelStreaming2Streamer::SendAllPlayerMessage with the
+// "Response" message type, which the PS2 frontend delivers to the portal's response listener
+// (parseUeToPortalEvent).
+//
+// The streamer is discovered by the id PRISM passes via -PixelStreamingID=orbit_<shortRunId>.
+// We never hardcode DefaultStreamer (§10.2): if no id is configured we fall back to the
+// module's default streamer id.
+#pragma once
+
+#include "CoreMinimal.h"
+#include "RebusPropertyValue.h"
+
+class URebusFixtureControlSubsystem;
+class URebusSceneSettingsSubsystem;
+class FJsonObject;
+
+DECLARE_DELEGATE(FRebusOnChannelReady); // fired once when the data channel first opens
+
+class FRebusDataChannel : public TSharedFromThis<FRebusDataChannel>
+{
+public:
+	void Initialize(const FString& InStreamerId,
+		URebusFixtureControlSubsystem* InControl,
+		URebusSceneSettingsSubsystem* InScene);
+
+	// The scene-settings subsystem is world-scoped and may not exist yet at Initialize time;
+	// the session wires it in once a game world is live.
+	void SetSceneSettings(URebusSceneSettingsSubsystem* InScene);
+
+	// Poll for the streamer + input handler and bind the UIInteraction handler. Safe to call
+	// repeatedly; returns true once bound.
+	bool TryBind();
+	bool IsBound() const { return bBound; }
+
+	// The session wires this to know when to emit Ready + FixtureRegistered.
+	FRebusOnChannelReady OnChannelReady;
+
+	// ---- UE -> portal read-back (§6) ----
+	void SendReady(const FString& UeVersion, const FString& ProjectVersion,
+		const TArray<FString>& Capabilities,
+		const FString& ProjectId, const FString& ModelId, const FString& CommitId,
+		int32 FixtureCount, int32 TrussCount);
+	void SendFixtureRegistered(const FString& FixtureId, const FString& LibraryFixtureId,
+		const FString& DisplayName, bool bHasPanTilt, bool bHasGobo);
+	void SendSceneState(const TMap<FString, FRebusPropertyValue>& Properties);
+	void SendError(const FString& Code, const FString& Message, bool bFatal, const FString& FixtureId = FString());
+	void SendNotice(const FString& Code, const FString& Message, const FString& FixtureId = FString());
+	void SendFrameStats(float Fps, float BitrateKbps, float PacketLossPct, float LatencyMs);
+
+private:
+	void HandleDescriptor(const FString& Descriptor);
+	void SendEvent(const TSharedRef<FJsonObject>& Event);
+	void SendPong(double Ts);
+
+private:
+	FString StreamerId;
+	TWeakObjectPtr<URebusFixtureControlSubsystem> Control;
+	TWeakObjectPtr<URebusSceneSettingsSubsystem> Scene;
+	bool bBound = false;
+	bool bReadyFired = false;
+};
