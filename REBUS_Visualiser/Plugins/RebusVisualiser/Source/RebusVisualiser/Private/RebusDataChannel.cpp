@@ -79,17 +79,17 @@ bool FRebusDataChannel::TryBind()
 		return false;
 	}
 
-	TWeakPtr<FRebusDataChannel> WeakThis = AsShared();
+	TWeakPtr<FRebusDataChannel> WeakSelf = AsShared();
 	InputHandler->RegisterMessageHandler(RebusUIInteraction,
-		[WeakThis](FString /*SourceId*/, FMemoryReader Ar)
+		[WeakSelf](FString /*SourceId*/, FMemoryReader Ar)
 		{
 			const FString Descriptor = ReadDescriptorString(Ar);
 			if (Descriptor.IsEmpty()) return;
 
 			// The message handler can fire off the game thread; route on the game thread.
-			AsyncTask(ENamedThreads::GameThread, [WeakThis, Descriptor]()
+			AsyncTask(ENamedThreads::GameThread, [WeakSelf, Descriptor]()
 			{
-				if (TSharedPtr<FRebusDataChannel> Self = WeakThis.Pin())
+				if (TSharedPtr<FRebusDataChannel> Self = WeakSelf.Pin())
 				{
 					Self->HandleDescriptor(Descriptor);
 				}
@@ -176,7 +176,7 @@ void FRebusDataChannel::SendEvent(const TSharedRef<FJsonObject>& Event)
 	FString Out;
 	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
 	FJsonSerializer::Serialize(Event, Writer);
-	Streamer->SendAllPlayerMessage(RebusResponseType, Out);
+	Streamer->SendAllPlayersMessage(RebusResponseType, Out);
 }
 
 void FRebusDataChannel::SendReady(const FString& UeVersion, const FString& ProjectVersion,
