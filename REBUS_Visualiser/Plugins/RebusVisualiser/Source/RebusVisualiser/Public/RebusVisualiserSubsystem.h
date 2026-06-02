@@ -86,6 +86,7 @@ private:
 
 	FTSTicker::FDelegateHandle TickHandle;
 
+	bool bEnvEnsured = false;
 	bool bSceneRequested = false;
 	bool bSceneLoaded = false;
 	bool bFixturesSpawned = false;

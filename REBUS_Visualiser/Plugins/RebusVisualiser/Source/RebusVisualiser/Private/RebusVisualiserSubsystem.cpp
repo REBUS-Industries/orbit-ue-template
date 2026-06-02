@@ -120,16 +120,43 @@ bool URebusVisualiserSubsystem::Tick(float DeltaSeconds)
 		Channel->TryBind();
 	}
 
-	// Start the scene load once a world is live and config is usable.
+	// Ensure the local scene environment (fog + unbound post-process + ground plane) as soon as
+	// a game world is live. This is a launch-time safety net and must NOT depend on the portal
+	// API key / project / model -- otherwise an unconfigured session renders with no floor.
+	if (!bEnvEnsured)
+	{
+		UWorld* World = GetActiveWorld();
+		if (World && World->IsGameWorld() && World->HasBegunPlay())
+		{
+			bEnvEnsured = true;
+			EnsureSceneEnvironment();
+		}
+	}
+
+	// Start the portal scene load once a world is live. The fixture fetch needs the API key +
+	// project/model; when those are absent we still complete the handshake with zero fixtures so
+	// the portal receives Ready and enables its scene/quality/ground controls (data-channel
+	// control is otherwise gated behind a Ready that would never arrive).
 	if (!bSceneRequested)
 	{
 		UWorld* World = GetActiveWorld();
 		const bool bWorldReady = World && World->IsGameWorld() && World->HasBegunPlay();
-		if (bWorldReady && Rest.IsValid() && Rest->IsConfigured() && !ProjectId.IsEmpty() && !ModelId.IsEmpty())
+		if (bWorldReady)
 		{
+			const bool bCanFetch = Rest.IsValid() && Rest->IsConfigured()
+				&& !ProjectId.IsEmpty() && !ModelId.IsEmpty();
 			bSceneRequested = true;
-			EnsureSceneEnvironment();
-			BeginSceneLoad();
+			if (bCanFetch)
+			{
+				BeginSceneLoad();
+			}
+			else
+			{
+				UE_LOG(LogRebusVisualiser, Warning,
+					TEXT("Portal scene fetch skipped (api-key/project/model missing); reporting Ready with no fixtures so scene control still works."));
+				bSceneLoaded = true; // nothing to fetch/spawn -> scene is "loaded"
+				TrySendReady();
+			}
 		}
 	}
 
