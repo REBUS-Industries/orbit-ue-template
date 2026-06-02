@@ -23,14 +23,23 @@ namespace
 	const TCHAR* RebusResponseType = TEXT("Response");
 	const TCHAR* RebusUIInteraction = TEXT("UIInteraction");
 
-	// The UIInteraction payload is the descriptor string encoded as UTF-16. Read whatever is
-	// left in the reader and reinterpret it as UTF-16 code units.
+	// A Pixel Streaming 2 "UIInteraction" payload is a uint16 character-count prefix followed by
+	// that many UTF-16 code units (see FEpicRtcStreamer::OnUIInteraction). The input handler has
+	// already stripped the leading message-id byte, so the reader starts at the length prefix.
+	// We MUST consume that prefix first -- treating the whole buffer as string data prepends the
+	// length as a garbage char and makes every descriptor fail to parse (dropping all control).
 	FString ReadDescriptorString(FMemoryReader& Ar)
 	{
-		const int64 Remaining = Ar.TotalSize() - Ar.Tell();
-		if (Remaining <= 1) return FString();
+		if (Ar.TotalSize() - Ar.Tell() < (int64)sizeof(uint16)) return FString();
 
-		const int32 NumUnits = (int32)(Remaining / sizeof(UTF16CHAR));
+		uint16 NumUnits = 0;
+		Ar << NumUnits;
+		if (NumUnits == 0) return FString();
+
+		// Guard against a malformed length that exceeds the remaining payload.
+		const int64 Remaining = Ar.TotalSize() - Ar.Tell();
+		if (Remaining < (int64)NumUnits * (int64)sizeof(UTF16CHAR)) return FString();
+
 		TArray<UTF16CHAR> Units;
 		Units.SetNumUninitialized(NumUnits + 1);
 		Ar.Serialize(Units.GetData(), NumUnits * sizeof(UTF16CHAR));
