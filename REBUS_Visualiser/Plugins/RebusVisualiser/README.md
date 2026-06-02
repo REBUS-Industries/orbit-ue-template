@@ -101,6 +101,13 @@ Send these as normal `UIInteraction` descriptors (same envelope as `SetFixturePa
 { "type": "RegisterFixtureProfile", "libraryId": "<id>", "profile": { ... }, "meshes": { ... } } // repeat per profile
 { "type": "LoadScene", "scene": { ... } }   // spawns using whatever profiles were cached above
 
+// Chunked mesh delivery (for a single fixture whose meshes exceed the ~60k-char message budget):
+{ "type": "RegisterFixtureMeshes",
+  "libraryId": "<libraryFixtureId>",
+  "meshes": { "version": 1, "meshes": [ /* a SUBSET of the fixture's meshes[] */ ] },
+  "chunkIndex": 0,        // optional, 0-based; omit / single message => chunkCount defaults to 1
+  "chunkCount": 1 }       // optional; total chunks for this libraryId — repeat per chunk
+
 // Remove all pushed fixtures:
 { "type": "ClearScene" }
 ```
@@ -116,6 +123,15 @@ Behaviour:
   For full parity — the physical head/yoke geometry moving with exact pivots, axes and limits —
   include the `profile` (with `motionRig` + `parts`/`<Beam>`); the GDTF solver then takes over.
 - Profiles can be sent inline in `LoadScene` or ahead of time via `RegisterFixtureProfile`.
+- `RegisterFixtureMeshes` delivers a fixture's meshes **additively and chunk-by-chunk** when one
+  fixture's full bundle is too large for a single message. Each message carries a *subset* of
+  `meshes[]`; the plugin **merges** the chunks per `libraryId` (appending, not overwriting) and,
+  once `chunkCount` messages have arrived (or `chunkCount <= 1` for a single message), commits the
+  merged bundle to the mesh cache — replacing any prior partial. Chunks are counted, not indexed,
+  so out-of-order/duplicate `chunkIndex` values are tolerated. On completion, if fixtures are
+  already spawned, the affected scene is re-spawned (re-broadcasting the handshake) so light-only
+  fixtures of that `libraryId` gain their geometry; otherwise a later `LoadScene` uses the now-
+  cached meshes.
 - IES/gobo images are still fetched lazily via REST; if the portal is unreachable they simply
   don't load, but dimmer/colour/pan-tilt/zoom still work.
 
@@ -150,13 +166,13 @@ The plugin already parses and drives the full GDTF rig — to make the **physica
         "pivot": { "x":0, "y":0,   "z":0 },            // RH Y-up metres, fixture-local
         "axis":  { "x":0, "y":1,   "z":0 },            // RH Y-up unit direction
         "minDeg": -270, "maxDeg": 270, "defaultDeg": 0,
-        "nodeName": "yoke", "parentNodeName": "",       // empty parent = base axis
+        "geometryName": "yoke", "parentGeometryName": "", // empty parent = base axis
         "affectedGeometryNames": ["yoke","head"] },     // links to mesh geometryName/modelName
       { "kind": "tilt",
         "pivot": { "x":0, "y":0.2, "z":0 },
         "axis":  { "x":1, "y":0,   "z":0 },
         "minDeg": -135, "maxDeg": 135, "defaultDeg": 0,
-        "nodeName": "head", "parentNodeName": "yoke",   // tilt is a CHILD of pan
+        "geometryName": "head", "parentGeometryName": "yoke", // tilt is a CHILD of pan
         "affectedGeometryNames": ["head"] }
     ]
   },
@@ -187,6 +203,13 @@ The plugin already parses and drives the full GDTF rig — to make the **physica
   ]
 }
 ```
+
+**Axis identity field names:** each axis's identity/parent link is read from **either**
+`nodeName`/`parentNodeName` **or** `geometryName`/`parentGeometryName` (the portal sends the
+latter). The explicit `nodeName`/`parentNodeName` win when both are present. These names are
+matched (`parentGeometryName` → `geometryName`) to resolve the parent-first axis order and the
+tilt-under-pan compensation, so the head's tilt chains under the pan. `affectedGeometryNames`
+remains the separate mesh→axis link field (unchanged).
 
 **The linking rule that makes geometry move:** a mesh is bucketed onto a motion axis when its
 `geometryName` *or* `modelName` (compared case-insensitively) appears in that axis's

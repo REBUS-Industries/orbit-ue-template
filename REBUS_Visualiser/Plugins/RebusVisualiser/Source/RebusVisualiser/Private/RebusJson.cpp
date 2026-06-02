@@ -228,8 +228,17 @@ namespace RebusJson
 				TryGetNumber(*AO, TEXT("minDeg"), Axis.MinDeg);
 				TryGetNumber(*AO, TEXT("maxDeg"), Axis.MaxDeg);
 				TryGetNumber(*AO, TEXT("defaultDeg"), Axis.DefaultDeg);
-				TryGetString(*AO, TEXT("nodeName"), Axis.NodeName);
-				TryGetString(*AO, TEXT("parentNodeName"), Axis.ParentNodeName);
+				// Per-axis identity: prefer the explicit nodeName/parentNodeName, but fall back to
+				// the portal's geometryName/parentGeometryName aliases so parent-link resolution
+				// (and the tilt-under-pan compensation that depends on ParentAxisIndex) works.
+				if (!TryGetString(*AO, TEXT("nodeName"), Axis.NodeName))
+				{
+					TryGetString(*AO, TEXT("geometryName"), Axis.NodeName);
+				}
+				if (!TryGetString(*AO, TEXT("parentNodeName"), Axis.ParentNodeName))
+				{
+					TryGetString(*AO, TEXT("parentGeometryName"), Axis.ParentNodeName);
+				}
 
 				const TArray<TSharedPtr<FJsonValue>>* Affected = nullptr;
 				if ((*AO)->TryGetArrayField(TEXT("affectedGeometryNames"), Affected) && Affected)

@@ -104,6 +104,14 @@ private:
 	TSet<FString> PendingProfiles;
 	TSet<FString> PendingMeshes;
 
+	// Chunked RegisterFixtureMeshes accumulation: the portal can split one fixture's meshes
+	// across multiple data-channel messages (each capped ~60k chars). We append each chunk's
+	// meshes per libraryId until chunkCount messages arrive, then commit the merged bundle into
+	// MeshCache. PendingMeshChunksSeen counts received messages (not indices) so out-of-order or
+	// duplicate chunkIndex values are tolerated.
+	TMap<FString, FRebusMeshBundle> PendingMeshChunks;
+	TMap<FString, int32> PendingMeshChunksSeen;
+
 	UPROPERTY() TArray<TObjectPtr<ARebusFixtureActor>> SpawnedFixtures;
 
 	FTSTicker::FDelegateHandle TickHandle;

@@ -484,6 +484,73 @@ void URebusVisualiserSubsystem::HandleSceneDefinition(const FString& Type, const
 		return;
 	}
 
+	if (Type == TEXT("RegisterFixtureMeshes"))
+	{
+		// Additive, chunk-aware mesh delivery: a fixture whose full mesh bundle exceeds the
+		// per-message budget is split across N messages, each carrying a SUBSET of meshes[].
+		// We merge the chunks per libraryId and commit to MeshCache once all have arrived.
+		// { libraryId, meshes:{ version, meshes:[...] }, chunkIndex?, chunkCount? }
+		FString LibraryId;
+		RebusJson::TryGetString(Msg, TEXT("libraryId"), LibraryId);
+		const FString MeshJson = FieldToString(Msg, TEXT("meshes"));
+		if (LibraryId.IsEmpty() || MeshJson.IsEmpty())
+		{
+			UE_LOG(LogRebusVisualiser, Warning, TEXT("RegisterFixtureMeshes missing libraryId/meshes; ignoring."));
+			return;
+		}
+
+		FRebusMeshBundle Chunk;
+		if (!RebusJson::ParseMeshBundle(MeshJson, Chunk))
+		{
+			UE_LOG(LogRebusVisualiser, Warning, TEXT("RegisterFixtureMeshes 'meshes' failed to parse (libraryId='%s'); ignoring."), *LibraryId);
+			return;
+		}
+
+		double ChunkCountD = 1.0;
+		double ChunkIndexD = 0.0;
+		RebusJson::TryGetNumber(Msg, TEXT("chunkCount"), ChunkCountD);
+		RebusJson::TryGetNumber(Msg, TEXT("chunkIndex"), ChunkIndexD);
+		const int32 ChunkCount = FMath::Max(1, (int32)ChunkCountD);
+		const int32 ChunkIndex = FMath::Max(0, (int32)ChunkIndexD);
+
+		// Append this chunk's meshes into the per-libraryId accumulator.
+		FRebusMeshBundle& Accum = PendingMeshChunks.FindOrAdd(LibraryId);
+		if (Chunk.Version != 0) Accum.Version = Chunk.Version;
+		const int32 MeshesInChunk = Chunk.Meshes.Num();
+		Accum.Meshes.Append(MoveTemp(Chunk.Meshes));
+		const int32 Seen = ++PendingMeshChunksSeen.FindOrAdd(LibraryId);
+
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("RegisterFixtureMeshes '%s' chunk %d/%d (%d mesh(es) in chunk, %d accumulated)."),
+			*LibraryId, ChunkIndex + 1, ChunkCount, MeshesInChunk, Accum.Meshes.Num());
+
+		// Complete when we've seen all chunks (or this is a single non-chunked message).
+		if (Seen < ChunkCount)
+		{
+			return;
+		}
+
+		FRebusMeshBundle Merged = MoveTemp(Accum);
+		const int32 TotalMeshes = Merged.Meshes.Num();
+		MeshCache.Add(LibraryId, MoveTemp(Merged));
+		PendingMeshChunks.Remove(LibraryId);
+		PendingMeshChunksSeen.Remove(LibraryId);
+
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("RegisterFixtureMeshes '%s' complete: merged %d mesh(es) into the cache."),
+			*LibraryId, TotalMeshes);
+
+		// Re-apply to already-spawned fixtures so any beam/light-only fixtures of this libraryId
+		// gain their geometry now that meshes arrived. Re-spawn only happens at load time and
+		// SpawnAllFixtures re-broadcasts the handshake.
+		if (bFixturesSpawned && SceneData.Fixtures.Num() > 0)
+		{
+			ClearSpawnedFixtures();
+			SpawnAllFixtures();
+		}
+		return;
+	}
+
 	// LoadScene: { scene, profiles?, meshes? } -> (re)spawn fixtures from the pushed scene.
 	const FString SceneJson = FieldToString(Msg, TEXT("scene"));
 	if (SceneJson.IsEmpty())
