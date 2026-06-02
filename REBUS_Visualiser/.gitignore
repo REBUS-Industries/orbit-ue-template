@@ -1,0 +1,39 @@
+# --- Unreal Engine generated / per-machine artefacts ---
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+Build/
+
+# Plugin build outputs (never commit compiled plugin binaries / intermediates)
+Plugins/*/Binaries/
+Plugins/*/Intermediate/
+
+# Per-user editor scratch content (developer collections etc.)
+Content/Developers/
+
+# Visual Studio / Rider / Xcode IDE files
+.vs/
+.idea/
+.vscode/
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+*.xcodeproj
+*.xcworkspace
+
+# Project descriptor backups (never commit these)
+*.uproject.bak*
+*.orig-backup
+*.uplugin.bak*
+
+# Build logs
+*.log
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini

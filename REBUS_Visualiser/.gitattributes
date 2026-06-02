@@ -1,0 +1,28 @@
+# This subtree intentionally OVERRIDES the repo-root .gitattributes LFS rules.
+#
+# The only binary assets committed here are the vendored third-party
+# glTFRuntime plugin's material library (~3 MB of small .uasset files) and a
+# plugin icon. At this size Git LFS adds a clone-time dependency for no real
+# benefit, so we store them as ordinary Git blobs. Re-evaluate (and enable LFS)
+# if/when real artist Content (large .umap / .uasset / textures) lands here.
+
+# Disable LFS + treat as binary for the vendored asset formats.
+*.uasset -filter -diff -merge -text
+*.umap   -filter -diff -merge -text
+*.png    -filter -diff -merge -text
+*.tga    -filter -diff -merge -text
+*.exr    -filter -diff -merge -text
+*.fbx    -filter -diff -merge -text
+*.bin    -filter -diff -merge -text
+*.gz     -filter -diff -merge -text
+*.zip    -filter -diff -merge -text
+
+# Normalise text files to LF.
+*.ini       text eol=lf
+*.uproject  text eol=lf
+*.uplugin   text eol=lf
+*.cs        text eol=lf
+*.cpp       text eol=lf
+*.h         text eol=lf
+*.md        text eol=lf
+*.gltf      text eol=lf
