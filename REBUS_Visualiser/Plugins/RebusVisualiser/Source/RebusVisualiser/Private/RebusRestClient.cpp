@@ -63,15 +63,21 @@ void FRebusRestClient::FetchScene(const FString& ProjectId, const FString& Model
 		Url += FString::Printf(TEXT("&versionId=%s"), *FGenericPlatformHttp::UrlEncode(VersionId));
 	}
 
+	UE_LOG(LogRebusVisualiser, Log, TEXT("FetchScene GET %s (key=%s)"),
+		*Url, ApiKey.IsEmpty() ? TEXT("<missing>") : TEXT("<set>"));
+
 	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> Req = MakeGet(Url, ApiKey);
 	Req->OnProcessRequestComplete().BindLambda(
-		[OnComplete](FHttpRequestPtr, FHttpResponsePtr Response, bool bOk)
+		[OnComplete, Url](FHttpRequestPtr, FHttpResponsePtr Response, bool bOk)
 		{
 			FRebusScene Scene;
 			if (!IsSuccess(Response, bOk))
 			{
-				UE_LOG(LogRebusVisualiser, Error, TEXT("FetchScene failed (code=%d)"),
-					Response.IsValid() ? Response->GetResponseCode() : -1);
+				const int32 Code = Response.IsValid() ? Response->GetResponseCode() : -1;
+				FString Body = Response.IsValid() ? Response->GetContentAsString() : FString();
+				if (Body.Len() > 256) Body = Body.Left(256) + TEXT("...");
+				UE_LOG(LogRebusVisualiser, Error, TEXT("FetchScene failed (code=%d) url=%s body=%s"),
+					Code, *Url, *Body);
 				OnComplete.ExecuteIfBound(false, Scene);
 				return;
 			}
