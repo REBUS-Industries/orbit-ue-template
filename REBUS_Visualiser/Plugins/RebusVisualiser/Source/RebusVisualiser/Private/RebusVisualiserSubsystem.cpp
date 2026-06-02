@@ -215,7 +215,17 @@ void URebusVisualiserSubsystem::OnSceneFetched(bool bOk, const FRebusScene& Scen
 {
 	if (!bOk)
 	{
-		if (Channel.IsValid()) Channel->SendError(TEXT("fetch-failed"), TEXT("Could not fetch scene"), true);
+		// A failed fetch (e.g. 404 / bad key) must NOT dead-end the handshake: report Ready with
+		// zero fixtures (non-fatal notice) so the portal still enables scene/quality/ground
+		// control. Previously this returned early and Ready never fired.
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Scene fetch failed; reporting Ready with no fixtures so scene control still works."));
+		if (Channel.IsValid())
+		{
+			Channel->SendNotice(TEXT("fetch-failed"), TEXT("Could not fetch scene; fixtures unavailable."));
+		}
+		bSceneLoaded = true;
+		TrySendReady();
 		return;
 	}
 	SceneData = Scene;

@@ -105,8 +105,16 @@ bool FRebusDataChannel::TryBind()
 	InputHandler->RegisterMessageHandler(RebusUIInteraction,
 		[WeakSelf](FString /*SourceId*/, FMemoryReader Ar)
 		{
+			// Diagnostic: confirms inbound UIInteraction reaches our handler at all (the portal
+			// side reports "no Pong/Ready"). If this never logs, the message isn't arriving here.
+			UE_LOG(LogRebusVisualiser, Log, TEXT("UIInteraction received (%lld bytes)."), Ar.TotalSize());
+
 			const FString Descriptor = ReadDescriptorString(Ar);
-			if (Descriptor.IsEmpty()) return;
+			if (Descriptor.IsEmpty())
+			{
+				UE_LOG(LogRebusVisualiser, Warning, TEXT("UIInteraction decoded to empty descriptor (length-prefix mismatch?)."));
+				return;
+			}
 
 			// The message handler can fire off the game thread; route on the game thread.
 			AsyncTask(ENamedThreads::GameThread, [WeakSelf, Descriptor]()
@@ -187,6 +195,8 @@ void FRebusDataChannel::HandleDescriptor(const FString& Descriptor)
 		return;
 	}
 
+	UE_LOG(LogRebusVisualiser, Log, TEXT("Descriptor type '%s'."), *Type);
+
 	// Per-fixture / selection first.
 	if (URebusFixtureControlSubsystem* Ctl = Control.Get())
 	{
@@ -233,12 +243,20 @@ void FRebusDataChannel::SendEvent(const TSharedRef<FJsonObject>& Event)
 	TSharedPtr<IPixelStreaming2Streamer> Streamer = ResolveStreamer(StreamerId);
 	if (!Streamer.IsValid())
 	{
+		UE_LOG(LogRebusVisualiser, Warning, TEXT("SendEvent: no streamer '%s' resolved; dropping event."),
+			StreamerId.IsEmpty() ? TEXT("<default>") : *StreamerId);
 		return;
 	}
 
 	FString Out;
 	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Out);
 	FJsonSerializer::Serialize(Event, Writer);
+
+	FString EventType;
+	Event->TryGetStringField(TEXT("type"), EventType);
+	UE_LOG(LogRebusVisualiser, Log, TEXT("Sending '%s' (Response, %d players)."),
+		*EventType, Streamer->GetConnectedPlayers().Num());
+
 	Streamer->SendAllPlayersMessage(RebusResponseType, Out);
 }
 
@@ -334,5 +352,6 @@ void FRebusDataChannel::SendPong(double Ts)
 	E->SetStringField(TEXT("type"), TEXT("Pong"));
 	E->SetNumberField(TEXT("ts"), Ts);
 	E->SetNumberField(TEXT("ueClockMs"), FPlatformTime::Seconds() * 1000.0);
+	UE_LOG(LogRebusVisualiser, Log, TEXT("Sending Pong (ts=%.0f)."), Ts);
 	SendEvent(E);
 }
