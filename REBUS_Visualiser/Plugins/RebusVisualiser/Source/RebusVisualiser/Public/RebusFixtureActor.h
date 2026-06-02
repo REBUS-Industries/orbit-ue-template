@@ -113,6 +113,7 @@ public:
 private:
 	void BuildComponentHierarchy();
 	void BuildMeshes(const FRebusMeshBundle& Meshes);
+	void ResolveHeadAxisFromMeshes(); // refine HeadAxisIndex to the deepest axis driving a head mesh
 	void BuildSpotLight();
 	void RefreshMotion();         // re-solve pan/tilt and push transforms to groups + light
 	void RefreshIntensity();      // fold dimmer * shutter-gate into the light intensity

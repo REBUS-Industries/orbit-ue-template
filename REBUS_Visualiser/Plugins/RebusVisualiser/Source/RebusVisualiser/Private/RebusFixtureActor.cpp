@@ -92,6 +92,11 @@ void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
 
 	BuildComponentHierarchy();
 	BuildMeshes(InMeshes);
+	// Tie the beam's tracked axis to the deepest axis that actually drives a head mesh proxy,
+	// so the spotlight rides the exact same rig output as the moving head geometry (no separate
+	// pan/tilt recompute that could drift). Falls back to the topological deepest axis for
+	// light-only fixtures whose meshes matched nothing.
+	ResolveHeadAxisFromMeshes();
 	BuildSpotLight();
 	RefreshMotion();
 	RecomputeConeAngles();
@@ -107,18 +112,72 @@ void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
 		if (Axis.Kind == ERebusAxisKind::Pan) ++PanAxes;
 		else if (Axis.Kind == ERebusAxisKind::Tilt) ++TiltAxes;
 	}
+	// Beam tracking mode: rig-attached (the spotlight rides Cumulative[HeadAxisIndex], the same
+	// solve output that drives the head meshes -> head-aligned, no drift) vs the synthetic
+	// pan/tilt fallback used when there is no valid GDTF MotionRig.
+	FString BeamAttach;
+	if (bHasPanTilt && Profile.MotionRig.Axes.IsValidIndex(HeadAxisIndex))
+	{
+		const TCHAR* HeadKind = TEXT("Other");
+		switch (Profile.MotionRig.Axes[HeadAxisIndex].Kind)
+		{
+		case ERebusAxisKind::Pan:  HeadKind = TEXT("Pan"); break;
+		case ERebusAxisKind::Tilt: HeadKind = TEXT("Tilt"); break;
+		default: break;
+		}
+		BeamAttach = FString::Printf(TEXT("rig-head axis %d (%s)"), HeadAxisIndex, HeadKind);
+	}
+	else
+	{
+		BeamAttach = TEXT("synthetic-pan-tilt fallback");
+	}
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s (lib %s): hasPanTilt=%s axes=%d (pan=%d tilt=%d) meshProxies=%d beam=%s"),
+		TEXT("Fixture %s (lib %s): hasPanTilt=%s axes=%d (pan=%d tilt=%d) meshProxies=%d beamSource=%s beamAttach=%s"),
 		*FixtureId, *LibraryFixtureId,
 		bHasPanTilt ? TEXT("true") : TEXT("false"),
 		Profile.MotionRig.Axes.Num(), PanAxes, TiltAxes,
 		MeshComponents.Num(),
-		bHasBeamNode ? TEXT("gdtf") : TEXT("fallback-down"));
+		bHasBeamNode ? TEXT("gdtf-beam") : TEXT("default-down"),
+		*BeamAttach);
 }
 
 void ARebusFixtureActor::BuildComponentHierarchy()
 {
+	// Topological deepest axis: the head/beam default, and the fallback when no mesh proxy
+	// bucketed onto a motion axis (e.g. a light-only fixture that still carries a rig).
 	HeadAxisIndex = RebusMotion::DeepestAxisIndex(Profile.MotionRig);
+}
+
+void ARebusFixtureActor::ResolveHeadAxisFromMeshes()
+{
+	// Prefer the deepest axis that an actual mesh proxy is bucketed onto, so the beam tracks
+	// the same rig output that visibly moves the head geometry. Keep the topological default
+	// (set in BuildComponentHierarchy) when nothing matched, so light-only fixtures still aim.
+	int32 BestAxis = INDEX_NONE;
+	int32 BestDepth = -1;
+	for (int32 Axis : MeshAxisBucket)
+	{
+		if (Axis == INDEX_NONE || !Profile.MotionRig.Axes.IsValidIndex(Axis))
+		{
+			continue;
+		}
+		int32 Depth = 0;
+		int32 P = Profile.MotionRig.Axes[Axis].ParentAxisIndex;
+		while (P != INDEX_NONE && Profile.MotionRig.Axes.IsValidIndex(P))
+		{
+			++Depth;
+			P = Profile.MotionRig.Axes[P].ParentAxisIndex;
+		}
+		if (Depth > BestDepth)
+		{
+			BestDepth = Depth;
+			BestAxis = Axis;
+		}
+	}
+	if (BestAxis != INDEX_NONE)
+	{
+		HeadAxisIndex = BestAxis;
+	}
 }
 
 void ARebusFixtureActor::BuildMeshes(const FRebusMeshBundle& Meshes)
@@ -336,9 +395,12 @@ void ARebusFixtureActor::RefreshMotion()
 
 	if (SpotLight)
 	{
+		// Rigidly ride the head: reuse the SAME cumulative axis transform that drives the head
+		// mesh proxies above (Cumulative[HeadAxisIndex]) rather than recomputing pan/tilt for the
+		// beam, so the beam can never drift from the geometry. Apply the beam rest as the light's
+		// local-within-head transform, then the head motion: BeamRest * Head (§7.7).
 		const FTransform Head = (HeadAxisIndex != INDEX_NONE && Cumulative.IsValidIndex(HeadAxisIndex))
 			? Cumulative[HeadAxisIndex] : FTransform::Identity;
-		// Apply beam rest first, then head motion (§7.7).
 		SpotLight->SetRelativeTransform(BeamRestTransform * Head);
 	}
 }
