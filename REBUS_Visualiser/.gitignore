@@ -12,6 +12,13 @@ Plugins/*/Intermediate/
 # Per-user editor scratch content (developer collections etc.)
 Content/Developers/
 
+# Auto-generated base level -- init_unreal.py regenerates it at editor startup
+# (see Content/Python/build_rebus_base_level.py), so it is a derived artefact.
+Content/REBUS/Maps/
+
+# Python bytecode cache
+Content/Python/__pycache__/
+
 # Visual Studio / Rider / Xcode IDE files
 .vs/
 .idea/

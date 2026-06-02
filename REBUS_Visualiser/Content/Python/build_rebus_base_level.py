@@ -48,11 +48,27 @@ def _spawn(actor_class, location=None, rotation=None, label=None):
     return actor
 
 
+def _component(actor, component_class):
+    """Fetch an actor's component by class.
+
+    Robust across engine versions -- avoids guessing the per-actor editor-property
+    name for the component (which differs between UE releases and is what broke on
+    5.7). Returns None and logs if the component can't be found.
+    """
+    comp = actor.get_component_by_class(component_class)
+    if comp is None:
+        unreal.log_warning("RebusBaseLevel: no {} on {}".format(
+            component_class.__name__, actor.get_actor_label()))
+    return comp
+
+
 def _add_exponential_height_fog():
     fog = _spawn(unreal.ExponentialHeightFog, unreal.Vector(0.0, 0.0, 200.0), label="RebusHeightFog")
     if not fog:
         return
-    comp = fog.get_editor_property("exponential_height_fog_component")
+    comp = _component(fog, unreal.ExponentialHeightFogComponent)
+    if not comp:
+        return
     # Exponential height fog is inherently a single global actor (full extent).
     _set(comp, "fog_density", 0.02)
     _set(comp, "fog_height_falloff", 0.2)
@@ -79,36 +95,66 @@ def _add_lighting():
     # Sun.
     sun = _spawn(unreal.DirectionalLight, rotation=unreal.Rotator(-45.0, 200.0, 0.0), label="RebusSun")
     if sun:
-        comp = sun.get_editor_property("directional_light_component")
-        _set(comp, "intensity", 6.0)
-        _set(comp, "mobility", unreal.ComponentMobility.MOVABLE)
-        _set(comp, "cast_shadows", True)
+        comp = _component(sun, unreal.DirectionalLightComponent)
+        if comp:
+            _set(comp, "intensity", 6.0)
+            _set(comp, "mobility", unreal.ComponentMobility.MOVABLE)
+            _set(comp, "cast_shadows", True)
 
     # Sky light (real-time capture so it follows the atmosphere).
     sky = _spawn(unreal.SkyLight, location=unreal.Vector(0.0, 0.0, 300.0), label="RebusSkyLight")
     if sky:
-        comp = sky.get_editor_property("light_component")
-        _set(comp, "real_time_capture", True)
-        _set(comp, "intensity", 1.0)
-        _set(comp, "mobility", unreal.ComponentMobility.MOVABLE)
+        comp = _component(sky, unreal.SkyLightComponent)
+        if comp:
+            _set(comp, "real_time_capture", True)
+            _set(comp, "intensity", 1.0)
+            _set(comp, "mobility", unreal.ComponentMobility.MOVABLE)
 
     # Sky atmosphere so the sky/skylight have something to sample.
     _spawn(unreal.SkyAtmosphere, label="RebusSkyAtmosphere")
     unreal.log("RebusBaseLevel: sun + sky light + sky atmosphere added.")
 
 
+def _populate():
+    # Isolate each section so a failure in one (e.g. a renamed property on a
+    # future engine drop) still lets the others spawn.
+    for step in (_add_exponential_height_fog, _add_post_process_volume, _add_lighting):
+        try:
+            step()
+        except Exception as exc:  # noqa: BLE001
+            unreal.log_error("RebusBaseLevel: {} failed ({})".format(step.__name__, exc))
+
+
 def build():
+    """Force-(re)create the base level from scratch and save it.
+
+    Replaces whatever level is currently open, so call this only for an explicit
+    (re)bake (Tools > Execute Python Script / headless -run=pythonscript).
+    """
     les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
 
     # Create a fresh, empty level (replaces whatever is open) and make it current.
     les.new_level(LEVEL_PACKAGE_PATH)
 
-    _add_exponential_height_fog()
-    _add_post_process_volume()
-    _add_lighting()
+    _populate()
 
     les.save_current_level()
     unreal.log("RebusBaseLevel: saved {}".format(LEVEL_PACKAGE_PATH))
+
+
+def ensure_base_level():
+    """Generate the base level only if it does not already exist.
+
+    Returns True if it had to build the level, False if it was already present.
+    This is the idempotent entry point the startup hook (init_unreal.py) uses so
+    opening the project always lands on a populated stage without clobbering an
+    existing BaseLevel on every launch.
+    """
+    if unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH):
+        return False
+    unreal.log("RebusBaseLevel: '{}' missing; generating it.".format(LEVEL_PACKAGE_PATH))
+    build()
+    return True
 
 
 if __name__ == "__main__":
