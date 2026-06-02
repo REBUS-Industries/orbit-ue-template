@@ -1,116 +1,78 @@
 # orbit-ue-template
 
-Unreal Engine **5.7** template project for the PRISM Visualiser inside
-[REBUS-ORBIT/prism](https://github.com/REBUS-ORBIT/prism).
+Unreal Engine **5.7** project for the PRISM Visualiser inside
+[REBUS-ORBIT/prism](https://github.com/REBUS-ORBIT/prism). The PRISM
+orchestrator launches this project in `-game` + Pixel Streaming, the ORBIT
+connector imports the selected ORBIT model into the live world, and the
+`RebusVisualiser` plugin drives lighting fixtures and reports state back to the
+portal.
 
-This repo ships **only the project shell** — `.uproject`, `Config/*.ini`, an
-empty `Content/REBUS/{Maps,BP,Materials}` tree, and the release CI. The actual
-scene, importer Blueprint and master material are populated by artists and
-checked in via Git LFS as `.umap` / `.uasset` binaries.
+## Layout
 
-The PRISM Agent fetches a tagged release of this repo, unpacks it under
-`%LOCALAPPDATA%\PRISM.Agent\ue-template\<tag>\`, copies the tree into a per-job
-working directory, drops the converted glTF in, and launches Unreal Editor
-in `-game` mode with Pixel Streaming.
-
----
-
-## How to open this project
-
-1. Install **Unreal Engine 5.7.4** (or later 5.7.x) via the Epic Games Launcher.
-2. Install **Git LFS** (`git lfs install --system`) before cloning, otherwise the
-   placeholder `.uasset` / `.umap` files come down as 130-byte pointer files.
-3. Clone this repo (or unzip a release): `git clone https://github.com/REBUS-ORBIT/orbit-ue-template.git`.
-4. Double-click `REBUSVis.uproject`. The launcher will associate it with your
-   5.7 install, prompt to download any missing plugins, and open the editor.
-
-No C++ compilation step. No Visual Studio. No UBT. If the editor asks to
-generate Visual Studio project files, you can decline.
-
----
-
-## Required plugins
-
-These are already declared as `"Enabled": true` in `REBUSVis.uproject` — UE
-will surface a warning on first open if any are missing from your install:
-
-| Plugin | Why we need it |
-| --- | --- |
-| `PixelStreaming2` | The orchestrator launches `-game` with `-PixelStreamingURL` to stream the viewport to the ORBIT web client. |
-| `Interchange` / `InterchangeAssets` / `InterchangeEditor` | The Python importer (in `BP_OrbitImporter`) wraps Interchange to bring the converted glTF in as a `World` + meshes + materials. |
-| `PythonScriptPlugin` | Lets the orchestrator drive the editor from a `-ExecutePythonScript=` command line. |
-| `EditorScriptingUtilities` | Required by the Python importer for level/asset manipulation (`unreal.EditorAssetLibrary`, `LevelEditorSubsystem`, etc.). |
-| `MovieRenderPipeline` | Used by the optional "render still / turntable" code path. |
-| `DMXEngine` / `DMXProtocol` / `DMXFixtures` | Reserved for lighting-design playback driven from ORBIT. Safe to leave on even when unused. |
-
----
-
-## Placeholders artists need to fill
-
-The orchestrator's Python importer assumes three assets exist at known paths.
-On a fresh clone they're empty `.gitkeep` placeholders. See
-[`Content/REBUS/README.md`](Content/REBUS/README.md) for the full table; the
-short version is:
-
-- `Content/REBUS/Maps/BaseLevel.umap` — empty level with `SkyAtmosphere`,
-  `VolumetricCloud`, `DirectionalLight` (sun), `SkyLight`,
-  `ExponentialHeightFog`, `PostProcessVolume`, and a 1×1 km neutral landscape.
-- `Content/REBUS/BP/BP_OrbitImporter.uasset` — Blueprint exposing a
-  Python-callable function `ImportGltf(gltfPath, targetFolder, levelName)` that
-  drives the Interchange import pipeline.
-- `Content/REBUS/Materials/M_DefaultLit.uasset` — master material applied to
-  any imported mesh whose `RenderMaterial` didn't survive the glTF round-trip.
-
-When all three exist, cut a release tagged `v1.0.0-ue5.7` (see Versioning
-below). The orchestrator will start fetching that tag.
-
----
-
-## How the orchestrator fetches this repo
-
-The PRISM Agent caches releases on disk so it doesn't re-download per job:
+The project lives in **[`REBUS_Visualiser/`](REBUS_Visualiser/)**:
 
 ```
-%LOCALAPPDATA%\PRISM.Agent\ue-template\
-├── v1.0.0-ue5.7\          ← unpacked release zip
-├── v1.0.1-ue5.7\
-└── ...
+REBUS_Visualiser/
+├── REBUS_Visualiser.uproject        # UE 5.7; enables the plugins below
+├── Source/                          # minimal C++ game module + Game/Editor targets
+├── Config/                          # DefaultEngine/Game/... (PixelStreaming2, Python)
+├── Content/Python/                  # build_rebus_base_level.py (portal-controllable env)
+└── Plugins/
+    ├── RebusVisualiser/             # vendored — fixture control, PS2 data channel, REST scene intake
+    ├── glTFRuntime/                 # vendored (MIT) — runtime .glb loader (receive)
+    └── OrbitConnector/              # NOT vendored — installed from orbit-connectors releases
 ```
 
-Resolution flow:
+## Plugins
 
-1. Agent reads its configured `ueTemplateTag` (defaults to the latest `v*-ue5.7`).
-2. If the cache for that tag is missing, it calls
-   `GET https://api.github.com/repos/REBUS-ORBIT/orbit-ue-template/releases/tags/<tag>`,
-   downloads the attached `orbit-ue-template-<tag>.zip` asset, and unpacks it.
-3. Per-job, the agent copies (`robocopy /MIR`) the unpacked tree into the
-   job's scratch directory, drops the converted glTF under
-   `<job>\Content\REBUS\Imports\<jobId>\`, rewrites
-   `Config/DefaultEngine.ini`'s `GameDefaultMap` / `EditorStartupMap` to the
-   per-job level, and launches `UnrealEditor.exe`.
+| Plugin | Vendored here? | Why |
+| --- | --- | --- |
+| `RebusVisualiser` | yes | UE side of the PRISM Visualiser: moving-head fixtures, IES/photometrics, motion-rig parity, PixelStreaming2 `UIInteraction` data channel, REST `/api/ue/*` scene intake. |
+| `glTFRuntime` | yes (MIT) | Runtime `.glb` loading for the connector's receive path. |
+| `OrbitConnector` | **no** | Canonical property of [`orbit-connectors`](https://github.com/REBUS-ORBIT/orbit-connectors); imports the full ORBIT geometry. Install it (plus the bundled `orbit-cli.exe`) from an orbit-connectors release — see below. |
+| `PixelStreaming2` | engine | Streams the viewport to the ORBIT web client. |
+| `ModelingToolsEditorMode`, `PythonScriptPlugin`, `EditorScriptingUtilities` | engine | Editor-only tooling (Python base-level builder, asset scripting). |
 
-The orchestrator's fetch / launch code lives in **PRISM Phase E**, not in this
-repo.
+## Installing OrbitConnector
 
----
+`OrbitConnector` is deliberately not committed here. Install it into the
+project's `Plugins/` from an [orbit-connectors release](https://github.com/REBUS-ORBIT/orbit-connectors/releases):
 
-## Versioning
+```powershell
+# from a checkout of orbit-connectors:
+installers\ue5\Update-OrbitConnector.ps1 -ProjectPath "<path>\REBUS_Visualiser"
+```
 
-We tag with the Unreal engine major.minor as a suffix so the agent can pick
-the right template for the editor it's about to launch.
+This places `Plugins/OrbitConnector/` and the bundled
+`Plugins/OrbitConnector/ThirdParty/Cli/win-x64/orbit-cli.exe`.
 
-| Tag pattern | Meaning |
-| --- | --- |
-| `v0.1.0-ue5.7-scaffold` | Scaffold-only — no usable scene yet. |
-| `v1.0.0-ue5.7` | First artist-populated release. |
-| `vX.Y.Z-ue5.7` | Subsequent releases on UE 5.7. |
-| `vX.Y.Z-ue5.8` | If/when we move to UE 5.8, run the `v1.0.0-ue5.8` line in parallel for a release window. |
+## Building
 
-Every tag matching `v*` triggers `.github/workflows/release.yml`, which zips
-the project (excluding `.git` / `.github` / `dist`) and attaches
-`orbit-ue-template-<tag>.zip` to the matching GitHub Release.
+This is a C++ project (`RebusVisualiser` + the project game module), so it
+**must be compiled** before it can run:
 
----
+1. Install **Unreal Engine 5.7.x** and a C++ toolchain (Visual Studio 2022 with
+   the *Game development with C++* workload).
+2. Install `OrbitConnector` (above).
+3. Open `REBUS_Visualiser/REBUS_Visualiser.uproject` — UE will prompt to build
+   `RebusVisualiser` / `REBUS_VisualiserEditor`; accept. (Or build the
+   `REBUS_VisualiserEditor` target via UBT / RunUAT.)
+
+## How PRISM uses it
+
+The PRISM orchestrator launches the **fixed** project in `-game` +
+PixelStreaming and passes the selected model as `-Orbit*` command-line tokens;
+the connector auto-imports it inside the streamed instance. See
+[`PRISM/docs/VISUALISER_CONNECTOR_IMPORT.md`](https://github.com/REBUS-ORBIT/prism/blob/main/docs/VISUALISER_CONNECTOR_IMPORT.md)
+and the connector's `PRISM-INTEGRATION.md` in `orbit-connectors` for the full
+contract.
+
+## Releases
+
+Every tag matching `v*` triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
+which zips the repo (excluding `.git` / `.github` / `dist`) and attaches
+`orbit-ue-template-<tag>.zip` to the GitHub Release. Tag with the engine
+major.minor as a suffix (e.g. `v1.0.0-ue5.7`).
 
 ## Licence
 
