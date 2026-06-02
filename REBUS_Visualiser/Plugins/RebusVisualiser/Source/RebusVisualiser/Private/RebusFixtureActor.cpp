@@ -238,14 +238,17 @@ void ARebusFixtureActor::BuildSpotLight()
 
 	if (!bHaveBeam)
 	{
-		// Fallback: head pivot (if any) + local barrel-forward (+X).
+		// Fallback: head pivot (if any), beam pointing straight DOWN (-Z). A spotlight emits
+		// along its local +X, so a zero rotation would fire horizontally; moving-head fixtures
+		// rest pointing down, which is also what a profile-less push expects. Pitch -90 aims +X
+		// to -Z. (When a GDTF <Beam> node is present, the branch above wins and uses it.)
 		FVector Origin = FVector::ZeroVector;
 		if (Profile.MotionRig.Axes.IsValidIndex(HeadAxisIndex))
 		{
 			Origin = RebusCoords::PointYUpMetersToUnreal(Profile.MotionRig.Axes[HeadAxisIndex].Pivot);
 		}
-		BeamRestTransform = FTransform(FRotator::ZeroRotator, Origin);
-		UE_LOG(LogRebusVisualiser, Verbose, TEXT("Fixture %s: no <Beam> node, using head-pivot fallback."), *FixtureId);
+		BeamRestTransform = FTransform(FRotator(-90.f, 0.f, 0.f), Origin);
+		UE_LOG(LogRebusVisualiser, Verbose, TEXT("Fixture %s: no <Beam> node, beam rests pointing down."), *FixtureId);
 	}
 }
 
@@ -253,12 +256,25 @@ void ARebusFixtureActor::RefreshMotion()
 {
 	if (!Profile.MotionRig.bValid || Profile.MotionRig.Axes.Num() == 0)
 	{
-		// Static fixture: meshes at rest, light at beam rest.
+		// No GDTF motion rig (e.g. a profile-less data-channel push). We can't tell the moving
+		// head from the static base, so the mesh proxies stay put, but we still aim the BEAM
+		// like a default moving head so pan/tilt are usable: rest straight down (-Z), tilt
+		// raises it toward the +X front, pan orbits about local up (+Z). Tilt sign chosen so a
+		// positive tilt lifts the beam off the floor; flip here if a fixture reads inverted.
 		for (UProceduralMeshComponent* PMC : MeshComponents)
 		{
 			if (PMC) PMC->SetRelativeTransform(FTransform::Identity);
 		}
-		if (SpotLight) SpotLight->SetRelativeTransform(BeamRestTransform);
+		if (SpotLight)
+		{
+			FVector Dir(0.f, 0.f, -1.f); // straight down at rest
+			Dir = FQuat(FVector::RightVector, FMath::DegreesToRadians(-TiltDeg.Current)).RotateVector(Dir);
+			Dir = FQuat(FVector::UpVector, FMath::DegreesToRadians(PanDeg.Current)).RotateVector(Dir);
+
+			FTransform T = BeamRestTransform; // keep the rest origin
+			T.SetRotation(FRotationMatrix::MakeFromX(Dir).ToQuat());
+			SpotLight->SetRelativeTransform(T);
+		}
 		return;
 	}
 

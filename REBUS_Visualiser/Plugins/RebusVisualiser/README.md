@@ -110,8 +110,11 @@ Behaviour:
   `scene.fixtures[]` at its `matrixZUpMeters` placement, registers it under the **Speckle node
   id** (`fixtures[].id`) — the same key `SetFixture*` uses — and re-broadcasts `Ready` +
   `FixtureRegistered`.
-- `profiles`/`meshes` are optional. Without a profile a fixture is **light-only** (no custom
-  geometry, no GDTF motion rig) — pan/tilt parity needs the profile's motion rig, so include it.
+- `profiles`/`meshes` are optional. Without a profile a fixture is **light-only**: it has no
+  custom geometry and no GDTF motion rig, so it falls back to a **default moving-head beam**
+  that rests pointing straight down and pans/tilts the spotlight from the inbound `pan`/`tilt`.
+  For full parity — the physical head/yoke geometry moving with exact pivots, axes and limits —
+  include the `profile` (with `motionRig` + `parts`/`<Beam>`); the GDTF solver then takes over.
 - Profiles can be sent inline in `LoadScene` or ahead of time via `RegisterFixtureProfile`.
 - IES/gobo images are still fetched lazily via REST; if the portal is unreachable they simply
   don't load, but dimmer/colour/pan-tilt/zoom still work.
