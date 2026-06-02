@@ -122,6 +122,82 @@ Behaviour:
 This is purely additive: the REST path (§Lifecycle 2) still runs, and a `LoadScene` push
 overrides it.
 
+### Moving-head parity: the `profile` + `meshes` the portal must push
+
+The plugin already parses and drives the full GDTF rig — to make the **physical heads move**
+(not just the beam), the portal must include each fixture's **`motionRig`** *and* its
+**`meshes`** in the push. Field names below are exactly what `RebusJson::ParseFixtureProfile`
+/ `ParseMeshBundle` read; unknown fields are ignored, missing optionals stay unset.
+
+**Coordinate conventions (do not mix these up):**
+- `scene.fixtures[].matrixZUpMeters` — **RH Z-up metres**, column-major (or row-major when
+  `matrixSource == "transform-row"`). This is the only Z-up payload.
+- `motionRig` pivots/axes/`pivotOffset`, mesh `vertices`, and beam vectors /
+  `worldMatrixMeters` — **RH Y-up metres**. (Most common mistake: the rig vectors are Y-up.)
+
+```jsonc
+// profiles["<libraryFixtureId>"]  — identical to GET /api/ue/fixtures/{libraryId}
+{
+  "schema": "rebus-ue-fixture/v5",
+  "id": "<libraryFixtureId>",            // must equal scene.fixtures[].fixtureId
+  "manufacturer": "...", "fixtureName": "...",
+  "dimensions": { "x": .., "y": .., "z": .. },        // metres, optional
+
+  "motionRig": {                                       // REQUIRED for head/yoke motion
+    "pivotOffset": { "x":0, "y":0, "z":0 },            // RH Y-up metres, optional
+    "axes": [
+      { "kind": "pan",                                 // "pan" | "tilt" | other
+        "pivot": { "x":0, "y":0,   "z":0 },            // RH Y-up metres, fixture-local
+        "axis":  { "x":0, "y":1,   "z":0 },            // RH Y-up unit direction
+        "minDeg": -270, "maxDeg": 270, "defaultDeg": 0,
+        "nodeName": "yoke", "parentNodeName": "",       // empty parent = base axis
+        "affectedGeometryNames": ["yoke","head"] },     // links to mesh geometryName/modelName
+      { "kind": "tilt",
+        "pivot": { "x":0, "y":0.2, "z":0 },
+        "axis":  { "x":1, "y":0,   "z":0 },
+        "minDeg": -135, "maxDeg": 135, "defaultDeg": 0,
+        "nodeName": "head", "parentNodeName": "yoke",   // tilt is a CHILD of pan
+        "affectedGeometryNames": ["head"] }
+    ]
+  },
+
+  "fixtureParts": [                                      // optional; gives the beam its aim (§7.7)
+    { "name": "Beam", "type": "Beam",
+      "worldMatrixMeters": [ /* 16, RH Y-up */ ],
+      "beamDirectionWorld": { "x":0, "y":-1, "z":0 },    // RH Y-up; -Y = points down
+      "beamUpWorld":        { "x":0, "y":0,  "z":1 } }
+  ],
+
+  "photometrics": { "luminousFlux":.., "beamAngle":.., "fieldAngle":.., "colorTemperature":.., "cri":.., "hasIesProfile":true },
+  "zoom":   { "minDeg":.., "maxDeg":.. },
+  "source": { "radiusMeters":.., "diameterMeters":.. },
+  "wheels": [ { "name":"Gobo 1", "kind":"gobo", "slots":[ { "name":"..","color":"..","imageUrl":".." } ] } ],
+  "iesProfiles": [ { "zoomDmx":0, "zoomAngleDeg":.., "beamAngleDeg":.., "fieldAngleDeg":.., "iesUrl":".." } ]
+}
+```
+
+```jsonc
+// meshes["<libraryFixtureId>"]  — identical to GET /api/ue/fixtures/{id}/meshes
+{
+  "version": 1,
+  "meshes": [
+    { "name": "head", "geometryName": "head", "modelName": "...",
+      "vertices": [ x,y,z,  x,y,z, ... ],   // metres, engine Y-up
+      "faces":    [ 0, i0,i1,i2,  1, j0,j1,j2,j3, ... ] }  // 0=tri, 1=quad, else explicit count
+  ]
+}
+```
+
+**The linking rule that makes geometry move:** a mesh is bucketed onto a motion axis when its
+`geometryName` *or* `modelName` (compared case-insensitively) appears in that axis's
+`affectedGeometryNames`. The **deepest** matching axis wins; a mesh that matches nothing stays
+on the static base; the beam/head tracks the deepest axis automatically. So the portal must
+keep `affectedGeometryNames` consistent with the mesh `geometryName`s it pushes — otherwise the
+geometry parents to the base and won't move even though the beam does.
+
+> Watch message size: a full mesh bundle can be large. For big fixtures push each profile (with
+> its meshes) via `RegisterFixtureProfile` first, then a final `LoadScene` carrying just `scene`.
+
 ## Compile-time touch-points to verify (Pixel Streaming 2)
 
 PS2's C++ surface shifted across 5.5→5.7 and was not compiler-checked on the authoring
