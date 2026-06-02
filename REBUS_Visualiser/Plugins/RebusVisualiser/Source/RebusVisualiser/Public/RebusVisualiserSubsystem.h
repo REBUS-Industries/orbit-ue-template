@@ -56,6 +56,11 @@ private:
 	// the level was authored without them. No-ops when the level already provides them.
 	void EnsureSceneEnvironment();
 
+	// Place the streamed view at the configured start pose (the level has no PlayerStart, so the
+	// default pawn would otherwise spawn at the origin). Returns false until the player
+	// controller + pawn exist, so the caller can retry on a later tick.
+	bool TryPositionPlayerView();
+
 	URebusFixtureControlSubsystem* GetControl() const;
 	URebusSceneSettingsSubsystem* GetSceneSettings() const;
 	UWorld* GetActiveWorld() const;
@@ -87,6 +92,7 @@ private:
 	FTSTicker::FDelegateHandle TickHandle;
 
 	bool bEnvEnsured = false;
+	bool bViewPositioned = false;
 	bool bSceneRequested = false;
 	bool bSceneLoaded = false;
 	bool bFixturesSpawned = false;

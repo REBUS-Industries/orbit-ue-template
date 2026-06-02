@@ -12,6 +12,8 @@
 #include "Engine/World.h"
 #include "Engine/Engine.h"
 #include "EngineUtils.h"
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/Pawn.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #include "Misc/ConfigCacheIni.h"
@@ -26,6 +28,11 @@
 #include "Materials/MaterialInterface.h"
 
 static const TCHAR* RebusProjectVersion = TEXT("rebus-visualiser-1.0.0");
+
+// Default streamed-view start pose. Authored in metres (0,-20,2) looking at (0,0,2); Unreal is
+// centimetres, so x100. The look is horizontal along +Y (yaw 90). Tweak here if the stage moves.
+static const FVector RebusViewStartLocation(0.f, -2000.f, 200.f);
+static const FVector RebusViewLookAtLocation(0.f, 0.f, 200.f);
 
 void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -130,6 +137,17 @@ bool URebusVisualiserSubsystem::Tick(float DeltaSeconds)
 		{
 			bEnvEnsured = true;
 			EnsureSceneEnvironment();
+		}
+	}
+
+	// Place the streamed view at the configured start pose. The player controller / pawn may not
+	// exist on the first ready tick, so retry until it succeeds (this is the only reposition).
+	if (!bViewPositioned)
+	{
+		UWorld* World = GetActiveWorld();
+		if (World && World->IsGameWorld() && World->HasBegunPlay())
+		{
+			bViewPositioned = TryPositionPlayerView();
 		}
 	}
 
@@ -439,4 +457,33 @@ void URebusVisualiserSubsystem::EnsureSceneEnvironment()
 			}
 		}
 	}
+}
+
+bool URebusVisualiserSubsystem::TryPositionPlayerView()
+{
+	UWorld* World = GetActiveWorld();
+	if (!World) return false;
+
+	APlayerController* PC = World->GetFirstPlayerController();
+	if (!PC) return false; // controller not spawned yet -> retry next tick
+
+	// Forward (actor +X / control-rotation forward) points from the eye to the look-at target.
+	const FRotator ViewRotation = (RebusViewLookAtLocation - RebusViewStartLocation).Rotation();
+
+	if (APawn* Pawn = PC->GetPawn())
+	{
+		Pawn->SetActorLocationAndRotation(RebusViewStartLocation, ViewRotation);
+	}
+	else
+	{
+		return false; // pawn not spawned yet -> retry next tick
+	}
+
+	// DefaultPawn's camera follows the controller's control rotation; set it so the view faces
+	// the target immediately (not just the pawn's actor rotation).
+	PC->SetControlRotation(ViewRotation);
+
+	UE_LOG(LogRebusVisualiser, Log, TEXT("Player view positioned at %s facing %s."),
+		*RebusViewStartLocation.ToString(), *ViewRotation.ToString());
+	return true;
 }
