@@ -127,6 +127,7 @@ void URebusSceneSettingsSubsystem::SetOriginGizmo(bool bShow)
 	// Persistent debug draw renders into the game viewport (and so into the Pixel Streaming
 	// frame) in Development builds. Clear first so repeated toggles don't stack.
 	FlushPersistentDebugLines(World);
+	FlushDebugStrings(World);
 	if (!bShow) return;
 
 	const float Len = 500.f;   // 5 m arms
@@ -136,6 +137,16 @@ void URebusSceneSettingsSubsystem::SetOriginGizmo(bool bShow)
 	DrawDebugDirectionalArrow(World, FVector::ZeroVector, FVector(0.f, Len, 0.f), Head, FColor::Green, true, -1.f, 0, Thick); // +Y
 	DrawDebugDirectionalArrow(World, FVector::ZeroVector, FVector(0.f, 0.f, Len), Head, FColor::Blue,  true, -1.f, 0, Thick); // +Z
 	DrawDebugSphere(World, FVector::ZeroVector, 15.f, 12, FColor::White, true, -1.f, 0, 3.f);
+
+	// Axis end labels so orientation is readable in-game (persistent, matching the arms above).
+	const float LabelFontScale = 1.5f;
+	DrawDebugString(World, FVector( Len, 0.f, 0.f), TEXT("X+"), nullptr, FColor::Red,   -1.f, false, LabelFontScale);
+	DrawDebugString(World, FVector(-Len, 0.f, 0.f), TEXT("X-"), nullptr, FColor::Red,   -1.f, false, LabelFontScale);
+	DrawDebugString(World, FVector(0.f,  Len, 0.f), TEXT("Y+"), nullptr, FColor::Green, -1.f, false, LabelFontScale);
+	DrawDebugString(World, FVector(0.f, -Len, 0.f), TEXT("Y-"), nullptr, FColor::Green, -1.f, false, LabelFontScale);
+	DrawDebugString(World, FVector(0.f, 0.f,  Len), TEXT("Z+"), nullptr, FColor::Blue,  -1.f, false, LabelFontScale);
+	DrawDebugString(World, FVector(0.f, 0.f, -Len), TEXT("Z-"), nullptr, FColor::Blue,  -1.f, false, LabelFontScale);
+
 	UE_LOG(LogRebusVisualiser, Log, TEXT("Origin gizmo enabled (X=red, Y=green, Z=blue)."));
 #else
 	UE_LOG(LogRebusVisualiser, Warning, TEXT("Origin gizmo unavailable: debug draw is compiled out in this build."));
