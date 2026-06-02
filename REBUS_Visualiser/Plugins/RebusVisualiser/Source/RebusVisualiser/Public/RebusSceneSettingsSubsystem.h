@@ -16,6 +16,7 @@ class ADirectionalLight;
 class ASkyLight;
 class AExponentialHeightFog;
 class APostProcessVolume;
+class AStaticMeshActor;
 class FJsonObject;
 
 UCLASS()
@@ -24,6 +25,10 @@ class REBUSVISUALISER_API URebusSceneSettingsSubsystem : public UWorldSubsystem
 	GENERATED_BODY()
 
 public:
+	// Seeds sensible defaults for the portal-controllable ground so the first SceneState
+	// read-back hydrates the controls even before the portal pushes a value.
+	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
+
 	// Apply a single catalogue property; stores the value for SceneState read-back.
 	// Returns false for an unknown name (the caller may surface a Notice).
 	bool ApplySceneProperty(const FString& Name, const FRebusPropertyValue& Value);
@@ -39,6 +44,10 @@ private:
 	ASkyLight* GetSkyLight();
 	AExponentialHeightFog* GetFog();
 	APostProcessVolume* GetPostProcess();
+	AStaticMeshActor* GetFloor();
+
+	// Swap the floor plane's material to the generated MI_RebusGround_<Preset> instance.
+	void SetGroundSurface(const FString& Preset);
 
 	void SetScalabilityBucket(const TCHAR* Group, int32 Bucket);
 	void SetCVarFloat(const TCHAR* CVar, float Value);
@@ -51,4 +60,5 @@ private:
 	TWeakObjectPtr<ASkyLight> CachedSky;
 	TWeakObjectPtr<AExponentialHeightFog> CachedFog;
 	TWeakObjectPtr<APostProcessVolume> CachedPostProcess;
+	TWeakObjectPtr<AStaticMeshActor> CachedFloor;
 };

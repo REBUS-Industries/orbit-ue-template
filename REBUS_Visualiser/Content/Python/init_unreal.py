@@ -30,6 +30,9 @@ def _ensure_and_load():
             les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
             les.load_level(base.LEVEL_PACKAGE_PATH)
             unreal.log("RebusBaseLevel: generated + loaded at startup.")
+        # Self-heal the floor into whatever BaseLevel is now open (covers levels
+        # baked before the floor feature existed).
+        base.ensure_floor_in_level()
     except Exception as exc:  # noqa: BLE001
         unreal.log_error("RebusBaseLevel: startup ensure failed ({})".format(exc))
 

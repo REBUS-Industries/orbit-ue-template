@@ -29,6 +29,22 @@ import unreal
 
 LEVEL_PACKAGE_PATH = "/Game/REBUS/Maps/BaseLevel"
 
+MATERIALS_DIR = "/Game/REBUS/Materials"
+GROUND_MASTER_PATH = MATERIALS_DIR + "/M_RebusGround"
+
+# Portal-controllable ground surface presets: name -> (ColorA, ColorB, Roughness).
+# These drive the procedural M_RebusGround master (no imported image textures needed);
+# the C++ scene-settings subsystem swaps between the generated instances on SetSceneProperty
+# name="GroundSurface". Keep these names in sync with SetGroundSurface() in
+# RebusSceneSettingsSubsystem.cpp.
+GROUND_PRESETS = {
+    "Concrete": (unreal.LinearColor(0.40, 0.40, 0.40, 1.0), unreal.LinearColor(0.52, 0.52, 0.50, 1.0), 0.85),
+    "Tarmac":   (unreal.LinearColor(0.05, 0.05, 0.06, 1.0), unreal.LinearColor(0.12, 0.12, 0.13, 1.0), 0.70),
+    "Sand":     (unreal.LinearColor(0.76, 0.66, 0.45, 1.0), unreal.LinearColor(0.87, 0.78, 0.57, 1.0), 0.90),
+    "Grass":    (unreal.LinearColor(0.09, 0.20, 0.06, 1.0), unreal.LinearColor(0.18, 0.34, 0.10, 1.0), 0.95),
+}
+GROUND_DEFAULT_PRESET = "Concrete"
+
 
 def _set(obj, name, value):
     """set_editor_property that logs instead of throwing on a renamed property."""
@@ -60,6 +76,130 @@ def _component(actor, component_class):
         unreal.log_warning("RebusBaseLevel: no {} on {}".format(
             component_class.__name__, actor.get_actor_label()))
     return comp
+
+
+def _instance_path(preset):
+    return "{}/MI_RebusGround_{}".format(MATERIALS_DIR, preset)
+
+
+def _build_ground_master(mat):
+    """Author the procedural ground master graph: lerp(ColorA, ColorB, Noise) -> BaseColor."""
+    mel = unreal.MaterialEditingLibrary
+
+    color_a = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -600, -150)
+    color_a.set_editor_property("parameter_name", "ColorA")
+    color_a.set_editor_property("default_value", unreal.LinearColor(0.40, 0.40, 0.40, 1.0))
+
+    color_b = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -600, 120)
+    color_b.set_editor_property("parameter_name", "ColorB")
+    color_b.set_editor_property("default_value", unreal.LinearColor(0.52, 0.52, 0.50, 1.0))
+
+    noise = mel.create_material_expression(mat, unreal.MaterialExpressionNoise, -600, 340)
+    # Small scale => broad features that read at ground scale (world-position driven).
+    _set(noise, "scale", 0.005)
+
+    lerp = mel.create_material_expression(mat, unreal.MaterialExpressionLinearInterpolate, -260, -20)
+    mel.connect_material_expressions(color_a, "", lerp, "A")
+    mel.connect_material_expressions(color_b, "", lerp, "B")
+    mel.connect_material_expressions(noise, "", lerp, "Alpha")
+    mel.connect_material_property(lerp, "", unreal.MaterialProperty.MP_BASE_COLOR)
+
+    rough = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -260, 260)
+    rough.set_editor_property("parameter_name", "Roughness")
+    rough.set_editor_property("default_value", 0.85)
+    mel.connect_material_property(rough, "", unreal.MaterialProperty.MP_ROUGHNESS)
+
+    mel.recompile_material(mat)
+
+
+def ensure_ground_materials(force=False):
+    """Generate the procedural ground master + one instance per surface preset.
+
+    Idempotent by default (only creates assets that don't already exist), which is what the
+    startup hook wants. With force=True it deletes any existing assets first and regenerates
+    them -- an unattended "always overwrite" so a full (re)bake never raises the editor's
+    overwrite-confirmation dialog. Only call force=True when the level is about to be rebuilt
+    (build()), so no live level actor is left referencing a deleted instance.
+    """
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+    mel = unreal.MaterialEditingLibrary
+
+    if force:
+        # Delete instances before the master so removing the master can't dangle their parent.
+        for preset in GROUND_PRESETS:
+            path = _instance_path(preset)
+            if unreal.EditorAssetLibrary.does_asset_exist(path):
+                unreal.EditorAssetLibrary.delete_asset(path)
+        if unreal.EditorAssetLibrary.does_asset_exist(GROUND_MASTER_PATH):
+            unreal.EditorAssetLibrary.delete_asset(GROUND_MASTER_PATH)
+
+    if not unreal.EditorAssetLibrary.does_asset_exist(GROUND_MASTER_PATH):
+        master = tools.create_asset("M_RebusGround", MATERIALS_DIR, unreal.Material, unreal.MaterialFactoryNew())
+        _build_ground_master(master)
+        unreal.EditorAssetLibrary.save_loaded_asset(master)
+
+    master = unreal.EditorAssetLibrary.load_asset(GROUND_MASTER_PATH)
+    if not master:
+        unreal.log_error("RebusBaseLevel: failed to load ground master material; skipping instances.")
+        return
+
+    for preset, (color_a, color_b, rough) in GROUND_PRESETS.items():
+        path = _instance_path(preset)
+        if unreal.EditorAssetLibrary.does_asset_exist(path):
+            continue
+        mic = tools.create_asset("MI_RebusGround_{}".format(preset), MATERIALS_DIR,
+                                 unreal.MaterialInstanceConstant, unreal.MaterialInstanceConstantFactoryNew())
+        mel.set_material_instance_parent(mic, master)
+        mel.set_material_instance_vector_parameter_value(mic, "ColorA", color_a)
+        mel.set_material_instance_vector_parameter_value(mic, "ColorB", color_b)
+        mel.set_material_instance_scalar_parameter_value(mic, "Roughness", rough)
+        unreal.EditorAssetLibrary.save_loaded_asset(mic)
+
+    unreal.log("RebusBaseLevel: ground materials ensured ({} presets).".format(len(GROUND_PRESETS)))
+
+
+def _add_floor():
+    plane = unreal.EditorAssetLibrary.load_asset("/Engine/BasicShapes/Plane.Plane")
+    floor = _spawn(unreal.StaticMeshActor, unreal.Vector(0.0, 0.0, 0.0), label="RebusFloor")
+    if not floor:
+        return
+    # Tag so URebusSceneSettingsSubsystem can find it for GroundSurface / bGroundVisible.
+    floor.set_editor_property("tags", ["RebusFloor"])
+    # ~2 km plane reads as an effectively infinite ground at stage scale.
+    floor.set_actor_scale3d(unreal.Vector(2000.0, 2000.0, 1.0))
+
+    comp = _component(floor, unreal.StaticMeshComponent)
+    if comp and plane:
+        comp.set_static_mesh(plane)
+        mic = unreal.EditorAssetLibrary.load_asset(_instance_path(GROUND_DEFAULT_PRESET))
+        if mic:
+            comp.set_material(0, mic)
+    unreal.log("RebusBaseLevel: infinite floor plane added (default surface: {}).".format(GROUND_DEFAULT_PRESET))
+
+
+def _has_floor(actor):
+    try:
+        return actor.actor_has_tag("RebusFloor")
+    except Exception:  # noqa: BLE001
+        return any(str(t) == "RebusFloor" for t in actor.get_editor_property("tags"))
+
+
+def ensure_floor_in_level():
+    """Add the floor to the currently-open level if it's missing, then save.
+
+    Self-heals an existing BaseLevel that was baked before the floor feature
+    existed (the floor is part of the level, not a separate asset, so the
+    map-missing check in ensure_base_level won't add it on its own). Idempotent.
+    """
+    eas = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    for actor in eas.get_all_level_actors():
+        if isinstance(actor, unreal.StaticMeshActor) and _has_floor(actor):
+            return False
+
+    _add_floor()
+    unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).save_current_level()
+    unreal.log("RebusBaseLevel: floor added to existing level and saved.")
+    return True
 
 
 def _add_exponential_height_fog():
@@ -118,7 +258,7 @@ def _add_lighting():
 def _populate():
     # Isolate each section so a failure in one (e.g. a renamed property on a
     # future engine drop) still lets the others spawn.
-    for step in (_add_exponential_height_fog, _add_post_process_volume, _add_lighting):
+    for step in (_add_exponential_height_fog, _add_post_process_volume, _add_lighting, _add_floor):
         try:
             step()
         except Exception as exc:  # noqa: BLE001
@@ -131,6 +271,11 @@ def build():
     Replaces whatever level is currently open, so call this only for an explicit
     (re)bake (Tools > Execute Python Script / headless -run=pythonscript).
     """
+    # A full bake always overwrites the generated materials (no confirmation dialog);
+    # safe because new_level below replaces the open level, so nothing references the
+    # instances we just deleted/recreated.
+    ensure_ground_materials(force=True)
+
     les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
 
     # Create a fresh, empty level (replaces whatever is open) and make it current.
@@ -150,6 +295,9 @@ def ensure_base_level():
     opening the project always lands on a populated stage without clobbering an
     existing BaseLevel on every launch.
     """
+    # Ground materials self-heal independently of the map (cheap if already present).
+    ensure_ground_materials()
+
     if unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH):
         return False
     unreal.log("RebusBaseLevel: '{}' missing; generating it.".format(LEVEL_PACKAGE_PATH))

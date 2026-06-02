@@ -12,9 +12,22 @@
 #include "Engine/SkyLight.h"
 #include "Engine/ExponentialHeightFog.h"
 #include "Engine/PostProcessVolume.h"
+#include "Engine/StaticMeshActor.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/SkyLightComponent.h"
 #include "Components/ExponentialHeightFogComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Materials/MaterialInterface.h"
+
+void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+	Super::Initialize(Collection);
+
+	// The baked floor defaults to Concrete and is visible; seed these so SceneState
+	// round-trips the ground controls before the portal pushes its first value.
+	Values.Add(TEXT("GroundSurface"), FRebusPropertyValue::MakeString(TEXT("Concrete")));
+	Values.Add(TEXT("bGroundVisible"), FRebusPropertyValue::MakeBool(true));
+}
 
 // ---- Actor lookups (cached) -----------------------------------------------------------
 
@@ -56,6 +69,51 @@ APostProcessVolume* URebusSceneSettingsSubsystem::GetPostProcess()
 		for (TActorIterator<APostProcessVolume> It(World); It; ++It) { CachedPostProcess = *It; break; }
 	}
 	return CachedPostProcess.Get();
+}
+
+AStaticMeshActor* URebusSceneSettingsSubsystem::GetFloor()
+{
+	if (CachedFloor.IsValid()) return CachedFloor.Get();
+	if (UWorld* World = GetWorld())
+	{
+		// The base level (and the EnsureSceneEnvironment backstop) tag the ground plane.
+		for (TActorIterator<AStaticMeshActor> It(World); It; ++It)
+		{
+			if (It->ActorHasTag(TEXT("RebusFloor"))) { CachedFloor = *It; break; }
+		}
+	}
+	return CachedFloor.Get();
+}
+
+void URebusSceneSettingsSubsystem::SetGroundSurface(const FString& Preset)
+{
+	AStaticMeshActor* Floor = GetFloor();
+	if (!Floor) return;
+
+	UStaticMeshComponent* Comp = Floor->GetStaticMeshComponent();
+	if (!Comp) return;
+
+	// Only allow the known presets (matches GROUND_PRESETS in build_rebus_base_level.py),
+	// so an arbitrary descriptor string can't trigger a load of an unintended asset.
+	const FString Clean = Preset.TrimStartAndEnd();
+	static const TSet<FString> Known = { TEXT("Concrete"), TEXT("Tarmac"), TEXT("Sand"), TEXT("Grass") };
+	if (!Known.Contains(Clean))
+	{
+		UE_LOG(LogRebusVisualiser, Warning, TEXT("GroundSurface '%s' is not a known preset; ignoring."), *Clean);
+		return;
+	}
+
+	const FString AssetPath = FString::Printf(
+		TEXT("/Game/REBUS/Materials/MI_RebusGround_%s.MI_RebusGround_%s"), *Clean, *Clean);
+	if (UMaterialInterface* Mat = LoadObject<UMaterialInterface>(nullptr, *AssetPath))
+	{
+		Comp->SetMaterial(0, Mat);
+		UE_LOG(LogRebusVisualiser, Log, TEXT("Ground surface set to '%s'."), *Clean);
+	}
+	else
+	{
+		UE_LOG(LogRebusVisualiser, Warning, TEXT("Ground material not found: %s"), *AssetPath);
+	}
 }
 
 void URebusSceneSettingsSubsystem::SetScalabilityBucket(const TCHAR* Group, int32 Bucket)
@@ -170,6 +228,22 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 	else if (Name == TEXT("VolumetricExtinctionScale"))
 	{
 		if (AExponentialHeightFog* Fog = GetFog()) Fog->GetComponent()->SetVolumetricFogExtinctionScale(Value.AsFloat());
+	}
+	// --- Ground plane (portal-controllable surface + visibility) ---
+	else if (Name == TEXT("GroundSurface"))
+	{
+		SetGroundSurface(Value.String);
+	}
+	else if (Name == TEXT("bGroundVisible"))
+	{
+		if (AStaticMeshActor* Floor = GetFloor())
+		{
+			const bool bHidden = !Value.bBool;
+			Floor->SetActorHiddenInGame(bHidden);
+#if WITH_EDITOR
+			Floor->SetIsTemporarilyHiddenInEditor(bHidden);
+#endif
+		}
 	}
 	// --- Stream Quality (Pixel Streaming encoder params) ---
 	else if (Name == TEXT("StreamStartBitrateMbps"))

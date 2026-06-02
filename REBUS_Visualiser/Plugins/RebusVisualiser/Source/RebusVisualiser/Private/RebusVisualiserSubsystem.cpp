@@ -19,7 +19,11 @@
 #include "Misc/App.h"
 #include "Engine/PostProcessVolume.h"
 #include "Engine/ExponentialHeightFog.h"
+#include "Engine/StaticMeshActor.h"
+#include "Engine/StaticMesh.h"
 #include "Components/ExponentialHeightFogComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Materials/MaterialInterface.h"
 
 static const TCHAR* RebusProjectVersion = TEXT("rebus-visualiser-1.0.0");
 
@@ -377,6 +381,35 @@ void URebusVisualiserSubsystem::EnsureSceneEnvironment()
 			PPV->bUnbound = true;
 			PPV->BlendWeight = 1.f;
 			UE_LOG(LogRebusVisualiser, Log, TEXT("Spawned default unbound PostProcessVolume."));
+		}
+	}
+
+	// --- Infinite-ish ground plane (tagged so scene-settings can swap surface / toggle) ---
+	bool bHasFloor = false;
+	for (TActorIterator<AStaticMeshActor> It(World); It; ++It)
+	{
+		if (It->ActorHasTag(TEXT("RebusFloor"))) { bHasFloor = true; break; }
+	}
+	if (!bHasFloor)
+	{
+		if (UStaticMesh* Plane = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane")))
+		{
+			if (AStaticMeshActor* Floor = World->SpawnActor<AStaticMeshActor>())
+			{
+				Floor->Tags.Add(TEXT("RebusFloor"));
+				if (UStaticMeshComponent* C = Floor->GetStaticMeshComponent())
+				{
+					C->SetMobility(EComponentMobility::Movable);
+					C->SetStaticMesh(Plane);
+					Floor->SetActorScale3D(FVector(2000.f, 2000.f, 1.f));
+					if (UMaterialInterface* Mat = LoadObject<UMaterialInterface>(nullptr,
+						TEXT("/Game/REBUS/Materials/MI_RebusGround_Concrete.MI_RebusGround_Concrete")))
+					{
+						C->SetMaterial(0, Mat);
+					}
+				}
+				UE_LOG(LogRebusVisualiser, Log, TEXT("Spawned default ground plane."));
+			}
 		}
 	}
 }
