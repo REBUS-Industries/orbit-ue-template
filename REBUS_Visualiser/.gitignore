@@ -12,10 +12,12 @@ Plugins/*/Intermediate/
 # Per-user editor scratch content (developer collections etc.)
 Content/Developers/
 
-# Auto-generated content -- init_unreal.py regenerates the base level + ground
-# materials at editor startup (see Content/Python/build_rebus_base_level.py),
-# so everything under Content/REBUS/ is a derived artefact.
-Content/REBUS/
+# NOTE: Content/REBUS/ (BaseLevel.umap + ground materials) IS committed. The
+# init_unreal.py builder regenerates it in the editor, but the product launches
+# the editor binary in -game mode where that authoring step is skipped (and is
+# never run during a cook), so the map/materials must ship in the repo or the
+# runtime fails with "map ... could not be found". The builder stays idempotent:
+# it only (re)generates these assets when they are absent.
 
 # Python bytecode cache
 Content/Python/__pycache__/
