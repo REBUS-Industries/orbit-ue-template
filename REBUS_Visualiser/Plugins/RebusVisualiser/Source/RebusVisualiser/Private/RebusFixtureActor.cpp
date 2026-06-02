@@ -97,6 +97,23 @@ void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
 	RecomputeConeAngles();
 	RefreshIntensity();
 	SelectIesForZoom();
+
+	// Per-fixture diagnostics: lets the portal team verify the pushed motionRig + meshes landed
+	// and wired up (rig axis count w/ pan/tilt breakdown, mesh-proxy count, beam source).
+	int32 PanAxes = 0;
+	int32 TiltAxes = 0;
+	for (const FRebusMotionAxis& Axis : Profile.MotionRig.Axes)
+	{
+		if (Axis.Kind == ERebusAxisKind::Pan) ++PanAxes;
+		else if (Axis.Kind == ERebusAxisKind::Tilt) ++TiltAxes;
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s (lib %s): hasPanTilt=%s axes=%d (pan=%d tilt=%d) meshProxies=%d beam=%s"),
+		*FixtureId, *LibraryFixtureId,
+		bHasPanTilt ? TEXT("true") : TEXT("false"),
+		Profile.MotionRig.Axes.Num(), PanAxes, TiltAxes,
+		MeshComponents.Num(),
+		bHasBeamNode ? TEXT("gdtf") : TEXT("fallback-down"));
 }
 
 void ARebusFixtureActor::BuildComponentHierarchy()
@@ -179,6 +196,32 @@ void ARebusFixtureActor::BuildMeshes(const FRebusMeshBundle& Meshes)
 		const int32 Axis = RebusMotion::ResolveAxisForMesh(Profile.MotionRig, Mesh.GeometryName, Mesh.ModelName);
 		MeshAxisBucket.SetNum(MeshComponents.Num());
 		MeshAxisBucket[ComponentIndex] = Axis;
+
+		// Per-mesh diagnostics: which motion axis (if any) this proxy bucketed onto, so the
+		// portal team can verify a pushed mesh actually attached to its pan/tilt group.
+		FString AxisDesc;
+		if (Axis == INDEX_NONE)
+		{
+			AxisDesc = TEXT("base");
+		}
+		else
+		{
+			const TCHAR* KindStr = TEXT("Other");
+			if (Profile.MotionRig.Axes.IsValidIndex(Axis))
+			{
+				switch (Profile.MotionRig.Axes[Axis].Kind)
+				{
+				case ERebusAxisKind::Pan:  KindStr = TEXT("Pan"); break;
+				case ERebusAxisKind::Tilt: KindStr = TEXT("Tilt"); break;
+				default: break;
+				}
+			}
+			AxisDesc = FString::Printf(TEXT("axis %d (%s)"), Axis, KindStr);
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s: mesh[%d] geom='%s' name='%s' -> %s"),
+			*FixtureId, ComponentIndex,
+			*Mesh.GeometryName, *Mesh.Name, *AxisDesc);
 	}
 
 	UE_LOG(LogRebusVisualiser, Log, TEXT("Fixture %s: built %d mesh proxies."), *FixtureId, MeshComponents.Num());
@@ -231,6 +274,7 @@ void ARebusFixtureActor::BuildSpotLight()
 			const FRotator Rot = FRotationMatrix::MakeFromXZ(Forward, Up).Rotator();
 			BeamRestTransform = FTransform(Rot, Origin);
 			bHaveBeam = true;
+			bHasBeamNode = true;
 		}
 		for (const FRebusFixturePart& Child : Part.Children) Visit(Child);
 	};

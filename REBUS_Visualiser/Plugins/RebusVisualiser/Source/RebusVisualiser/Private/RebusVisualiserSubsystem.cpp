@@ -542,7 +542,8 @@ void URebusVisualiserSubsystem::BroadcastHandshake()
 	{
 		if (!F) continue;
 		Channel->SendFixtureRegistered(F->GetFixtureId(), F->GetLibraryFixtureId(),
-			F->GetDisplayName(), F->HasPanTilt(), F->HasGobo());
+			F->GetDisplayName(), F->HasPanTilt(), F->HasGobo(),
+			F->GetMotionAxisCount(), F->GetMeshComponentCount());
 	}
 
 	// Mirror current scene/ground/quality so a (re)connecting viewer paints the live state.

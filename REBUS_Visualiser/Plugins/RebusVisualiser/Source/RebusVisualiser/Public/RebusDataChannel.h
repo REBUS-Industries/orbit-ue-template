@@ -64,7 +64,8 @@ public:
 		const FString& ProjectId, const FString& ModelId, const FString& CommitId,
 		int32 FixtureCount, int32 TrussCount);
 	void SendFixtureRegistered(const FString& FixtureId, const FString& LibraryFixtureId,
-		const FString& DisplayName, bool bHasPanTilt, bool bHasGobo);
+		const FString& DisplayName, bool bHasPanTilt, bool bHasGobo,
+		int32 AxisCount, int32 MeshCount);
 	void SendSceneState(const TMap<FString, FRebusPropertyValue>& Properties);
 	void SendError(const FString& Code, const FString& Message, bool bFatal, const FString& FixtureId = FString());
 	void SendNotice(const FString& Code, const FString& Message, const FString& FixtureId = FString());

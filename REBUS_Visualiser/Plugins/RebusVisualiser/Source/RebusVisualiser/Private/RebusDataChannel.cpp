@@ -293,7 +293,8 @@ void FRebusDataChannel::SendReady(const FString& UeVersion, const FString& Proje
 }
 
 void FRebusDataChannel::SendFixtureRegistered(const FString& FixtureId, const FString& LibraryFixtureId,
-	const FString& DisplayName, bool bHasPanTilt, bool bHasGobo)
+	const FString& DisplayName, bool bHasPanTilt, bool bHasGobo,
+	int32 AxisCount, int32 MeshCount)
 {
 	TSharedRef<FJsonObject> E = MakeShared<FJsonObject>();
 	E->SetStringField(TEXT("type"), TEXT("FixtureRegistered"));
@@ -302,6 +303,10 @@ void FRebusDataChannel::SendFixtureRegistered(const FString& FixtureId, const FS
 	E->SetStringField(TEXT("displayName"), DisplayName);
 	E->SetBoolField(TEXT("hasPanTilt"), bHasPanTilt);
 	E->SetBoolField(TEXT("hasGobo"), bHasGobo);
+	// Additive diagnostics so the portal can verify the pushed motionRig/meshes wired up; the
+	// portal ignores unknown fields, so these are non-breaking.
+	E->SetNumberField(TEXT("axisCount"), AxisCount);
+	E->SetNumberField(TEXT("meshCount"), MeshCount);
 	SendEvent(E);
 }
 

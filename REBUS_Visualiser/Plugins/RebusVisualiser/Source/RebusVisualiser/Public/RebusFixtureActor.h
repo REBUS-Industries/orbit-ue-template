@@ -106,6 +106,10 @@ public:
 	bool HasPanTilt() const { return bHasPanTilt; }
 	bool HasGobo() const { return bHasGobo; }
 
+	// Diagnostics: how many motion axes the rig has, and how many mesh proxies were built.
+	int32 GetMotionAxisCount() const { return Profile.MotionRig.Axes.Num(); }
+	int32 GetMeshComponentCount() const { return MeshComponents.Num(); }
+
 private:
 	void BuildComponentHierarchy();
 	void BuildMeshes(const FRebusMeshBundle& Meshes);
@@ -148,6 +152,10 @@ private:
 	// Beam rest transform in fixture-local Unreal space (light placement before motion).
 	FTransform BeamRestTransform = FTransform::Identity;
 	int32 HeadAxisIndex = INDEX_NONE;
+
+	// True when BuildSpotLight() placed the beam from a GDTF <Beam> node; false on the
+	// down-pointing fallback. Surfaced in the per-fixture diagnostics summary.
+	bool bHasBeamNode = false;
 
 	// ---- Live control state ----
 	FRebusScalarFade Dimmer;       // 0..1
