@@ -51,6 +51,14 @@ private:
 	void OnChannelReady();
 	void TrySendReady();
 
+	// Send Ready + FixtureRegistered + current SceneState + live selection to all viewers.
+	// Idempotent on the portal side; safe to repeat for every (re)connecting viewer.
+	void BroadcastHandshake();
+
+	// A viewer's data track opened. If we've already completed the initial handshake, re-send it
+	// so this (possibly late-joining) viewer becomes controllable instead of waiting forever.
+	void OnViewerConnected();
+
 	// Find-or-spawn the default scene environment (ExponentialHeightFog with volumetric fog +
 	// an unbound PostProcessVolume) so the stream renders and is portal-controllable even if
 	// the level was authored without them. No-ops when the level already provides them.

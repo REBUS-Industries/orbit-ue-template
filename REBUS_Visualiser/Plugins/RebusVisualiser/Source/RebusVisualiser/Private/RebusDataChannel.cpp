@@ -17,6 +17,7 @@
 #include "IPixelStreaming2Module.h"
 #include "IPixelStreaming2Streamer.h"
 #include "IPixelStreaming2InputHandler.h"
+#include "PixelStreaming2Delegates.h"
 
 namespace
 {
@@ -56,6 +57,18 @@ namespace
 		IPixelStreaming2Module& Module = IPixelStreaming2Module::Get();
 		const FString Id = StreamerId.IsEmpty() ? Module.GetDefaultStreamerID() : StreamerId;
 		return Module.FindStreamer(Id);
+	}
+}
+
+FRebusDataChannel::~FRebusDataChannel()
+{
+	if (DataTrackOpenHandle.IsValid())
+	{
+		if (UPixelStreaming2Delegates* Delegates = UPixelStreaming2Delegates::Get())
+		{
+			Delegates->OnDataTrackOpenNative.Remove(DataTrackOpenHandle);
+		}
+		DataTrackOpenHandle.Reset();
 	}
 }
 
@@ -105,6 +118,24 @@ bool FRebusDataChannel::TryBind()
 			});
 		});
 
+	// A viewer's data track usually opens AFTER we bind, so the one-shot Ready broadcast below
+	// can land before anyone is listening. Subscribe so we can re-greet each viewer on connect.
+	if (!DataTrackOpenHandle.IsValid())
+	{
+		if (UPixelStreaming2Delegates* Delegates = UPixelStreaming2Delegates::Get())
+		{
+			TWeakPtr<FRebusDataChannel> WeakChannel = AsShared();
+			DataTrackOpenHandle = Delegates->OnDataTrackOpenNative.AddLambda(
+				[WeakChannel](FString InStreamerId, FString PlayerId)
+				{
+					if (TSharedPtr<FRebusDataChannel> Self = WeakChannel.Pin())
+					{
+						Self->OnViewerDataTrackOpen(InStreamerId, PlayerId);
+					}
+				});
+		}
+	}
+
 	bBound = true;
 	UE_LOG(LogRebusVisualiser, Log, TEXT("Data channel bound to streamer '%s'."),
 		StreamerId.IsEmpty() ? TEXT("<default>") : *StreamerId);
@@ -116,6 +147,29 @@ bool FRebusDataChannel::TryBind()
 		OnChannelReady.ExecuteIfBound();
 	}
 	return true;
+}
+
+void FRebusDataChannel::OnViewerDataTrackOpen(FString InStreamerId, FString PlayerId)
+{
+	// Only react to our own streamer (PRISM may run others in-proc). Empty StreamerId means we
+	// fell back to the module default, so accept any in that case.
+	if (!StreamerId.IsEmpty() && InStreamerId != StreamerId)
+	{
+		return;
+	}
+
+	UE_LOG(LogRebusVisualiser, Log, TEXT("Viewer data track open (streamer='%s', player='%s'); re-greeting."),
+		*InStreamerId, *PlayerId);
+
+	// The delegate can fire off the game thread; re-greet on the game thread.
+	TWeakPtr<FRebusDataChannel> WeakSelf = AsShared();
+	AsyncTask(ENamedThreads::GameThread, [WeakSelf]()
+	{
+		if (TSharedPtr<FRebusDataChannel> Self = WeakSelf.Pin())
+		{
+			Self->OnViewerConnected.ExecuteIfBound();
+		}
+	});
 }
 
 void FRebusDataChannel::HandleDescriptor(const FString& Descriptor)

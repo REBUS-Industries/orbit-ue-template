@@ -49,6 +49,7 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	Channel = MakeShared<FRebusDataChannel>();
 	Channel->Initialize(StreamerId, GetControl(), GetSceneSettings());
 	Channel->OnChannelReady.BindUObject(this, &URebusVisualiserSubsystem::OnChannelReady);
+	Channel->OnViewerConnected.BindUObject(this, &URebusVisualiserSubsystem::OnViewerConnected);
 
 	TickHandle = FTSTicker::GetCoreTicker().AddTicker(
 		FTickerDelegate::CreateUObject(this, &URebusVisualiserSubsystem::Tick), 0.f);
@@ -370,6 +371,15 @@ void URebusVisualiserSubsystem::TrySendReady()
 		return;
 	}
 	bReadySent = true;
+	BroadcastHandshake();
+}
+
+void URebusVisualiserSubsystem::BroadcastHandshake()
+{
+	if (!Channel.IsValid())
+	{
+		return;
+	}
 
 	const TArray<FString> Capabilities = { TEXT("scene-state"), TEXT("gobos"), TEXT("truss-visibility") };
 	const FString UeVersion = FEngineVersion::Current().ToString(EVersionComponent::Patch);
@@ -384,10 +394,28 @@ void URebusVisualiserSubsystem::TrySendReady()
 			F->GetDisplayName(), F->HasPanTilt(), F->HasGobo());
 	}
 
+	// Mirror current scene/ground/quality so a (re)connecting viewer paints the live state.
+	if (URebusSceneSettingsSubsystem* Sce = GetSceneSettings())
+	{
+		Channel->SendSceneState(Sce->GetSceneState());
+	}
+
 	// Re-apply the live selection so a late/reconnecting stream paints it (§5.3).
 	if (URebusFixtureControlSubsystem* Ctl = GetControl())
 	{
 		Ctl->SelectFixtures(Ctl->GetCurrentSelection(), Ctl->GetPrimarySelection());
+	}
+}
+
+void URebusVisualiserSubsystem::OnViewerConnected()
+{
+	// The first viewer is covered by TrySendReady once the scene loads. But a viewer's data
+	// track typically opens a beat AFTER the channel binds (and Ready was already broadcast to
+	// nobody), and reconnects happen at any time -- so re-greet whenever we've a handshake to
+	// send. If the scene hasn't loaded yet, the pending TrySendReady will reach this viewer.
+	if (bReadySent)
+	{
+		BroadcastHandshake();
 	}
 }
 

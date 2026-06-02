@@ -24,10 +24,13 @@ class URebusSceneSettingsSubsystem;
 class FJsonObject;
 
 DECLARE_DELEGATE(FRebusOnChannelReady); // fired once when the data channel first opens
+DECLARE_DELEGATE(FRebusOnViewerConnected); // fired each time a viewer's data track opens
 
 class FRebusDataChannel : public TSharedFromThis<FRebusDataChannel>
 {
 public:
+	~FRebusDataChannel();
+
 	void Initialize(const FString& InStreamerId,
 		URebusFixtureControlSubsystem* InControl,
 		URebusSceneSettingsSubsystem* InScene);
@@ -43,6 +46,11 @@ public:
 
 	// The session wires this to know when to emit Ready + FixtureRegistered.
 	FRebusOnChannelReady OnChannelReady;
+
+	// Fired (game thread) whenever a viewer's data track opens. A viewer typically connects a
+	// beat AFTER the channel binds, so the one-shot Ready broadcast can be missed; the session
+	// re-broadcasts the handshake on this so every (re)connecting viewer becomes controllable.
+	FRebusOnViewerConnected OnViewerConnected;
 
 	// ---- UE -> portal read-back (§6) ----
 	void SendReady(const FString& UeVersion, const FString& ProjectVersion,
@@ -60,11 +68,13 @@ private:
 	void HandleDescriptor(const FString& Descriptor);
 	void SendEvent(const TSharedRef<FJsonObject>& Event);
 	void SendPong(double Ts);
+	void OnViewerDataTrackOpen(FString InStreamerId, FString PlayerId);
 
 private:
 	FString StreamerId;
 	TWeakObjectPtr<URebusFixtureControlSubsystem> Control;
 	TWeakObjectPtr<URebusSceneSettingsSubsystem> Scene;
+	FDelegateHandle DataTrackOpenHandle;
 	bool bBound = false;
 	bool bReadyFired = false;
 };
