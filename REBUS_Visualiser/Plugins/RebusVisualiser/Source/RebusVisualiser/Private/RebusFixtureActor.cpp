@@ -145,14 +145,18 @@ void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
 	{
 		BeamAttach = TEXT("synthetic-pan-tilt fallback");
 	}
+	// Confirm the per-fixture spotlight is flagged as a MegaLight (folded into the one-per-fixture
+	// summary so it stays a single log line).
+	const bool bMegaLight = SpotLight && SpotLight->bAllowMegaLights;
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s (lib %s): hasPanTilt=%s axes=%d (pan=%d tilt=%d) meshProxies=%d beamSource=%s beamAttach=%s"),
+		TEXT("Fixture %s (lib %s): hasPanTilt=%s axes=%d (pan=%d tilt=%d) meshProxies=%d beamSource=%s beamAttach=%s allowMegaLights=%d"),
 		*FixtureId, *LibraryFixtureId,
 		bHasPanTilt ? TEXT("true") : TEXT("false"),
 		Profile.MotionRig.Axes.Num(), PanAxes, TiltAxes,
 		MeshComponents.Num(),
 		bHasBeamNode ? TEXT("gdtf-beam") : TEXT("default-down"),
-		*BeamAttach);
+		*BeamAttach,
+		bMegaLight ? 1 : 0);
 }
 
 void ARebusFixtureActor::BuildComponentHierarchy()
@@ -313,8 +317,11 @@ void ARebusFixtureActor::BuildSpotLight()
 	// volumetric height fog regardless of the global MegaLights mode.
 	SpotLight->SetVolumetricScatteringIntensity(2.5f);
 
-	// Opt this light into MegaLights stochastic sampling (5.7's per-light flag; defaults true,
-	// but assert it so the project-level r.MegaLights.Allow=1 governs the whole rig).
+	// Opt this fixture light into MegaLights. bAllowMegaLights is the public uint32:1 per-light
+	// flag on ULightComponent (UE 5.7.4 has no Set* accessor for it) and defaults to true, but
+	// we assert it explicitly so EVERY imported fixture light is a MegaLight regardless of any
+	// future engine default change. The project-level r.MegaLights.Allow=1 ([SystemSettings])
+	// then governs the whole rig. The spotlight is the only emissive light the plugin spawns.
 	SpotLight->bAllowMegaLights = 1;
 
 	// Hero-beam cap: volumetric shadows are costly, so only the first N spotlights of the spawn
