@@ -154,9 +154,13 @@ private:
 	void BuildBeamCone();          // spawn the procedural cone mesh + per-fixture beam MID
 	void UpdateBeamConeGeometry(); // (re)generate the frustum: base=lens radius, far=Length*tan(half)
 	void RefreshBeamEmissive();    // drive BeamColor/BeamIntensity from live colour x dimmer x gate
-	// Push the WORLD-space beam origin + forward to the raymarch MID (BeamOrigin/BeamDir) so the
-	// Custom HLSL marches the same cone the procedural mesh occupies; called each RefreshMotion.
+	// Push the WORLD-space beam origin + forward to the raymarch MID (BeamOrigin/BeamDir). The
+	// vector is sampled from the LIVE SpotLight (its world emission forward / location) so the
+	// marched body always matches where the floor is actually lit; also emits the alignment log.
 	void RefreshBeamSpatialParams();
+	// Re-orient + co-locate the cone mesh from the live SpotLight world transform (ground truth)
+	// so its +X (frustum opening) is the real emission forward, then re-push the raymarch feeds.
+	void DriveBeamConeFromSpotLight();
 	// Resolve the SpotLight's volumetric state for Phase-2 light-blocking shadows: hero shadow
 	// beams (bWantsVolumetricShadow + budget) get a modest fog VolumetricScatteringIntensity + Cast
 	// Volumetric Shadow (native VSM carves truss gaps on runtime meshes); everyone else is mesh-only
@@ -243,6 +247,9 @@ private:
 	// beam origin) composed with the head motion each RefreshMotion. LastFarRadius lets zoom ticks
 	// skip a rebuild when the far radius is ~unchanged.
 	FTransform BeamConeRest = FTransform::Identity;
+	// Last beam forward (= SpotLight world emission) we emitted an alignment log for; throttles the
+	// per-update beam-align proof to meaningful aim changes (dot < 0.999) instead of every tick.
+	FVector LastLoggedBeamFwd = FVector::ZeroVector;
 	float BeamBaseRadiusUnreal = 2.f;    // cone base radius (lens radius), UE cm
 	float BeamLengthUnreal = 6000.f;     // cone length (= SpotLight AttenuationRadius), UE cm
 	float BeamConeLastFarRadius = -1.f;  // last-built far radius (rebuild gate), UE cm

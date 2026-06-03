@@ -824,13 +824,49 @@ void ARebusFixtureActor::RefreshBeamEmissive()
 void ARebusFixtureActor::RefreshBeamSpatialParams()
 {
 	if (!BeamMID || !BeamCone) return;
-	// World-space beam origin (cone base = the lens) and forward (+X = the emission axis), so the
-	// view-ray raymarch in M_RebusBeam evaluates axial/radial against the exact same cone the
-	// procedural mesh occupies after pan/tilt. Packed into the RGB of vector params.
-	const FVector O = BeamCone->GetComponentLocation();
-	const FVector D = BeamCone->GetForwardVector();
+
+	// GROUND TRUTH (v1.0.34): the raymarched beam body MUST march along the direction the SpotLight
+	// ACTUALLY lights the floor -- its live USpotLightComponent world forward (+X emission axis)
+	// AFTER all rest/head composition -- not the cone component's own basis. The previous fix only
+	// asserted "BeamConeRest's +X == emission" by construction, but the rendered shaft proved the
+	// cone could still oppose the real emission; sampling the SpotLight directly removes any chance
+	// of BeamDir disagreeing with where the light is cast. BeamOrigin = the lit origin (lens), at
+	// the SpotLight component location, which the cone base is co-located with (DriveBeamConeFromSpotLight).
+	const FVector O = SpotLight ? SpotLight->GetComponentLocation() : BeamCone->GetComponentLocation();
+	const FVector D = (SpotLight ? SpotLight->GetForwardVector() : BeamCone->GetForwardVector()).GetSafeNormal();
 	BeamMID->SetVectorParameterValue(TEXT("BeamOrigin"), FLinearColor((float)O.X, (float)O.Y, (float)O.Z, 0.f));
 	BeamMID->SetVectorParameterValue(TEXT("BeamDir"), FLinearColor((float)D.X, (float)D.Y, (float)D.Z, 0.f));
+
+	// Definitive alignment proof: the SpotLight world forward (where the floor is lit), the cone
+	// mesh world forward (which way the frustum opens), and the material BeamDir feed must all be
+	// the SAME vector -- dot ~= +1, never -1. Throttled to meaningful aim changes so a pan/tilt
+	// sweep logs a verifiable trail without spamming every tick.
+	if (SpotLight && FVector::DotProduct(D, LastLoggedBeamFwd) < 0.999f)
+	{
+		LastLoggedBeamFwd = D;
+		const FVector ConeFwd = BeamCone->GetForwardVector().GetSafeNormal();
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s beam align: spotFwd=(%.3f,%.3f,%.3f) coneFwd=(%.3f,%.3f,%.3f) beamDir=(%.3f,%.3f,%.3f) dot(spot,cone)=%.3f dot(spot,beamDir)=%.3f"),
+			*FixtureId, D.X, D.Y, D.Z, ConeFwd.X, ConeFwd.Y, ConeFwd.Z, D.X, D.Y, D.Z,
+			FVector::DotProduct(D, ConeFwd), FVector::DotProduct(D, D));
+	}
+}
+
+void ARebusFixtureActor::DriveBeamConeFromSpotLight()
+{
+	if (!SpotLight || !BeamCone) return;
+
+	// Orient the cone mesh so its local +X (the generated frustum opens base->far along +X, see
+	// UpdateBeamConeGeometry) IS the SpotLight's live world emission forward, and co-locate its
+	// base ring (local origin = the lens) with the SpotLight's world location. This replaces the
+	// earlier BeamConeRest*Head reliance (which assumed that rest basis equalled the real emission)
+	// with the single source of truth -- the same component whose +X lights the floor -- so the
+	// mesh shaft can never render opposite the spotlight. The cone is radially symmetric, so the
+	// arbitrary roll MakeFromX picks for the up axis is irrelevant.
+	const FVector SpotFwd = SpotLight->GetForwardVector().GetSafeNormal();
+	const FVector SpotLoc = SpotLight->GetComponentLocation();
+	BeamCone->SetWorldLocationAndRotation(SpotLoc, FRotationMatrix::MakeFromX(SpotFwd).ToQuat());
+	RefreshBeamSpatialParams(); // push the (now spotlight-aligned) world origin/dir to the raymarch MID
 }
 
 void ARebusFixtureActor::RefreshBeamShadowMode()
@@ -907,17 +943,10 @@ void ARebusFixtureActor::RefreshMotion()
 				LensDisc->SetRelativeTransform(DiscT);
 			}
 
-			// Cone-mesh beam rides the SAME synthetic aim as the spotlight: its local +X (the cone
-			// axis) -> Dir via MakeFromX, identical to the SpotLight rotation above, so it opens
-			// along the beam forward (not 180deg out). Roll is irrelevant (radially symmetric).
-			if (BeamCone)
-			{
-				FTransform BeamT;
-				BeamT.SetRotation(FRotationMatrix::MakeFromX(Dir).ToQuat());
-				BeamT.SetLocation(BeamConeRest.GetLocation());
-				BeamCone->SetRelativeTransform(BeamT);
-				RefreshBeamSpatialParams(); // push the new world origin/dir to the raymarch MID
-			}
+			// Cone-mesh beam rides the SpotLight's live world emission (DriveBeamConeFromSpotLight
+			// samples SpotLight->GetForwardVector() AFTER the SetRelativeTransform above), so the
+			// shaft opens along EXACTLY the synthetic aim the spotlight lights, never 180deg out.
+			DriveBeamConeFromSpotLight();
 		}
 		return;
 	}
@@ -951,12 +980,11 @@ void ARebusFixtureActor::RefreshMotion()
 			LensDisc->SetRelativeTransform(LensDiscRest * Head);
 		}
 
-		// Cone-mesh beam rides the SAME head transform so the shaft tracks pan/tilt identically.
-		if (BeamCone)
-		{
-			BeamCone->SetRelativeTransform(BeamConeRest * Head);
-			RefreshBeamSpatialParams(); // push the new world origin/dir to the raymarch MID
-		}
+		// Cone-mesh beam tracks the SpotLight's live world emission rather than re-deriving its own
+		// BeamConeRest*Head basis: DriveBeamConeFromSpotLight reads SpotLight->GetForwardVector()
+		// (set just above) so the shaft opens along exactly the direction the floor is lit, through
+		// every pan/tilt, and can never invert relative to the spotlight.
+		DriveBeamConeFromSpotLight();
 	}
 }
 
