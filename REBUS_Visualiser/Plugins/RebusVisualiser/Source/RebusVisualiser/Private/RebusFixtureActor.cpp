@@ -342,25 +342,51 @@ void ARebusFixtureActor::BuildSpotLight()
 		SpotLight->SetTemperature((float)Profile.Photometrics.ColorTemperature.GetValue());
 	}
 
-	// Beam rest transform: prefer the GDTF <Beam> node (§7.7), else head pivot + barrel +X.
+	// Beam rest transform from the GDTF <Beam> node (§7.7). A USpotLightComponent emits along
+	// its local +X, so we map the beam's FORWARD (emission) direction onto +X and beamUp onto +Z
+	// via MakeFromXZ. The emission axis is NEVER the matrix +X column -- that is the geometry's
+	// SIDE axis, and using it fired the cone ~90deg off the lens ("out to the left"). When the
+	// portal does not send an explicit beamDirectionWorld we take the beam node's DOWN axis
+	// (-Y in the Y-up source, the documented default "beamDirectionWorld":{0,-1,0}) so the cone
+	// exits the lens, not the side.
 	bool bHaveBeam = false;
 	TFunction<void(const FRebusFixturePart&)> Visit = [&](const FRebusFixturePart& Part)
 	{
 		if (!bHaveBeam && Part.bIsBeam && Part.bHasWorldMatrixMeters)
 		{
 			const FMatrix M = RebusCoords::MatrixToUnreal(Part.WorldMatrixMeters, /*bRowMajor*/false, /*bYUp*/true);
-			FVector Origin = M.GetOrigin();
+			const FVector Origin = M.GetOrigin();
+
 			FVector Forward = Part.bHasBeamDirection
 				? RebusCoords::DirectionYUpToUnreal(Part.BeamDirectionWorld)
-				: M.GetUnitAxis(EAxis::X);
+				: (-M.GetUnitAxis(EAxis::Y)).GetSafeNormal(); // GDTF emission = node's down axis
+			if (Forward.IsNearlyZero())
+			{
+				Forward = FVector(0.f, 0.f, -1.f);
+			}
+
 			FVector Up = Part.bHasBeamUp
 				? RebusCoords::DirectionYUpToUnreal(Part.BeamUpWorld)
-				: FVector::UpVector;
+				: M.GetUnitAxis(EAxis::Z).GetSafeNormal();
+			// Guard a beamUp that is (near) parallel to forward -- MakeFromXZ would degenerate.
+			if (Up.IsNearlyZero() || FMath::Abs(FVector::DotProduct(Forward, Up)) > 0.999f)
+			{
+				Up = (FMath::Abs(Forward.Z) < 0.9f) ? FVector::UpVector : FVector::ForwardVector;
+			}
 
 			const FRotator Rot = FRotationMatrix::MakeFromXZ(Forward, Up).Rotator();
 			BeamRestTransform = FTransform(Rot, Origin);
 			bHaveBeam = true;
 			bHasBeamNode = true;
+
+			// Verifiable mapping: dump the resolved beam forward/up (UE world-ish) and the
+			// spotlight component's resulting +X so a residual yaw is immediately obvious.
+			const FVector CompFwd = Rot.RotateVector(FVector::ForwardVector);
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Fixture %s beam: src=%s fwdUE=(%.3f,%.3f,%.3f) upUE=(%.3f,%.3f,%.3f) compFwd(+X)=(%.3f,%.3f,%.3f)"),
+				*FixtureId,
+				Part.bHasBeamDirection ? TEXT("beamDirectionWorld") : TEXT("node -Y (down)"),
+				Forward.X, Forward.Y, Forward.Z, Up.X, Up.Y, Up.Z, CompFwd.X, CompFwd.Y, CompFwd.Z);
 		}
 		for (const FRebusFixturePart& Child : Part.Children) Visit(Child);
 	};
@@ -378,7 +404,10 @@ void ARebusFixtureActor::BuildSpotLight()
 			Origin = RebusCoords::PointYUpMetersToUnreal(Profile.MotionRig.Axes[HeadAxisIndex].Pivot);
 		}
 		BeamRestTransform = FTransform(FRotator(-90.f, 0.f, 0.f), Origin);
-		UE_LOG(LogRebusVisualiser, Verbose, TEXT("Fixture %s: no <Beam> node, beam rests pointing down."), *FixtureId);
+		const FVector CompFwd = BeamRestTransform.GetRotation().RotateVector(FVector::ForwardVector);
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s beam: no <Beam> node, resting straight down compFwd(+X)=(%.3f,%.3f,%.3f)."),
+			*FixtureId, CompFwd.X, CompFwd.Y, CompFwd.Z);
 	}
 }
 
