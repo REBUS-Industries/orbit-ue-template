@@ -256,8 +256,8 @@ r.MegaLights.DownsampleMode=1
 r.MegaLights.Volume=1
 r.MegaLights.Volume.GridPixelSize=2
 r.MegaLights.Volume.GridSizeZ=128
-r.VolumetricFog.HistoryWeight=0.75
-r.VolumetricFog.GridPixelSize=4
+r.VolumetricFog.HistoryWeight=0.9
+r.VolumetricFog.GridPixelSize=2
 r.VolumetricFog.GridSizeZ=128
 ```
 
@@ -269,12 +269,21 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 
 | CVar | Default | Engine default |
 | --- | --- | --- |
-| `r.VolumetricFog.HistoryWeight` | `0.75` | 0.9 |
-| `r.VolumetricFog.GridPixelSize` | `4` | 16 |
+| `r.VolumetricFog.HistoryWeight` | `0.9` | 0.9 |
+| `r.VolumetricFog.GridPixelSize` | `2` | 16 |
 | `r.VolumetricFog.GridSizeZ` | `128` | 64 |
 
 > Note: the engine `r.VolumetricFog.*` froxel grid is **separate** from the MegaLights lighting
 > volume grid (`r.MegaLights.Volume.*`). Only the latter is tier-controlled.
+
+> **Beam smoothness (v1.0.37).** The beam material `M_RebusBeam` has **no noise term** — its
+> raymarch density is a smooth analytic radial-core × length-falloff profile. The "patchy" beam was
+> the **coarse froxel grid** of the hero-shadow fog (`VolumetricScatteringIntensity` re-enabled on
+> hero beams). Fixed by halving the froxel footprint (`r.VolumetricFog.GridPixelSize` 4 → **2**),
+> raising temporal accumulation (`r.VolumetricFog.HistoryWeight` 0.75 → **0.9**), and lowering
+> `RebusHeroShadowScatter` (1.5 → **0.8**) so the smooth mesh-cone raymarch dominates while the fog
+> still carves the truss shadow gaps. To tune live without a rebuild: `r.VolumetricFog.GridPixelSize`
+> (lower = finer/heavier), `r.VolumetricFog.HistoryWeight` (higher = smoother, slight latency).
 
 ### `RenderQuality` scene property (runtime tiers)
 

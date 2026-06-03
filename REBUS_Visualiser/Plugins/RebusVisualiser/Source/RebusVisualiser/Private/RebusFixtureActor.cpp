@@ -60,7 +60,12 @@ namespace
 	// Volumetric Shadow to carve real truss gaps in the fog, while the mesh cone provides the crisp
 	// shaft. Gated by SetFixtureBeamVolumetrics(castVolumetricShadow) + this per-batch hero budget.
 	constexpr int32 RebusMaxShadowFogBeams = 6;
-	constexpr float RebusHeroShadowScatter = 1.5f;
+	// v1.0.37: lowered 1.5 -> 0.8 so the SMOOTH analytic mesh-cone raymarch (M_RebusBeam, which has
+	// no noise term) dominates the beam look, while the froxel fog contributes just enough to carve
+	// the real truss shadow gaps -- the coarse froxel grid was the source of the "patchy" beam, so
+	// we lean on the crisp raymarch and keep the fog subtle (paired with the finer VolumetricFog
+	// grid + higher HistoryWeight in DefaultEngine.ini).
+	constexpr float RebusHeroShadowScatter = 0.8f;
 
 	// Rotation that lays a plane (engine /BasicShapes/Plane, local +Z normal) perpendicular to the
 	// beam: plane +Z -> Forward, plane +X -> Up. Guards a near-parallel up like MakeFromXZ does.
