@@ -7,9 +7,12 @@
 #include "RebusVisualiserLog.h"
 
 #include "Components/SpotLightComponent.h"
+#include "Components/StaticMeshComponent.h"
 #include "ProceduralMeshComponent.h"
+#include "Engine/StaticMesh.h"
 #include "Engine/TextureLightProfile.h"
 #include "Engine/Texture2D.h"
+#include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "ImageUtils.h"
 
@@ -29,6 +32,24 @@ namespace
 	// cast them ("hero beams"); the rest still scatter (VolumetricScatteringIntensity) but skip
 	// the per-light volumetric shadow pass (§8.4).
 	constexpr int32 RebusMaxVolumetricShadowBeams = 8;
+
+	// Emissive strength at FULL output (dimmer=1, shutter open) for the lens-flare disc; scaled
+	// by dimmer x shutter-gate so it blooms bright at full and goes dark when fully dimmed (§8.3a).
+	constexpr float RebusLensFlareMaxEmissive = 24.f;
+
+	// Rotation that lays a plane (engine /BasicShapes/Plane, local +Z normal) perpendicular to the
+	// beam: plane +Z -> Forward, plane +X -> Up. Guards a near-parallel up like MakeFromXZ does.
+	FQuat LensDiscRotationFromForward(const FVector& Forward, const FVector& Up)
+	{
+		FVector F = Forward.GetSafeNormal();
+		if (F.IsNearlyZero()) F = FVector(0.f, 0.f, -1.f);
+		FVector U = Up;
+		if (U.IsNearlyZero() || FMath::Abs(FVector::DotProduct(F, U)) > 0.999f)
+		{
+			U = (FMath::Abs(F.Z) < 0.9f) ? FVector::UpVector : FVector::ForwardVector;
+		}
+		return FRotationMatrix::MakeFromZX(F, U).ToQuat();
+	}
 }
 
 int32 ARebusFixtureActor::VolumetricShadowBeamCount = 0;
@@ -115,6 +136,7 @@ void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
 	// light-only fixtures whose meshes matched nothing.
 	ResolveHeadAxisFromMeshes();
 	BuildSpotLight();
+	BuildLensDisc();   // emissive lens-flare disc at the beam origin (reuses the beam transform)
 	RefreshMotion();
 	RecomputeConeAngles();
 	RefreshIntensity();
@@ -386,6 +408,8 @@ void ARebusFixtureActor::BuildSpotLight()
 
 			const FRotator Rot = FRotationMatrix::MakeFromXZ(Forward, Up).Rotator();
 			BeamRestTransform = FTransform(Rot, Origin);
+			BeamForwardLocal = Forward;   // shared with the lens disc so it aims identically
+			BeamUpLocal = Up;
 			bHaveBeam = true;
 			bHasBeamNode = true;
 
@@ -415,10 +439,103 @@ void ARebusFixtureActor::BuildSpotLight()
 		}
 		BeamRestTransform = FTransform(FRotator(-90.f, 0.f, 0.f), Origin);
 		const FVector CompFwd = BeamRestTransform.GetRotation().RotateVector(FVector::ForwardVector);
+		BeamForwardLocal = CompFwd; // straight down at rest; shared with the lens disc
+		BeamUpLocal = BeamRestTransform.GetRotation().RotateVector(FVector::UpVector);
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("Fixture %s beam: no <Beam> node, resting straight down compFwd(+X)=(%.3f,%.3f,%.3f)."),
 			*FixtureId, CompFwd.X, CompFwd.Y, CompFwd.Z);
 	}
+}
+
+void ARebusFixtureActor::BuildLensDisc()
+{
+	// Resolve the lens-opening diameter (metres): photometrics.lensDiameter (v6) first, then the
+	// source aperture (radiusMeters*2, then diameterMeters). Skip the disc entirely when neither
+	// is present (§8.3a fallback order).
+	double DiamMeters = -1.0;
+	const TCHAR* DiamSrc = TEXT("none");
+	if (Profile.Photometrics.LensDiameter >= 0.0)
+	{
+		DiamMeters = Profile.Photometrics.LensDiameter;
+		DiamSrc = TEXT("lensDiameter");
+	}
+	else if (Profile.Source.RadiusMeters.IsSet())
+	{
+		DiamMeters = Profile.Source.RadiusMeters.GetValue() * 2.0;
+		DiamSrc = TEXT("source.radius*2");
+	}
+	else if (Profile.Source.DiameterMeters.IsSet())
+	{
+		DiamMeters = Profile.Source.DiameterMeters.GetValue();
+		DiamSrc = TEXT("source.diameter");
+	}
+
+	if (DiamMeters <= KINDA_SMALL_NUMBER)
+	{
+		UE_LOG(LogRebusVisualiser, Verbose,
+			TEXT("Fixture %s lens disc: no lensDiameter/source aperture; skipping."), *FixtureId);
+		return;
+	}
+	const float DiamUnreal = (float)(DiamMeters * RebusCoords::METERS_TO_UNREAL);
+
+	// Load the committed emissive material + the engine plane. If the material has not been baked
+	// yet (build_rebus_base_level.py authors + saves /Game/REBUS/Materials/M_RebusLensFlare), skip
+	// the disc gracefully -- the SpotLight/IES beam is unaffected.
+	UMaterialInterface* LensMat = LoadObject<UMaterialInterface>(
+		nullptr, TEXT("/Game/REBUS/Materials/M_RebusLensFlare.M_RebusLensFlare"));
+	UStaticMesh* Plane = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane"));
+	if (!LensMat || !Plane)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s lens disc: material(%d)/plane(%d) missing; skipping (run build_rebus_base_level.py)."),
+			*FixtureId, LensMat != nullptr ? 1 : 0, Plane != nullptr ? 1 : 0);
+		return;
+	}
+
+	LensDisc = NewObject<UStaticMeshComponent>(this, TEXT("LensDisc"));
+	LensDisc->SetupAttachment(FixtureRoot);
+	LensDisc->RegisterComponent();
+	LensDisc->SetMobility(EComponentMobility::Movable);
+	LensDisc->SetStaticMesh(Plane);
+	LensDisc->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	LensDisc->SetCastShadow(false);            // purely an additive flare; never occludes the beam
+	LensDisc->bCastDynamicShadow = false;
+
+	LensDiscMID = UMaterialInstanceDynamic::Create(LensMat, this);
+	LensDisc->SetMaterial(0, LensDiscMID);
+
+	// Disc rest: plane normal (+Z) along the beam forward, at the beam origin, scaled so the engine
+	// Plane (100 uu base) spans the lens diameter. Composed with head motion in RefreshMotion.
+	const float PlaneScale = DiamUnreal / 100.f;
+	const FQuat DiscRot = LensDiscRotationFromForward(BeamForwardLocal, BeamUpLocal);
+	LensDiscRest = FTransform(DiscRot, BeamRestTransform.GetLocation(), FVector(PlaneScale, PlaneScale, PlaneScale));
+
+	RefreshLensDisc(); // initial emissive from the current dimmer/colour
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s lens disc: diameter=%.3fm (src=%s) spawned, head-parented."),
+		*FixtureId, DiamMeters, DiamSrc);
+}
+
+void ARebusFixtureActor::RefreshLensDisc()
+{
+	if (!LensDiscMID) return;
+
+	// Same shutter-gate the SpotLight uses, so the flare strobes/blacks-out in lockstep.
+	float Gate = 1.f;
+	switch (ShutterMode)
+	{
+	case ERebusShutterMode::Closed: Gate = 0.f; break;
+	case ERebusShutterMode::Strobe: Gate = (ShutterPhase < 0.5f) ? 1.f : 0.f; break;
+	default: break;
+	}
+
+	const FLinearColor Linear(
+		FMath::Clamp(ColorR.Current, 0.f, 1.f),
+		FMath::Clamp(ColorG.Current, 0.f, 1.f),
+		FMath::Clamp(ColorB.Current, 0.f, 1.f), 1.f);
+	LensDiscMID->SetVectorParameterValue(TEXT("EmissiveColor"), Linear);
+	LensDiscMID->SetScalarParameterValue(TEXT("EmissiveStrength"),
+		RebusLensFlareMaxEmissive * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate);
 }
 
 void ARebusFixtureActor::RefreshMotion()
@@ -443,6 +560,16 @@ void ARebusFixtureActor::RefreshMotion()
 			FTransform T = BeamRestTransform; // keep the rest origin
 			T.SetRotation(FRotationMatrix::MakeFromX(Dir).ToQuat());
 			SpotLight->SetRelativeTransform(T);
+
+			// Lens disc tracks the same synthetic aim: plane normal along the beam Dir.
+			if (LensDisc)
+			{
+				FTransform DiscT;
+				DiscT.SetRotation(LensDiscRotationFromForward(Dir, BeamUpLocal));
+				DiscT.SetLocation(LensDiscRest.GetLocation());
+				DiscT.SetScale3D(LensDiscRest.GetScale3D());
+				LensDisc->SetRelativeTransform(DiscT);
+			}
 		}
 		return;
 	}
@@ -468,6 +595,13 @@ void ARebusFixtureActor::RefreshMotion()
 		const FTransform Head = (HeadAxisIndex != INDEX_NONE && Cumulative.IsValidIndex(HeadAxisIndex))
 			? Cumulative[HeadAxisIndex] : FTransform::Identity;
 		SpotLight->SetRelativeTransform(BeamRestTransform * Head);
+
+		// Lens disc rides the SAME head transform (LensDiscRest * Head), so it stays co-located
+		// with the beam origin and perpendicular to the v1.0.21 beam direction through pan/tilt.
+		if (LensDisc)
+		{
+			LensDisc->SetRelativeTransform(LensDiscRest * Head);
+		}
 	}
 }
 
@@ -530,6 +664,10 @@ void ARebusFixtureActor::RefreshIntensity()
 		FMath::Clamp(ColorG.Current, 0.f, 1.f),
 		FMath::Clamp(ColorB.Current, 0.f, 1.f), 1.f);
 	SpotLight->SetLightColor(Linear);
+
+	// Keep the emissive lens disc in lockstep with the live output (same dimmer/colour/shutter
+	// path), so the glowing lens brightens/colours with the beam and darkens when dimmed (§8.3a).
+	RefreshLensDisc();
 }
 
 // ---- Control surface ------------------------------------------------------------------
@@ -767,63 +905,66 @@ void ARebusFixtureActor::FetchAndAssignIes(const FString& IesUrl)
 		}));
 }
 
-FString ARebusFixtureActor::ResolveGoboWheel(int32 WheelIndex, const FString& WheelName) const
+int32 ARebusFixtureActor::ResolveGoboWheelIndex(int32 WheelIndex, const FString& WheelName) const
 {
-	if (InlineGobos.Gobos.Num() == 0) return FString();
+	if (InlineGobos.Gobos.Num() == 0) return INDEX_NONE;
 
-	// The fixture's gobo wheels are the inline (RegisterFixtureGobos) wheels of gobo kind, taken
-	// in STABLE first-seen insertion order (the order entries appear in InlineGobos.Gobos, which
-	// preserves the order the portal pushed them). Distinct by wheel name (case-insensitive).
-	TArray<FString> GoboWheels;
-	auto AddDistinct = [&GoboWheels](const FString& W)
-	{
-		for (const FString& Existing : GoboWheels) { if (Existing.Equals(W, ESearchCase::IgnoreCase)) return; }
-		GoboWheels.Add(W);
-	};
+	// An explicit wheelIndex is the contract's primary key (0-based into the full wheels[]): trust
+	// it directly. SelectInlineGobo will warn + fall through if no (wheelIndex, slot) entry exists.
+	if (WheelIndex != INDEX_NONE) return WheelIndex;
+
+	// Absent wheelIndex -> the FIRST gobo-kind wheel = smallest wheelIndex among inline entries
+	// tagged kind=="gobo" (NOT insertion order, so a colour/effect wheel preceding the gobo wheel
+	// can't mis-resolve). Falls back to the smallest wheelIndex of any entry, else INDEX_NONE.
+	int32 Best = INDEX_NONE;
 	for (const FRebusInlineGobo& G : InlineGobos.Gobos)
 	{
-		if (G.WheelKind.Equals(TEXT("gobo"), ESearchCase::IgnoreCase)) AddDistinct(G.Wheel);
+		if (G.WheelIndex == INDEX_NONE) continue;
+		if (G.WheelKind.Equals(TEXT("gobo"), ESearchCase::IgnoreCase))
+		{
+			Best = (Best == INDEX_NONE) ? G.WheelIndex : FMath::Min(Best, G.WheelIndex);
+		}
 	}
-	// Tolerant: if nothing was tagged gobo-kind, treat every pushed wheel as a candidate.
-	if (GoboWheels.Num() == 0)
-	{
-		for (const FRebusInlineGobo& G : InlineGobos.Gobos) AddDistinct(G.Wheel);
-	}
-	if (GoboWheels.Num() == 0) return FString();
+	if (Best != INDEX_NONE) return Best;
 
-	// Precedence: wheelIndex (0-based Nth gobo wheel) > wheel name > first gobo-kind wheel.
-	if (WheelIndex != INDEX_NONE)
+	for (const FRebusInlineGobo& G : InlineGobos.Gobos)
 	{
-		if (GoboWheels.IsValidIndex(WheelIndex)) return GoboWheels[WheelIndex];
-		UE_LOG(LogRebusVisualiser, Warning,
-			TEXT("Fixture %s gobo: wheelIndex %d out of range (%d gobo wheel(s)); using first gobo wheel '%s'."),
-			*FixtureId, WheelIndex, GoboWheels.Num(), *GoboWheels[0]);
-		return GoboWheels[0];
+		if (G.WheelIndex == INDEX_NONE) continue;
+		Best = (Best == INDEX_NONE) ? G.WheelIndex : FMath::Min(Best, G.WheelIndex);
 	}
-	if (!WheelName.IsEmpty())
-	{
-		for (const FString& W : GoboWheels) { if (W.Equals(WheelName, ESearchCase::IgnoreCase)) return W; }
-		return WheelName; // unknown name: keep it so a direct match can still be attempted
-	}
-	return GoboWheels[0];
+	return Best; // INDEX_NONE when no entry carries an explicit wheelIndex (legacy push)
 }
 
 const FRebusInlineGobo* ARebusFixtureActor::SelectInlineGobo(int32 Slot, int32 WheelIndex, const FString& WheelName) const
 {
 	if (InlineGobos.Gobos.Num() == 0) return nullptr;
 
-	const FString TargetWheel = ResolveGoboWheel(WheelIndex, WheelName);
-	if (!TargetWheel.IsEmpty())
+	// 1) Primary key (wheelIndex, slot): the contract's direct lookup.
+	const int32 TargetWheelIndex = ResolveGoboWheelIndex(WheelIndex, WheelName);
+	if (TargetWheelIndex != INDEX_NONE)
 	{
 		for (const FRebusInlineGobo& G : InlineGobos.Gobos)
 		{
-			if (G.Slot == Slot && G.Wheel.Equals(TargetWheel, ESearchCase::IgnoreCase))
-			{
-				return &G;
-			}
+			if (G.Slot == Slot && G.WheelIndex == TargetWheelIndex) return &G;
+		}
+		if (WheelIndex != INDEX_NONE)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Fixture %s gobo: no inline image for (wheelIndex=%d, slot=%d); trying name/any-slot."),
+				*FixtureId, WheelIndex, Slot);
 		}
 	}
-	// No explicit selector given and no wheel match: accept any wheel's matching slot.
+
+	// 2) Secondary: match by wheel NAME (back-compat for legacy entries without a wheelIndex).
+	if (!WheelName.IsEmpty())
+	{
+		for (const FRebusInlineGobo& G : InlineGobos.Gobos)
+		{
+			if (G.Slot == Slot && G.Wheel.Equals(WheelName, ESearchCase::IgnoreCase)) return &G;
+		}
+	}
+
+	// 3) No usable selector: accept any wheel's matching slot.
 	if (WheelIndex == INDEX_NONE && WheelName.IsEmpty())
 	{
 		for (const FRebusInlineGobo& G : InlineGobos.Gobos)
@@ -863,16 +1004,16 @@ void ARebusFixtureActor::AssignGobo(int32 GoboIndex, int32 WheelIndex, const FSt
 		if (Inline->Bytes.Num() > 0 && ApplyGoboTextureFromBytes(Inline->Bytes))
 		{
 			UE_LOG(LogRebusVisualiser, Verbose,
-				TEXT("Fixture %s gobo assigned (source=inline, wheelIndex=%d -> wheel='%s', slot=%d, %d bytes)."),
-				*FixtureId, WheelIndex, *Inline->Wheel, Inline->Slot, Inline->Bytes.Num());
+				TEXT("Fixture %s gobo assigned (source=inline, reqWheelIdx=%d -> wheelIndex=%d wheel='%s', slot=%d, %d bytes)."),
+				*FixtureId, WheelIndex, Inline->WheelIndex, *Inline->Wheel, Inline->Slot, Inline->Bytes.Num());
 			return;
 		}
 		// 2) Inline entry carries only a signed url fallback (or its bytes failed to decode).
 		if (!Inline->ImageUrl.IsEmpty())
 		{
 			UE_LOG(LogRebusVisualiser, Verbose,
-				TEXT("Fixture %s gobo assigned (source=inline-url, wheelIndex=%d -> wheel='%s', slot=%d)."),
-				*FixtureId, WheelIndex, *Inline->Wheel, Inline->Slot);
+				TEXT("Fixture %s gobo assigned (source=inline-url, reqWheelIdx=%d -> wheelIndex=%d wheel='%s', slot=%d)."),
+				*FixtureId, WheelIndex, Inline->WheelIndex, *Inline->Wheel, Inline->Slot);
 			FetchAndAssignGoboFromUrl(Inline->ImageUrl);
 			return;
 		}

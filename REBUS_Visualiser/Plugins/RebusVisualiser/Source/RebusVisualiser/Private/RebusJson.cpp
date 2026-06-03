@@ -343,6 +343,9 @@ namespace RebusJson
 			TryGetOptionalNumber(*Photo, TEXT("colorTemperature"), Out.Photometrics.ColorTemperature);
 			TryGetOptionalNumber(*Photo, TEXT("cri"), Out.Photometrics.Cri);
 			TryGetBool(*Photo, TEXT("hasIesProfile"), Out.Photometrics.bHasIesProfile);
+			// v6 additive: diameter of the luminous opening (metres). Absent/null -> stays the
+			// sentinel (-1) so the disc falls back to the source aperture (§8.3a).
+			TryGetNumber(*Photo, TEXT("lensDiameter"), Out.Photometrics.LensDiameter);
 		}
 
 		const TSharedPtr<FJsonObject>* Zoom = nullptr;

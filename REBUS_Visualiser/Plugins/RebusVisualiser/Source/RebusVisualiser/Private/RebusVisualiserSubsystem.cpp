@@ -789,11 +789,14 @@ void URebusVisualiserSubsystem::HandleSceneDefinition(const FString& Type, const
 			FirstString(GObj, { TEXT("wheelKind"), TEXT("kind"), TEXT("type") }, Entry.WheelKind);
 			Entry.WheelKind.ToLowerInline();
 			RebusJson::TryGetString(GObj, TEXT("name"), Entry.Name);
+			FirstString(GObj, { TEXT("slotName"), TEXT("slot_name") }, Entry.SlotName);
 			FirstString(GObj, { TEXT("mime"), TEXT("contentType") }, Entry.Mime);
 			FirstString(GObj, { TEXT("imageUrl"), TEXT("url") }, Entry.ImageUrl);
 			FirstString(GObj, { TEXT("dataBase64"), TEXT("data") }, Entry.DataBase64);
 
 			double Num = 0.0;
+			// wheelIndex is the PRIMARY key: 0-based into the full wheels[] (NOT gobo-kind only).
+			if (RebusJson::TryGetNumber(GObj, TEXT("wheelIndex"), Num)) Entry.WheelIndex = (int32)Num;
 			if (RebusJson::TryGetNumber(GObj, TEXT("slot"), Num)) Entry.Slot = (int32)Num;
 			if (RebusJson::TryGetNumber(GObj, TEXT("part"), Num)) Entry.Part = (int32)Num;
 			if (RebusJson::TryGetNumber(GObj, TEXT("partCount"), Num)) Entry.PartCount = FMath::Max(1, (int32)Num);
@@ -818,13 +821,17 @@ void URebusVisualiserSubsystem::HandleSceneDefinition(const FString& Type, const
 		PendingGoboEntries.Remove(LibraryId);
 		PendingGoboChunksSeen.Remove(LibraryId);
 
-		// Group by (wheel, slot), preserving first-seen order. The unit-separator key avoids
-		// collisions between e.g. wheel "1" slot "23" and wheel "12" slot "3".
+		// Group by the PRIMARY cache key (wheelIndex, slot), preserving first-seen order. The
+		// unit-separator key avoids collisions (e.g. wheelIndex 1 slot 23 vs 12 slot 3). When an
+		// entry carries no explicit wheelIndex (legacy push) we key by wheel NAME instead; the
+		// 'i'/'n' prefix keeps the two namespaces from colliding (index 1 vs wheel named "1").
 		TArray<FString> Order;
 		TMap<FString, TArray<FRebusInlineGoboPending>> ByKey;
 		for (FRebusInlineGoboPending& Entry : Pending)
 		{
-			const FString Key = FString::Printf(TEXT("%s\x1f%d"), *Entry.Wheel, Entry.Slot);
+			const FString Key = (Entry.WheelIndex != INDEX_NONE)
+				? FString::Printf(TEXT("i%d\x1f%d"), Entry.WheelIndex, Entry.Slot)
+				: FString::Printf(TEXT("n%s\x1f%d"), *Entry.Wheel, Entry.Slot);
 			TArray<FRebusInlineGoboPending>& List = ByKey.FindOrAdd(Key);
 			if (List.Num() == 0) Order.Add(Key);
 			List.Add(MoveTemp(Entry));
@@ -857,10 +864,12 @@ void URebusVisualiserSubsystem::HandleSceneDefinition(const FString& Type, const
 				FullBase64 += E.DataBase64;
 				if (!bMetaSet)
 				{
+					Out.WheelIndex = E.WheelIndex;
 					Out.Wheel = E.Wheel;
 					Out.WheelKind = E.WheelKind;
 					Out.Slot = E.Slot;
 					Out.Name = E.Name;
+					Out.SlotName = E.SlotName;
 					Out.Mime = E.Mime;
 					Out.ImageUrl = E.ImageUrl;
 					bMetaSet = true;

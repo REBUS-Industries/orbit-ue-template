@@ -32,6 +32,12 @@ LEVEL_PACKAGE_PATH = "/Game/REBUS/Maps/BaseLevel"
 MATERIALS_DIR = "/Game/REBUS/Materials"
 GROUND_MASTER_PATH = MATERIALS_DIR + "/M_RebusGround"
 
+# Emissive "glowing lens" flare disc material (ue-plugin-build-guide.md §8.3a). Unlit, two-sided,
+# translucent so a radial UV mask reads as a round soft-edged lens regardless of facing. The C++
+# fixture actor (RebusFixtureActor::BuildLensDisc) loads it by this path, makes a MID per fixture
+# and drives EmissiveColor (linear fixture colour) + EmissiveStrength (dimmer x output) live.
+LENS_FLARE_PATH = MATERIALS_DIR + "/M_RebusLensFlare"
+
 # Portal-controllable ground surface presets: name -> (ColorA, ColorB, Roughness).
 # These drive the procedural M_RebusGround master (no imported image textures needed);
 # the C++ scene-settings subsystem swaps between the generated instances on SetSceneProperty
@@ -110,6 +116,72 @@ def _build_ground_master(mat):
     mel.connect_material_property(rough, "", unreal.MaterialProperty.MP_ROUGHNESS)
 
     mel.recompile_material(mat)
+
+
+def _build_lens_flare_master(mat):
+    """Author the emissive lens-flare graph: (EmissiveColor*EmissiveStrength*radialMask) ->
+    Emissive, radialMask -> Opacity. Unlit + two-sided + translucent."""
+    mel = unreal.MaterialEditingLibrary
+
+    # Unlit two-sided translucent: facing-independent soft round glow.
+    _set(mat, "material_domain", unreal.MaterialDomain.MD_SURFACE)
+    _set(mat, "shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    _set(mat, "blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
+    _set(mat, "two_sided", True)
+
+    color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -760, -200)
+    color.set_editor_property("parameter_name", "EmissiveColor")
+    color.set_editor_property("default_value", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
+
+    strength = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -760, 40)
+    strength.set_editor_property("parameter_name", "EmissiveStrength")
+    strength.set_editor_property("default_value", 0.0)
+
+    # Radial mask from the plane UVs: 1 at centre -> 0 at the inscribed circle edge (radius 0.5).
+    tc = mel.create_material_expression(mat, unreal.MaterialExpressionTextureCoordinate, -760, 260)
+    centre = mel.create_material_expression(mat, unreal.MaterialExpressionConstant2Vector, -760, 420)
+    _set(centre, "r", 0.5)
+    _set(centre, "g", 0.5)
+    dist = mel.create_material_expression(mat, unreal.MaterialExpressionDistance, -540, 320)
+    mel.connect_material_expressions(tc, "", dist, "A")
+    mel.connect_material_expressions(centre, "", dist, "B")
+    twice = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -380, 320)
+    _set(twice, "const_b", 2.0)
+    mel.connect_material_expressions(dist, "", twice, "A")
+    inv = mel.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -240, 320)
+    mel.connect_material_expressions(twice, "", inv, "")
+    mask = mel.create_material_expression(mat, unreal.MaterialExpressionClamp, -100, 320)
+    _set(mask, "min_default", 0.0)
+    _set(mask, "max_default", 1.0)
+    mel.connect_material_expressions(inv, "", mask, "")
+
+    # Emissive = EmissiveColor * EmissiveStrength * radialMask.
+    cs = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -420, -140)
+    mel.connect_material_expressions(color, "", cs, "A")
+    mel.connect_material_expressions(strength, "", cs, "B")
+    csm = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -220, -80)
+    mel.connect_material_expressions(cs, "", csm, "A")
+    mel.connect_material_expressions(mask, "", csm, "B")
+    mel.connect_material_property(csm, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    mel.connect_material_property(mask, "", unreal.MaterialProperty.MP_OPACITY)
+
+    mel.recompile_material(mat)
+
+
+def ensure_lens_material(force=False):
+    """Generate the emissive lens-flare master material. Idempotent (only creates when missing)
+    unless force=True (delete + regenerate, e.g. during a full build())."""
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+
+    if force and unreal.EditorAssetLibrary.does_asset_exist(LENS_FLARE_PATH):
+        unreal.EditorAssetLibrary.delete_asset(LENS_FLARE_PATH)
+
+    if not unreal.EditorAssetLibrary.does_asset_exist(LENS_FLARE_PATH):
+        mat = tools.create_asset("M_RebusLensFlare", MATERIALS_DIR, unreal.Material, unreal.MaterialFactoryNew())
+        _build_lens_flare_master(mat)
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+
+    unreal.log("RebusBaseLevel: lens-flare material ensured.")
 
 
 def ensure_ground_materials(force=False):
@@ -278,6 +350,7 @@ def build():
     # safe because new_level below replaces the open level, so nothing references the
     # instances we just deleted/recreated.
     ensure_ground_materials(force=True)
+    ensure_lens_material(force=True)
 
     les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
 
@@ -298,8 +371,9 @@ def ensure_base_level():
     opening the project always lands on a populated stage without clobbering an
     existing BaseLevel on every launch.
     """
-    # Ground materials self-heal independently of the map (cheap if already present).
+    # Ground + lens materials self-heal independently of the map (cheap if already present).
     ensure_ground_materials()
+    ensure_lens_material()
 
     if unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH):
         return False

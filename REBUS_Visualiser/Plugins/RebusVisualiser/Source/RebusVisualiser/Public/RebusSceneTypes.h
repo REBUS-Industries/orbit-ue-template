@@ -2,7 +2,7 @@
 //
 // Parsed representations of the portal's REST payloads:
 //   * /api/ue/scene                      -> FRebusScene + FRebusSceneFixture[]
-//   * /api/ue/fixtures/{libraryId}       -> FRebusFixtureProfile (schema rebus-ue-fixture/v5)
+//   * /api/ue/fixtures/{libraryId}       -> FRebusFixtureProfile (schema rebus-ue-fixture/v6)
 //   * /api/ue/fixtures/{id}/meshes       -> FRebusMeshBundle
 //
 // All field names mirror the wire schema (ue-plugin-build-guide.md §4). Parsing is by field
@@ -112,6 +112,10 @@ struct FRebusPhotometrics
 	TOptional<double> ColorTemperature; // Kelvin
 	TOptional<double> Cri;
 	bool bHasIesProfile = false;
+	// Diameter of the luminous opening in METRES (schema v6; portal resolves IES luminous-opening
+	// dims -> GDTF BeamRadius diameter -> null). Sentinel < 0 means absent/null. Drives the
+	// emissive lens-flare disc size (§8.3a); falls back to the source aperture when absent.
+	double LensDiameter = -1.0;
 };
 
 struct FRebusZoomRange
@@ -233,10 +237,13 @@ struct FRebusInlineIesPending
 
 struct FRebusInlineGobo
 {
-	FString Wheel;       // wheel id/name this slot belongs to
-	FString WheelKind;   // "gobo" | "color" | ... (lower-cased); used to find the gobo wheel
+	int32 WheelIndex = INDEX_NONE; // PRIMARY key: 0-based index into the full wheels[] (NOT just
+	                               // gobo-kind wheels). SetFixtureGobo's wheelIndex matches this.
+	FString Wheel;       // wheel id/name this slot belongs to (secondary metadata)
+	FString WheelKind;   // "gobo" | "color" | ... (lower-cased); used to find the first gobo wheel
 	int32 Slot = 0;      // 0-based slot index within the wheel (correlates to goboIndex)
 	FString Name;
+	FString SlotName;    // optional slot display name (metadata)
 	FString Mime;        // "image/png" | "image/jpeg" | ... (informational; decode auto-detects)
 	FString ImageUrl;    // absolute signed GCS url fallback when no inline bytes
 	TArray<uint8> Bytes; // decoded (base64 -> bytes) image data; empty => use ImageUrl
@@ -251,10 +258,12 @@ struct FRebusInlineGobos
 // element from one (possibly chunked) message, holding one fragment of a (wheel,slot) image.
 struct FRebusInlineGoboPending
 {
+	int32 WheelIndex = INDEX_NONE; // 0-based into the full wheels[]; primary cache key with Slot
 	FString Wheel;
 	FString WheelKind;
 	int32 Slot = 0;
 	FString Name;
+	FString SlotName;
 	FString Mime;
 	FString ImageUrl;
 	FString DataBase64;  // one fragment (part); concatenated by part before a single decode

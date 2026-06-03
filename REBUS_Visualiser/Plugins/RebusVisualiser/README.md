@@ -136,20 +136,22 @@ Send these as normal `UIInteraction` descriptors (same envelope as `SetFixturePa
   "chunkIndex": 0,        // optional, message-level; same model as RegisterFixtureMeshes
   "chunkCount": 1 }       // optional, message-level; total messages for this libraryId
 
-// Inline base64 gobo wheel images (REST-free; no imageUrl fetch), keyed (libraryId, wheel, slot).
+// Inline base64 gobo wheel images (REST-free; no imageUrl fetch), keyed (libraryId, wheelIndex, slot).
 // Field aliases accepted: dataBase64|data, mime|contentType, imageUrl|url, wheelKind|kind|type.
 { "type": "RegisterFixtureGobos",
   "libraryId": "<libraryFixtureId>",
   "gobos": [
-    { "wheel": "<wheel id/name>",          // groups slots into a wheel
-      "wheelKind": "gobo",                 // wheelKind|kind|type; "gobo" wheel is the selectable one
+    { "wheelIndex": 0,                     // PRIMARY key: 0-based index into the full wheels[]
+      "wheel": "<wheel id/name>",          // secondary metadata (groups slots into a wheel)
+      "wheelKind": "gobo",                 // wheelKind|kind|type; identifies the gobo-kind wheel
       "slot": 0,                           // 0-based slot index; correlates to SetFixtureGobo.goboIndex
+      "slotName": "...",                   // optional slot display name (metadata)
       "name": "...",
       "dataBase64": "<base64 image bytes>",// dataBase64|data; base64 of the png/jpeg
       "mime": "image/png",                 // mime|contentType (informational; decode auto-detects)
       "imageUrl": "<absolute signed GCS url>", // imageUrl|url; fallback when no inline bytes
-      "part": 0,                           // optional, 0-based fragment index of THIS (wheel,slot) image
-      "partCount": 1 }                     // optional, total fragments for THIS (wheel,slot)
+      "part": 0,                           // optional, 0-based fragment index of THIS (wheelIndex,slot) image
+      "partCount": 1 }                     // optional, total fragments for THIS (wheelIndex,slot)
   ],
   "chunkIndex": 0,        // optional, message-level; same model as RegisterFixtureMeshes/Ies
   "chunkCount": 1 }       // optional, message-level; total messages for this libraryId
@@ -202,28 +204,29 @@ Behaviour:
   - **Message-level** (`chunkIndex`/`chunkCount`): `gobos[]` are appended per `libraryId`,
     order-independent, finalized once `chunkCount` messages have arrived.
   - **Per-image fragmentation** (`part`/`partCount`): the accumulated entries are grouped by
-    `(wheel, slot)`; when any entry has `partCount > 1`, its entries are sorted by `part` and
+    `(wheelIndex, slot)`; when any entry has `partCount > 1`, its entries are sorted by `part` and
     their `dataBase64` is **concatenated BEFORE a single `FBase64::Decode`** (so a base64 blob
     split mid-string reassembles correctly). Otherwise the lone entry's `dataBase64` is decoded.
-  - On finalize the plugin caches the decoded bytes per `(libraryId, wheel, slot)`. The
-    `UTexture2D` is built lazily on selection via `FImageUtils::ImportBufferAsTexture2D` (engine
-    image utils, auto-detects png/jpeg — no `ImageWrapper` dependency) and fed into the **same**
-    light-function MID path the URL gobo fetch uses (texture swap only — no new render path). If
-    the fixture is already spawned, the currently-selected gobo is re-applied so it appears
-    without a reselect.
-- **Gobo selection correlation** (`SetFixtureGobo`): `goboIndex` (0-based) selects the **slot**
-  within a gobo wheel. The wheel is chosen from two optional selectors with this precedence:
-  1. **`wheelIndex`** (0-based) — selects the **Nth gobo-kind wheel** for the fixture's
-     `libraryId`. The fixture's gobo wheels are the `RegisterFixtureGobos` wheels of gobo kind
-     (`wheelKind/kind/type == "gobo"`), taken in **stable first-seen insertion order** (the order
-     the portal pushed them). Out-of-range → warning, falls back to the first gobo wheel. This
-     **removes the multi-gobo-wheel ambiguity** previously noted.
-  2. **`wheel`** (legacy name string) — used when `wheelIndex` is absent; matches a wheel by name.
-  3. Otherwise the **first gobo-kind wheel** is assumed (single-wheel fixtures need no selector).
+    (Legacy entries without a `wheelIndex` fall back to grouping by wheel **name**.)
+  - On finalize the plugin caches the decoded bytes per **`(libraryId, wheelIndex, slot)`** (the
+    contract's primary key; `wheel` name is retained as secondary metadata). The `UTexture2D` is
+    built lazily on selection via `FImageUtils::ImportBufferAsTexture2D` (engine image utils,
+    auto-detects png/jpeg — no `ImageWrapper` dependency) and fed into the **same** light-function
+    MID path the URL gobo fetch uses (texture swap only — no new render path). If the fixture is
+    already spawned, the currently-selected gobo is re-applied so it appears without a reselect.
+- **Gobo selection correlation** (`SetFixtureGobo(goboIndex, wheelIndex?)`): `goboIndex` (0-based)
+  is the **slot**; `wheelIndex` is **0-based into the full `wheels[]`** (NOT just gobo-kind wheels).
+  The cache is keyed by **`(wheelIndex, slot)`**, so selection is a direct lookup:
+  1. With an explicit **`wheelIndex`**, the texture for `(wheelIndex, slot == goboIndex)` is used
+     directly — a colour/effect wheel preceding the gobo wheel can no longer mis-resolve it.
+  2. When **`wheelIndex` is absent**, fall back to the **first gobo-kind wheel** = the *smallest*
+     `wheelIndex` among inline entries tagged `wheelKind/kind/type == "gobo"` (then the smallest
+     `wheelIndex` of any entry). A legacy `wheel` **name** hint is still honoured as a secondary
+     match for pushes that carry no `wheelIndex`.
+  3. A null/empty/out-of-range `goboIndex` clears the gobo.
 
-  In all cases `slot == goboIndex` picks the slot within the resolved wheel; a null/empty/
-  out-of-range index clears the gobo. Wheel resolution is centralized in
-  `ARebusFixtureActor::ResolveGoboWheel` (the one spot to tweak if the portal's delta differs).
+  Wheel resolution is centralized in `ARebusFixtureActor::ResolveGoboWheelIndex` (the one spot to
+  tweak if the portal's delta differs).
 - **Gobo precedence** (`AssignGobo`): an inline base64 image for the selected `(wheel, slot)`
   **wins**; else its (or the profile wheel's) signed `imageUrl` is fetched; else nothing.
 - Gobo/IES URLs (when no inline data is present) are still fetched lazily; if the portal is
@@ -368,7 +371,8 @@ The plugin already parses and drives the full GDTF rig — to make the **physica
       "beamUpWorld":        { "x":0, "y":0,  "z":1 } }
   ],
 
-  "photometrics": { "luminousFlux":.., "beamAngle":.., "fieldAngle":.., "colorTemperature":.., "cri":.., "hasIesProfile":true },
+  "photometrics": { "luminousFlux":.., "beamAngle":.., "fieldAngle":.., "colorTemperature":.., "cri":.., "hasIesProfile":true,
+                    "lensDiameter":0.18 },   // v6 additive (metres); diameter of the luminous opening → lens-flare disc (§8.3a)
   "zoom":   { "minDeg":.., "maxDeg":.. },
   "source": { "radiusMeters":.., "diameterMeters":.. },
   "wheels": [ { "name":"Gobo 1", "kind":"gobo", "slots":[ { "name":"..","color":"..","imageUrl":".." } ] } ],
@@ -433,6 +437,23 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
   `UTexture2D` and feeds a light-function MID; the actual light-function material
   (`M_RebusGobo` with a `GoboTexture` param + *Volumetric Fog Uses Light Function Atlas*) is a
   content asset to author. Without it, gobo fetch is a no-op (lights still work).
+- **Emissive lens-flare disc (§8.3a)** (`RebusFixtureActor::BuildLensDisc`) spawns a thin
+  `/Engine/BasicShapes/Plane` at the **`<Beam>` node origin**, parented under `FixtureRoot` and
+  composed with the head motion (`LensDiscRest * Head`) so it tracks pan/tilt and stays
+  perpendicular to the v1.0.21 beam direction (plane normal along the beam aim). Its **diameter
+  source order** is `photometrics.lensDiameter` (metres, v6) → `source.radiusMeters * 2` →
+  `source.diameterMeters` → **skip the disc** (no fallback geometry). The plane (100 uu base) is
+  scaled to `diameterCm / 100`. The material is the committed **unlit, two-sided, translucent**
+  master `/Game/REBUS/Materials/M_RebusLensFlare` (vector `EmissiveColor`, scalar
+  `EmissiveStrength`, radial UV mask → round soft-edged glow), authored by the editor Python
+  script `build_rebus_base_level.py` (same `MaterialEditingLibrary` pattern as the ground
+  materials; guarded to editor-authoring context). A per-fixture `UMaterialInstanceDynamic` is
+  driven from the **live output** on the **same path that updates the SpotLight**
+  (`RefreshIntensity` → `RefreshLensDisc`): `EmissiveColor` = the current linear fixture colour,
+  `EmissiveStrength ∝ dimmer × shutter-gate` (bright at full output, dark when fully dimmed, and
+  strobes in lockstep). It is purely **additive** — it never reshapes the SpotLight/IES beam. If
+  the material asset hasn't been baked yet, the disc is skipped gracefully (the beam is
+  unaffected; run the Python script once so runtime/cook can load it).
 - **Mesh→axis bucketing** matches GDTF `affectedGeometryNames`; opaque MVR proxy names
   (`mvr-glb-<uuid>`) that match nothing fall to the static base. The guide's height-plane
   split (§7.6) is the more robust fallback to add if needed.

@@ -17,6 +17,7 @@
 #include "RebusFixtureActor.generated.h"
 
 class USpotLightComponent;
+class UStaticMeshComponent;
 class UProceduralMeshComponent;
 class UTextureLightProfile;
 class FRebusRestClient;
@@ -133,6 +134,8 @@ private:
 	void BuildMeshes(const FRebusMeshBundle& Meshes);
 	void ResolveHeadAxisFromMeshes(); // refine HeadAxisIndex to the deepest axis driving a head mesh
 	void BuildSpotLight();
+	void BuildLensDisc();         // emissive "glowing lens" flare disc at the beam origin (§8.3a)
+	void RefreshLensDisc();       // drive disc emissive from live dimmer x colour x shutter-gate
 	void RefreshMotion();         // re-solve pan/tilt and push transforms to groups + light
 	void RefreshIntensity();      // fold dimmer * shutter-gate into the light intensity
 	void RecomputeConeAngles();   // from zoom + photometrics + iris/frost
@@ -145,13 +148,13 @@ private:
 	// the signed imageUrl fetch over nothing. WheelIndex/WheelName disambiguate multi-wheel
 	// fixtures (see ResolveGoboWheel for the precedence).
 	void AssignGobo(int32 GoboIndex, int32 WheelIndex, const FString& WheelName);
-	// Resolve the target gobo wheel NAME from the selectors. The fixture's gobo wheels are the
-	// inline (RegisterFixtureGobos) wheels of gobo kind, in first-seen insertion order.
-	// Precedence: WheelIndex (0-based Nth gobo wheel) > WheelName > first gobo-kind wheel.
-	// Out-of-range WheelIndex logs a warning and falls back to the first gobo wheel. Empty when
-	// no inline gobos exist. This is the single place to tweak if the portal's delta differs.
-	FString ResolveGoboWheel(int32 WheelIndex, const FString& WheelName) const;
-	// Pick the inline gobo image for the resolved (wheel, slot); null when none pushed/match.
+	// Resolve the target gobo WHEELINDEX (0-based into the full wheels[]) from the selectors.
+	// An explicit WheelIndex is trusted as-is (the primary cache key). When absent, fall back to
+	// the FIRST gobo-kind wheel = the smallest wheelIndex among inline entries tagged kind=="gobo"
+	// (then any wheel's smallest index). INDEX_NONE when no inline entry carries a wheelIndex
+	// (legacy push) -- callers then fall back to wheel-name / any-slot matching.
+	int32 ResolveGoboWheelIndex(int32 WheelIndex, const FString& WheelName) const;
+	// Pick the inline gobo image for the resolved (wheelIndex, slot); null when none pushed/match.
 	const FRebusInlineGobo* SelectInlineGobo(int32 Slot, int32 WheelIndex, const FString& WheelName) const;
 	// Build + assign a gobo UTexture2D from decoded image bytes via the existing light-function
 	// MID path; returns true when a texture was applied.
@@ -178,6 +181,13 @@ private:
 	UPROPERTY() TObjectPtr<UTextureLightProfile> ActiveIesProfile = nullptr;
 	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> GoboMID = nullptr;
 
+	// Emissive "glowing lens" flare disc: a thin plane at the beam origin, normal along the beam
+	// forward, parented under FixtureRoot and driven by BeamRest/head motion like the SpotLight so
+	// it tracks pan/tilt. Null when no lensDiameter/source aperture resolved or the material is
+	// missing. Its MID's EmissiveColor/EmissiveStrength follow the live fixture colour x dimmer.
+	UPROPERTY() TObjectPtr<UStaticMeshComponent> LensDisc = nullptr;
+	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> LensDiscMID = nullptr;
+
 	TSharedPtr<FRebusRestClient> RestClient;
 
 	// Identity / capabilities.
@@ -201,6 +211,14 @@ private:
 	// Beam rest transform in fixture-local Unreal space (light placement before motion).
 	FTransform BeamRestTransform = FTransform::Identity;
 	int32 HeadAxisIndex = INDEX_NONE;
+
+	// Resolved beam emission forward/up in fixture-local Unreal space (pre-motion), shared by the
+	// SpotLight and the lens disc so they aim identically. The disc rest transform (plane normal
+	// along forward, co-located at the beam origin, scaled to the lens diameter) is composed with
+	// the head motion (LensDiscRest * Head) exactly like the SpotLight.
+	FVector BeamForwardLocal = FVector(0.f, 0.f, -1.f);
+	FVector BeamUpLocal = FVector::UpVector;
+	FTransform LensDiscRest = FTransform::Identity;
 
 	// True when BuildSpotLight() placed the beam from a GDTF <Beam> node; false on the
 	// down-pointing fallback. Surfaced in the per-fixture diagnostics summary.
