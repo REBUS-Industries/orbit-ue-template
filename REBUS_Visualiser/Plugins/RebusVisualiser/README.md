@@ -437,6 +437,15 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
   `UTexture2D` and feeds a light-function MID; the actual light-function material
   (`M_RebusGobo` with a `GoboTexture` param + *Volumetric Fog Uses Light Function Atlas*) is a
   content asset to author. Without it, gobo fetch is a no-op (lights still work).
+- **Spotlight source size (§8.3)** (`RebusFixtureActor::BuildSpotLight`) sizes the
+  `USpotLightComponent` emitter so the **beam starts at the lens diameter** (a finite disc, not a
+  point) — the beam and its volumetric scattering emanate from the lens and gain soft-shadow
+  penumbrae. `SourceRadius` (UE cm) is resolved by this precedence, the same diameter source order
+  as the lens-flare disc but converted to a **radius**: `photometrics.lensDiameter / 2` (the IES
+  lens opening) → `source.radiusMeters` → `source.diameterMeters / 2` → **leave the engine default
+  untouched** (never fabricated). `SourceLength = 0` whenever a radius is set (circular GDTF beam,
+  no second axis). The resolved radius is cached and reused as the base for the frost penumbra
+  scaling, so the beam-origin diameter stays consistent with the lens-flare disc.
 - **Emissive lens-flare disc (§8.3a)** (`RebusFixtureActor::BuildLensDisc`) spawns a thin
   `/Engine/BasicShapes/Plane` at the **`<Beam>` node origin**, parented under `FixtureRoot` and
   composed with the head motion (`LensDiscRest * Head`) so it tracks pan/tilt and stays

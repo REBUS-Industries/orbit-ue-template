@@ -360,13 +360,40 @@ void ARebusFixtureActor::BuildSpotLight()
 	}
 	SpotLight->MarkRenderStateDirty();
 
-	// Source size: map source.radiusMeters -> SourceRadius (§8.3); leave default when null.
-	if (Profile.Source.RadiusMeters.IsSet())
+	// Source size: emit the beam from a finite disc the size of the lens opening so the beam (and
+	// its volumetric scattering) STARTS at the lens diameter and gets soft-shadow penumbrae (§8.3).
+	// The radius uses the SAME diameter source order as the v1.0.27 lens-flare disc, converted to a
+	// RADIUS: photometrics.lensDiameter/2 (IES lens opening) -> source.radiusMeters ->
+	// source.diameterMeters/2. None known -> leave the engine default untouched (never fabricate).
+	// Cached as BaseSourceRadiusUnreal so the frost penumbra scaling (RecomputeConeAngles) stays
+	// consistent with the lens-flare disc instead of reverting to source.radiusMeters.
+	const TCHAR* SourceRadiusSrc = TEXT("engine-default");
+	if (Profile.Photometrics.LensDiameter >= 0.0)
 	{
-		const float RadiusUnreal = (float)(Profile.Source.RadiusMeters.GetValue() * RebusCoords::METERS_TO_UNREAL);
-		SpotLight->SetSourceRadius(RadiusUnreal);
-		SpotLight->SetSourceLength(0.f);
+		BaseSourceRadiusUnreal = (float)(Profile.Photometrics.LensDiameter * 0.5 * RebusCoords::METERS_TO_UNREAL);
+		SourceRadiusSrc = TEXT("lensDiameter");
 	}
+	else if (Profile.Source.RadiusMeters.IsSet())
+	{
+		BaseSourceRadiusUnreal = (float)(Profile.Source.RadiusMeters.GetValue() * RebusCoords::METERS_TO_UNREAL);
+		SourceRadiusSrc = TEXT("source.radius");
+	}
+	else if (Profile.Source.DiameterMeters.IsSet())
+	{
+		BaseSourceRadiusUnreal = (float)(Profile.Source.DiameterMeters.GetValue() * 0.5 * RebusCoords::METERS_TO_UNREAL);
+		SourceRadiusSrc = TEXT("source.diameter");
+	}
+
+	if (BaseSourceRadiusUnreal >= 0.f)
+	{
+		SpotLight->SetSourceRadius(BaseSourceRadiusUnreal);
+		SpotLight->SetSourceLength(0.f); // circular GDTF beam, no second axis
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s source: SourceRadius=%s cm (src=%s)"),
+		*FixtureId,
+		BaseSourceRadiusUnreal >= 0.f ? *FString::Printf(TEXT("%.3f"), BaseSourceRadiusUnreal) : TEXT("engine-default"),
+		SourceRadiusSrc);
 
 	if (Profile.Photometrics.ColorTemperature.IsSet())
 	{
@@ -637,11 +664,12 @@ void ARebusFixtureActor::RecomputeConeAngles()
 	SpotLight->SetOuterConeAngle(OuterHalf);
 	SpotLight->SetInnerConeAngle(FMath::Min(InnerHalf, OuterHalf));
 
-	// Frost also enlarges the apparent source for softer penumbra.
-	if (Profile.Source.RadiusMeters.IsSet())
+	// Frost also enlarges the apparent source for softer penumbra. Scale the resolved base source
+	// radius (the lens-opening disc set in BuildSpotLight) so the beam-origin diameter stays
+	// consistent with the lens-flare disc; left untouched when no source size was known.
+	if (BaseSourceRadiusUnreal >= 0.f)
 	{
-		const float Base = (float)(Profile.Source.RadiusMeters.GetValue() * RebusCoords::METERS_TO_UNREAL);
-		SpotLight->SetSourceRadius(Base * FMath::Lerp(1.f, 4.f, FMath::Clamp(Frost.Current, 0.f, 1.f)));
+		SpotLight->SetSourceRadius(BaseSourceRadiusUnreal * FMath::Lerp(1.f, 4.f, FMath::Clamp(Frost.Current, 0.f, 1.f)));
 	}
 }
 

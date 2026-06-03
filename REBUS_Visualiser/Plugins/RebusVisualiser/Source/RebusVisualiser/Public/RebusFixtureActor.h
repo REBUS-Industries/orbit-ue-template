@@ -220,6 +220,12 @@ private:
 	FVector BeamUpLocal = FVector::UpVector;
 	FTransform LensDiscRest = FTransform::Identity;
 
+	// SpotLight emitter radius (UE cm) resolved from the lens opening (lensDiameter/2 ->
+	// source.radius -> source.diameter/2) so the beam STARTS at the lens diameter (§8.3). Sentinel
+	// < 0 = none known -> the engine-default SourceRadius is left untouched. Reused as the base for
+	// frost penumbra scaling so the beam origin stays consistent with the lens-flare disc.
+	float BaseSourceRadiusUnreal = -1.f;
+
 	// True when BuildSpotLight() placed the beam from a GDTF <Beam> node; false on the
 	// down-pointing fallback. Surfaced in the per-fixture diagnostics summary.
 	bool bHasBeamNode = false;
