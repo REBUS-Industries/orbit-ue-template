@@ -788,10 +788,10 @@ void ARebusFixtureActor::UpdateBeamConeGeometry()
 	TArray<int32> Triangles;
 	TArray<FVector> Normals;
 	TArray<FVector2D> UVs;
-	Positions.Reserve(Segs * 2);
-	Normals.Reserve(Segs * 2);
-	UVs.Reserve(Segs * 2);
-	Triangles.Reserve(Segs * 6);
+	Positions.Reserve(Segs * 2 + 2);   // +2 cap centres
+	Normals.Reserve(Segs * 2 + 2);
+	UVs.Reserve(Segs * 2 + 2);
+	Triangles.Reserve(Segs * 12);      // side walls + 2 cap fans
 
 	// Generated along the local +X axis (the spotlight emission axis): base ring at x=0 (the lens)
 	// and far ring at x=+L (downrange). With BeamConeRest reusing the SpotLight rotation, +X maps to
@@ -817,6 +817,35 @@ void ARebusFixtureActor::UpdateBeamConeGeometry()
 		const int32 F1 = 2 * ((S + 1) % Segs) + 1;
 		Triangles.Add(B0); Triangles.Add(F0); Triangles.Add(F1);
 		Triangles.Add(B0); Triangles.Add(F1); Triangles.Add(B1);
+	}
+
+	// End caps (v1.0.41): close the volume with a base disc at x=0 (the lens) and a far disc at x=+L
+	// (the throw), each a triangle fan to a centre vertex on the axis. This gives the raymarch a
+	// surface ALONG the axis, fixing the v1.0.39 down-axis thinning (looking straight down the cone
+	// previously hit no lateral wall -> no fragment -> the shaft vanished). The material is two-sided
+	// so the fan winding only needs to be self-consistent; normals are unused (unlit additive
+	// raymarch) and the cap fragment behaves exactly like the side wall (EXIT = its own depth, so a
+	// front cap self-cancels and the far cap carries the column -> no double-add). The v1.0.40
+	// distance falloff already dims the far end, so the far cap reads as the column's end, not a hard
+	// bright disc.
+	const int32 BaseCenter = Positions.Num();
+	Positions.Add(FVector(0.f, 0.f, 0.f));      // lens-end axis centre
+	Normals.Add(FVector(-1.f, 0.f, 0.f));
+	UVs.Add(FVector2D(0.5f, 0.f));
+	const int32 FarCenter = Positions.Num();
+	Positions.Add(FVector(L, 0.f, 0.f));        // throw-end axis centre
+	Normals.Add(FVector(1.f, 0.f, 0.f));
+	UVs.Add(FVector2D(0.5f, 1.f));
+	for (int32 S = 0; S < Segs; ++S)
+	{
+		const int32 B0 = 2 * S;
+		const int32 B1 = 2 * ((S + 1) % Segs);
+		const int32 F0 = 2 * S + 1;
+		const int32 F1 = 2 * ((S + 1) % Segs) + 1;
+		// Base cap fan (faces -X back toward the fixture).
+		Triangles.Add(BaseCenter); Triangles.Add(B0); Triangles.Add(B1);
+		// Far cap fan (faces +X downrange; opposite winding to the base cap).
+		Triangles.Add(FarCenter); Triangles.Add(F1); Triangles.Add(F0);
 	}
 
 	const TArray<FColor> NoColors;

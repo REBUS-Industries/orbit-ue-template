@@ -334,6 +334,20 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 > `BeamFalloff` (source→tip dimming strength; lower = more even along length), `BeamSharpness` (radial
 > edge softness).
 
+> **Capped (closed) beam cone (v1.0.41).** `UpdateBeamConeGeometry` now adds a **base cap** (disc at
+> the lens, `x=0`) and a **far cap** (disc at the throw, `x=L`) as triangle fans to axis-centre
+> vertices, so the procedural cone is a fully closed volume. This resolves the v1.0.39 down-axis edge
+> case: looking straight down the cone's axis previously hit no lateral wall → no fragment → the
+> shaft thinned to nothing; the caps now provide a fragment along the axis, so the raymarch sees a
+> surface and the full column inscatters (a bright disc/column instead of nothing). The raymarch is
+> unchanged (C++ geometry only, **no re-bake**): a cap fragment behaves exactly like the side wall —
+> EXIT = its own surface depth (clamped by scene depth), ENTRY = camera when inside else the analytic
+> front intersection — so a near cap self-cancels and the far cap carries the column (**no
+> double-add**). The material stays two-sided so caps render from both sides; cap normals are unused
+> (unlit additive). The v1.0.40 distance falloff already dims the far end, so the far cap reads as the
+> natural end of the column rather than a hard bright disc. Bounds are unchanged (cap centres lie on
+> the axis within the existing ring extents).
+
 ### `RenderQuality` scene property (runtime tiers)
 
 Push `SetSceneProperty name="RenderQuality" value="<tier>"` (case-insensitive; unknown values
