@@ -246,34 +246,43 @@ r.MegaLights.DownsampleMode=1
 r.MegaLights.Volume=1
 r.MegaLights.Volume.GridPixelSize=2
 r.MegaLights.Volume.GridSizeZ=128
-r.VolumetricFog.GridPixelSize=2
+r.VolumetricFog.HistoryWeight=0.75
+r.VolumetricFog.GridPixelSize=4
+r.VolumetricFog.GridSizeZ=128
 ```
 
 `r.MegaLights.Allow=1`, `r.MegaLights.DownsampleMode=1`, and `r.MegaLights.Volume=1` are
 **baselined** (the same for every tier — the runtime tiers always re-assert `Allow`/`Volume`).
-The volumetric **grid pixel size is `2` on first load** (sharper volumetrics) for BOTH the
-MegaLights lighting volume (`r.MegaLights.Volume.GridPixelSize`) and the engine volumetric-fog
-froxel grid (`r.VolumetricFog.GridPixelSize`). `NumSamplesPerPixel`, `Volume.GridPixelSize` (+
-the matching `VolumetricFog.GridPixelSize`), and `Volume.GridSizeZ` are then **per-tier** (below).
+
+The engine **VolumetricFog froxel-grid** CVars (`r.VolumetricFog.*`) are **fixed defaults** and
+are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless of tier:
+
+| CVar | Default | Engine default |
+| --- | --- | --- |
+| `r.VolumetricFog.HistoryWeight` | `0.75` | 0.9 |
+| `r.VolumetricFog.GridPixelSize` | `4` | 16 |
+| `r.VolumetricFog.GridSizeZ` | `128` | 64 |
+
+> Note: the engine `r.VolumetricFog.*` froxel grid is **separate** from the MegaLights lighting
+> volume grid (`r.MegaLights.Volume.*`). Only the latter is tier-controlled.
 
 ### `RenderQuality` scene property (runtime tiers)
 
 Push `SetSceneProperty name="RenderQuality" value="<tier>"` (case-insensitive; unknown values
-fall back to `live`). Each tier re-applies these CVars at runtime via a console override.
-`Volume.GridPixelSize` and `VolumetricFog.GridPixelSize` are kept in lock-step (one value drives
-both grids):
+fall back to `live`). Each tier re-applies **only** the MegaLights volume grid + sample count via
+a console override (and re-asserts `Allow`/`Volume`); it does **not** touch `r.VolumetricFog.*`:
 
-| Tier | `NumSamplesPerPixel` | `Volume.GridPixelSize` (= `VolumetricFog.GridPixelSize`) | `Volume.GridSizeZ` | Use |
+| Tier | `NumSamplesPerPixel` | `Volume.GridPixelSize` | `Volume.GridSizeZ` | Use |
 | --- | --- | --- | --- | --- |
-| **`live`** *(default)* | 2 | 2 | 64 | lightest sampling, sharp grid — live previs streaming |
+| **`live`** *(default)* | 2 | 8 | 64 | lightest — live previs streaming |
 | `previs` | 4 | 4 | 128 | the "start here" baseline |
 | `final` | 8 | 2 | 192 | heavy — final renders |
 
 `live` is the **runtime default**: it is seeded in `URebusSceneSettingsSubsystem::Initialize`
-(overriding the `[SystemSettings]` baseline for the live stream) and stored in `SceneState`, so
-the portal's control hydrates to `live` and every tier switch is logged. On first load the
-volumetric grid pixel size is therefore `2` with no tier switch. All tiers also re-assert
-`r.MegaLights.Allow=1` + `r.MegaLights.Volume=1`.
+(overriding the MegaLights volume `[SystemSettings]` baseline for the live stream) and stored in
+`SceneState`, so the portal's control hydrates to `live` and every tier switch is logged. All
+tiers also re-assert `r.MegaLights.Allow=1` + `r.MegaLights.Volume=1`. The `r.VolumetricFog.*`
+froxel grid is untouched by tier switches and remains at the fixed defaults above.
 
 ### Volumetric fog + per-fixture beam scattering defaults
 

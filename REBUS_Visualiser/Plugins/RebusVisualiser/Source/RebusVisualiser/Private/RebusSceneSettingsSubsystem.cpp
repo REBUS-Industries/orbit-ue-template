@@ -164,10 +164,11 @@ void URebusSceneSettingsSubsystem::SetRenderQuality(const FString& Tier)
 	// Resolve the tier (case-insensitive; anything unrecognised falls back to the lightest
 	// "live" preset so a bad push can never make the stream heavier than the live baseline).
 	const FString Clean = Tier.TrimStartAndEnd();
-	// GridPixelSize drives BOTH the MegaLights lighting volume grid and the engine volumetric-fog
-	// froxel grid (smaller = sharper/heavier). live defaults to 2 so first-load volumetrics are
-	// sharp without a tier switch.
-	int32 Samples = 2, GridPixelSize = 2, GridSizeZ = 64;   // live (default)
+	// Per-tier values drive ONLY the MegaLights lighting volume grid + sample count (smaller
+	// GridPixelSize = sharper/heavier). The engine VolumetricFog froxel grid (r.VolumetricFog.*)
+	// is intentionally NOT touched here -- it stays at the fixed [SystemSettings] defaults so a
+	// tier switch can never override the user's VolumetricFog grid/history settings.
+	int32 Samples = 2, GridPixelSize = 8, GridSizeZ = 64;   // live (default)
 	const TCHAR* Resolved = TEXT("live");
 	if (Clean.Equals(TEXT("final"), ESearchCase::IgnoreCase))
 	{
@@ -191,16 +192,14 @@ void URebusSceneSettingsSubsystem::SetRenderQuality(const FString& Tier)
 	SetCVarInt(TEXT("r.MegaLights.NumSamplesPerPixel"), Samples);
 	SetCVarInt(TEXT("r.MegaLights.Volume.GridPixelSize"), GridPixelSize);
 	SetCVarInt(TEXT("r.MegaLights.Volume.GridSizeZ"), GridSizeZ);
-	// Keep the engine volumetric-fog froxel grid in lock-step with the lighting volume grid.
-	SetCVarInt(TEXT("r.VolumetricFog.GridPixelSize"), GridPixelSize);
 
 	// Store the canonical resolved name (overwriting whatever raw string was pushed) so the
 	// SceneState read-back always reports a valid tier.
 	Values.Add(TEXT("RenderQuality"), FRebusPropertyValue::MakeString(Resolved));
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("RenderQuality -> '%s' (MegaLights NumSamplesPerPixel=%d Volume.GridPixelSize=%d Volume.GridSizeZ=%d, VolumetricFog.GridPixelSize=%d)."),
-		Resolved, Samples, GridPixelSize, GridSizeZ, GridPixelSize);
+		TEXT("RenderQuality -> '%s' (MegaLights NumSamplesPerPixel=%d Volume.GridPixelSize=%d Volume.GridSizeZ=%d; VolumetricFog grid untouched)."),
+		Resolved, Samples, GridPixelSize, GridSizeZ);
 }
 
 void URebusSceneSettingsSubsystem::SetScalabilityBucket(const TCHAR* Group, int32 Bucket)
