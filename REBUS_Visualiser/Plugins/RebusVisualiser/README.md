@@ -552,6 +552,20 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
     `USceneCaptureComponent2D` depth-shadow was rejected as higher-risk to validate headlessly.
     Gated by `bWantsVolumetricShadow` + the hero budget; `ApplyBeamVolumetrics` logs
     `wantsShadow/shadowHero/heroBudget`.
+  - **A fixture does NOT self-shadow its own beam (v1.0.36)**: with the hero fog re-enabled, a
+    fixture's OWN body geometry sits right at the light source and was carving mottled gaps into the
+    base of its own beam (made worse by the v1.0.35 bound Orbit model stacking on top — two
+    near-source occluders). Patchiness therefore tracked the hero/shadow-casting beams, not the
+    mesh-only ones. Fix: `DisableSelfBeamVolumetricShadow` clears `bCastDynamicShadow` (keeping
+    `CastShadow` for contact/RT grounding) on **both** the control-channel body `MeshComponents` (on
+    `BuildMeshes`) **and** the matched/bound Orbit model components (on `BindOrbitComponents`). A
+    movable spotlight's volumetric fog is shadowed by its VSM/shadow depth, which only includes
+    `CastShadow && bCastDynamicShadow` primitives — UE5.7 has **no** per-primitive volumetric-fog
+    flag (`bCastVolumetricShadow`/`SetCastVolumetricShadow` are **light-only**), so the dynamic-shadow
+    opt-out is the lever. **Trade-off**: the fixture body no longer casts a dynamic shadow into ANY
+    beam (incl. neighbours) or onto the floor — acceptable since fixture bodies are small/airborne.
+    The trusses/set are OTHER actors and keep their dynamic shadows, so the wanted truss
+    self-shadowing (the whole point of the hybrid) is **unaffected**.
 - **Mesh→axis bucketing** matches GDTF `affectedGeometryNames`; opaque MVR proxy names
   (`mvr-glb-<uuid>`) that match nothing fall to the static base. The guide's height-plane
   split (§7.6) is the more robust fallback to add if needed.

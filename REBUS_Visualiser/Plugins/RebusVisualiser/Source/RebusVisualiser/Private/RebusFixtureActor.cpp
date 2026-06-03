@@ -339,6 +339,10 @@ void ARebusFixtureActor::BuildMeshes(const FRebusMeshBundle& Meshes)
 		// Custom depth on for the selection outline; off until selected.
 		PMC->SetRenderCustomDepth(false);
 
+		// A fixture's own body must not cast a volumetric-fog shadow into its own beam (it sits at
+		// the light source and otherwise mottles the beam base). Keeps contact/RT grounding.
+		DisableSelfBeamVolumetricShadow(PMC);
+
 		const int32 ComponentIndex = MeshComponents.Add(PMC);
 		const int32 Axis = RebusMotion::ResolveAxisForMesh(Profile.MotionRig, Mesh.GeometryName, Mesh.ModelName);
 		MeshAxisBucket.SetNum(MeshComponents.Num());
@@ -1016,6 +1020,23 @@ FTransform ARebusFixtureActor::ComputeHeadLocal(float InPanDeg, float InTiltDeg)
 		? Cumulative[HeadAxisIndex] : FTransform::Identity;
 }
 
+void ARebusFixtureActor::DisableSelfBeamVolumetricShadow(UPrimitiveComponent* Comp)
+{
+	if (!Comp) return;
+	// Keep the primitive a shadow caster (CastShadow stays true -> contact/ray-traced grounding is
+	// preserved) but drop its DYNAMIC shadow-map contribution. A movable spotlight's volumetric fog
+	// inscattering is shadowed by that light's VSM/shadow depth, which only includes primitives with
+	// CastShadow && bCastDynamicShadow -- so clearing bCastDynamicShadow removes the fixture body /
+	// bound Orbit model from the fog occlusion that was mottling the base of its own beam, without a
+	// (non-existent in UE5.7) per-primitive volumetric-fog toggle. Trade-off: the body no longer
+	// casts a dynamic shadow into ANY beam (incl. neighbours) or onto the floor -- acceptable since
+	// fixture bodies are small/airborne; the trusses/set (other actors) keep their dynamic shadows,
+	// so the hybrid's wanted truss self-shadowing is unaffected.
+	Comp->SetCastShadow(true);
+	Comp->bCastDynamicShadow = false;
+	Comp->MarkRenderStateDirty();
+}
+
 void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Components, const FString& MatchedObjectId)
 {
 	OrbitComponents.Reset();
@@ -1040,6 +1061,9 @@ void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Com
 		OrbitCompRestWorld.Add(CompRest);
 		// Driven world = CompRest * HeadWorldRest^-1 * HeadWorldNow; precompute the constant prefix.
 		OrbitBindBase.Add(CompRest * HeadWorldRestInv);
+		// The bound Orbit model sits right on top of this fixture's light source, so exclude it from
+		// its own beam's volumetric-fog shadow (it would otherwise double-occlude with the body).
+		DisableSelfBeamVolumetricShadow(Cast<UPrimitiveComponent>(Comp));
 	}
 
 	UE_LOG(LogRebusVisualiser, Log,

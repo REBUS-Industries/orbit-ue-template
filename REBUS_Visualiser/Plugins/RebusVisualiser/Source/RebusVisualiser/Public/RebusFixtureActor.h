@@ -18,6 +18,7 @@
 
 class USpotLightComponent;
 class UStaticMeshComponent;
+class UPrimitiveComponent;
 class UStaticMesh;
 class UMaterialInterface;
 class UProceduralMeshComponent;
@@ -194,6 +195,13 @@ private:
 	// The head's fixture-local transform for a given pan/tilt (deepest head axis' cumulative solve;
 	// identity for no-rig fixtures). Shared by the Orbit-bind rest capture + live drive.
 	FTransform ComputeHeadLocal(float InPanDeg, float InTiltDeg) const;
+
+	// Stop a primitive owned by THIS fixture (a control-channel body mesh or a bound Orbit model
+	// component) from casting the dynamic VSM shadow that mottles its own beam's volumetric fog,
+	// while keeping it a shadow caster for contact/RT grounding. UE5.7 exposes no per-primitive
+	// volumetric-fog flag, so opting the body out of the dynamic shadow map (the source the fog
+	// inscattering samples) is the lever. Applied to control meshes on build + Orbit comps on bind.
+	static void DisableSelfBeamVolumetricShadow(UPrimitiveComponent* Comp);
 	void RefreshIntensity();      // fold dimmer * shutter-gate into the light intensity
 	void RecomputeConeAngles();   // from zoom + photometrics + iris/frost
 	void SelectIesForZoom();      // pick/assign the zoom-keyed IES profile (inline > URL > cone)
