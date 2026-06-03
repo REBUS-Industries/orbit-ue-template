@@ -47,6 +47,21 @@ namespace
 	constexpr float RebusBeamSharpness = 2.5f;
 	constexpr float RebusBeamFalloff = 1.6f;
 
+	// Phase 2 (v1.0.33) raymarch tuning: view-ray march steps + per-step density seeded on the MID
+	// (StepCount/BeamDensity in M_RebusBeam's Custom HLSL). 32 steps is a good live/final balance.
+	constexpr float RebusBeamStepCount = 32.f;
+	constexpr float RebusBeamDensity = 0.0025f;
+
+	// Phase 2 light-blocking volumetric shadows (the must-have) use the NATIVE VSM fog hybrid:
+	// runtime-imported glTF trusses have NO mesh distance fields (glTFRuntime's import config has no
+	// DF option, and DF are an editor/DDC build step), so a material raymarch can't trace them and
+	// the Global Distance Field doesn't contain them. Virtual Shadow Maps DO shadow runtime meshes,
+	// so hero shadow-casting beams re-enable a modest SpotLight VolumetricScatteringIntensity + Cast
+	// Volumetric Shadow to carve real truss gaps in the fog, while the mesh cone provides the crisp
+	// shaft. Gated by SetFixtureBeamVolumetrics(castVolumetricShadow) + this per-batch hero budget.
+	constexpr int32 RebusMaxShadowFogBeams = 6;
+	constexpr float RebusHeroShadowScatter = 1.5f;
+
 	// Rotation that lays a plane (engine /BasicShapes/Plane, local +Z normal) perpendicular to the
 	// beam: plane +Z -> Forward, plane +X -> Up. Guards a near-parallel up like MakeFromXZ does.
 	FQuat LensDiscRotationFromForward(const FVector& Forward, const FVector& Up)
@@ -63,10 +78,12 @@ namespace
 }
 
 int32 ARebusFixtureActor::VolumetricShadowBeamCount = 0;
+int32 ARebusFixtureActor::ShadowFogBeamCount = 0;
 
 void ARebusFixtureActor::ResetVolumetricShadowBudget()
 {
 	VolumetricShadowBeamCount = 0;
+	ShadowFogBeamCount = 0;
 }
 
 ARebusFixtureActor::ARebusFixtureActor()
@@ -366,11 +383,12 @@ void ARebusFixtureActor::BuildSpotLight()
 	SpotLight->SetIntensityUnits(ELightUnits::Candelas);
 	SpotLight->SetAttenuationRadius(6000.f);
 
-	// Hybrid mesh-beam (Phase 1, §8.4a): the visible shaft is now the cone-mesh beam (BuildBeamCone),
-	// so suppress THIS light's fog scattering to avoid a competing noisy froxel beam while keeping
-	// it for surface lighting + IES + soft shadows. FogScatteringIntensity (2.5) is the value
-	// restored on the SpotLight if the portal toggles bMeshBeams=false (back to the fog beam).
-	// Default mesh-beams-on => scattering 0 here.
+	// Hybrid mesh-beam (§8.4a): the visible shaft is the cone-mesh beam (BuildBeamCone), so suppress
+	// THIS light's fog scattering by default to avoid a competing noisy froxel beam while keeping it
+	// for surface lighting + IES + soft shadows. FogScatteringIntensity (2.5) is restored if the
+	// portal toggles bMeshBeams=false (back to the fog beam). Phase 2: hero shadow beams later
+	// re-enable a modest scattering + Cast Volumetric Shadow here via RefreshBeamShadowMode (the
+	// native VSM path that produces light-blocking truss gaps on runtime meshes). Default => 0.
 	SpotLight->SetVolumetricScatteringIntensity(bMeshBeamEnabled ? 0.f : FogScatteringIntensity);
 
 	// Opt this fixture light into MegaLights. bAllowMegaLights is the public uint32:1 per-light
@@ -676,6 +694,9 @@ void ARebusFixtureActor::BuildBeamCone()
 	BeamMID = UMaterialInstanceDynamic::Create(Mat, this);
 	BeamMID->SetScalarParameterValue(TEXT("BeamSharpness"), RebusBeamSharpness);
 	BeamMID->SetScalarParameterValue(TEXT("BeamFalloff"), RebusBeamFalloff);
+	// Raymarch tuning (Phase 2): march step count + per-step density for the Custom HLSL body.
+	BeamMID->SetScalarParameterValue(TEXT("StepCount"), RebusBeamStepCount);
+	BeamMID->SetScalarParameterValue(TEXT("BeamDensity"), RebusBeamDensity);
 
 	// Rest transform: the cone mesh is generated along its local +X (the SAME axis a
 	// USpotLightComponent emits along), so it must use the SAME rotation basis as the SpotLight
@@ -689,9 +710,10 @@ void ARebusFixtureActor::BuildBeamCone()
 	BeamCone->SetRelativeTransform(BeamConeRest);
 
 	BeamConeLastFarRadius = -1.f; // force the first section build
-	UpdateBeamConeGeometry();
+	UpdateBeamConeGeometry();     // also seeds BeamLength/LensRadius/FarRadius on the MID
 	BeamCone->SetMaterial(0, BeamMID);
 	RefreshBeamEmissive();
+	RefreshBeamSpatialParams();   // seed world BeamOrigin/BeamDir (RefreshMotion re-pushes per frame)
 
 	const float OuterHalf = ResolveOuterHalfDeg();
 	const float CurIntensity = RebusMeshBeamMaxIntensity * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * MeshBeamUserScale;
@@ -765,6 +787,16 @@ void ARebusFixtureActor::UpdateBeamConeGeometry()
 	const TArray<FProcMeshTangent> NoTangents;
 	BeamCone->ClearMeshSection(0);
 	BeamCone->CreateMeshSection(0, Positions, Triangles, Normals, UVs, NoColors, NoTangents, /*bCreateCollision*/ false);
+
+	// Feed the geometry sizes to the raymarch shader so the marched cone matches the mesh exactly
+	// (length along +X, base = lens radius, far ring radius). World origin/dir come from the
+	// component each RefreshMotion via RefreshBeamSpatialParams.
+	if (BeamMID)
+	{
+		BeamMID->SetScalarParameterValue(TEXT("BeamLength"), L);
+		BeamMID->SetScalarParameterValue(TEXT("LensRadius"), RB);
+		BeamMID->SetScalarParameterValue(TEXT("FarRadius"), RF);
+	}
 }
 
 void ARebusFixtureActor::RefreshBeamEmissive()
@@ -789,6 +821,43 @@ void ARebusFixtureActor::RefreshBeamEmissive()
 		RebusMeshBeamMaxIntensity * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate * MeshBeamUserScale);
 }
 
+void ARebusFixtureActor::RefreshBeamSpatialParams()
+{
+	if (!BeamMID || !BeamCone) return;
+	// World-space beam origin (cone base = the lens) and forward (+X = the emission axis), so the
+	// view-ray raymarch in M_RebusBeam evaluates axial/radial against the exact same cone the
+	// procedural mesh occupies after pan/tilt. Packed into the RGB of vector params.
+	const FVector O = BeamCone->GetComponentLocation();
+	const FVector D = BeamCone->GetForwardVector();
+	BeamMID->SetVectorParameterValue(TEXT("BeamOrigin"), FLinearColor((float)O.X, (float)O.Y, (float)O.Z, 0.f));
+	BeamMID->SetVectorParameterValue(TEXT("BeamDir"), FLinearColor((float)D.X, (float)D.Y, (float)D.Z, 0.f));
+}
+
+void ARebusFixtureActor::RefreshBeamShadowMode()
+{
+	if (!SpotLight) return;
+
+	// A hero shadow beam is one that asked for volumetric shadows AND won a per-batch budget slot.
+	const bool bShadowActive = bWantsVolumetricShadow && bGrantedShadowHero;
+
+	if (bMeshBeamEnabled)
+	{
+		// Mesh cone is the crisp shaft. Hero shadow beams ALSO emit a modest native fog scattering
+		// with Cast Volumetric Shadow so VSM (which works on runtime-imported glTF meshes that lack
+		// distance fields) carves real truss gaps into the volume. Non-hero beams stay mesh-only
+		// (scattering 0) so there's no competing froxel noise.
+		SpotLight->SetVolumetricScatteringIntensity(bShadowActive ? RebusHeroShadowScatter : 0.f);
+		SpotLight->SetCastVolumetricShadow(bShadowActive);
+	}
+	else
+	{
+		// Fog-beam A/B mode: restore the froxel beam; hero beams still cast volumetric shadow.
+		SpotLight->SetVolumetricScatteringIntensity(FogScatteringIntensity);
+		SpotLight->SetCastVolumetricShadow(bShadowActive);
+	}
+	SpotLight->MarkRenderStateDirty();
+}
+
 void ARebusFixtureActor::SetMeshBeamEnabled(bool bEnabled)
 {
 	bMeshBeamEnabled = bEnabled;
@@ -796,16 +865,13 @@ void ARebusFixtureActor::SetMeshBeamEnabled(bool bEnabled)
 	{
 		BeamCone->SetVisibility(bEnabled);
 	}
-	if (SpotLight)
-	{
-		// Mesh on => suppress the fog beam; mesh off => restore it so the old froxel beam returns.
-		SpotLight->SetVolumetricScatteringIntensity(bEnabled ? 0.f : FogScatteringIntensity);
-		SpotLight->MarkRenderStateDirty();
-	}
+	// Re-resolve the SpotLight volumetric state (mesh-only vs hero VSM fog shadow vs restored fog).
+	RefreshBeamShadowMode();
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s mesh beam %s (SpotLight fog scattering=%.2f)."),
+		TEXT("Fixture %s mesh beam %s (shadowHero=%d wantsShadow=%d fogScatter=%.2f)."),
 		*FixtureId, bEnabled ? TEXT("ENABLED") : TEXT("DISABLED -> fog beam restored"),
-		bEnabled ? 0.f : FogScatteringIntensity);
+		bGrantedShadowHero ? 1 : 0, bWantsVolumetricShadow ? 1 : 0,
+		bEnabled ? (bWantsVolumetricShadow && bGrantedShadowHero ? RebusHeroShadowScatter : 0.f) : FogScatteringIntensity);
 }
 
 void ARebusFixtureActor::RefreshMotion()
@@ -850,6 +916,7 @@ void ARebusFixtureActor::RefreshMotion()
 				BeamT.SetRotation(FRotationMatrix::MakeFromX(Dir).ToQuat());
 				BeamT.SetLocation(BeamConeRest.GetLocation());
 				BeamCone->SetRelativeTransform(BeamT);
+				RefreshBeamSpatialParams(); // push the new world origin/dir to the raymarch MID
 			}
 		}
 		return;
@@ -888,6 +955,7 @@ void ARebusFixtureActor::RefreshMotion()
 		if (BeamCone)
 		{
 			BeamCone->SetRelativeTransform(BeamConeRest * Head);
+			RefreshBeamSpatialParams(); // push the new world origin/dir to the raymarch MID
 		}
 	}
 }
@@ -1042,25 +1110,33 @@ void ARebusFixtureActor::ApplyPrism(int32 Facets, float RotationDeg)
 
 void ARebusFixtureActor::ApplyBeamVolumetrics(float Intensity, bool bCastVolumetricShadow)
 {
-	// Phase 1 re-point (§8.4a): this now tunes the MESH beam intensity (a multiplier on
-	// BeamIntensity) rather than the SpotLight fog scattering, since the cone-mesh beam is the
-	// visible shaft. The same value is stored as FogScatteringIntensity so a bMeshBeams=false
-	// toggle restores an equivalent fog beam. castVolumetricShadow is parsed + held for Phase 2
-	// (true light-blocking volumetric shadows) but not acted on yet.
+	// §8.4a re-point: this tunes the MESH beam intensity (a multiplier on BeamIntensity), since the
+	// cone-mesh beam is the visible shaft. The same value is stored as FogScatteringIntensity so a
+	// bMeshBeams=false toggle restores an equivalent fog beam. castVolumetricShadow (Phase 2) opts
+	// the fixture into the native VSM fog volumetric-shadow hybrid for light-blocking truss gaps.
 	const float Clamped = FMath::Clamp(Intensity, 0.f, 10.f);
 	MeshBeamUserScale = Clamped;
 	FogScatteringIntensity = Clamped;
 	bWantsVolumetricShadow = bCastVolumetricShadow;
 
-	if (SpotLight && !bMeshBeamEnabled)
+	// Grant a hero volumetric-shadow slot once, under the per-batch budget (volumetric shadows are
+	// costly). Runtime-imported glTF trusses have no distance fields, so the must-have light-blocking
+	// shadows come from native VSM fog on these hero beams (see RefreshBeamShadowMode), not a
+	// material raymarch. Latched in bGrantedShadowHero so re-toggling doesn't re-consume the budget.
+	if (bCastVolumetricShadow && !bGrantedShadowHero && ShadowFogBeamCount < RebusMaxShadowFogBeams)
 	{
-		// Only push to the light when the fog beam is the active mode; otherwise it stays at 0.
-		SpotLight->SetVolumetricScatteringIntensity(FogScatteringIntensity);
-		SpotLight->bCastVolumetricShadow = bCastVolumetricShadow;
-		SpotLight->MarkRenderStateDirty();
+		bGrantedShadowHero = true;
+		++ShadowFogBeamCount;
 	}
 
+	RefreshBeamShadowMode();
 	RefreshBeamEmissive();
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s beam volumetrics: scale=%.2f wantsShadow=%d shadowHero=%d (fog=%.2f, heroBudget=%d/%d)."),
+		*FixtureId, Clamped, bCastVolumetricShadow ? 1 : 0, bGrantedShadowHero ? 1 : 0,
+		(bMeshBeamEnabled && bWantsVolumetricShadow && bGrantedShadowHero) ? RebusHeroShadowScatter : 0.f,
+		ShadowFogBeamCount, RebusMaxShadowFogBeams);
 }
 
 void ARebusFixtureActor::ApplyGobo(int32 GoboIndex, bool bHasIndex, int32 WheelIndex, const FString& Wheel, float /*FadeSeconds*/)

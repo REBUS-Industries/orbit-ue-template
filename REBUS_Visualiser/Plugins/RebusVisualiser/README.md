@@ -313,7 +313,8 @@ Each per-fixture `USpotLightComponent` (`BuildSpotLight`) gets:
 - `VolumetricScatteringIntensity = 0` while the **hybrid cone-mesh beam** is on (the default,
   §8.4a) — the mesh shaft is the visible beam, so this light's fog scattering is suppressed to
   avoid a competing noisy froxel beam. The fog value (2.5) is restored if `bMeshBeams` is toggled
-  off.
+  off. **Exception (Phase 2)**: a hero shadow-casting beam re-enables a modest scattering (1.5) +
+  `Cast Volumetric Shadow` so the native VSM fog carves light-blocking truss gaps (§8.4a).
 - `bAllowMegaLights = true` — opts the light into MegaLights (5.7's per-light flag; defaults
   true, asserted so the project-level `r.MegaLights.Allow` governs the whole rig).
 - **Hero-beam volumetric-shadow cap**: `SetCastVolumetricShadow(true)` for only the **first 8**
@@ -325,7 +326,8 @@ Each per-fixture `USpotLightComponent` (`BuildSpotLight`) gets:
 - `SetFixtureBeamVolumetrics` (`ApplyBeamVolumetrics`) is **re-pointed (§8.4a)**: it now tunes the
   **mesh beam** intensity (a multiplier on `BeamIntensity`) rather than the fog scattering. The
   same value is stored so a `bMeshBeams=false` toggle restores an equivalent fog beam; the
-  `castVolumetricShadow` flag is parsed + held for Phase 2 (true volumetric shadows).
+  `castVolumetricShadow` flag (Phase 2) opts the fixture into the **native VSM fog volumetric-shadow
+  hybrid** for light-blocking truss gaps, gated by a hero budget (`RebusMaxShadowFogBeams = 6`).
 
 > **Caveat:** UE 5.7 MegaLights + volumetric fog can show artefacts with some sky / height-fog
 > and GPU/driver combinations (flicker, sample noise, banding in the fog volume). The tiers
@@ -494,31 +496,52 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
     rebuilds when the far radius is ~unchanged).
   - **Material** (`/Game/REBUS/Materials/M_RebusBeam`, authored in `build_rebus_base_level.py`,
     baked + committed, CDO hard-ref + `/Game/REBUS` cook dir for cook-safety): an **unlit,
-    two-sided, ADDITIVE faux-volumetric** shader. `Emissive = BeamColor × BeamIntensity × mask`,
-    `mask = (1 − Fresnel(BeamSharpness)) × pow(1 − V, BeamFalloff) × DepthFade`. The
-    `(1 − Fresnel)` term gives a soft on-axis core falling off toward the silhouette (radial
-    falloff), `V` (0 at the lens → 1 at the throw) drives the **length attenuation**, and
-    **`DepthFade` + the translucent depth-test against the opaque scene** give the **scene-depth
-    occlusion** (the shaft disappears behind trusses/set pieces from the camera) and a near-face
-    soft-clip. MID params: `BeamColor`, `BeamIntensity`, `BeamSharpness`, `BeamFalloff`. *This
-    Phase-1 shader is a high-quality **faux-volumetric** cone (fresnel + length fade + depth
-    occlusion), not yet a true multi-step raymarch — see Phase 2 below.*
+    two-sided, ADDITIVE** shader whose body is a **true N-step view-ray raymarch** in a single
+    Custom HLSL node (Phase 2, v1.0.33). For each pixel it marches `StepCount` (~32) samples along
+    the view ray from the cone's front face downrange, accumulating **front-to-back with
+    transmittance** (`trans *= 1 − (1 − exp(−d·dt))`, energy-conserving) a density
+    `d = BeamDensity × core × lenA`, where `core = pow(saturate(1 − radial/radiusAt), BeamSharpness)`
+    is the **on-axis radial profile** (bright core → soft edge, `radiusAt` interpolated lens→far so
+    it matches the mesh) and `lenA = pow(saturate(1 − axial/Length), BeamFalloff)` is the **length
+    attenuation**. Output is `float4(BeamColor × BeamIntensity × coverage, coverage)` → Emissive +
+    Opacity. **Camera scene-depth occlusion** clips the march at the opaque scene (`SceneDepth`
+    converted to a distance along the view ray via the front-face `PixelDepth`), so the shaft
+    disappears behind geometry from the camera; a **near-face soft clip** (`PixelDepth` ramp) stops
+    popping when flying through the cone. MID params: `BeamColor`, `BeamIntensity`, `BeamSharpness`,
+    `BeamFalloff`, plus the raymarch params `StepCount` + `BeamDensity` and the geometry feeds
+    `BeamOrigin`/`BeamDir` (world, pushed each `RefreshMotion` so the marched cone matches the mesh
+    after pan/tilt), `BeamLength`, `LensRadius`, `FarRadius`. *The Custom HLSL compiles cleanly in
+    the headless bake (validated — `Success - 0 error(s), 0 warning(s)`).*
   - **Driven live**: `SetFixtureColor` → `BeamColor`; `RefreshIntensity` (dimmer × shutter-gate)
     → `BeamIntensity` (× `SetFixtureBeamVolumetrics` multiplier), so the shaft fades to nothing
     when dimmed/closed and strobes in lockstep; zoom/iris → frustum + half-angle; pan/tilt → head
     parenting. Initialised from current state at spawn.
   - **Coexistence + toggle**: while the mesh beam is on, the SpotLight's fog
-    `VolumetricScatteringIntensity` is **forced to 0** (no competing noisy froxel beam). The
-    `SetSceneProperty` boolean **`bMeshBeams`** (default `true`,
+    `VolumetricScatteringIntensity` is **forced to 0** by default (no competing noisy froxel beam).
+    The `SetSceneProperty` boolean **`bMeshBeams`** (default `true`,
     `RebusSceneSettingsSubsystem::SetMeshBeamsEnabled`) toggles every fixture's cone on/off and,
     when off, **restores** the SpotLight fog scattering (the old fog beam) for runtime A/B. The
     lens-flare disc sits at the cone base (unchanged). `BuildBeamCone` logs a consolidated line
     (`beam: SPAWNED matOk ... baseRadius/farRadius/length/halfAngle ... BeamIntensity ...
-    occlusion=depthtest+depthfade meshBeams=...`).
-  - **Phase 2 (deferred)**: a true raymarched beam body (N-step inscattering accumulation) and
-    **true light-blocking volumetric shadows** (a shaft that's occluded by geometry *inside* the
-    cone, not just from the camera). The `castVolumetricShadow` field is already parsed + held
-    (`bWantsVolumetricShadow`) for that; only camera/scene-depth occlusion ships in Phase 1.
+    meshBeams=... coneFwd/spotFwd`).
+  - **Light-blocking volumetric shadows (Phase 2, the must-have) — native VSM fog hybrid**: the
+    trusses/set are **runtime-imported via glTFRuntime**, which has **no distance-field import
+    option** (`FglTFRuntimeStaticMeshConfig` has no `bGenerateDistanceField`; mesh distance fields
+    are an editor/DDC build step), so those meshes are **absent from the Global Distance Field** and
+    a material can't `DistanceToNearestSurface`-trace them — and a material also can't sample a
+    specific light's shadow map. The technique that **actually** carves a truss gap on runtime
+    geometry is therefore **Virtual Shadow Maps**, which render *all* geometry regardless of
+    distance fields. So a fixture that requests volumetric shadows
+    (`SetFixtureBeamVolumetrics(castVolumetricShadow=true)`) and wins a **hero budget** slot
+    (`RebusMaxShadowFogBeams = 6` per spawn batch, reset with the v1.0.19 cap) gets a **modest
+    SpotLight `VolumetricScatteringIntensity` (1.5) + `Cast Volumetric Shadow`** re-enabled
+    (`RefreshBeamShadowMode`): the native fog volume then shows the **real light-blocking truss
+    gaps**, while the **mesh cone provides the crisp shaft**. All other beams stay mesh-only
+    (scattering 0). **Trade-off / limit**: the shadow gaps come from the (slightly noisier, froxel)
+    fog volume, not the crisp mesh cone, and only the few hero beams pay the cost; a per-fixture
+    `USceneCaptureComponent2D` depth-shadow was rejected as higher-risk to validate headlessly.
+    Gated by `bWantsVolumetricShadow` + the hero budget; `ApplyBeamVolumetrics` logs
+    `wantsShadow/shadowHero/heroBudget`.
 - **Mesh→axis bucketing** matches GDTF `affectedGeometryNames`; opaque MVR proxy names
   (`mvr-glb-<uuid>`) that match nothing fall to the static base. The guide's height-plane
   split (§7.6) is the more robust fallback to add if needed.

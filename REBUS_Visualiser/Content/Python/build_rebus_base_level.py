@@ -197,18 +197,89 @@ def ensure_lens_material(force=False):
     unreal.log("RebusBaseLevel: lens-flare material ensured.")
 
 
-def _build_beam_master(mat):
-    """Author the faux-volumetric beam graph (v1.0.31).
+_BEAM_RAYMARCH_HLSL = """
+// True N-step view-ray raymarch through the cone volume (Phase 2, v1.0.33).
+// Front-to-back accumulation with transmittance; density = on-axis radial core * length
+// attenuation. Camera scene-depth occlusion clips samples behind opaque geometry; a near-face
+// fade stops popping when flying through the cone. Output: float4(rgb beam colour, a coverage).
+float3 ro = CamPos.xyz;
+float3 pp = PixelPos.xyz;
+float3 toPix = pp - ro;
+float tFront = length(toPix);
+if (tFront < 0.001) { return float4(0,0,0,0); }
+float3 rd = toPix / tFront;
 
-    Emissive = BeamColor * BeamIntensity * mask, Opacity = mask, where
-      mask = (1 - Fresnel(BeamSharpness)) * pow(1 - V, BeamFalloff) * DepthFade.
-    The (1 - Fresnel) term gives a soft on-axis core that fades toward the cone silhouette; the
-    length term (texcoord V: 0 at the lens base, 1 at the far ring) fades the shaft along the
-    throw; DepthFade soft-clips where the additive shell meets solid geometry / the near camera.
-    Unlit + two-sided + ADDITIVE so it never shows a black card when the fixture is dark, and the
-    back faces add through for a fuller shaft. Scene-depth OCCLUSION (the shaft disappearing behind
-    trusses) is the translucent depth-test against the opaque scene + this DepthFade softening
-    (Phase 1 camera-occlusion). Phase 2 replaces the body with a true raymarch + volumetric shadow.
+float3 bo = BeamOrigin.xyz;
+float3 bd = normalize(BeamDir.xyz);
+float blen = max(BeamLength, 1.0);
+
+// March from the cone front face (this pixel) downrange, bounded by the beam length and clipped
+// at the opaque scene depth. SceneDepth/PixelDepth are camera-Z; convert to a distance along THIS
+// view ray via the front face: cameraDepth(t) = t * (PixelDepth / tFront).
+float tStart = tFront;
+float tEndCone = tFront + blen;
+float tOcc = (PixelDepth > 0.001) ? (SceneDepth * tFront / PixelDepth) : tEndCone;
+float tEnd = min(tEndCone, tOcc);
+if (tEnd <= tStart) { return float4(0,0,0,0); }
+
+int steps = (int)clamp(StepCount, 2.0, 64.0);
+float dt = (tEnd - tStart) / steps;
+float invLen = 1.0 / blen;
+float radSpan = FarRadius - LensRadius;
+float sharp = max(BeamSharpness, 0.01);
+float fall = max(BeamFalloff, 0.01);
+
+float trans = 1.0;
+float t = tStart + dt * 0.5;
+const int MAXSTEPS = 64;
+[loop]
+for (int i = 0; i < MAXSTEPS; ++i)
+{
+    if (i >= steps) { break; }
+    if (t >= tEnd) { break; }
+    float3 wp = ro + rd * t;
+    float3 rel = wp - bo;
+    float axial = dot(rel, bd);
+    float aN = axial * invLen;
+    if (aN >= 0.0 && aN <= 1.0)
+    {
+        float radiusAt = LensRadius + radSpan * aN;
+        float3 perp = rel - axial * bd;
+        float radial = length(perp);
+        float rN = (radiusAt > 0.001) ? (radial / radiusAt) : 2.0;
+        if (rN < 1.0)
+        {
+            float core = pow(saturate(1.0 - rN), sharp);
+            float lenA = pow(saturate(1.0 - aN), fall);
+            float d = BeamDensity * core * lenA;
+            float a = 1.0 - exp(-d * dt);
+            trans *= (1.0 - a);
+        }
+    }
+    t += dt;
+}
+
+float nearFade = saturate((PixelDepth - 16.0) / 48.0);
+float coverage = saturate(1.0 - trans) * nearFade;
+float3 col = BeamColor.rgb * BeamIntensity * coverage;
+return float4(col, coverage);
+"""
+
+
+def _build_beam_master(mat):
+    """Author the TRUE raymarched beam graph (Phase 2, v1.0.33).
+
+    A single Custom HLSL node marches the view ray through the cone volume (front-to-back with
+    transmittance), with a radial on-axis core -> soft edge profile (BeamSharpness) and a length
+    attenuation (BeamFalloff), additive output. Camera scene-depth occlusion (the shaft hidden
+    behind opaque geometry) and a near-face soft clip are kept. The cone geometry is fed as params
+    (BeamOrigin/BeamDir world from the component, BeamLength, LensRadius, FarRadius) so the shader
+    math matches the procedural mesh exactly. StepCount + BeamDensity tune the march.
+
+    Unlit + two-sided + ADDITIVE so it never shows a black card when dark and back faces add
+    through. Light-BLOCKING volumetric shadows on runtime-imported trusses are NOT done in this
+    shader (runtime glTF meshes have no mesh distance fields, so a material can't trace them) --
+    that is the native VSM fog hybrid on hero beams (see RebusFixtureActor::RefreshBeamShadowMode).
     """
     mel = unreal.MaterialEditingLibrary
 
@@ -217,65 +288,84 @@ def _build_beam_master(mat):
     _set(mat, "blend_mode", unreal.BlendMode.BLEND_ADDITIVE)
     _set(mat, "two_sided", True)
 
-    color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -820, -220)
+    # ---- Driveable parameters (per-fixture MID) ----
+    color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, -260)
     color.set_editor_property("parameter_name", "BeamColor")
     color.set_editor_property("default_value", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
 
-    intensity = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -820, 0)
-    intensity.set_editor_property("parameter_name", "BeamIntensity")
-    intensity.set_editor_property("default_value", 0.0)
+    def _scalar(name, default, y):
+        s = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -1100, y)
+        s.set_editor_property("parameter_name", name)
+        s.set_editor_property("default_value", default)
+        return s
 
-    sharp = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -820, 320)
-    sharp.set_editor_property("parameter_name", "BeamSharpness")
-    sharp.set_editor_property("default_value", 2.5)
+    intensity = _scalar("BeamIntensity", 0.0, -140)
+    sharp = _scalar("BeamSharpness", 2.5, -60)
+    falloff = _scalar("BeamFalloff", 1.6, 20)
+    stepcount = _scalar("StepCount", 32.0, 100)
+    density = _scalar("BeamDensity", 0.0025, 180)
+    beamlen = _scalar("BeamLength", 6000.0, 260)
+    lensrad = _scalar("LensRadius", 2.0, 340)
+    farrad = _scalar("FarRadius", 1000.0, 420)
 
-    falloff = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -820, 560)
-    falloff.set_editor_property("parameter_name", "BeamFalloff")
-    falloff.set_editor_property("default_value", 1.6)
+    beamorigin = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 500)
+    beamorigin.set_editor_property("parameter_name", "BeamOrigin")
+    beamorigin.set_editor_property("default_value", unreal.LinearColor(0.0, 0.0, 0.0, 0.0))
 
-    # On-axis core: (1 - Fresnel) so the shell is brightest where it faces the camera and fades
-    # toward the grazing silhouette, reading as a soft solid shaft rather than a hard-edged cone.
-    fres = mel.create_material_expression(mat, unreal.MaterialExpressionFresnel, -600, 300)
-    mel.connect_material_expressions(sharp, "", fres, "ExponentIn")
-    core = mel.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -440, 300)
-    mel.connect_material_expressions(fres, "", core, "")
+    beamdir = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 580)
+    beamdir.set_editor_property("parameter_name", "BeamDir")
+    beamdir.set_editor_property("default_value", unreal.LinearColor(1.0, 0.0, 0.0, 0.0))
 
-    # Length fade: V (0 at the lens base, 1 at the far ring) -> pow(1 - V, BeamFalloff).
-    tc = mel.create_material_expression(mat, unreal.MaterialExpressionTextureCoordinate, -820, 760)
-    vmask = mel.create_material_expression(mat, unreal.MaterialExpressionComponentMask, -640, 760)
-    _set(vmask, "r", False)
-    _set(vmask, "g", True)
-    _set(vmask, "b", False)
-    _set(vmask, "a", False)
-    mel.connect_material_expressions(tc, "", vmask, "")
-    inv_v = mel.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -480, 760)
-    mel.connect_material_expressions(vmask, "", inv_v, "")
-    lenfade = mel.create_material_expression(mat, unreal.MaterialExpressionPower, -320, 720)
-    mel.connect_material_expressions(inv_v, "", lenfade, "Base")
-    mel.connect_material_expressions(falloff, "", lenfade, "Exp")
+    # ---- Scene/view inputs (engine nodes) ----
+    campos = mel.create_material_expression(mat, unreal.MaterialExpressionCameraPositionWS, -1100, 680)
+    pixelpos = mel.create_material_expression(mat, unreal.MaterialExpressionWorldPosition, -1100, 760)
+    scenedepth = mel.create_material_expression(mat, unreal.MaterialExpressionSceneDepth, -1100, 840)
+    pixeldepth = mel.create_material_expression(mat, unreal.MaterialExpressionPixelDepth, -1100, 920)
 
-    # Scene-depth soft-clip (camera occlusion / near-face fade). DepthFade's output is a 0..1
-    # factor that approaches 0 as the translucent pixel nears opaque geometry behind it.
-    depth = mel.create_material_expression(mat, unreal.MaterialExpressionDepthFade, -320, 980)
-    _set(depth, "fade_distance_default", 200.0)
+    # ---- Custom raymarch node ----
+    custom = mel.create_material_expression(mat, unreal.MaterialExpressionCustom, -500, 100)
+    custom.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT4)
+    custom.set_editor_property("description", "RebusBeamRaymarch")
+    custom.set_editor_property("code", _BEAM_RAYMARCH_HLSL)
 
-    # mask = core * lenfade * depth.
-    m1 = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -160, 480)
-    mel.connect_material_expressions(core, "", m1, "A")
-    mel.connect_material_expressions(lenfade, "", m1, "B")
-    mask = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, 0, 540)
-    mel.connect_material_expressions(m1, "", mask, "A")
-    mel.connect_material_expressions(depth, "", mask, "B")
+    input_names = [
+        "CamPos", "PixelPos", "SceneDepth", "PixelDepth",
+        "BeamColor", "BeamIntensity", "BeamSharpness", "BeamFalloff",
+        "StepCount", "BeamDensity", "BeamOrigin", "BeamDir",
+        "BeamLength", "LensRadius", "FarRadius",
+    ]
+    custom_inputs = []
+    for n in input_names:
+        ci = unreal.CustomInput()
+        ci.set_editor_property("input_name", unreal.Name(n))
+        custom_inputs.append(ci)
+    custom.set_editor_property("inputs", custom_inputs)
 
-    # Emissive = BeamColor * BeamIntensity * mask.
-    ci = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -440, -120)
-    mel.connect_material_expressions(color, "", ci, "A")
-    mel.connect_material_expressions(intensity, "", ci, "B")
-    emissive = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -200, -60)
-    mel.connect_material_expressions(ci, "", emissive, "A")
-    mel.connect_material_expressions(mask, "", emissive, "B")
-    mel.connect_material_property(emissive, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
-    mel.connect_material_property(mask, "", unreal.MaterialProperty.MP_OPACITY)
+    src_for = {
+        "CamPos": campos, "PixelPos": pixelpos, "SceneDepth": scenedepth, "PixelDepth": pixeldepth,
+        "BeamColor": color, "BeamIntensity": intensity, "BeamSharpness": sharp, "BeamFalloff": falloff,
+        "StepCount": stepcount, "BeamDensity": density, "BeamOrigin": beamorigin, "BeamDir": beamdir,
+        "BeamLength": beamlen, "LensRadius": lensrad, "FarRadius": farrad,
+    }
+    for n in input_names:
+        mel.connect_material_expressions(src_for[n], "", custom, n)
+
+    # Custom returns float4(rgb beam colour, a coverage): rgb -> Emissive, a -> Opacity.
+    rgb_mask = mel.create_material_expression(mat, unreal.MaterialExpressionComponentMask, -180, 40)
+    _set(rgb_mask, "r", True)
+    _set(rgb_mask, "g", True)
+    _set(rgb_mask, "b", True)
+    _set(rgb_mask, "a", False)
+    mel.connect_material_expressions(custom, "", rgb_mask, "")
+    mel.connect_material_property(rgb_mask, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+
+    a_mask = mel.create_material_expression(mat, unreal.MaterialExpressionComponentMask, -180, 200)
+    _set(a_mask, "r", False)
+    _set(a_mask, "g", False)
+    _set(a_mask, "b", False)
+    _set(a_mask, "a", True)
+    mel.connect_material_expressions(custom, "", a_mask, "")
+    mel.connect_material_property(a_mask, "", unreal.MaterialProperty.MP_OPACITY)
 
     mel.recompile_material(mat)
 

@@ -154,6 +154,14 @@ private:
 	void BuildBeamCone();          // spawn the procedural cone mesh + per-fixture beam MID
 	void UpdateBeamConeGeometry(); // (re)generate the frustum: base=lens radius, far=Length*tan(half)
 	void RefreshBeamEmissive();    // drive BeamColor/BeamIntensity from live colour x dimmer x gate
+	// Push the WORLD-space beam origin + forward to the raymarch MID (BeamOrigin/BeamDir) so the
+	// Custom HLSL marches the same cone the procedural mesh occupies; called each RefreshMotion.
+	void RefreshBeamSpatialParams();
+	// Resolve the SpotLight's volumetric state for Phase-2 light-blocking shadows: hero shadow
+	// beams (bWantsVolumetricShadow + budget) get a modest fog VolumetricScatteringIntensity + Cast
+	// Volumetric Shadow (native VSM carves truss gaps on runtime meshes); everyone else is mesh-only
+	// (scattering 0). When the mesh beam is toggled off the fog beam is restored.
+	void RefreshBeamShadowMode();
 	float ResolveOuterHalfDeg() const; // current outer cone half-angle (zoom range + iris), degrees
 	void RefreshMotion();         // re-solve pan/tilt and push transforms to groups + light
 	void RefreshIntensity();      // fold dimmer * shutter-gate into the light intensity
@@ -185,6 +193,10 @@ private:
 
 	// Count of spotlights granted volumetric shadows in the current spawn batch (hero-beam cap).
 	static int32 VolumetricShadowBeamCount;
+
+	// Phase-2 hero-shadow budget: count of fixtures granted the native VSM fog volumetric-shadow
+	// hybrid (RefreshBeamShadowMode) in the current spawn batch. Capped at RebusMaxShadowFogBeams.
+	static int32 ShadowFogBeamCount;
 
 private:
 	UPROPERTY() TObjectPtr<USceneComponent> FixtureRoot = nullptr;
@@ -238,12 +250,15 @@ private:
 	// bMeshBeams runtime toggle (default true = mesh beam on, fog scattering suppressed). When the
 	// portal pushes bMeshBeams=false the cone hides and FogScatteringIntensity is restored on the
 	// SpotLight. MeshBeamUserScale is the SetFixtureBeamVolumetrics intensity multiplier on the
-	// mesh BeamIntensity; bWantsVolumetricShadow is the parsed castVolumetricShadow flag held for
-	// Phase 2 (true light-blocking volumetric shadows -- not acted on yet).
+	// mesh BeamIntensity; bWantsVolumetricShadow is the parsed castVolumetricShadow flag that (Phase
+	// 2) drives the native VSM fog volumetric-shadow hybrid for hero beams (RefreshBeamShadowMode).
 	bool bMeshBeamEnabled = true;
 	float MeshBeamUserScale = 1.f;
 	float FogScatteringIntensity = 2.5f;
 	bool bWantsVolumetricShadow = false;
+	// True once this fixture has been granted a hero volumetric-shadow slot (under the per-batch
+	// RebusMaxShadowFogBeams budget). Latched so toggling shadow on/off doesn't re-consume budget.
+	bool bGrantedShadowHero = false;
 
 	TSharedPtr<FRebusRestClient> RestClient;
 
