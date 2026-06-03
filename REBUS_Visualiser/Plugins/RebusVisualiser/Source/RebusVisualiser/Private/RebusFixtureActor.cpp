@@ -15,6 +15,7 @@
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "ImageUtils.h"
+#include "UObject/ConstructorHelpers.h"
 
 namespace
 {
@@ -67,6 +68,17 @@ ARebusFixtureActor::ARebusFixtureActor()
 	FixtureRoot = CreateDefaultSubobject<USceneComponent>(TEXT("FixtureRoot"));
 	RootComponent = FixtureRoot;
 	FixtureRoot->SetMobility(EComponentMobility::Movable);
+
+	// Hard-reference the lens-flare disc assets from the CDO so the cooker ALWAYS packages them
+	// for -game/packaged builds. A runtime-only LoadObject-by-path is not a cook dependency, so
+	// the emissive material (referenced by nothing in the level) was being stripped from cooked
+	// builds -> the disc silently failed to load. Belt-and-suspenders with the
+	// DirectoriesToAlwaysCook entries in DefaultGame.ini. FObjectFinder only resolves in-editor /
+	// during cook; in a cooked runtime these UPROPERTYs are simply serialized in.
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> PlaneFinder(TEXT("/Engine/BasicShapes/Plane.Plane"));
+	if (PlaneFinder.Succeeded()) LensPlaneMesh = PlaneFinder.Object;
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> LensMatFinder(TEXT("/Game/REBUS/Materials/M_RebusLensFlare.M_RebusLensFlare"));
+	if (LensMatFinder.Succeeded()) LensMaterial = LensMatFinder.Object;
 }
 
 void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
@@ -362,30 +374,17 @@ void ARebusFixtureActor::BuildSpotLight()
 
 	// Source size: emit the beam from a finite disc the size of the lens opening so the beam (and
 	// its volumetric scattering) STARTS at the lens diameter and gets soft-shadow penumbrae (§8.3).
-	// The radius uses the SAME diameter source order as the v1.0.27 lens-flare disc, converted to a
-	// RADIUS: photometrics.lensDiameter/2 (IES lens opening) -> source.radiusMeters ->
-	// source.diameterMeters/2. None known -> leave the engine default untouched (never fabricate).
-	// Cached as BaseSourceRadiusUnreal so the frost penumbra scaling (RecomputeConeAngles) stays
-	// consistent with the lens-flare disc instead of reverting to source.radiusMeters.
-	const TCHAR* SourceRadiusSrc = TEXT("engine-default");
-	if (Profile.Photometrics.LensDiameter >= 0.0)
+	// The radius is HALF the SAME resolved lens diameter the lens-flare disc uses (so the glowing
+	// disc and the beam origin always line up): lensDiameter/2 -> source.radius -> source.diameter/2
+	// -> dimensions fallback. None resolvable -> leave the engine default untouched. Cached as
+	// BaseSourceRadiusUnreal so the frost penumbra scaling (RecomputeConeAngles) stays consistent.
+	// NOTE: SourceRadius gives soft penumbrae but does NOT visibly widen the volumetric beam base
+	// in UE -- the emissive lens-flare disc (§8.3a) is the actual visual cue for the lens diameter.
+	const TCHAR* SourceRadiusSrc = nullptr;
+	const double LensDiamMeters = ResolveLensDiameterMeters(SourceRadiusSrc);
+	if (LensDiamMeters > KINDA_SMALL_NUMBER)
 	{
-		BaseSourceRadiusUnreal = (float)(Profile.Photometrics.LensDiameter * 0.5 * RebusCoords::METERS_TO_UNREAL);
-		SourceRadiusSrc = TEXT("lensDiameter");
-	}
-	else if (Profile.Source.RadiusMeters.IsSet())
-	{
-		BaseSourceRadiusUnreal = (float)(Profile.Source.RadiusMeters.GetValue() * RebusCoords::METERS_TO_UNREAL);
-		SourceRadiusSrc = TEXT("source.radius");
-	}
-	else if (Profile.Source.DiameterMeters.IsSet())
-	{
-		BaseSourceRadiusUnreal = (float)(Profile.Source.DiameterMeters.GetValue() * 0.5 * RebusCoords::METERS_TO_UNREAL);
-		SourceRadiusSrc = TEXT("source.diameter");
-	}
-
-	if (BaseSourceRadiusUnreal >= 0.f)
-	{
+		BaseSourceRadiusUnreal = (float)(LensDiamMeters * 0.5 * RebusCoords::METERS_TO_UNREAL);
 		SpotLight->SetSourceRadius(BaseSourceRadiusUnreal);
 		SpotLight->SetSourceLength(0.f); // circular GDTF beam, no second axis
 	}
@@ -393,7 +392,7 @@ void ARebusFixtureActor::BuildSpotLight()
 		TEXT("Fixture %s source: SourceRadius=%s cm (src=%s)"),
 		*FixtureId,
 		BaseSourceRadiusUnreal >= 0.f ? *FString::Printf(TEXT("%.3f"), BaseSourceRadiusUnreal) : TEXT("engine-default"),
-		SourceRadiusSrc);
+		SourceRadiusSrc ? SourceRadiusSrc : TEXT("engine-default"));
 
 	if (Profile.Photometrics.ColorTemperature.IsSet())
 	{
@@ -474,48 +473,73 @@ void ARebusFixtureActor::BuildSpotLight()
 	}
 }
 
-void ARebusFixtureActor::BuildLensDisc()
+double ARebusFixtureActor::ResolveLensDiameterMeters(const TCHAR*& OutSrc) const
 {
-	// Resolve the lens-opening diameter (metres): photometrics.lensDiameter (v6) first, then the
-	// source aperture (radiusMeters*2, then diameterMeters). Skip the disc entirely when neither
-	// is present (§8.3a fallback order).
-	double DiamMeters = -1.0;
-	const TCHAR* DiamSrc = TEXT("none");
 	if (Profile.Photometrics.LensDiameter >= 0.0)
 	{
-		DiamMeters = Profile.Photometrics.LensDiameter;
-		DiamSrc = TEXT("lensDiameter");
+		OutSrc = TEXT("lensDiameter");
+		return Profile.Photometrics.LensDiameter;
 	}
-	else if (Profile.Source.RadiusMeters.IsSet())
+	if (Profile.Source.RadiusMeters.IsSet())
 	{
-		DiamMeters = Profile.Source.RadiusMeters.GetValue() * 2.0;
-		DiamSrc = TEXT("source.radius*2");
+		OutSrc = TEXT("source.radius*2");
+		return Profile.Source.RadiusMeters.GetValue() * 2.0;
 	}
-	else if (Profile.Source.DiameterMeters.IsSet())
+	if (Profile.Source.DiameterMeters.IsSet())
 	{
-		DiamMeters = Profile.Source.DiameterMeters.GetValue();
-		DiamSrc = TEXT("source.diameter");
+		OutSrc = TEXT("source.diameter");
+		return Profile.Source.DiameterMeters.GetValue();
 	}
+	// Synthetic fallback so a lens disc + finite beam origin still show when the portal sends no
+	// lens/source size: a modest fraction of the fixture's smaller cross-section (width=Y /
+	// height=Z), clamped to a plausible lens range. Logged as a fallback so it's clearly derived.
+	if (Profile.bHasDimensions)
+	{
+		const double Cross = FMath::Min(FMath::Abs(Profile.DimensionsMeters.Y), FMath::Abs(Profile.DimensionsMeters.Z));
+		if (Cross > KINDA_SMALL_NUMBER)
+		{
+			OutSrc = TEXT("dimensions-fallback");
+			return FMath::Clamp(Cross * 0.4, 0.03, 0.5);
+		}
+	}
+	OutSrc = TEXT("none");
+	return -1.0;
+}
+
+void ARebusFixtureActor::BuildLensDisc()
+{
+	const TCHAR* DiamSrc = TEXT("none");
+	const double DiamMeters = ResolveLensDiameterMeters(DiamSrc);
+
+	// Always surface the parsed lensDiameter so the portal team can see exactly what arrived.
+	const FString LensDiamStr = (Profile.Photometrics.LensDiameter >= 0.0)
+		? FString::Printf(TEXT("%.4f"), Profile.Photometrics.LensDiameter) : FString(TEXT("null"));
 
 	if (DiamMeters <= KINDA_SMALL_NUMBER)
 	{
-		UE_LOG(LogRebusVisualiser, Verbose,
-			TEXT("Fixture %s lens disc: no lensDiameter/source aperture; skipping."), *FixtureId);
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s lens disc: SKIP (no size) lensDiameter=%s source.radius=%s source.diameter=%s dims=%d"),
+			*FixtureId, *LensDiamStr,
+			Profile.Source.RadiusMeters.IsSet() ? TEXT("set") : TEXT("null"),
+			Profile.Source.DiameterMeters.IsSet() ? TEXT("set") : TEXT("null"),
+			Profile.bHasDimensions ? 1 : 0);
 		return;
 	}
 	const float DiamUnreal = (float)(DiamMeters * RebusCoords::METERS_TO_UNREAL);
 
-	// Load the committed emissive material + the engine plane. If the material has not been baked
-	// yet (build_rebus_base_level.py authors + saves /Game/REBUS/Materials/M_RebusLensFlare), skip
-	// the disc gracefully -- the SpotLight/IES beam is unaffected.
-	UMaterialInterface* LensMat = LoadObject<UMaterialInterface>(
-		nullptr, TEXT("/Game/REBUS/Materials/M_RebusLensFlare.M_RebusLensFlare"));
-	UStaticMesh* Plane = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane"));
-	if (!LensMat || !Plane)
+	// Cook-safe asset access: prefer the CDO hard refs (packaged by the cooker), fall back to a
+	// runtime load by path. Log exactly which asset failed so a cooked-build miss is provable.
+	UStaticMesh* Plane = LensPlaneMesh ? LensPlaneMesh.Get()
+		: LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane"));
+	UMaterialInterface* LensMat = LensMaterial ? LensMaterial.Get()
+		: LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/REBUS/Materials/M_RebusLensFlare.M_RebusLensFlare"));
+	const bool bMeshOk = (Plane != nullptr);
+	const bool bMatOk = (LensMat != nullptr);
+	if (!bMeshOk || !bMatOk)
 	{
 		UE_LOG(LogRebusVisualiser, Warning,
-			TEXT("Fixture %s lens disc: material(%d)/plane(%d) missing; skipping (run build_rebus_base_level.py)."),
-			*FixtureId, LensMat != nullptr ? 1 : 0, Plane != nullptr ? 1 : 0);
+			TEXT("Fixture %s lens disc: SKIP (asset load failed) meshOk=%d matOk=%d -- ensure /Engine/BasicShapes + /Game/REBUS are cooked (DirectoriesToAlwaysCook)."),
+			*FixtureId, bMeshOk ? 1 : 0, bMatOk ? 1 : 0);
 		return;
 	}
 
@@ -527,20 +551,32 @@ void ARebusFixtureActor::BuildLensDisc()
 	LensDisc->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	LensDisc->SetCastShadow(false);            // purely an additive flare; never occludes the beam
 	LensDisc->bCastDynamicShadow = false;
+	LensDisc->SetVisibility(true);
+	LensDisc->SetHiddenInGame(false);
 
 	LensDiscMID = UMaterialInstanceDynamic::Create(LensMat, this);
 	LensDisc->SetMaterial(0, LensDiscMID);
 
-	// Disc rest: plane normal (+Z) along the beam forward, at the beam origin, scaled so the engine
-	// Plane (100 uu base) spans the lens diameter. Composed with head motion in RefreshMotion.
+	// Disc rest: plane normal (+Z) along the beam forward, scaled so the 100 uu engine Plane spans
+	// the lens diameter, pushed slightly PROUD of the lens plane along the aim so opaque head
+	// geometry can't occlude/clip it. Composed with head motion in RefreshMotion.
 	const float PlaneScale = DiamUnreal / 100.f;
+	const float ForwardOffset = FMath::Max(DiamUnreal * 0.25f, 1.f); // cm, >= 1cm proud of the lens
+	const FVector DiscOrigin = BeamRestTransform.GetLocation() + BeamForwardLocal.GetSafeNormal() * ForwardOffset;
 	const FQuat DiscRot = LensDiscRotationFromForward(BeamForwardLocal, BeamUpLocal);
-	LensDiscRest = FTransform(DiscRot, BeamRestTransform.GetLocation(), FVector(PlaneScale, PlaneScale, PlaneScale));
+	LensDiscRest = FTransform(DiscRot, DiscOrigin, FVector(PlaneScale, PlaneScale, PlaneScale));
+	LensDisc->SetRelativeTransform(LensDiscRest); // initial placement (RefreshMotion re-applies *Head)
 
 	RefreshLensDisc(); // initial emissive from the current dimmer/colour
+
+	// One consolidated, parseable diagnostics line so the next round is provable from logs.
+	const float CurStrength = RebusLensFlareMaxEmissive * FMath::Clamp(Dimmer.Current, 0.f, 1.f);
+	const FVector RelScale = LensDisc->GetRelativeScale3D();
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s lens disc: diameter=%.3fm (src=%s) spawned, head-parented."),
-		*FixtureId, DiamMeters, DiamSrc);
+		TEXT("Fixture %s lens disc: SPAWNED lensDiameter=%s diam=%.2fcm (src=%s) planeScale=%.4f relScale=(%.3f,%.3f,%.3f) meshOk=%d matOk=%d emissiveMax=%.1f curStrength=%.2f SourceRadius=%.3fcm"),
+		*FixtureId, *LensDiamStr, DiamUnreal, DiamSrc, PlaneScale,
+		RelScale.X, RelScale.Y, RelScale.Z, bMeshOk ? 1 : 0, bMatOk ? 1 : 0,
+		RebusLensFlareMaxEmissive, CurStrength, BaseSourceRadiusUnreal);
 }
 
 void ARebusFixtureActor::RefreshLensDisc()

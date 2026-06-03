@@ -33,9 +33,11 @@ MATERIALS_DIR = "/Game/REBUS/Materials"
 GROUND_MASTER_PATH = MATERIALS_DIR + "/M_RebusGround"
 
 # Emissive "glowing lens" flare disc material (ue-plugin-build-guide.md §8.3a). Unlit, two-sided,
-# translucent so a radial UV mask reads as a round soft-edged lens regardless of facing. The C++
-# fixture actor (RebusFixtureActor::BuildLensDisc) loads it by this path, makes a MID per fixture
-# and drives EmissiveColor (linear fixture colour) + EmissiveStrength (dimmer x output) live.
+# ADDITIVE so a radial UV mask reads as a round soft-edged lens regardless of facing AND so the
+# disc is invisible when the fixture is dark (additive adds nothing at EmissiveStrength 0) -- a
+# translucent disc would instead show as a black card when off. The C++ fixture actor
+# (RebusFixtureActor::BuildLensDisc) loads it by this path, makes a MID per fixture and drives
+# EmissiveColor (linear fixture colour) + EmissiveStrength (dimmer x output) live.
 LENS_FLARE_PATH = MATERIALS_DIR + "/M_RebusLensFlare"
 
 # Portal-controllable ground surface presets: name -> (ColorA, ColorB, Roughness).
@@ -120,13 +122,14 @@ def _build_ground_master(mat):
 
 def _build_lens_flare_master(mat):
     """Author the emissive lens-flare graph: (EmissiveColor*EmissiveStrength*radialMask) ->
-    Emissive, radialMask -> Opacity. Unlit + two-sided + translucent."""
+    Emissive, radialMask -> Opacity. Unlit + two-sided + ADDITIVE (glow that vanishes when off)."""
     mel = unreal.MaterialEditingLibrary
 
-    # Unlit two-sided translucent: facing-independent soft round glow.
+    # Unlit two-sided additive: facing-independent soft round glow that adds nothing when the
+    # fixture is dark (no black card), and blooms when bright.
     _set(mat, "material_domain", unreal.MaterialDomain.MD_SURFACE)
     _set(mat, "shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
-    _set(mat, "blend_mode", unreal.BlendMode.BLEND_TRANSLUCENT)
+    _set(mat, "blend_mode", unreal.BlendMode.BLEND_ADDITIVE)
     _set(mat, "two_sided", True)
 
     color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -760, -200)

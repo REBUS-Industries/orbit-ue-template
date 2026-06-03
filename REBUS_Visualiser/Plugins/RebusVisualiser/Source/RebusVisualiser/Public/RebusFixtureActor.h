@@ -18,6 +18,8 @@
 
 class USpotLightComponent;
 class UStaticMeshComponent;
+class UStaticMesh;
+class UMaterialInterface;
 class UProceduralMeshComponent;
 class UTextureLightProfile;
 class FRebusRestClient;
@@ -136,6 +138,12 @@ private:
 	void BuildSpotLight();
 	void BuildLensDisc();         // emissive "glowing lens" flare disc at the beam origin (§8.3a)
 	void RefreshLensDisc();       // drive disc emissive from live dimmer x colour x shutter-gate
+	// Resolve the lens-opening diameter (metres) shared by the lens disc + SpotLight SourceRadius,
+	// so the glowing disc and the finite beam origin always line up. Precedence:
+	// photometrics.lensDiameter -> source.radiusMeters*2 -> source.diameterMeters -> a clamped
+	// fraction of the fixture dimensions (synthetic fallback so something always shows) -> -1
+	// (nothing resolvable). OutSrc names the resolved source for diagnostics.
+	double ResolveLensDiameterMeters(const TCHAR*& OutSrc) const;
 	void RefreshMotion();         // re-solve pan/tilt and push transforms to groups + light
 	void RefreshIntensity();      // fold dimmer * shutter-gate into the light intensity
 	void RecomputeConeAngles();   // from zoom + photometrics + iris/frost
@@ -187,6 +195,14 @@ private:
 	// missing. Its MID's EmissiveColor/EmissiveStrength follow the live fixture colour x dimmer.
 	UPROPERTY() TObjectPtr<UStaticMeshComponent> LensDisc = nullptr;
 	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> LensDiscMID = nullptr;
+
+	// Hard CDO references to the disc mesh + material, resolved in the constructor so the COOKER
+	// packages them for -game/packaged builds. A runtime LoadObject-by-path is NOT a cook
+	// dependency, which is why the disc silently failed to load in cooked builds (the material is
+	// referenced by nothing in the level). May be null if the asset is absent; BuildLensDisc then
+	// falls back to a runtime load and logs which asset failed.
+	UPROPERTY() TObjectPtr<UStaticMesh> LensPlaneMesh = nullptr;
+	UPROPERTY() TObjectPtr<UMaterialInterface> LensMaterial = nullptr;
 
 	TSharedPtr<FRebusRestClient> RestClient;
 

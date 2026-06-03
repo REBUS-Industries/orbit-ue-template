@@ -451,18 +451,25 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
   composed with the head motion (`LensDiscRest * Head`) so it tracks pan/tilt and stays
   perpendicular to the v1.0.21 beam direction (plane normal along the beam aim). Its **diameter
   source order** is `photometrics.lensDiameter` (metres, v6) → `source.radiusMeters * 2` →
-  `source.diameterMeters` → **skip the disc** (no fallback geometry). The plane (100 uu base) is
-  scaled to `diameterCm / 100`. The material is the committed **unlit, two-sided, translucent**
-  master `/Game/REBUS/Materials/M_RebusLensFlare` (vector `EmissiveColor`, scalar
-  `EmissiveStrength`, radial UV mask → round soft-edged glow), authored by the editor Python
-  script `build_rebus_base_level.py` (same `MaterialEditingLibrary` pattern as the ground
-  materials; guarded to editor-authoring context). A per-fixture `UMaterialInstanceDynamic` is
-  driven from the **live output** on the **same path that updates the SpotLight**
-  (`RefreshIntensity` → `RefreshLensDisc`): `EmissiveColor` = the current linear fixture colour,
-  `EmissiveStrength ∝ dimmer × shutter-gate` (bright at full output, dark when fully dimmed, and
-  strobes in lockstep). It is purely **additive** — it never reshapes the SpotLight/IES beam. If
-  the material asset hasn't been baked yet, the disc is skipped gracefully (the beam is
-  unaffected; run the Python script once so runtime/cook can load it).
+  `source.diameterMeters` → a **synthetic dimensions fallback** (`0.4 × min(width, height)`,
+  clamped 3–50 cm, so a disc + finite source always show when the portal sends no lens/source
+  size) → skip only if even dimensions are absent. The plane (100 uu base) is scaled to
+  `diameterCm / 100` and pushed slightly proud of the lens plane along the aim so head geometry
+  can't clip it. The material is the committed **unlit, two-sided, ADDITIVE** master
+  `/Game/REBUS/Materials/M_RebusLensFlare` (vector `EmissiveColor`, scalar `EmissiveStrength`,
+  radial UV mask → round soft-edged glow). Additive (not translucent) means the disc **vanishes
+  when the fixture is dark** instead of showing a black card. It is authored by the editor Python
+  script `build_rebus_base_level.py` and the baked `.uasset` is committed. **Cook-safety:** the
+  material is loaded by path (not referenced by any map), so the actor **hard-refs the mesh +
+  material from its CDO** *and* `Config/DefaultGame.ini` lists `/Game/REBUS` + `/Engine/BasicShapes`
+  under `DirectoriesToAlwaysCook` — otherwise the cooker strips the material and the disc never
+  appears in `-game`/packaged builds. A per-fixture `UMaterialInstanceDynamic` is driven from the
+  **live output** on the **same path that updates the SpotLight** (`RefreshIntensity` →
+  `RefreshLensDisc`): `EmissiveColor` = the current linear fixture colour, `EmissiveStrength ∝
+  dimmer × shutter-gate` (bright at full output, dark when fully dimmed, strobes in lockstep). It
+  is purely **additive** — it never reshapes the SpotLight/IES beam. `BuildLensDisc` logs a single
+  consolidated diagnostics line (`lens disc: SPAWNED ... meshOk/matOk ... relScale ... SourceRadius`)
+  so a missing asset or zero scale is provable from logs.
 - **Mesh→axis bucketing** matches GDTF `affectedGeometryNames`; opaque MVR proxy names
   (`mvr-glb-<uuid>`) that match nothing fall to the static base. The guide's height-plane
   split (§7.6) is the more robust fallback to add if needed.
