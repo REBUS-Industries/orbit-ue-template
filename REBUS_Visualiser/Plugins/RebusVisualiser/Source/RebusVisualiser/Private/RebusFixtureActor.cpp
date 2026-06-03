@@ -346,9 +346,9 @@ void ARebusFixtureActor::BuildSpotLight()
 	// its local +X, so we map the beam's FORWARD (emission) direction onto +X and beamUp onto +Z
 	// via MakeFromXZ. The emission axis is NEVER the matrix +X column -- that is the geometry's
 	// SIDE axis, and using it fired the cone ~90deg off the lens ("out to the left"). When the
-	// portal does not send an explicit beamDirectionWorld we take the beam node's DOWN axis
-	// (-Y in the Y-up source, the documented default "beamDirectionWorld":{0,-1,0}) so the cone
-	// exits the lens, not the side.
+	// portal does not send an explicit beamDirectionWorld we take the beam node's +Y axis: that
+	// is the lens-FRONT normal in this content (the -Y guess fired the cone out the REAR of the
+	// head), so the cone exits the lens, not the side and not the back.
 	bool bHaveBeam = false;
 	TFunction<void(const FRebusFixturePart&)> Visit = [&](const FRebusFixturePart& Part)
 	{
@@ -359,7 +359,7 @@ void ARebusFixtureActor::BuildSpotLight()
 
 			FVector Forward = Part.bHasBeamDirection
 				? RebusCoords::DirectionYUpToUnreal(Part.BeamDirectionWorld)
-				: (-M.GetUnitAxis(EAxis::Y)).GetSafeNormal(); // GDTF emission = node's down axis
+				: M.GetUnitAxis(EAxis::Y).GetSafeNormal(); // GDTF emission = node's +Y (lens front)
 			if (Forward.IsNearlyZero())
 			{
 				Forward = FVector(0.f, 0.f, -1.f);
@@ -385,7 +385,7 @@ void ARebusFixtureActor::BuildSpotLight()
 			UE_LOG(LogRebusVisualiser, Log,
 				TEXT("Fixture %s beam: src=%s fwdUE=(%.3f,%.3f,%.3f) upUE=(%.3f,%.3f,%.3f) compFwd(+X)=(%.3f,%.3f,%.3f)"),
 				*FixtureId,
-				Part.bHasBeamDirection ? TEXT("beamDirectionWorld") : TEXT("node -Y (down)"),
+				Part.bHasBeamDirection ? TEXT("beamDirectionWorld") : TEXT("node +Y (lens front)"),
 				Forward.X, Forward.Y, Forward.Z, Up.X, Up.Y, Up.Z, CompFwd.X, CompFwd.Y, CompFwd.Z);
 		}
 		for (const FRebusFixturePart& Child : Part.Children) Visit(Child);
