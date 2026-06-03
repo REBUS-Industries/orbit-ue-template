@@ -47,10 +47,11 @@ namespace
 	constexpr float RebusBeamSharpness = 2.5f;
 	constexpr float RebusBeamFalloff = 1.6f;
 
-	// v1.0.38: render-bounds inflation for the beam cone so the elongated additive-translucent shaft
-	// is not wrongly frustum/occlusion-culled at certain camera angles (see BuildBeamCone). Scales
-	// only the bounds extent (origin unchanged); raise if a beam still pops out at extreme angles.
-	constexpr float RebusBeamBoundsScale = 3.f;
+	// Modest render-bounds margin for the beam cone (extent-only; origin unchanged so translucency
+	// sort order is unaffected). The real "beam vanishes up close / inside" fix is the v1.0.39
+	// raymarch entry/exit rework in M_RebusBeam -- bounds were NOT the cause -- so this is kept small
+	// (just a little frustum-cull headroom for the elongated shaft), reduced from the v1.0.38 3x.
+	constexpr float RebusBeamBoundsScale = 1.5f;
 
 	// Phase 2 (v1.0.33) raymarch tuning: view-ray march steps + per-step density seeded on the MID
 	// (StepCount/BeamDensity in M_RebusBeam's Custom HLSL). 32 steps is a good live/final balance.

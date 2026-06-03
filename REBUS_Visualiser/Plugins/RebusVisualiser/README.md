@@ -285,19 +285,29 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 > still carves the truss shadow gaps. To tune live without a rebuild: `r.VolumetricFog.GridPixelSize`
 > (lower = finer/heavier), `r.VolumetricFog.HistoryWeight` (higher = smoother, slight latency).
 
-> **Beam not culled at camera angles (v1.0.38).** The mesh-cone beam (`BeamCone`, a
-> `UProceduralMeshComponent` + the additive `M_RebusBeam`) could vanish entirely from certain camera
-> angles. It is **not** single-sided (`M_RebusBeam` is two-sided, so it renders from every side) and
-> the view-ray raymarch draws on whichever cone face the rasterizer hits — so the cause was **culling
-> of the whole component**: a long (~tens of metres), thin, translucent shaft that runs from the
-> fixture down to the floor whose screen-projected bounds fall mostly over the closer opaque floor
-> gets HZB **occlusion-culled** (and is borderline for frustum culling). Fixed in C++ (`BuildBeamCone`,
-> no re-bake): the cone uses its own section bounds (`bUseAttachParentBound=false`), never acts as an
-> occluder (`bUseAsOccluder=false`), and its render bounds are conservatively inflated via
-> `SetBoundsScale(RebusBeamBoundsScale)` (default **3×**, extent-only so translucency sort order is
-> unchanged) so enough of the volume pokes past occluders to stay drawn. If a beam still pops out at
-> an extreme angle, raise `RebusBeamBoundsScale`. Flying *into* the cone still soft-clips only the
-> near-plane portion (the near-face fade), not the whole beam.
+> **Beam stays visible up close / inside the cone (v1.0.39).** The mesh-cone beam (`BeamCone`, a
+> `UProceduralMeshComponent` + the additive two-sided `M_RebusBeam`) vanished when the camera moved
+> **close to or inside** the cone (the lit floor pool stayed; only the volumetric shaft dropped out,
+> on all beams). This was **not** culling — it was a mesh-bounded raymarch **entry** bug. The old
+> Custom HLSL started the march at the rasterized fragment (`tFront`) and marched **forward
+> downrange**; when the camera is inside, the only fragment is the far wall (a back face, drawn
+> because the material is two-sided), and marching forward from it leaves the cone so every sample
+> missed. Fixed by reworking the march interval analytically from the **view ray vs the cone**
+> (re-baked `M_RebusBeam`, `0 error(s)`):
+> - **ENTRY** = the camera itself when the camera is inside the cone (so the march always starts at
+>   `t=0`), otherwise the analytic near (front-wall) intersection so distant beams stay tightly
+>   sampled.
+> - **EXIT** = this fragment's own surface distance, clamped by the opaque **scene depth** (occlusion
+>   preserved). Because EXIT is the fragment's own depth, a front-face fragment marches a ~zero
+>   interval and the far/back-face fragment carries the shaft — so two-sided drawing never
+>   double-adds, with no per-face branching.
+> - A short **near-camera soft fade** (last ~10 cm) avoids a hard wall in the lens when flying
+>   through; it no longer blanks the whole beam.
+>
+> The v1.0.38 bounds work is kept but reduced to a **modest 1.5×** margin (`RebusBeamBoundsScale`,
+> extent-only) since bounds were never the cause. Still to watch: looking straight **down the open
+> axis** of the cone (toward the far opening) has no lateral back face along that ray, so the shaft
+> can thin to nothing there — an acceptable edge case (the beam is a small bright dot from that view).
 
 ### `RenderQuality` scene property (runtime tiers)
 

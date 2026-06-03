@@ -198,52 +198,111 @@ def ensure_lens_material(force=False):
 
 
 _BEAM_RAYMARCH_HLSL = """
-// True N-step view-ray raymarch through the cone volume (Phase 2, v1.0.33).
-// Front-to-back accumulation with transmittance; density = on-axis radial core * length
-// attenuation. Camera scene-depth occlusion clips samples behind opaque geometry; a near-face
-// fade stops popping when flying through the cone. Output: float4(rgb beam colour, a coverage).
+// True N-step view-ray raymarch through the cone volume (Phase 2; entry/exit rework v1.0.39).
+//
+// v1.0.39 fix -- the beam used to vanish when the camera got close to / inside the cone. The old
+// code started the march at the rasterized fragment (tFront) and marched FORWARD downrange. When
+// the camera is inside, the only rasterized fragment is the far wall (back face, drawn because the
+// material is two-sided); marching forward from it leaves the cone, so every sample missed and the
+// shaft disappeared. The march interval is now built from the VIEW RAY vs the cone analytically:
+//   ENTRY = camera itself when the camera is inside the cone (so the march always starts), else the
+//           analytic near (front-wall) intersection so distant beams stay tightly sampled.
+//   EXIT  = this fragment's own surface distance, also clamped by the opaque scene depth.
+// Because EXIT is the fragment's own depth, a front-face fragment marches a ~zero interval (its
+// surface IS the entry) and the far/back-face fragment carries the shaft -- so two-sided drawing
+// never double-adds, with no per-face branching. A short near-camera soft fade avoids a hard wall
+// in the lens when flying through. Output: float4(rgb beam colour, a coverage).
 float3 ro = CamPos.xyz;
 float3 pp = PixelPos.xyz;
 float3 toPix = pp - ro;
-float tFront = length(toPix);
-if (tFront < 0.001) { return float4(0,0,0,0); }
-float3 rd = toPix / tFront;
+float tPix = length(toPix);
+if (tPix < 0.001) { return float4(0,0,0,0); }
+float3 rd = toPix / tPix;
 
 float3 bo = BeamOrigin.xyz;
 float3 bd = normalize(BeamDir.xyz);
 float blen = max(BeamLength, 1.0);
+float r0 = max(LensRadius, 0.0);
+float rF = max(FarRadius, r0 + 0.01);
+float k = (rF - r0) / blen;          // dRadius / dAxial along the cone
 
-// March from the cone front face (this pixel) downrange, bounded by the beam length and clipped
-// at the opaque scene depth. SceneDepth/PixelDepth are camera-Z; convert to a distance along THIS
-// view ray via the front face: cameraDepth(t) = t * (PixelDepth / tFront).
-float tStart = tFront;
-float tEndCone = tFront + blen;
-float tOcc = (PixelDepth > 0.001) ? (SceneDepth * tFront / PixelDepth) : tEndCone;
-float tEnd = min(tEndCone, tOcc);
-if (tEnd <= tStart) { return float4(0,0,0,0); }
+// Opaque scene-depth occlusion. SceneDepth/PixelDepth are camera-Z; the ratio tPix/PixelDepth =
+// 1/cos(view angle) converts the camera-Z scene depth to a distance along THIS view ray.
+float tOcc = (PixelDepth > 0.001) ? (SceneDepth * tPix / PixelDepth) : (tPix + blen);
+
+// ---- Analytic view-ray vs truncated cone (lateral surface, axial in [0, blen]) ----
+// perp(t)^2 == radius(axial(t))^2  ->  quadratic qa t^2 + qb t + qc = 0.
+float3 A = ro - bo;
+float a0 = dot(A, bd);               // axial of camera
+float ad = dot(rd, bd);              // axial rate along the ray (rd is unit)
+float AA = dot(A, A);
+float rr = dot(A, rd);
+float p  = r0 + k * a0;
+float q  = k * ad;
+float qa = (1.0 - ad * ad) - q * q;
+float qb = 2.0 * ((rr - a0 * ad) - q * p);
+float qc = (AA - a0 * a0) - p * p;
+
+// Is the camera inside the cone volume? (then ENTRY = camera so the march always runs).
+float radCam = length(A - a0 * bd);
+bool camInside = (a0 >= 0.0 && a0 <= blen) && (radCam <= (r0 + k * a0));
+
+float tEntry = 0.0;                   // default: start at the camera (covers the inside case)
+if (!camInside)
+{
+    // First lateral hit ahead of the camera whose axial coord lies within [0, blen] = front wall.
+    float tHit = 1e9;
+    if (abs(qa) > 1e-6)
+    {
+        float disc = qb * qb - 4.0 * qa * qc;
+        if (disc >= 0.0)
+        {
+            float sq = sqrt(disc);
+            float ta = (-qb - sq) / (2.0 * qa);
+            float tb = (-qb + sq) / (2.0 * qa);
+            float axa = a0 + ad * ta;
+            float axb = a0 + ad * tb;
+            if (ta > 0.001 && axa >= 0.0 && axa <= blen) { tHit = min(tHit, ta); }
+            if (tb > 0.001 && axb >= 0.0 && axb <= blen) { tHit = min(tHit, tb); }
+        }
+    }
+    else if (abs(qb) > 1e-6)
+    {
+        float tl = -qc / qb;
+        float axl = a0 + ad * tl;
+        if (tl > 0.001 && axl >= 0.0 && axl <= blen) { tHit = tl; }
+    }
+    if (tHit < 1e9) { tEntry = tHit; }
+}
+
+// EXIT = this fragment's own surface, clamped by opaque scene depth. (Front-face fragments thus
+// march ~zero; the far/back-face fragment carries the shaft -> no two-sided double-add.)
+float tExit = min(tPix, tOcc);
+if (tExit <= tEntry) { return float4(0,0,0,0); }
 
 int steps = (int)clamp(StepCount, 2.0, 64.0);
-float dt = (tEnd - tStart) / steps;
+float dt = (tExit - tEntry) / steps;
 float invLen = 1.0 / blen;
-float radSpan = FarRadius - LensRadius;
+float radSpan = rF - r0;
 float sharp = max(BeamSharpness, 0.01);
 float fall = max(BeamFalloff, 0.01);
+const float NEAR_FADE_CM = 10.0;      // fade only the few cm nearest the camera (no hard wall)
 
 float trans = 1.0;
-float t = tStart + dt * 0.5;
+float t = tEntry + dt * 0.5;
 const int MAXSTEPS = 64;
 [loop]
 for (int i = 0; i < MAXSTEPS; ++i)
 {
     if (i >= steps) { break; }
-    if (t >= tEnd) { break; }
+    if (t >= tExit) { break; }
     float3 wp = ro + rd * t;
     float3 rel = wp - bo;
     float axial = dot(rel, bd);
     float aN = axial * invLen;
     if (aN >= 0.0 && aN <= 1.0)
     {
-        float radiusAt = LensRadius + radSpan * aN;
+        float radiusAt = r0 + radSpan * aN;
         float3 perp = rel - axial * bd;
         float radial = length(perp);
         float rN = (radiusAt > 0.001) ? (radial / radiusAt) : 2.0;
@@ -251,7 +310,8 @@ for (int i = 0; i < MAXSTEPS; ++i)
         {
             float core = pow(saturate(1.0 - rN), sharp);
             float lenA = pow(saturate(1.0 - aN), fall);
-            float d = BeamDensity * core * lenA;
+            float nf = saturate(t / NEAR_FADE_CM);   // soft near-camera fade only
+            float d = BeamDensity * core * lenA * nf;
             float a = 1.0 - exp(-d * dt);
             trans *= (1.0 - a);
         }
@@ -259,8 +319,7 @@ for (int i = 0; i < MAXSTEPS; ++i)
     t += dt;
 }
 
-float nearFade = saturate((PixelDepth - 16.0) / 48.0);
-float coverage = saturate(1.0 - trans) * nearFade;
+float coverage = saturate(1.0 - trans);
 float3 col = BeamColor.rgb * BeamIntensity * coverage;
 return float4(col, coverage);
 """
@@ -271,13 +330,18 @@ def _build_beam_master(mat):
 
     A single Custom HLSL node marches the view ray through the cone volume (front-to-back with
     transmittance), with a radial on-axis core -> soft edge profile (BeamSharpness) and a length
-    attenuation (BeamFalloff), additive output. Camera scene-depth occlusion (the shaft hidden
-    behind opaque geometry) and a near-face soft clip are kept. The cone geometry is fed as params
+    attenuation (BeamFalloff), additive output. v1.0.39: the march interval is built analytically
+    from the view ray vs the cone (ENTRY = camera when the camera is inside the cone, else the
+    analytic front-wall hit; EXIT = the fragment's own surface clamped by scene depth) so the shaft
+    stays visible when the camera is near / at the mouth of / fully inside the cone, and the
+    two-sided draw never double-adds. Camera scene-depth occlusion (the shaft hidden behind opaque
+    geometry) and a short near-camera soft fade are kept. The cone geometry is fed as params
     (BeamOrigin/BeamDir world from the component, BeamLength, LensRadius, FarRadius) so the shader
     math matches the procedural mesh exactly. StepCount + BeamDensity tune the march.
 
-    Unlit + two-sided + ADDITIVE so it never shows a black card when dark and back faces add
-    through. Light-BLOCKING volumetric shadows on runtime-imported trusses are NOT done in this
+    Unlit + two-sided + ADDITIVE so it never shows a black card when dark and back faces still draw
+    when the camera is inside (the back wall is the fragment that carries the shaft). Light-BLOCKING
+    volumetric shadows on runtime-imported trusses are NOT done in this
     shader (runtime glTF meshes have no mesh distance fields, so a material can't trace them) --
     that is the native VSM fog hybrid on hero beams (see RebusFixtureActor::RefreshBeamShadowMode).
     """
