@@ -43,9 +43,15 @@ namespace
 	// multiplier 1) -- scaled live by dimmer x gate x SetFixtureBeamVolumetrics. BeamSharpness =
 	// Fresnel exponent (edge softness), BeamFalloff = length-fade exponent; both seed the MID.
 	constexpr int32 RebusBeamConeSegments = 24;
-	constexpr float RebusMeshBeamMaxIntensity = 3.f;
+	// v1.0.40: brightened the shaft (was 3.0) so it reads as a clearly visible volumetric beam.
+	constexpr float RebusMeshBeamMaxIntensity = 4.f;
 	constexpr float RebusBeamSharpness = 2.5f;
+	// v1.0.40: BeamFalloff is now the distance-from-SOURCE inverse-square STRENGTH in M_RebusBeam
+	// (0 = flat along length, higher = dims faster downrange), NOT the old length-fade pow exponent.
 	constexpr float RebusBeamFalloff = 1.6f;
+	// v1.0.40: floor for the beam base (lens) radius so the shaft starts from a visible disc of the
+	// lens diameter rather than a near-point when a fixture reports an unrealistically tiny lens.
+	constexpr float RebusBeamLensRadiusFloorCm = 3.f;
 
 	// Modest render-bounds margin for the beam cone (extent-only; origin unchanged so translucency
 	// sort order is unaffected). The real "beam vanishes up close / inside" fix is the v1.0.39
@@ -56,7 +62,9 @@ namespace
 	// Phase 2 (v1.0.33) raymarch tuning: view-ray march steps + per-step density seeded on the MID
 	// (StepCount/BeamDensity in M_RebusBeam's Custom HLSL). 32 steps is a good live/final balance.
 	constexpr float RebusBeamStepCount = 32.f;
-	constexpr float RebusBeamDensity = 0.0025f;
+	// v1.0.40: raised (was 0.0025) to pair with the width-normalized density model so the shaft is a
+	// nice, clearly visible volumetric beam. Tunable live via the BeamDensity MID param.
+	constexpr float RebusBeamDensity = 0.015f;
 
 	// Phase 2 light-blocking volumetric shadows (the must-have) use the NATIVE VSM fog hybrid:
 	// runtime-imported glTF trusses have NO mesh distance fields (glTFRuntime's import config has no
@@ -679,8 +687,8 @@ void ARebusFixtureActor::BuildBeamCone()
 	const TCHAR* DiamSrc = TEXT("none");
 	const double DiamMeters = ResolveLensDiameterMeters(DiamSrc);
 	BeamBaseRadiusUnreal = (DiamMeters > KINDA_SMALL_NUMBER)
-		? (float)(DiamMeters * 0.5 * RebusCoords::METERS_TO_UNREAL)
-		: 2.f;
+		? FMath::Max((float)(DiamMeters * 0.5 * RebusCoords::METERS_TO_UNREAL), RebusBeamLensRadiusFloorCm)
+		: RebusBeamLensRadiusFloorCm;
 
 	// Length = the SpotLight throw (AttenuationRadius) so the shaft matches the light's reach.
 	BeamLengthUnreal = SpotLight ? SpotLight->AttenuationRadius : 6000.f;

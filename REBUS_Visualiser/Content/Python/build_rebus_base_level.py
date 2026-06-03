@@ -211,7 +211,14 @@ _BEAM_RAYMARCH_HLSL = """
 // Because EXIT is the fragment's own depth, a front-face fragment marches a ~zero interval (its
 // surface IS the entry) and the far/back-face fragment carries the shaft -- so two-sided drawing
 // never double-adds, with no per-face branching. A short near-camera soft fade avoids a hard wall
-// in the lens when flying through. Output: float4(rgb beam colour, a coverage).
+// in the lens when flying through.
+//
+// v1.0.40 brightness model -- the beam was faint and faded NEAR the fixture. Two fixes in the
+// per-sample density: (1) a width-bias normalization (density ~ 1/radiusAt) so a ray crossing the
+// wide far end no longer reads brighter than the narrow near-lens region purely from path length;
+// (2) a distance-from-SOURCE softened inverse-square falloff so the shaft is BRIGHTEST at the lens
+// and dims downrange (BeamFalloff = strength). The radial core starts at the lens radius (LensRadius
+// at axial=0), so the shaft visibly begins as a disc of the lens diameter. Output: float4(rgb, a).
 float3 ro = CamPos.xyz;
 float3 pp = PixelPos.xyz;
 float3 toPix = pp - ro;
@@ -285,8 +292,9 @@ float dt = (tExit - tEntry) / steps;
 float invLen = 1.0 / blen;
 float radSpan = rF - r0;
 float sharp = max(BeamSharpness, 0.01);
-float fall = max(BeamFalloff, 0.01);
+float fall = max(BeamFalloff, 0.0);
 const float NEAR_FADE_CM = 10.0;      // fade only the few cm nearest the camera (no hard wall)
+const float REF_RADIUS_CM = 100.0;    // fixed length scale for the width-bias normalization
 
 float trans = 1.0;
 float t = tEntry + dt * 0.5;
@@ -309,9 +317,19 @@ for (int i = 0; i < MAXSTEPS; ++i)
         if (rN < 1.0)
         {
             float core = pow(saturate(1.0 - rN), sharp);
-            float lenA = pow(saturate(1.0 - aN), fall);
+            // v1.0.40 width-bias normalization: optical density per unit length ~ 1/radiusAt, so a
+            // view ray crossing the WIDE far end no longer reads brighter than the NARROW near-lens
+            // region purely from path length (the old bug that made the beam faint at the fixture).
+            // REF_RADIUS_CM is a fixed scale folded into BeamDensity; the radiusAt term cancels the
+            // chord-length growth so the on-axis shaft is uniform along its length before falloff.
+            float widthNorm = REF_RADIUS_CM / max(radiusAt, 1.0);
+            // v1.0.40 distance-from-SOURCE falloff (softened inverse square): brightest at the lens
+            // (axial=0) and dimming downrange, matching a real light shaft. BeamFalloff = strength
+            // (0 = flat, higher = faster falloff); the +1 clamp keeps it finite at the lens.
+            float dn = axial * invLen;               // 0 at lens .. 1 at the far throw
+            float srcAtten = 1.0 / (1.0 + fall * dn * dn);
             float nf = saturate(t / NEAR_FADE_CM);   // soft near-camera fade only
-            float d = BeamDensity * core * lenA * nf;
+            float d = BeamDensity * core * widthNorm * srcAtten * nf;
             float a = 1.0 - exp(-d * dt);
             trans *= (1.0 - a);
         }
@@ -367,7 +385,7 @@ def _build_beam_master(mat):
     sharp = _scalar("BeamSharpness", 2.5, -60)
     falloff = _scalar("BeamFalloff", 1.6, 20)
     stepcount = _scalar("StepCount", 32.0, 100)
-    density = _scalar("BeamDensity", 0.0025, 180)
+    density = _scalar("BeamDensity", 0.015, 180)
     beamlen = _scalar("BeamLength", 6000.0, 260)
     lensrad = _scalar("LensRadius", 2.0, 340)
     farrad = _scalar("FarRadius", 1000.0, 420)

@@ -309,6 +309,31 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 > axis** of the cone (toward the far opening) has no lateral back face along that ray, so the shaft
 > can thin to nothing there — an acceptable edge case (the beam is a small bright dot from that view).
 
+> **Beam brightness & source-to-tip falloff (v1.0.40).** The shaft was faint and *faded out near the
+> fixture* — the opposite of a real light beam. Cause: the raymarch density had no width
+> normalization, so a view ray crosses a **short** path through the narrow near-lens region (faint)
+> and a **long** path through the wide far end (brighter), peaking mid-beam; and the old `lenA`
+> length term pushed the far end toward zero. Reworked the per-sample density in `M_RebusBeam`
+> (re-baked, `0 error(s)`):
+> - **Width-bias normalization** — density scales as `REF_RADIUS_CM / radiusAt`, cancelling the
+>   chord-length growth so the on-axis shaft reads **uniform along its length** before falloff
+>   (near-lens no longer faint).
+> - **Distance-from-source falloff** — a softened inverse square `1 / (1 + BeamFalloff·(axial/Length)²)`
+>   makes the beam **brightest at the lens** and dim smoothly downrange (matches the inverse-square
+>   intuition). `BeamFalloff` is now this falloff **strength** (0 = flat, higher = faster dimming),
+>   not the old length-fade exponent.
+> - **Lens-diameter start** — the cone base radius (`BeamBaseRadiusUnreal`, fed as `LensRadius`) is
+>   the resolved lens radius, floored to `RebusBeamLensRadiusFloorCm` (**3 cm**) so the shaft begins
+>   as a visible disc of the lens diameter, not a point; the mesh base ring and the material radial
+>   profile agree on it at `axial=0`.
+> - **Brighter defaults** — `RebusMeshBeamMaxIntensity` 3 → **4** and `RebusBeamDensity` 0.0025 →
+>   **0.015**.
+>
+> **Tune live (MID scalar params, no re-bake):** `BeamDensity` (overall thickness/visibility, higher
+> = denser), `BeamIntensity` (additive brightness; also driven by dimmer × `SetFixtureBeamVolumetrics`),
+> `BeamFalloff` (source→tip dimming strength; lower = more even along length), `BeamSharpness` (radial
+> edge softness).
+
 ### `RenderQuality` scene property (runtime tiers)
 
 Push `SetSceneProperty name="RenderQuality" value="<tier>"` (case-insensitive; unknown values
