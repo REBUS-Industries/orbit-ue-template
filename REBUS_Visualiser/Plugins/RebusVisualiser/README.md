@@ -285,6 +285,20 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 > still carves the truss shadow gaps. To tune live without a rebuild: `r.VolumetricFog.GridPixelSize`
 > (lower = finer/heavier), `r.VolumetricFog.HistoryWeight` (higher = smoother, slight latency).
 
+> **Beam not culled at camera angles (v1.0.38).** The mesh-cone beam (`BeamCone`, a
+> `UProceduralMeshComponent` + the additive `M_RebusBeam`) could vanish entirely from certain camera
+> angles. It is **not** single-sided (`M_RebusBeam` is two-sided, so it renders from every side) and
+> the view-ray raymarch draws on whichever cone face the rasterizer hits — so the cause was **culling
+> of the whole component**: a long (~tens of metres), thin, translucent shaft that runs from the
+> fixture down to the floor whose screen-projected bounds fall mostly over the closer opaque floor
+> gets HZB **occlusion-culled** (and is borderline for frustum culling). Fixed in C++ (`BuildBeamCone`,
+> no re-bake): the cone uses its own section bounds (`bUseAttachParentBound=false`), never acts as an
+> occluder (`bUseAsOccluder=false`), and its render bounds are conservatively inflated via
+> `SetBoundsScale(RebusBeamBoundsScale)` (default **3×**, extent-only so translucency sort order is
+> unchanged) so enough of the volume pokes past occluders to stay drawn. If a beam still pops out at
+> an extreme angle, raise `RebusBeamBoundsScale`. Flying *into* the cone still soft-clips only the
+> near-plane portion (the near-face fade), not the whole beam.
+
 ### `RenderQuality` scene property (runtime tiers)
 
 Push `SetSceneProperty name="RenderQuality" value="<tier>"` (case-insensitive; unknown values

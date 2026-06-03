@@ -47,6 +47,11 @@ namespace
 	constexpr float RebusBeamSharpness = 2.5f;
 	constexpr float RebusBeamFalloff = 1.6f;
 
+	// v1.0.38: render-bounds inflation for the beam cone so the elongated additive-translucent shaft
+	// is not wrongly frustum/occlusion-culled at certain camera angles (see BuildBeamCone). Scales
+	// only the bounds extent (origin unchanged); raise if a beam still pops out at extreme angles.
+	constexpr float RebusBeamBoundsScale = 3.f;
+
 	// Phase 2 (v1.0.33) raymarch tuning: view-ray march steps + per-step density seeded on the MID
 	// (StepCount/BeamDensity in M_RebusBeam's Custom HLSL). 32 steps is a good live/final balance.
 	constexpr float RebusBeamStepCount = 32.f;
@@ -699,6 +704,11 @@ void ARebusFixtureActor::BuildBeamCone()
 	BeamCone->SetCastShadow(false);
 	BeamCone->bCastDynamicShadow = false;
 	BeamCone->SetVisibility(bMeshBeamEnabled);
+	// v1.0.38 culling fix: the cone is a long (~tens of metres), thin, additive-translucent mesh
+	// that runs from the fixture down to the floor. Use the component's OWN section bounds (never
+	// the small attach-parent bounds) and never let it act as an occluder.
+	BeamCone->bUseAttachParentBound = false;
+	BeamCone->bUseAsOccluder = false;
 
 	BeamMID = UMaterialInstanceDynamic::Create(Mat, this);
 	BeamMID->SetScalarParameterValue(TEXT("BeamSharpness"), RebusBeamSharpness);
@@ -721,6 +731,14 @@ void ARebusFixtureActor::BuildBeamCone()
 	BeamConeLastFarRadius = -1.f; // force the first section build
 	UpdateBeamConeGeometry();     // also seeds BeamLength/LensRadius/FarRadius on the MID
 	BeamCone->SetMaterial(0, BeamMID);
+
+	// v1.0.38 culling fix: conservatively inflate the render bounds so the beam is never wrongly
+	// culled at certain camera angles. The CreateMeshSection bounds are geometrically correct, but a
+	// very elongated translucent shaft whose screen projection falls mostly over the closer opaque
+	// floor can be HZB occlusion-culled (and is borderline for frustum culling). A generous bounds
+	// scale keeps enough of the volume poking past occluders so the additive beam stays drawn. Only
+	// the extent is scaled (origin unchanged), so translucency sort order is unaffected.
+	BeamCone->SetBoundsScale(RebusBeamBoundsScale);
 	RefreshBeamEmissive();
 	RefreshBeamSpatialParams();   // seed world BeamOrigin/BeamDir (RefreshMotion re-pushes per frame)
 
