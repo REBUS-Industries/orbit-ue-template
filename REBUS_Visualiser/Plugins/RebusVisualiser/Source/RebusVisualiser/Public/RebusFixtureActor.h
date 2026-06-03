@@ -75,9 +75,12 @@ public:
 	virtual void Tick(float DeltaSeconds) override;
 
 	// Build the actor from the scene placement + profile. Meshes may be empty (light-only).
+	// InInlineIes carries any RegisterFixtureIes raw .ies profiles pushed for this libraryId
+	// (preferred over a URL fetch in SelectIesForZoom); may be empty.
 	void Setup(const FRebusSceneFixture& InSceneFixture,
 		const FRebusFixtureProfile& InProfile,
-		const FRebusMeshBundle& InMeshes);
+		const FRebusMeshBundle& InMeshes,
+		const FRebusInlineIes& InInlineIes);
 
 	// ---- Control surface (§5.2). Each takes an optional fade in seconds (<=0 = snap). ----
 	void ApplyDimmer(float Intensity01, float FadeSeconds = 0.f);
@@ -118,7 +121,9 @@ private:
 	void RefreshMotion();         // re-solve pan/tilt and push transforms to groups + light
 	void RefreshIntensity();      // fold dimmer * shutter-gate into the light intensity
 	void RecomputeConeAngles();   // from zoom + photometrics + iris/frost
-	void SelectIesForZoom();      // pick/assign the zoom-keyed IES profile
+	void SelectIesForZoom();      // pick/assign the zoom-keyed IES profile (inline > URL > cone)
+	// Pick the inline IES profile nearest the requested zoomDmx (null when none pushed).
+	const FRebusInlineIesProfile* SelectInlineIes(int32 ZoomDmx) const;
 	void FetchAndAssignIes(const FString& IesUrl);
 	void FetchAndAssignGobo(int32 GoboIndex);
 
@@ -150,6 +155,10 @@ private:
 	// Parsed profile (kept for motion solve, cone math, wheel lookup, IES selection).
 	FRebusFixtureProfile Profile;
 
+	// Inline IES profiles pushed for this fixture's libraryId via RegisterFixtureIes. Preferred
+	// over the URL fetch in SelectIesForZoom; empty when none were pushed.
+	FRebusInlineIes InlineIes;
+
 	// Beam rest transform in fixture-local Unreal space (light placement before motion).
 	FTransform BeamRestTransform = FTransform::Identity;
 	int32 HeadAxisIndex = INDEX_NONE;
@@ -175,7 +184,8 @@ private:
 	float GoboRotationSpeed = 0.f; // -1..1
 	float GoboAngle = 0.f;
 	int32 CurrentGoboIndex = INDEX_NONE;
-	int32 CurrentIesZoomDmx = -1;  // which iesProfiles[] entry is loaded
+	int32 CurrentIesZoomDmx = -1;  // which IES entry (inline or URL) is loaded, by zoomDmx
+	bool bActiveIesInline = false; // true when the loaded IES came from an inline iesText push
 
 	bool bAnimating = false;
 };

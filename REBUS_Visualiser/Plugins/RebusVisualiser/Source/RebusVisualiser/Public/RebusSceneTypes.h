@@ -189,3 +189,38 @@ struct FRebusMeshBundle
 	int32 Version = 0;
 	TArray<FRebusMesh> Meshes;
 };
+
+// ---- Inline IES (RegisterFixtureIes data-channel push) ---------------------------------
+//
+// The portal can push raw IESNA LM-63 photometric file *text* inline over the data channel as
+// a REST-free alternative to fetching a signed iesUrl. One finalized profile per
+// (libraryId, profileId), indexed by zoomDmx for zoom selection (mirrors iesProfiles[]).
+
+struct FRebusInlineIesProfile
+{
+	FString ProfileId;          // "default" or a per-zoom-step id
+	int32 ZoomDmx = 0;          // 0..255, the primary zoom index key
+	double ZoomAngleDeg = 0.0;  // optional metadata (index without re-parsing the .ies)
+	double BeamAngleDeg = 0.0;
+	double FieldAngleDeg = 0.0;
+	TArray<uint8> Bytes;        // reassembled literal .ies file text, as bytes for the importer
+};
+
+struct FRebusInlineIes
+{
+	TArray<FRebusInlineIesProfile> Profiles; // finalized, one per profileId
+};
+
+// Scratch accumulator entry for RegisterFixtureIes before finalization: a single profiles[]
+// element from one (possibly chunked) message, holding one fragment of a profileId's iesText.
+struct FRebusInlineIesPending
+{
+	FString ProfileId;
+	int32 ZoomDmx = 0;
+	double ZoomAngleDeg = 0.0;
+	double BeamAngleDeg = 0.0;
+	double FieldAngleDeg = 0.0;
+	FString IesText;            // one fragment (part); concatenated by part when partCount > 1
+	int32 Part = 0;
+	int32 PartCount = 1;
+};

@@ -37,12 +37,14 @@ ARebusFixtureActor::ARebusFixtureActor()
 }
 
 void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
-	const FRebusFixtureProfile& InProfile, const FRebusMeshBundle& InMeshes)
+	const FRebusFixtureProfile& InProfile, const FRebusMeshBundle& InMeshes,
+	const FRebusInlineIes& InInlineIes)
 {
 	FixtureId = InSceneFixture.Id;
 	LibraryFixtureId = InSceneFixture.LibraryFixtureId;
 	DisplayName = InSceneFixture.Name;
 	Profile = InProfile;
+	InlineIes = InInlineIes;
 
 	bHasPanTilt = Profile.MotionRig.bValid && Profile.MotionRig.Axes.Num() > 0;
 	bHasGobo = FindFirstGoboWheel(Profile) != INDEX_NONE;
@@ -571,12 +573,63 @@ void ARebusFixtureActor::ApplyGobo(int32 GoboIndex, bool bHasIndex, float /*Fade
 
 // ---- IES / gobo fetch -----------------------------------------------------------------
 
+const FRebusInlineIesProfile* ARebusFixtureActor::SelectInlineIes(int32 ZoomDmx) const
+{
+	// Pick the inline profile nearest the requested zoomDmx. A single "default" profile (or any
+	// lone entry) is therefore always selected; a per-zoom set picks the closest step. This
+	// mirrors the URL iesProfiles[] zoom selection so both paths behave the same.
+	if (InlineIes.Profiles.Num() == 0) return nullptr;
+	const FRebusInlineIesProfile* Best = &InlineIes.Profiles[0];
+	for (const FRebusInlineIesProfile& P : InlineIes.Profiles)
+	{
+		if (FMath::Abs(P.ZoomDmx - ZoomDmx) < FMath::Abs(Best->ZoomDmx - ZoomDmx)) Best = &P;
+	}
+	return Best;
+}
+
 void ARebusFixtureActor::SelectIesForZoom()
 {
 	if (!SpotLight) return;
 
-	// Map the current zoom half-angle back to a 0..255 DMX-ish key for iesProfiles[] lookup.
-	// We approximate by linearly mapping the zoom range onto 0..255.
+	// Map the current zoom half-angle back to a 0..255 DMX-ish key for zoom selection. We
+	// approximate by linearly mapping the zoom range onto 0..255; this same key drives both the
+	// inline iesText profiles and the URL iesProfiles[] lookup.
+	int32 ZoomDmx = 128;
+	if (Profile.Zoom.bValid && Profile.Zoom.MaxDeg > Profile.Zoom.MinDeg)
+	{
+		const double FullAngle = ZoomDeg.Current * 2.0;
+		const double T = (FullAngle - Profile.Zoom.MinDeg) / (Profile.Zoom.MaxDeg - Profile.Zoom.MinDeg);
+		ZoomDmx = FMath::Clamp((int32)FMath::RoundToInt(T * 255.0), 0, 255);
+	}
+
+	// 1) Prefer an inline iesText profile pushed via RegisterFixtureIes (no REST fetch). Build
+	//    the UTextureLightProfile straight from the cached .ies bytes (same RebusIes path the
+	//    URL fetch uses). On a build failure we fall through to the URL path below.
+	if (const FRebusInlineIesProfile* Inline = SelectInlineIes(ZoomDmx))
+	{
+		if (bActiveIesInline && CurrentIesZoomDmx == Inline->ZoomDmx && ActiveIesProfile)
+		{
+			return; // this inline entry is already loaded
+		}
+		if (UTextureLightProfile* Prof = RebusIes::BuildLightProfile(this, Inline->Bytes))
+		{
+			ActiveIesProfile = Prof;
+			SpotLight->SetIESTexture(Prof);
+			// Keep the portal's brightness authority (§8.2 step 4).
+			SpotLight->bUseIESBrightness = false;
+			SpotLight->IESBrightnessScale = 1.f;
+			SpotLight->MarkRenderStateDirty();
+			bActiveIesInline = true;
+			CurrentIesZoomDmx = Inline->ZoomDmx;
+			return;
+		}
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s: inline IES profile '%s' failed to build; falling back to URL/cone."),
+			*FixtureId, *Inline->ProfileId);
+	}
+
+	// 2) Fall back to a signed iesUrl/iesProfileUrl fetch (REST relative redirect or absolute
+	//    signed GCS URL -- opaque to us). Nearest entry by zoomDmx (§8.2 zoom selection).
 	auto PickProfileUrl = [&](FString& OutUrl, int32& OutKey) -> bool
 	{
 		if (Profile.IesProfiles.Num() == 0)
@@ -584,19 +637,10 @@ void ARebusFixtureActor::SelectIesForZoom()
 			if (!Profile.IesProfileUrl.IsEmpty()) { OutUrl = Profile.IesProfileUrl; OutKey = -1; return true; }
 			return false;
 		}
-		// Estimate the DMX from zoom angle position within the range.
-		int32 Dmx = 128;
-		if (Profile.Zoom.bValid && Profile.Zoom.MaxDeg > Profile.Zoom.MinDeg)
-		{
-			const double FullAngle = ZoomDeg.Current * 2.0;
-			const double T = (FullAngle - Profile.Zoom.MinDeg) / (Profile.Zoom.MaxDeg - Profile.Zoom.MinDeg);
-			Dmx = FMath::Clamp((int32)FMath::RoundToInt(T * 255.0), 0, 255);
-		}
-		// Nearest entry by zoomDmx (§8.2 zoom selection).
 		const FRebusIesProfileRef* Best = &Profile.IesProfiles[0];
 		for (const FRebusIesProfileRef& Ref : Profile.IesProfiles)
 		{
-			if (FMath::Abs(Ref.ZoomDmx - Dmx) < FMath::Abs(Best->ZoomDmx - Dmx)) Best = &Ref;
+			if (FMath::Abs(Ref.ZoomDmx - ZoomDmx) < FMath::Abs(Best->ZoomDmx - ZoomDmx)) Best = &Ref;
 		}
 		OutUrl = Best->IesUrl;
 		OutKey = Best->ZoomDmx;
@@ -606,17 +650,19 @@ void ARebusFixtureActor::SelectIesForZoom()
 	FString Url; int32 Key = -1;
 	if (!PickProfileUrl(Url, Key))
 	{
-		// No IES at all -> clear and keep the synthesized cone (§8.2 step 5).
+		// 3) No IES at all -> clear and keep the synthesized cone (§8.2 step 5).
 		SpotLight->SetIESTexture(nullptr);
 		ActiveIesProfile = nullptr;
 		CurrentIesZoomDmx = -1;
+		bActiveIesInline = false;
 		return;
 	}
-	if (Key == CurrentIesZoomDmx && ActiveIesProfile)
+	if (!bActiveIesInline && Key == CurrentIesZoomDmx && ActiveIesProfile)
 	{
-		return; // already loaded
+		return; // already loaded this URL entry
 	}
 	CurrentIesZoomDmx = Key;
+	bActiveIesInline = false;
 	FetchAndAssignIes(Url);
 }
 

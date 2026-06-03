@@ -348,6 +348,7 @@ void URebusVisualiserSubsystem::SpawnAllFixtures()
 
 	static const FRebusFixtureProfile EmptyProfile;
 	static const FRebusMeshBundle EmptyMeshes;
+	static const FRebusInlineIes EmptyInlineIes;
 
 	for (const FRebusSceneFixture& F : SceneData.Fixtures)
 	{
@@ -355,6 +356,8 @@ void URebusVisualiserSubsystem::SpawnAllFixtures()
 		if (!Profile) Profile = &EmptyProfile;
 		const FRebusMeshBundle* Meshes = F.LibraryFixtureId.IsEmpty() ? &EmptyMeshes : MeshCache.Find(F.LibraryFixtureId);
 		if (!Meshes) Meshes = &EmptyMeshes;
+		const FRebusInlineIes* InlineIes = F.LibraryFixtureId.IsEmpty() ? &EmptyInlineIes : InlineIesCache.Find(F.LibraryFixtureId);
+		if (!InlineIes) InlineIes = &EmptyInlineIes;
 
 		FActorSpawnParameters Params;
 		Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
@@ -362,7 +365,7 @@ void URebusVisualiserSubsystem::SpawnAllFixtures()
 		if (!Actor) continue;
 
 		Actor->SetRestClient(Rest);
-		Actor->Setup(F, *Profile, *Meshes);
+		Actor->Setup(F, *Profile, *Meshes, *InlineIes);
 
 		Ctl->RegisterFixture(F.Id, Actor); // register under the Speckle node id (§3)
 		SpawnedFixtures.Add(Actor);
@@ -452,6 +455,11 @@ void URebusVisualiserSubsystem::HandleSceneDefinition(const FString& Type, const
 	if (Type == TEXT("ClearScene"))
 	{
 		ClearSpawnedFixtures();
+		// Drop the inline-IES cache + its accumulation scratch alongside the fixtures, so a
+		// subsequent push starts clean (mirrors clearing the pushed scene).
+		InlineIesCache.Empty();
+		PendingIesProfiles.Empty();
+		PendingIesChunksSeen.Empty();
 		UE_LOG(LogRebusVisualiser, Log, TEXT("ClearScene: removed all pushed fixtures."));
 		if (bReadySent) BroadcastHandshake();
 		return;
@@ -543,6 +551,148 @@ void URebusVisualiserSubsystem::HandleSceneDefinition(const FString& Type, const
 		// Re-apply to already-spawned fixtures so any beam/light-only fixtures of this libraryId
 		// gain their geometry now that meshes arrived. Re-spawn only happens at load time and
 		// SpawnAllFixtures re-broadcasts the handshake.
+		if (bFixturesSpawned && SceneData.Fixtures.Num() > 0)
+		{
+			ClearSpawnedFixtures();
+			SpawnAllFixtures();
+		}
+		return;
+	}
+
+	if (Type == TEXT("RegisterFixtureIes"))
+	{
+		// Inline raw IESNA LM-63 photometric *text* pushed over the data channel (REST-free
+		// alternative to fetching a signed iesUrl). Two independent accumulation levels:
+		//   * message-level (chunkIndex/chunkCount): profiles[] are appended per libraryId,
+		//     order-independent, finalized once chunkCount messages arrive (like meshes);
+		//   * per-profile fragmentation (part/partCount): within the accumulated entries we
+		//     group by profileId and concatenate iesText fragments (sorted by part) when
+		//     partCount > 1, otherwise the lone entry's iesText is the whole file.
+		// { libraryId, profiles:[{ profileId, zoomDmx?, zoomAngleDeg?, beamAngleDeg?,
+		//   fieldAngleDeg?, iesText, part?, partCount? }], chunkIndex?, chunkCount? }
+		FString LibraryId;
+		RebusJson::TryGetString(Msg, TEXT("libraryId"), LibraryId);
+		const TArray<TSharedPtr<FJsonValue>>* ProfilesArr = nullptr;
+		if (LibraryId.IsEmpty() || !Msg->TryGetArrayField(TEXT("profiles"), ProfilesArr) || !ProfilesArr)
+		{
+			UE_LOG(LogRebusVisualiser, Warning, TEXT("RegisterFixtureIes missing libraryId/profiles; ignoring."));
+			return;
+		}
+
+		double ChunkCountD = 1.0;
+		double ChunkIndexD = 0.0;
+		RebusJson::TryGetNumber(Msg, TEXT("chunkCount"), ChunkCountD);
+		RebusJson::TryGetNumber(Msg, TEXT("chunkIndex"), ChunkIndexD);
+		const int32 ChunkCount = FMath::Max(1, (int32)ChunkCountD);
+		const int32 ChunkIndex = FMath::Max(0, (int32)ChunkIndexD);
+
+		// Append this message's profiles[] entries into the per-libraryId accumulator.
+		TArray<FRebusInlineIesPending>& Accum = PendingIesProfiles.FindOrAdd(LibraryId);
+		int32 EntriesInMsg = 0;
+		for (const TSharedPtr<FJsonValue>& Val : *ProfilesArr)
+		{
+			const TSharedPtr<FJsonObject> PObj = Val.IsValid() ? Val->AsObject() : nullptr;
+			if (!PObj.IsValid()) continue;
+
+			FRebusInlineIesPending Entry;
+			RebusJson::TryGetString(PObj, TEXT("profileId"), Entry.ProfileId);
+			if (Entry.ProfileId.IsEmpty()) Entry.ProfileId = TEXT("default");
+
+			double Num = 0.0;
+			if (RebusJson::TryGetNumber(PObj, TEXT("zoomDmx"), Num)) Entry.ZoomDmx = (int32)Num;
+			RebusJson::TryGetNumber(PObj, TEXT("zoomAngleDeg"), Entry.ZoomAngleDeg);
+			RebusJson::TryGetNumber(PObj, TEXT("beamAngleDeg"), Entry.BeamAngleDeg);
+			RebusJson::TryGetNumber(PObj, TEXT("fieldAngleDeg"), Entry.FieldAngleDeg);
+			RebusJson::TryGetString(PObj, TEXT("iesText"), Entry.IesText);
+			if (RebusJson::TryGetNumber(PObj, TEXT("part"), Num)) Entry.Part = (int32)Num;
+			if (RebusJson::TryGetNumber(PObj, TEXT("partCount"), Num)) Entry.PartCount = FMath::Max(1, (int32)Num);
+
+			Accum.Add(MoveTemp(Entry));
+			++EntriesInMsg;
+		}
+
+		const int32 Seen = ++PendingIesChunksSeen.FindOrAdd(LibraryId);
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("RegisterFixtureIes '%s' chunk %d/%d (%d profile entr(ies) in msg, %d accumulated)."),
+			*LibraryId, ChunkIndex + 1, ChunkCount, EntriesInMsg, Accum.Num());
+
+		// Complete when we've seen all messages (or this is a single non-chunked message).
+		if (Seen < ChunkCount)
+		{
+			return;
+		}
+
+		// Finalize: group by profileId, reassemble part fragments, build the per-profile cache.
+		TArray<FRebusInlineIesPending> Pending = MoveTemp(Accum);
+		PendingIesProfiles.Remove(LibraryId);
+		PendingIesChunksSeen.Remove(LibraryId);
+
+		// Group entries by profileId, preserving first-seen order.
+		TArray<FString> Order;
+		TMap<FString, TArray<FRebusInlineIesPending>> ByProfile;
+		for (FRebusInlineIesPending& Entry : Pending)
+		{
+			TArray<FRebusInlineIesPending>& List = ByProfile.FindOrAdd(Entry.ProfileId);
+			if (List.Num() == 0) Order.Add(Entry.ProfileId);
+			List.Add(MoveTemp(Entry));
+		}
+
+		FRebusInlineIes Finalized;
+		int32 TotalBytes = 0;
+		for (const FString& Pid : Order)
+		{
+			TArray<FRebusInlineIesPending>& List = ByProfile[Pid];
+
+			// If any fragment declares partCount > 1, this profile's iesText was split: sort by
+			// part and concatenate to rebuild the full file. Otherwise a single entry holds it.
+			bool bFragmented = false;
+			for (const FRebusInlineIesPending& E : List) { if (E.PartCount > 1) { bFragmented = true; break; } }
+			if (bFragmented)
+			{
+				List.Sort([](const FRebusInlineIesPending& A, const FRebusInlineIesPending& B)
+				{
+					return A.Part < B.Part;
+				});
+			}
+
+			FRebusInlineIesProfile Out;
+			Out.ProfileId = Pid;
+			FString FullText;
+			bool bMetaSet = false;
+			for (const FRebusInlineIesPending& E : List)
+			{
+				FullText += E.IesText;
+				if (!bMetaSet)
+				{
+					Out.ZoomDmx = E.ZoomDmx;
+					Out.ZoomAngleDeg = E.ZoomAngleDeg;
+					Out.BeamAngleDeg = E.BeamAngleDeg;
+					Out.FieldAngleDeg = E.FieldAngleDeg;
+					bMetaSet = true;
+				}
+			}
+			if (FullText.IsEmpty())
+			{
+				continue; // nothing to build for this profileId
+			}
+
+			// .ies is ASCII text; carry it to the importer verbatim as UTF-8 bytes (same byte
+			// buffer the URL-fetch path feeds to RebusIes::BuildLightProfile).
+			const FTCHARToUTF8 Conv(*FullText);
+			Out.Bytes.Append(reinterpret_cast<const uint8*>(Conv.Get()), Conv.Length());
+			TotalBytes += Out.Bytes.Num();
+			Finalized.Profiles.Add(MoveTemp(Out));
+		}
+
+		const int32 NumProfiles = Finalized.Profiles.Num();
+		InlineIesCache.Add(LibraryId, MoveTemp(Finalized));
+
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("RegisterFixtureIes '%s' complete: %d inline IES profile(s), %d total bytes."),
+			*LibraryId, NumProfiles, TotalBytes);
+
+		// Re-apply to already-spawned fixtures so the affected libraryId gets its true IES now
+		// (consistent with the meshes path; SpawnAllFixtures re-broadcasts the handshake).
 		if (bFixturesSpawned && SceneData.Fixtures.Num() > 0)
 		{
 			ClearSpawnedFixtures();

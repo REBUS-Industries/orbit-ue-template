@@ -108,7 +108,24 @@ Send these as normal `UIInteraction` descriptors (same envelope as `SetFixturePa
   "chunkIndex": 0,        // optional, 0-based; omit / single message => chunkCount defaults to 1
   "chunkCount": 1 }       // optional; total chunks for this libraryId — repeat per chunk
 
-// Remove all pushed fixtures:
+// Inline raw .ies photometrics (REST-free; no iesUrl fetch). The portal pushes the literal
+// IESNA LM-63 file *text* per libraryId, optionally per zoom step, keyed by zoomDmx:
+{ "type": "RegisterFixtureIes",
+  "libraryId": "<libraryFixtureId>",
+  "profiles": [
+    { "profileId": "<id or \"default\">", // groups fragments; "default" = the default profile
+      "zoomDmx": 0,                        // optional, 0..255; primary zoom index key
+      "zoomAngleDeg": 0,                   // optional metadata (index without re-parsing the .ies)
+      "beamAngleDeg": 0,                   // optional metadata
+      "fieldAngleDeg": 0,                  // optional metadata
+      "iesText": "<literal IESNA LM-63 file text>", // NOT base64 — the raw .ies file verbatim
+      "part": 0,                           // optional, 0-based fragment index of THIS profile's iesText
+      "partCount": 1 }                     // optional, total fragments for THIS profileId
+  ],
+  "chunkIndex": 0,        // optional, message-level; same model as RegisterFixtureMeshes
+  "chunkCount": 1 }       // optional, message-level; total messages for this libraryId
+
+// Remove all pushed fixtures (also clears any inline-IES cache):
 { "type": "ClearScene" }
 ```
 
@@ -132,8 +149,30 @@ Behaviour:
   already spawned, the affected scene is re-spawned (re-broadcasting the handshake) so light-only
   fixtures of that `libraryId` gain their geometry; otherwise a later `LoadScene` uses the now-
   cached meshes.
-- IES/gobo images are still fetched lazily via REST; if the portal is unreachable they simply
-  don't load, but dimmer/colour/pan-tilt/zoom still work.
+- `RegisterFixtureIes` delivers the fixture's **photometrics as raw IESNA LM-63 file text**
+  inline (no URL fetch), keyed per `libraryId`. It has **two independent accumulation levels**:
+  - **Message-level** (`chunkIndex`/`chunkCount`): `profiles[]` are appended per `libraryId`,
+    order-independent (same model as `RegisterFixtureMeshes`), and finalized once `chunkCount`
+    messages have arrived (or `chunkCount <= 1` for a single message).
+  - **Per-profile fragmentation** (`part`/`partCount`): the accumulated entries are grouped by
+    `profileId`; when any entry for a `profileId` has `partCount > 1`, its entries are sorted by
+    `part` and their `iesText` is **concatenated** to rebuild the full file. Otherwise the lone
+    entry's `iesText` is the whole file.
+  - On finalize the plugin builds one `UTextureLightProfile` per `(libraryId, profileId)` from
+    the reassembled text and **indexes by `zoomDmx`** (the default profile = `profileId
+    == "default"`, else the entry nearest mid-zoom). `iesText` is fed verbatim to the **same**
+    `RebusIes::BuildLightProfile` (engine `FIESConverter`) the URL fetch uses — no base64, no
+    second parser. If fixtures are already spawned, the affected scene is re-applied so the
+    fixtures gain their true IES immediately.
+- **IES precedence** (`SelectIesForZoom`): an inline `iesText` profile for the requested zoom
+  **wins**; if a needed profile isn't inline, the signed `iesUrl`/`iesProfileUrl` is fetched
+  (existing REST path); if neither exists, the **synthetic cone** is kept. The inline push never
+  regresses the URL path.
+- Gobo images (and IES URLs when no inline IES is present) are still fetched lazily; if the
+  portal is unreachable they simply don't load, but dimmer/colour/pan-tilt/zoom still work.
+  Treat each IES URL value as **opaque**: over the data channel the portal sends **absolute
+  signed GCS URLs** (GET directly, no `x-api-key`, no redirect), while over REST `iesUrl` is a
+  relative `/ies` **307 redirect** fetched with `x-api-key`.
 
 This is purely additive: the REST path (§Lifecycle 2) still runs, and a `LoadScene` push
 overrides it.

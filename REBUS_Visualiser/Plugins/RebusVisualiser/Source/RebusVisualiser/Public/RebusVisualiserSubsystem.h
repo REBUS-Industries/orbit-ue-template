@@ -112,6 +112,19 @@ private:
 	TMap<FString, FRebusMeshBundle> PendingMeshChunks;
 	TMap<FString, int32> PendingMeshChunksSeen;
 
+	// Inline IES (RegisterFixtureIes): raw IESNA LM-63 file *text* pushed over the data channel,
+	// finalized per libraryId into a list of (profileId, zoomDmx) -> reassembled .ies bytes. The
+	// fixture actor builds the UTextureLightProfile lazily and prefers these over a URL fetch.
+	TMap<FString, FRebusInlineIes> InlineIesCache;
+
+	// Two-level accumulation scratch for RegisterFixtureIes (mirrors the mesh-chunk members):
+	//   * PendingIesProfiles   -- raw profiles[] entries appended per libraryId across messages,
+	//   * PendingIesChunksSeen -- message count per libraryId (finalize once chunkCount arrive).
+	// On finalize we group entries by profileId and concatenate part fragments (part/partCount)
+	// to rebuild each profile's full .ies text before building the light profile.
+	TMap<FString, TArray<FRebusInlineIesPending>> PendingIesProfiles;
+	TMap<FString, int32> PendingIesChunksSeen;
+
 	UPROPERTY() TArray<TObjectPtr<ARebusFixtureActor>> SpawnedFixtures;
 
 	FTSTicker::FDelegateHandle TickHandle;
