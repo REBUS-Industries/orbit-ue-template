@@ -211,12 +211,19 @@ Behaviour:
     light-function MID path the URL gobo fetch uses (texture swap only — no new render path). If
     the fixture is already spawned, the currently-selected gobo is re-applied so it appears
     without a reselect.
-- **Gobo selection correlation** (`SetFixtureGobo`): the descriptor carries only `goboIndex`
-  (0-based, no wheel field today). It resolves against the **first gobo-kind wheel** for the
-  fixture's `libraryId`, picking the entry whose `slot == goboIndex`. A null/empty/out-of-range
-  index clears the gobo. If a future `SetFixtureGobo` adds an optional `wheel` field, it is
-  honored to disambiguate **multi-wheel fixtures**; until then, multi-gobo-wheel fixtures are
-  ambiguous and the first gobo-kind wheel is assumed.
+- **Gobo selection correlation** (`SetFixtureGobo`): `goboIndex` (0-based) selects the **slot**
+  within a gobo wheel. The wheel is chosen from two optional selectors with this precedence:
+  1. **`wheelIndex`** (0-based) — selects the **Nth gobo-kind wheel** for the fixture's
+     `libraryId`. The fixture's gobo wheels are the `RegisterFixtureGobos` wheels of gobo kind
+     (`wheelKind/kind/type == "gobo"`), taken in **stable first-seen insertion order** (the order
+     the portal pushed them). Out-of-range → warning, falls back to the first gobo wheel. This
+     **removes the multi-gobo-wheel ambiguity** previously noted.
+  2. **`wheel`** (legacy name string) — used when `wheelIndex` is absent; matches a wheel by name.
+  3. Otherwise the **first gobo-kind wheel** is assumed (single-wheel fixtures need no selector).
+
+  In all cases `slot == goboIndex` picks the slot within the resolved wheel; a null/empty/
+  out-of-range index clears the gobo. Wheel resolution is centralized in
+  `ARebusFixtureActor::ResolveGoboWheel` (the one spot to tweak if the portal's delta differs).
 - **Gobo precedence** (`AssignGobo`): an inline base64 image for the selected `(wheel, slot)`
   **wins**; else its (or the profile wheel's) signed `imageUrl` is fetched; else nothing.
 - Gobo/IES URLs (when no inline data is present) are still fetched lazily; if the portal is

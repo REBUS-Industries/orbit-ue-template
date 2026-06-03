@@ -31,7 +31,7 @@ public:
 	void SetFixtureColor(const FString& Id, const FLinearColor& Srgb, float FadeSeconds = 0.f);
 	void SetFixturePanTilt(const FString& Id, float PanDeg, float TiltDeg, float FadeSeconds = 0.f);
 	void SetFixtureZoom(const FString& Id, float ZoomDeg, float FadeSeconds = 0.f);
-	void SetFixtureGobo(const FString& Id, int32 GoboIndex, bool bHasIndex, const FString& Wheel = FString(), float FadeSeconds = 0.f);
+	void SetFixtureGobo(const FString& Id, int32 GoboIndex, bool bHasIndex, int32 WheelIndex = INDEX_NONE, const FString& Wheel = FString(), float FadeSeconds = 0.f);
 	void SetFixtureIris(const FString& Id, float Iris01, float FadeSeconds = 0.f);
 	void SetFixtureFocus(const FString& Id, float Focus01, float FadeSeconds = 0.f);
 	void SetFixtureFrost(const FString& Id, float Frost01, float FadeSeconds = 0.f);

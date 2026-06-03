@@ -622,19 +622,22 @@ void ARebusFixtureActor::ApplyBeamVolumetrics(float Intensity, bool bCastVolumet
 	SpotLight->MarkRenderStateDirty();
 }
 
-void ARebusFixtureActor::ApplyGobo(int32 GoboIndex, bool bHasIndex, const FString& Wheel, float /*FadeSeconds*/)
+void ARebusFixtureActor::ApplyGobo(int32 GoboIndex, bool bHasIndex, int32 WheelIndex, const FString& Wheel, float /*FadeSeconds*/)
 {
 	// Discrete: switch the slot immediately (a wheel slot can't be half-selected, §11).
 	if (!bHasIndex)
 	{
 		CurrentGoboIndex = INDEX_NONE;
+		CurrentGoboWheelIndex = WheelIndex;
 		CurrentGoboWheel = Wheel;
 		if (SpotLight) SpotLight->SetLightFunctionMaterial(nullptr);
 		return;
 	}
+	// Remember the full selection so a RegisterFixtureGobos re-push can re-apply it.
 	CurrentGoboIndex = GoboIndex;
-	CurrentGoboWheel = Wheel; // remembered so a RegisterFixtureGobos re-push can re-apply it
-	AssignGobo(GoboIndex, Wheel);
+	CurrentGoboWheelIndex = WheelIndex;
+	CurrentGoboWheel = Wheel;
+	AssignGobo(GoboIndex, WheelIndex, Wheel);
 }
 
 void ARebusFixtureActor::SetInlineGobos(const FRebusInlineGobos& InInlineGobos)
@@ -644,7 +647,7 @@ void ARebusFixtureActor::SetInlineGobos(const FRebusInlineGobos& InInlineGobos)
 	// Refresh the live selection so the newly-pushed image appears without a reselect.
 	if (CurrentGoboIndex != INDEX_NONE)
 	{
-		AssignGobo(CurrentGoboIndex, CurrentGoboWheel);
+		AssignGobo(CurrentGoboIndex, CurrentGoboWheelIndex, CurrentGoboWheel);
 	}
 }
 
@@ -764,32 +767,64 @@ void ARebusFixtureActor::FetchAndAssignIes(const FString& IesUrl)
 		}));
 }
 
-const FRebusInlineGobo* ARebusFixtureActor::SelectInlineGobo(int32 Slot, const FString& WheelHint) const
+FString ARebusFixtureActor::ResolveGoboWheel(int32 WheelIndex, const FString& WheelName) const
+{
+	if (InlineGobos.Gobos.Num() == 0) return FString();
+
+	// The fixture's gobo wheels are the inline (RegisterFixtureGobos) wheels of gobo kind, taken
+	// in STABLE first-seen insertion order (the order entries appear in InlineGobos.Gobos, which
+	// preserves the order the portal pushed them). Distinct by wheel name (case-insensitive).
+	TArray<FString> GoboWheels;
+	auto AddDistinct = [&GoboWheels](const FString& W)
+	{
+		for (const FString& Existing : GoboWheels) { if (Existing.Equals(W, ESearchCase::IgnoreCase)) return; }
+		GoboWheels.Add(W);
+	};
+	for (const FRebusInlineGobo& G : InlineGobos.Gobos)
+	{
+		if (G.WheelKind.Equals(TEXT("gobo"), ESearchCase::IgnoreCase)) AddDistinct(G.Wheel);
+	}
+	// Tolerant: if nothing was tagged gobo-kind, treat every pushed wheel as a candidate.
+	if (GoboWheels.Num() == 0)
+	{
+		for (const FRebusInlineGobo& G : InlineGobos.Gobos) AddDistinct(G.Wheel);
+	}
+	if (GoboWheels.Num() == 0) return FString();
+
+	// Precedence: wheelIndex (0-based Nth gobo wheel) > wheel name > first gobo-kind wheel.
+	if (WheelIndex != INDEX_NONE)
+	{
+		if (GoboWheels.IsValidIndex(WheelIndex)) return GoboWheels[WheelIndex];
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s gobo: wheelIndex %d out of range (%d gobo wheel(s)); using first gobo wheel '%s'."),
+			*FixtureId, WheelIndex, GoboWheels.Num(), *GoboWheels[0]);
+		return GoboWheels[0];
+	}
+	if (!WheelName.IsEmpty())
+	{
+		for (const FString& W : GoboWheels) { if (W.Equals(WheelName, ESearchCase::IgnoreCase)) return W; }
+		return WheelName; // unknown name: keep it so a direct match can still be attempted
+	}
+	return GoboWheels[0];
+}
+
+const FRebusInlineGobo* ARebusFixtureActor::SelectInlineGobo(int32 Slot, int32 WheelIndex, const FString& WheelName) const
 {
 	if (InlineGobos.Gobos.Num() == 0) return nullptr;
 
-	// Resolve the target wheel: an explicit hint (forward-compat SetFixtureGobo.wheel) wins;
-	// otherwise the first gobo-kind wheel, falling back to the first wheel present. This mirrors
-	// the URL path's FindFirstGoboWheel selection.
-	FString TargetWheel = WheelHint;
-	if (TargetWheel.IsEmpty())
+	const FString TargetWheel = ResolveGoboWheel(WheelIndex, WheelName);
+	if (!TargetWheel.IsEmpty())
 	{
 		for (const FRebusInlineGobo& G : InlineGobos.Gobos)
 		{
-			if (G.WheelKind.Equals(TEXT("gobo"), ESearchCase::IgnoreCase)) { TargetWheel = G.Wheel; break; }
-		}
-		if (TargetWheel.IsEmpty()) TargetWheel = InlineGobos.Gobos[0].Wheel;
-	}
-
-	for (const FRebusInlineGobo& G : InlineGobos.Gobos)
-	{
-		if (G.Slot == Slot && G.Wheel.Equals(TargetWheel, ESearchCase::IgnoreCase))
-		{
-			return &G;
+			if (G.Slot == Slot && G.Wheel.Equals(TargetWheel, ESearchCase::IgnoreCase))
+			{
+				return &G;
+			}
 		}
 	}
-	// No exact wheel match: when no hint was given, accept any wheel's matching slot.
-	if (WheelHint.IsEmpty())
+	// No explicit selector given and no wheel match: accept any wheel's matching slot.
+	if (WheelIndex == INDEX_NONE && WheelName.IsEmpty())
 	{
 		for (const FRebusInlineGobo& G : InlineGobos.Gobos)
 		{
@@ -817,32 +852,34 @@ bool ARebusFixtureActor::ApplyGoboTextureFromBytes(const TArray<uint8>& Bytes)
 	return false;
 }
 
-void ARebusFixtureActor::AssignGobo(int32 GoboIndex, const FString& WheelHint)
+void ARebusFixtureActor::AssignGobo(int32 GoboIndex, int32 WheelIndex, const FString& WheelName)
 {
 	if (!SpotLight) return;
 
-	// 1) Prefer an inline base64 image pushed via RegisterFixtureGobos (no REST fetch).
-	if (const FRebusInlineGobo* Inline = SelectInlineGobo(GoboIndex, WheelHint))
+	// 1) Prefer an inline base64 image pushed via RegisterFixtureGobos (no REST fetch). The
+	//    wheel is resolved from the selectors (wheelIndex > wheel name > first gobo wheel).
+	if (const FRebusInlineGobo* Inline = SelectInlineGobo(GoboIndex, WheelIndex, WheelName))
 	{
 		if (Inline->Bytes.Num() > 0 && ApplyGoboTextureFromBytes(Inline->Bytes))
 		{
 			UE_LOG(LogRebusVisualiser, Verbose,
-				TEXT("Fixture %s gobo assigned (source=inline wheel='%s' slot=%d, %d bytes)."),
-				*FixtureId, *Inline->Wheel, Inline->Slot, Inline->Bytes.Num());
+				TEXT("Fixture %s gobo assigned (source=inline, wheelIndex=%d -> wheel='%s', slot=%d, %d bytes)."),
+				*FixtureId, WheelIndex, *Inline->Wheel, Inline->Slot, Inline->Bytes.Num());
 			return;
 		}
 		// 2) Inline entry carries only a signed url fallback (or its bytes failed to decode).
 		if (!Inline->ImageUrl.IsEmpty())
 		{
 			UE_LOG(LogRebusVisualiser, Verbose,
-				TEXT("Fixture %s gobo assigned (source=inline-url wheel='%s' slot=%d)."),
-				*FixtureId, *Inline->Wheel, Inline->Slot);
+				TEXT("Fixture %s gobo assigned (source=inline-url, wheelIndex=%d -> wheel='%s', slot=%d)."),
+				*FixtureId, WheelIndex, *Inline->Wheel, Inline->Slot);
 			FetchAndAssignGoboFromUrl(Inline->ImageUrl);
 			return;
 		}
 	}
 
-	// 3) Fall back to the profile wheel's signed imageUrl (existing REST path).
+	// 3) Fall back to the profile wheel's signed imageUrl (existing REST path; legacy single
+	//    gobo wheel -- the multi-wheel selectors apply to the inline cache above).
 	FetchAndAssignGobo(GoboIndex);
 }
 

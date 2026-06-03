@@ -93,9 +93,10 @@ public:
 	void ApplyColor(const FLinearColor& SrgbColor, float FadeSeconds = 0.f);
 	void ApplyPanTilt(float PanDeg, float TiltDeg, float FadeSeconds = 0.f);
 	void ApplyZoom(float ZoomHalfAngleDeg, float FadeSeconds = 0.f);
-	// bHasIndex=false => clear. Wheel is an optional hint to disambiguate multi-wheel fixtures
-	// (SetFixtureGobo may add it later); empty => first gobo-kind wheel.
-	void ApplyGobo(int32 GoboIndex, bool bHasIndex, const FString& Wheel = FString(), float FadeSeconds = 0.f);
+	// bHasIndex=false => clear. WheelIndex (0-based) selects the Nth gobo-kind wheel for
+	// multi-wheel fixtures; Wheel is the legacy name hint. Selector precedence: WheelIndex >
+	// Wheel name > first gobo-kind wheel. GoboIndex still selects the slot within the wheel.
+	void ApplyGobo(int32 GoboIndex, bool bHasIndex, int32 WheelIndex = INDEX_NONE, const FString& Wheel = FString(), float FadeSeconds = 0.f);
 	void ApplyIris(float Iris01, float FadeSeconds = 0.f);
 	void ApplyFocus(float Focus01, float FadeSeconds = 0.f);
 	void ApplyFrost(float Frost01, float FadeSeconds = 0.f);
@@ -141,11 +142,17 @@ private:
 	void FetchAndAssignIes(const FString& IesUrl);
 
 	// Assign the gobo for the selected slot, preferring an inline base64 image (no fetch) over
-	// the signed imageUrl fetch over nothing. WheelHint disambiguates multi-wheel fixtures.
-	void AssignGobo(int32 GoboIndex, const FString& WheelHint);
-	// Pick the inline gobo image for (slot, wheel hint); null when none pushed/match. Falls back
-	// to the first gobo-kind wheel when WheelHint is empty.
-	const FRebusInlineGobo* SelectInlineGobo(int32 Slot, const FString& WheelHint) const;
+	// the signed imageUrl fetch over nothing. WheelIndex/WheelName disambiguate multi-wheel
+	// fixtures (see ResolveGoboWheel for the precedence).
+	void AssignGobo(int32 GoboIndex, int32 WheelIndex, const FString& WheelName);
+	// Resolve the target gobo wheel NAME from the selectors. The fixture's gobo wheels are the
+	// inline (RegisterFixtureGobos) wheels of gobo kind, in first-seen insertion order.
+	// Precedence: WheelIndex (0-based Nth gobo wheel) > WheelName > first gobo-kind wheel.
+	// Out-of-range WheelIndex logs a warning and falls back to the first gobo wheel. Empty when
+	// no inline gobos exist. This is the single place to tweak if the portal's delta differs.
+	FString ResolveGoboWheel(int32 WheelIndex, const FString& WheelName) const;
+	// Pick the inline gobo image for the resolved (wheel, slot); null when none pushed/match.
+	const FRebusInlineGobo* SelectInlineGobo(int32 Slot, int32 WheelIndex, const FString& WheelName) const;
 	// Build + assign a gobo UTexture2D from decoded image bytes via the existing light-function
 	// MID path; returns true when a texture was applied.
 	bool ApplyGoboTextureFromBytes(const TArray<uint8>& Bytes);
@@ -216,7 +223,8 @@ private:
 	float GoboRotationSpeed = 0.f; // -1..1
 	float GoboAngle = 0.f;
 	int32 CurrentGoboIndex = INDEX_NONE;
-	FString CurrentGoboWheel;      // optional wheel hint for the live gobo selection (re-apply)
+	int32 CurrentGoboWheelIndex = INDEX_NONE; // live wheelIndex selector (re-apply on re-push)
+	FString CurrentGoboWheel;      // live wheel-name hint for the gobo selection (re-apply)
 	int32 CurrentIesZoomDmx = -1;  // which IES entry (inline or URL) is loaded, by zoomDmx
 	bool bActiveIesInline = false; // true when the loaded IES came from an inline iesText push
 
