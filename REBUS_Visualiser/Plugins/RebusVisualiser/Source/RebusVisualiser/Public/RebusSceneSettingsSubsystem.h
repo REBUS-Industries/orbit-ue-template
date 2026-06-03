@@ -65,6 +65,11 @@ private:
 	// its SpotLight fog VolumetricScatteringIntensity (the old froxel beam), for runtime A/B.
 	void SetMeshBeamsEnabled(bool bEnabled);
 
+	// Enable/disable driving Orbit-imported fixture models from fixture motion (bDriveOrbitModels
+	// scene property, default false). Routes to the fixture control subsystem, which binds the
+	// imported models to fixtures by object id and drives them with the same motion solve.
+	void SetDriveOrbitModelsEnabled(bool bEnabled);
+
 	// Apply a MegaLights + volumetric-fog-volume quality tier at runtime ("live"/"previs"/
 	// "final", case-insensitive; unknown -> "live"). Re-tunes r.MegaLights.* via console
 	// override and stores the canonical tier name so SceneState round-trips it.

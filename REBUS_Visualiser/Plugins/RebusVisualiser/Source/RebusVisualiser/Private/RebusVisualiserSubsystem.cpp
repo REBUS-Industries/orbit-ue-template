@@ -202,6 +202,23 @@ bool URebusVisualiserSubsystem::Tick(float DeltaSeconds)
 		TrySendReady();
 	}
 
+	// Periodic Orbit-model rebind (Phase 1 A/B sync test): while driving is enabled, retry binding
+	// so a late OrbitConnector import (or a re-import that replaced the components) binds to the
+	// already-spawned fixtures without a manual re-toggle. Cheap no-op when driving is off or no
+	// Orbit import is present.
+	if (URebusFixtureControlSubsystem* Ctl = GetControl())
+	{
+		if (Ctl->IsDrivingOrbitModels())
+		{
+			OrbitRebindTimer += DeltaSeconds;
+			if (OrbitRebindTimer >= 1.0f)
+			{
+				OrbitRebindTimer = 0.f;
+				Ctl->RebindOrbitModels();
+			}
+		}
+	}
+
 	// Periodic FrameStats for the diagnostics strip (§6.6).
 	if (bReadySent && Channel.IsValid())
 	{

@@ -50,8 +50,29 @@ public:
 	// this subsystem owns (so the caller can fall through to scene-property handling).
 	bool HandleControlDescriptor(const FString& Type, const TSharedPtr<FJsonObject>& Msg);
 
+	// ---- Orbit-imported model binding (Phase 1 A/B sync test, v1.0.35) --------------------
+	// Enable/disable driving every fixture's matched Orbit-imported model from its motion solve.
+	// Toggled live via the bDriveOrbitModels scene property or the Rebus.DriveOrbitModels console
+	// command. Pushes the flag to all fixtures and (re)binds against the current Orbit import.
+	void SetDriveOrbitModels(bool bEnabled);
+	bool IsDrivingOrbitModels() const { return bDriveOrbitModels; }
+
+	// Scan the world for the Orbit import (found generically by actor class name so this plugin
+	// keeps NO compile/link dependency on OrbitConnector), group imported components by object-id
+	// tag, and bind each one to the registered fixture sharing that id. Idempotent + cheap; a no-op
+	// when no Orbit import is present. Handles late binding both ways (called on a timer + on spawn
+	// + on toggle): a fixture that spawns after the import binds here, and an import that arrives
+	// after the fixtures binds on the next pass. Logs matched / unmatched ids for sync verification.
+	void RebindOrbitModels();
+
 private:
 	UPROPERTY() TMap<FString, TObjectPtr<ARebusFixtureActor>> Fixtures;
 	TArray<FString> CurrentSelection;
 	FString PrimarySelection;
+
+	// Global enable for driving Orbit-imported models (default off; the control-channel meshes
+	// remain the source of truth until Phase 2). Per-fixture flag lives on each ARebusFixtureActor.
+	bool bDriveOrbitModels = false;
+	// Logged-once guard so the "no Orbit import present" / match-summary lines don't spam the timer.
+	int32 LastOrbitMatchLogged = -1;
 };

@@ -5,6 +5,11 @@
 #include "RebusVisualiserLog.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "Engine/GameInstance.h"
+#include "Engine/World.h"
+#include "EngineUtils.h"
+#include "Components/SceneComponent.h"
+#include "GameFramework/Actor.h"
 
 void URebusFixtureControlSubsystem::RegisterFixture(const FString& NodeId, ARebusFixtureActor* Actor)
 {
@@ -258,4 +263,120 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 	}
 
 	return false; // not a fixture/selection type -> let scene-property handling try.
+}
+
+// ---- Orbit-imported model binding (Phase 1 A/B sync test) -----------------------------
+
+void URebusFixtureControlSubsystem::SetDriveOrbitModels(bool bEnabled)
+{
+	bDriveOrbitModels = bEnabled;
+	LastOrbitMatchLogged = -1; // force a fresh match-summary log on the next rebind
+
+	// Push the flag to every fixture first (so a disable restores even fixtures that no longer
+	// match an import), then (re)bind so freshly-matched fixtures start driving immediately.
+	for (const TPair<FString, TObjectPtr<ARebusFixtureActor>>& Pair : Fixtures)
+	{
+		if (ARebusFixtureActor* Actor = Pair.Value.Get())
+		{
+			Actor->SetDriveOrbitModel(bEnabled);
+		}
+	}
+
+	UE_LOG(LogRebusVisualiser, Log, TEXT("bDriveOrbitModels=%d (fixtures=%d)."), bEnabled ? 1 : 0, Fixtures.Num());
+
+	if (bEnabled)
+	{
+		RebindOrbitModels();
+	}
+}
+
+void URebusFixtureControlSubsystem::RebindOrbitModels()
+{
+	if (!bDriveOrbitModels) return; // only spend cycles while the A/B test is on
+
+	UWorld* World = nullptr;
+	if (UGameInstance* GI = GetGameInstance())
+	{
+		World = GI->GetWorld();
+	}
+	if (!World) return;
+
+	// Build objectId -> imported components by scanning any Orbit import root. The root is found
+	// GENERICALLY by its class name so RebusVisualiser keeps no compile/link dependency on the
+	// (separately-owned) OrbitConnector plugin; the imported mesh components are tagged with their
+	// glb node-name ancestry (the object id lives at one of those levels).
+	TMap<FString, TArray<USceneComponent*>> OrbitIndex;
+	int32 RootCount = 0;
+	int32 TaggedComps = 0;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor || Actor->GetClass()->GetName() != TEXT("OrbitImportRoot"))
+		{
+			continue;
+		}
+		++RootCount;
+		TArray<USceneComponent*> Comps;
+		Actor->GetComponents(Comps);
+		for (USceneComponent* Comp : Comps)
+		{
+			if (!Comp || Comp->ComponentTags.Num() == 0) continue;
+			++TaggedComps;
+			for (const FName& Tag : Comp->ComponentTags)
+			{
+				OrbitIndex.FindOrAdd(Tag.ToString()).Add(Comp);
+			}
+		}
+	}
+
+	if (RootCount == 0)
+	{
+		// No Orbit import in the world yet -> nothing to bind (the common case; late binding will
+		// pick it up once an import arrives). Log once so the absence is visible without spamming.
+		if (LastOrbitMatchLogged != 0)
+		{
+			LastOrbitMatchLogged = 0;
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Orbit bind: no OrbitImportRoot present yet (fixtures=%d). Will retry."), Fixtures.Num());
+		}
+		return;
+	}
+
+	int32 Matched = 0, Unmatched = 0;
+	TArray<FString> UnmatchedIds;
+	for (const TPair<FString, TObjectPtr<ARebusFixtureActor>>& Pair : Fixtures)
+	{
+		ARebusFixtureActor* Actor = Pair.Value.Get();
+		if (!Actor) continue;
+		const FString& FixtureId = Pair.Key;
+
+		if (TArray<USceneComponent*>* Found = OrbitIndex.Find(FixtureId))
+		{
+			// (Re)bind only when not already bound to this id with live components -- re-binding
+			// would otherwise re-capture the currently-driven pose as the new "rest" and drift.
+			if (Actor->GetBoundOrbitObjectId() != FixtureId || !Actor->HasOrbitBinding())
+			{
+				Actor->BindOrbitComponents(*Found, FixtureId);
+			}
+			Actor->SetDriveOrbitModel(bDriveOrbitModels);
+			++Matched;
+		}
+		else
+		{
+			++Unmatched;
+			if (UnmatchedIds.Num() < 12) UnmatchedIds.Add(FixtureId);
+		}
+	}
+
+	// Summary log, throttled to when the matched count changes (a fresh import / spawn), so a
+	// 1 Hz rebind timer doesn't flood the log once steady.
+	if (Matched != LastOrbitMatchLogged)
+	{
+		LastOrbitMatchLogged = Matched;
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Orbit bind: roots=%d taggedComps=%d distinctObjectIds=%d | fixtures matched=%d unmatched=%d%s%s"),
+			RootCount, TaggedComps, OrbitIndex.Num(), Matched, Unmatched,
+			UnmatchedIds.Num() > 0 ? TEXT(" unmatchedFixtureIds=") : TEXT(""),
+			UnmatchedIds.Num() > 0 ? *FString::Join(UnmatchedIds, TEXT(",")) : TEXT(""));
+	}
 }

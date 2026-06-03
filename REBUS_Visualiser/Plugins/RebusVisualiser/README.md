@@ -524,6 +524,16 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
     lens-flare disc sits at the cone base (unchanged). `BuildBeamCone` logs a consolidated line
     (`beam: SPAWNED matOk ... baseRadius/farRadius/length/halfAngle ... BeamIntensity ...
     meshBeams=... coneFwd/spotFwd`).
+  - **Direction = the live spotlight emission (ground truth, v1.0.34)**: the cone mesh and the
+    raymarch are no longer oriented from a *constructed* rest basis (which could still render the
+    shaft 180° opposite the real emission). Each `RefreshMotion`, `DriveBeamConeFromSpotLight`
+    reads the **live `USpotLightComponent` world transform** *after* the spotlight is positioned —
+    `GetForwardVector()` (the `+X` axis that actually lights the floor) and `GetComponentLocation()`
+    (the lit origin) — orients the cone so its `+X` (frustum opening) **is** that vector, and feeds
+    the same vector to the material `BeamOrigin`/`BeamDir`. So the spotlight forward, the cone mesh
+    forward and the material `BeamDir` are provably the **same** vector. `RefreshBeamSpatialParams`
+    emits a throttled proof line per aim change: `beam align: spotFwd=… coneFwd=… beamDir=…
+    dot(spot,cone)=… dot(spot,beamDir)=…` (both dots must read `~1.000`, never `-1`).
   - **Light-blocking volumetric shadows (Phase 2, the must-have) — native VSM fog hybrid**: the
     trusses/set are **runtime-imported via glTFRuntime**, which has **no distance-field import
     option** (`FglTFRuntimeStaticMeshConfig` has no `bGenerateDistanceField`; mesh distance fields
@@ -548,6 +558,61 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
 - **Volumetric beams under MegaLights** (§5.7) — beams scatter through the level's volumetric
   height fog with MegaLights + its lighting volume (`r.MegaLights.Volume=1`) enabled. See the
   `RenderQuality` tiers and the artefact caveat above if the fog volume shows noise/banding.
+
+## Orbit-imported model binding (Phase 1 A/B sync test)
+
+The OrbitConnector import brings in the **light-fixture models** alongside the trusses/set. Those
+models share the **same object id** as the fixtures delivered over the control channel, so we can
+drive the imported model with the **same motion solve** as its `ARebusFixtureActor` and confirm
+they move in sync. This is **Phase 1**: an overlay/A-B test — the control-channel mesh proxies stay
+visible and authoritative; the Orbit overlay is **off by default** and toggled live. (Phase 2 —
+dropping the control-channel `RegisterFixtureMeshes` import in favour of the Orbit models — is **not
+done** here.)
+
+- **Identification / matching (by object id).** On import, every Orbit static-mesh component is
+  tagged (`UActorComponent::ComponentTags`) with the **names of its glb-node ancestry** — the
+  Speckle object id is expected to be one of those node names. `URebusFixtureControlSubsystem::`
+  `RebindOrbitModels` finds the import actor **generically by class name** (`"OrbitImportRoot"`, so
+  RebusVisualiser keeps **no compile/link dependency** on the separately-owned OrbitConnector
+  plugin), groups the tagged components into an `objectId → components` index, and binds each group
+  to the registered fixture whose **`FixtureId` (Speckle node id)** equals that object id.
+- **How the model is driven.** `ARebusFixtureActor::BindOrbitComponents` caches each component's
+  imported (rest) world transform and the **head world transform at the rest pose** (`pan=tilt=0`),
+  precomputing `OrbitBindBase = CompRestWorld · HeadWorldRest⁻¹`. Each `RefreshMotion`,
+  `DriveOrbitModel(HeadLocal)` sets every bound component's world transform to
+  `OrbitBindBase · (HeadLocal · ActorWorld)` — i.e. it applies **only the head's delta from rest**
+  using the *same* `Cumulative[HeadAxisIndex]` solve that moves the control-channel head meshes, so
+  the overlay tracks pan/tilt identically. No-rig fixtures drive with an identity head (the control
+  meshes don't move either, so they stay in lock-step). The control-channel meshes are **not
+  hidden** — both render together for the comparison.
+- **Toggle (live).** Off by default. Enable either way:
+  - **Scene property:** `SetSceneProperty name="bDriveOrbitModels" value=true|false` (round-trips in
+    `SceneState`, re-asserted on respawn via `ReapplyAll`).
+  - **Console:** `Rebus.DriveOrbitModels 1` / `Rebus.DriveOrbitModels 0`.
+  Disabling restores every bound model to its imported pose.
+- **Late binding (both orders).** Binding runs on a **1 Hz retry** (`URebusVisualiserSubsystem::
+  Tick` → `RebindOrbitModels`, only while driving is enabled) plus on toggle and on (re)spawn. So a
+  fixture that spawns **after** the import binds on the next pass, an import that arrives **after**
+  the fixtures binds on the next tick, and a **re-import** (which destroys the components — held as
+  weak pointers) rebinds when the live binding goes stale. Re-binding an already-bound id is skipped
+  so the rest pose is never re-captured mid-motion.
+- **Diagnostics to watch.** `Orbit bind: roots=… taggedComps=… distinctObjectIds=… | fixtures
+  matched=… unmatched=… unmatchedFixtureIds=…` (match summary, throttled to changes);
+  `Fixture <id>: BOUND <n> Orbit-imported component(s) by objectId '<id>'`; and per-update
+  `Fixture <id>: drove Orbit model '<id>' pan=… tilt=… headRot=(P=… Y=… R=…) comps=…` (throttled to
+  pan/tilt changes) so the overlay motion can be diffed against the control meshes.
+- **Caveats / assumptions for the portal/import team to confirm.**
+  - **The Orbit object id == the fixture `FixtureId`** (Speckle node id). Matching is exact-string
+    against the glb node-name ancestry; if the portal exports the model under a *different* id (e.g.
+    a Speckle *application* id or a decorated name), the `unmatchedFixtureIds` log will show it and a
+    normalisation step is needed.
+  - **Object-id tagging lives in OrbitConnector.** The import must tag each imported mesh component
+    with its glb node-name ancestry (as this build does locally) for matching to work. That change
+    is **not committed here** (OrbitConnector is owned by `orbit-connectors`); it must be upstreamed.
+    Until then, a clean checkout binds **0** models (logged) and the overlay is simply inert.
+  - **Whole-model overlay.** Phase 1 drives the *entire* matched model with the head solve (it can't
+    tell yoke from base from generic tags), which is correct for pure pan/tilt sync but would also
+    rotate a static base; per-part (head-only) driving is a Phase-2 refinement.
 
 ## Acceptance mapping (§12)
 

@@ -118,6 +118,25 @@ public:
 	// SpotLight's fog scattering is restored (the old fog beam), so the two can be A/B'd at runtime.
 	void SetMeshBeamEnabled(bool bEnabled);
 
+	// ---- Orbit-imported model binding (Phase 1 A/B sync test, v1.0.35) --------------------
+	// Bind the Orbit-imported fixture-model components (already matched to this fixture by object
+	// id by the control subsystem) so their world transforms can be driven by this fixture's head
+	// motion. Caches each component's imported (rest) world transform + the head world transform at
+	// the rest pose (pan=tilt=0), so DriveOrbitModel applies ONLY the incremental head motion since
+	// rest -- the Orbit model then tracks pan/tilt exactly like the control-channel head meshes
+	// (both stay visible; this is an A/B sync confirmation, not a replacement). Re-binding replaces
+	// any previous binding (e.g. after a re-import).
+	void BindOrbitComponents(const TArray<USceneComponent*>& Components, const FString& MatchedObjectId);
+	void ClearOrbitBinding();
+	// True only while at least one bound Orbit component is still alive (false after a re-import
+	// destroyed them, so the control subsystem knows to re-bind).
+	bool HasOrbitBinding() const;
+	// Enable/disable driving the bound Orbit model from this fixture's motion. Disabling restores
+	// the Orbit components to their imported (rest) world transforms.
+	void SetDriveOrbitModel(bool bEnabled);
+	bool IsDrivingOrbitModel() const { return bDriveOrbitModel; }
+	const FString& GetBoundOrbitObjectId() const { return BoundOrbitObjectId; }
+
 	// REST client used to lazily fetch gobo wheel images / IES bytes.
 	void SetRestClient(TSharedPtr<FRebusRestClient> InClient) { RestClient = InClient; }
 
@@ -168,6 +187,13 @@ private:
 	void RefreshBeamShadowMode();
 	float ResolveOuterHalfDeg() const; // current outer cone half-angle (zoom range + iris), degrees
 	void RefreshMotion();         // re-solve pan/tilt and push transforms to groups + light
+	// Apply the fixture's current head motion (HeadLocal = the head axis' cumulative fixture-local
+	// transform, or identity for no-rig fixtures) to the bound Orbit-imported components, in world
+	// space, as the delta from the rest pose. No-op when not driving / unbound.
+	void DriveOrbitModel(const FTransform& HeadLocal);
+	// The head's fixture-local transform for a given pan/tilt (deepest head axis' cumulative solve;
+	// identity for no-rig fixtures). Shared by the Orbit-bind rest capture + live drive.
+	FTransform ComputeHeadLocal(float InPanDeg, float InTiltDeg) const;
 	void RefreshIntensity();      // fold dimmer * shutter-gate into the light intensity
 	void RecomputeConeAngles();   // from zoom + photometrics + iris/frost
 	void SelectIesForZoom();      // pick/assign the zoom-keyed IES profile (inline > URL > cone)
@@ -290,6 +316,23 @@ private:
 	// Beam rest transform in fixture-local Unreal space (light placement before motion).
 	FTransform BeamRestTransform = FTransform::Identity;
 	int32 HeadAxisIndex = INDEX_NONE;
+
+	// ---- Orbit-imported model binding state (Phase 1 sync test) ----
+	// When true, RefreshMotion also drives the bound Orbit components from the head motion.
+	bool bDriveOrbitModel = false;
+	// Object id (Speckle node id) this fixture is bound to on the Orbit-import side.
+	FString BoundOrbitObjectId;
+	// The matched Orbit-imported components (weak so a re-import that destroys them is tolerated).
+	TArray<TWeakObjectPtr<USceneComponent>> OrbitComponents;
+	// Each bound component's imported (rest) world transform; restored when driving is disabled.
+	TArray<FTransform> OrbitCompRestWorld;
+	// Per-component constant: CompRestWorld * HeadWorldRest^-1, so the driven world transform is
+	// just OrbitBindBase[i] * HeadWorldNow (one multiply per component per update).
+	TArray<FTransform> OrbitBindBase;
+	// Head world transform at the rest (pan=tilt=0) pose, captured at bind time.
+	FTransform OrbitHeadWorldRest = FTransform::Identity;
+	// Last pan/tilt we emitted a drive-sync log for (throttles the per-update sync log).
+	FVector2D LastOrbitLogPanTilt = FVector2D(FLT_MAX, FLT_MAX);
 
 	// Resolved beam emission forward/up in fixture-local Unreal space (pre-motion), shared by the
 	// SpotLight and the lens disc so they aim identically. The disc rest transform (plane normal

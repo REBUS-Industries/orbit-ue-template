@@ -948,6 +948,11 @@ void ARebusFixtureActor::RefreshMotion()
 			// shaft opens along EXACTLY the synthetic aim the spotlight lights, never 180deg out.
 			DriveBeamConeFromSpotLight();
 		}
+
+		// No GDTF rig: the control-channel mesh proxies don't move, so drive the bound Orbit model
+		// with an identity head -- it stays at its imported pose, in A/B lock-step with the (also
+		// static) control meshes rather than diverging.
+		DriveOrbitModel(FTransform::Identity);
 		return;
 	}
 
@@ -985,6 +990,147 @@ void ARebusFixtureActor::RefreshMotion()
 		// (set just above) so the shaft opens along exactly the direction the floor is lit, through
 		// every pan/tilt, and can never invert relative to the spotlight.
 		DriveBeamConeFromSpotLight();
+	}
+
+	// Drive the bound Orbit-imported model with the SAME head solve that moved the control-channel
+	// head meshes above (Cumulative[HeadAxisIndex]), so the two render on top of each other and
+	// pan/tilt together. No-op when not driving / unbound.
+	const FTransform OrbitHead = (HeadAxisIndex != INDEX_NONE && Cumulative.IsValidIndex(HeadAxisIndex))
+		? Cumulative[HeadAxisIndex] : FTransform::Identity;
+	DriveOrbitModel(OrbitHead);
+}
+
+// ---- Orbit-imported model binding (Phase 1 A/B sync test) -----------------------------
+
+FTransform ARebusFixtureActor::ComputeHeadLocal(float InPanDeg, float InTiltDeg) const
+{
+	// The head's fixture-local transform = the deepest head axis' cumulative solve. No rig -> the
+	// control meshes don't move, so the head is identity (the Orbit model holds its imported pose).
+	if (!Profile.MotionRig.bValid || Profile.MotionRig.Axes.Num() == 0)
+	{
+		return FTransform::Identity;
+	}
+	TArray<FTransform> Cumulative;
+	RebusMotion::Solve(Profile.MotionRig, InPanDeg, InTiltDeg, Cumulative);
+	return (HeadAxisIndex != INDEX_NONE && Cumulative.IsValidIndex(HeadAxisIndex))
+		? Cumulative[HeadAxisIndex] : FTransform::Identity;
+}
+
+void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Components, const FString& MatchedObjectId)
+{
+	OrbitComponents.Reset();
+	OrbitCompRestWorld.Reset();
+	OrbitBindBase.Reset();
+	BoundOrbitObjectId = MatchedObjectId;
+	LastOrbitLogPanTilt = FVector2D(FLT_MAX, FLT_MAX);
+
+	// The imported model corresponds to the fixture's REST pose (pan=tilt=0): cache the head world
+	// transform there so DriveOrbitModel applies only the DELTA from rest as pan/tilt change. With
+	// FTransform's child*parent convention, a component's world = childRel * parent, so the head
+	// world (head mesh proxies are parented under the actor root) is HeadLocal * ActorWorld.
+	const FTransform ActorWorld = GetActorTransform();
+	OrbitHeadWorldRest = ComputeHeadLocal(0.f, 0.f) * ActorWorld;
+	const FTransform HeadWorldRestInv = OrbitHeadWorldRest.Inverse();
+
+	for (USceneComponent* Comp : Components)
+	{
+		if (!Comp) continue;
+		const FTransform CompRest = Comp->GetComponentTransform();
+		OrbitComponents.Add(Comp);
+		OrbitCompRestWorld.Add(CompRest);
+		// Driven world = CompRest * HeadWorldRest^-1 * HeadWorldNow; precompute the constant prefix.
+		OrbitBindBase.Add(CompRest * HeadWorldRestInv);
+	}
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s: BOUND %d Orbit-imported component(s) by objectId '%s' (drive=%s)."),
+		*FixtureId, OrbitComponents.Num(), *MatchedObjectId,
+		bDriveOrbitModel ? TEXT("ON") : TEXT("off"));
+
+	// Snap the model to the fixture's current pose now, so a late bind doesn't pop on the next tick.
+	if (bDriveOrbitModel)
+	{
+		DriveOrbitModel(ComputeHeadLocal(PanDeg.Current, TiltDeg.Current));
+	}
+}
+
+void ARebusFixtureActor::ClearOrbitBinding()
+{
+	OrbitComponents.Reset();
+	OrbitCompRestWorld.Reset();
+	OrbitBindBase.Reset();
+	BoundOrbitObjectId.Reset();
+}
+
+bool ARebusFixtureActor::HasOrbitBinding() const
+{
+	for (const TWeakObjectPtr<USceneComponent>& C : OrbitComponents)
+	{
+		if (C.IsValid()) return true;
+	}
+	return false;
+}
+
+void ARebusFixtureActor::SetDriveOrbitModel(bool bEnabled)
+{
+	bDriveOrbitModel = bEnabled;
+	if (bEnabled)
+	{
+		// Push the model to the fixture's current pose immediately (if bound).
+		if (HasOrbitBinding())
+		{
+			DriveOrbitModel(ComputeHeadLocal(PanDeg.Current, TiltDeg.Current));
+		}
+	}
+	else
+	{
+		// Restore the Orbit components to their imported (rest) world transforms so they stop
+		// tracking and sit exactly where the import placed them.
+		int32 Restored = 0;
+		for (int32 i = 0; i < OrbitComponents.Num(); ++i)
+		{
+			USceneComponent* Comp = OrbitComponents[i].Get();
+			if (Comp && OrbitCompRestWorld.IsValidIndex(i))
+			{
+				Comp->SetWorldTransform(OrbitCompRestWorld[i]);
+				++Restored;
+			}
+		}
+		if (Restored > 0)
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Fixture %s: drive Orbit model OFF; restored %d component(s) to imported pose."),
+				*FixtureId, Restored);
+		}
+	}
+}
+
+void ARebusFixtureActor::DriveOrbitModel(const FTransform& HeadLocal)
+{
+	if (!bDriveOrbitModel || OrbitComponents.Num() == 0) return;
+
+	const FTransform HeadWorldNow = HeadLocal * GetActorTransform();
+	int32 Driven = 0;
+	for (int32 i = 0; i < OrbitComponents.Num(); ++i)
+	{
+		USceneComponent* Comp = OrbitComponents[i].Get();
+		if (!Comp || !OrbitBindBase.IsValidIndex(i)) continue;
+		Comp->SetWorldTransform(OrbitBindBase[i] * HeadWorldNow);
+		++Driven;
+	}
+	if (Driven == 0) return;
+
+	// Per-update sync log (throttled to meaningful pan/tilt changes) so the Orbit model motion can
+	// be compared against the control-channel head meshes for the A/B confirmation.
+	const FVector2D PanTilt(PanDeg.Current, TiltDeg.Current);
+	if (FMath::Abs(PanTilt.X - LastOrbitLogPanTilt.X) + FMath::Abs(PanTilt.Y - LastOrbitLogPanTilt.Y) > 0.5f)
+	{
+		LastOrbitLogPanTilt = PanTilt;
+		const FRotator HeadRot = HeadLocal.Rotator();
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s: drove Orbit model '%s' pan=%.1f tilt=%.1f headRot=(P=%.1f Y=%.1f R=%.1f) comps=%d"),
+			*FixtureId, *BoundOrbitObjectId, PanTilt.X, PanTilt.Y,
+			HeadRot.Pitch, HeadRot.Yaw, HeadRot.Roll, Driven);
 	}
 }
 

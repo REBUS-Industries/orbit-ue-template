@@ -3,6 +3,8 @@
 #include "RebusJson.h"
 #include "RebusVisualiserLog.h"
 #include "RebusFixtureActor.h"
+#include "RebusFixtureControlSubsystem.h"
+#include "Engine/GameInstance.h"
 
 #include "EngineUtils.h"
 #include "Dom/JsonObject.h"
@@ -33,6 +35,9 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// Hybrid cone-mesh volumetric beam is the default beam mode (v1.0.31); seed it so SceneState
 	// round-trips the control and a respawn re-asserts it via ReapplyAll.
 	Values.Add(TEXT("bMeshBeams"), FRebusPropertyValue::MakeBool(true));
+	// Phase-1 A/B sync test (v1.0.35): drive Orbit-imported fixture models from fixture motion.
+	// Default OFF -- the control-channel meshes stay authoritative; the toggle enables the overlay.
+	Values.Add(TEXT("bDriveOrbitModels"), FRebusPropertyValue::MakeBool(false));
 
 	// Seed the lightest tier as the runtime default (live previs streaming). This overrides the
 	// heavier [SystemSettings] baseline from DefaultEngine.ini for the live stream; the portal
@@ -181,6 +186,21 @@ void URebusSceneSettingsSubsystem::SetMeshBeamsEnabled(bool bEnabled)
 		TEXT("bMeshBeams=%d applied to %d fixture(s) (%s)."),
 		bEnabled ? 1 : 0, Count,
 		bEnabled ? TEXT("cone-mesh beam") : TEXT("fog beam restored"));
+}
+
+void URebusSceneSettingsSubsystem::SetDriveOrbitModelsEnabled(bool bEnabled)
+{
+	// Delegate to the fixture control subsystem (GameInstance-scoped), which owns the fixture
+	// registry + the Orbit bind/scan. World subsystem -> GameInstance subsystem hop.
+	UWorld* World = GetWorld();
+	if (!World) return;
+	if (UGameInstance* GI = World->GetGameInstance())
+	{
+		if (URebusFixtureControlSubsystem* Ctl = GI->GetSubsystem<URebusFixtureControlSubsystem>())
+		{
+			Ctl->SetDriveOrbitModels(bEnabled);
+		}
+	}
 }
 
 void URebusSceneSettingsSubsystem::SetRenderQuality(const FString& Tier)
@@ -364,6 +384,11 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 	else if (Name == TEXT("bMeshBeams"))
 	{
 		SetMeshBeamsEnabled(Value.bBool);
+	}
+	// --- Phase-1 sync test: drive Orbit-imported fixture models from fixture motion ---
+	else if (Name == TEXT("bDriveOrbitModels"))
+	{
+		SetDriveOrbitModelsEnabled(Value.bBool);
 	}
 	// --- Stream Quality (Pixel Streaming encoder params) ---
 	else if (Name == TEXT("StreamStartBitrateMbps"))
