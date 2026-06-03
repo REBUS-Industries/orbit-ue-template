@@ -40,6 +40,16 @@ GROUND_MASTER_PATH = MATERIALS_DIR + "/M_RebusGround"
 # EmissiveColor (linear fixture colour) + EmissiveStrength (dimmer x output) live.
 LENS_FLARE_PATH = MATERIALS_DIR + "/M_RebusLensFlare"
 
+# Hybrid volumetric-beam master (v1.0.31). Unlit + two-sided + ADDITIVE faux-volumetric cone
+# shader: a soft on-axis core falling off toward the silhouette (1 - Fresnel), a length fade from
+# the lens toward the throw (BeamFalloff), and a DepthFade so the shaft soft-clips into geometry /
+# the near camera (camera-occlusion). The C++ fixture actor (RebusFixtureActor::BuildBeamCone)
+# loads it by this path, makes a MID per fixture and drives BeamColor (linear fixture colour) +
+# BeamIntensity (dimmer x output x SetFixtureBeamVolumetrics) live; the cone MESH carries the IES
+# sizing (lens-radius base, fieldAngle far radius). Phase 2 will swap the body for a true raymarch
+# + light-blocking volumetric shadows.
+BEAM_PATH = MATERIALS_DIR + "/M_RebusBeam"
+
 # Portal-controllable ground surface presets: name -> (ColorA, ColorB, Roughness).
 # These drive the procedural M_RebusGround master (no imported image textures needed);
 # the C++ scene-settings subsystem swaps between the generated instances on SetSceneProperty
@@ -185,6 +195,105 @@ def ensure_lens_material(force=False):
         unreal.EditorAssetLibrary.save_loaded_asset(mat)
 
     unreal.log("RebusBaseLevel: lens-flare material ensured.")
+
+
+def _build_beam_master(mat):
+    """Author the faux-volumetric beam graph (v1.0.31).
+
+    Emissive = BeamColor * BeamIntensity * mask, Opacity = mask, where
+      mask = (1 - Fresnel(BeamSharpness)) * pow(1 - V, BeamFalloff) * DepthFade.
+    The (1 - Fresnel) term gives a soft on-axis core that fades toward the cone silhouette; the
+    length term (texcoord V: 0 at the lens base, 1 at the far ring) fades the shaft along the
+    throw; DepthFade soft-clips where the additive shell meets solid geometry / the near camera.
+    Unlit + two-sided + ADDITIVE so it never shows a black card when the fixture is dark, and the
+    back faces add through for a fuller shaft. Scene-depth OCCLUSION (the shaft disappearing behind
+    trusses) is the translucent depth-test against the opaque scene + this DepthFade softening
+    (Phase 1 camera-occlusion). Phase 2 replaces the body with a true raymarch + volumetric shadow.
+    """
+    mel = unreal.MaterialEditingLibrary
+
+    _set(mat, "material_domain", unreal.MaterialDomain.MD_SURFACE)
+    _set(mat, "shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    _set(mat, "blend_mode", unreal.BlendMode.BLEND_ADDITIVE)
+    _set(mat, "two_sided", True)
+
+    color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -820, -220)
+    color.set_editor_property("parameter_name", "BeamColor")
+    color.set_editor_property("default_value", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
+
+    intensity = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -820, 0)
+    intensity.set_editor_property("parameter_name", "BeamIntensity")
+    intensity.set_editor_property("default_value", 0.0)
+
+    sharp = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -820, 320)
+    sharp.set_editor_property("parameter_name", "BeamSharpness")
+    sharp.set_editor_property("default_value", 2.5)
+
+    falloff = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -820, 560)
+    falloff.set_editor_property("parameter_name", "BeamFalloff")
+    falloff.set_editor_property("default_value", 1.6)
+
+    # On-axis core: (1 - Fresnel) so the shell is brightest where it faces the camera and fades
+    # toward the grazing silhouette, reading as a soft solid shaft rather than a hard-edged cone.
+    fres = mel.create_material_expression(mat, unreal.MaterialExpressionFresnel, -600, 300)
+    mel.connect_material_expressions(sharp, "", fres, "ExponentIn")
+    core = mel.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -440, 300)
+    mel.connect_material_expressions(fres, "", core, "")
+
+    # Length fade: V (0 at the lens base, 1 at the far ring) -> pow(1 - V, BeamFalloff).
+    tc = mel.create_material_expression(mat, unreal.MaterialExpressionTextureCoordinate, -820, 760)
+    vmask = mel.create_material_expression(mat, unreal.MaterialExpressionComponentMask, -640, 760)
+    _set(vmask, "r", False)
+    _set(vmask, "g", True)
+    _set(vmask, "b", False)
+    _set(vmask, "a", False)
+    mel.connect_material_expressions(tc, "", vmask, "")
+    inv_v = mel.create_material_expression(mat, unreal.MaterialExpressionOneMinus, -480, 760)
+    mel.connect_material_expressions(vmask, "", inv_v, "")
+    lenfade = mel.create_material_expression(mat, unreal.MaterialExpressionPower, -320, 720)
+    mel.connect_material_expressions(inv_v, "", lenfade, "Base")
+    mel.connect_material_expressions(falloff, "", lenfade, "Exp")
+
+    # Scene-depth soft-clip (camera occlusion / near-face fade). DepthFade's output is a 0..1
+    # factor that approaches 0 as the translucent pixel nears opaque geometry behind it.
+    depth = mel.create_material_expression(mat, unreal.MaterialExpressionDepthFade, -320, 980)
+    _set(depth, "fade_distance_default", 200.0)
+
+    # mask = core * lenfade * depth.
+    m1 = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -160, 480)
+    mel.connect_material_expressions(core, "", m1, "A")
+    mel.connect_material_expressions(lenfade, "", m1, "B")
+    mask = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, 0, 540)
+    mel.connect_material_expressions(m1, "", mask, "A")
+    mel.connect_material_expressions(depth, "", mask, "B")
+
+    # Emissive = BeamColor * BeamIntensity * mask.
+    ci = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -440, -120)
+    mel.connect_material_expressions(color, "", ci, "A")
+    mel.connect_material_expressions(intensity, "", ci, "B")
+    emissive = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -200, -60)
+    mel.connect_material_expressions(ci, "", emissive, "A")
+    mel.connect_material_expressions(mask, "", emissive, "B")
+    mel.connect_material_property(emissive, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+    mel.connect_material_property(mask, "", unreal.MaterialProperty.MP_OPACITY)
+
+    mel.recompile_material(mat)
+
+
+def ensure_beam_material(force=False):
+    """Generate the faux-volumetric beam master material. Idempotent (only creates when missing)
+    unless force=True (delete + regenerate, e.g. during a full build())."""
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+
+    if force and unreal.EditorAssetLibrary.does_asset_exist(BEAM_PATH):
+        unreal.EditorAssetLibrary.delete_asset(BEAM_PATH)
+
+    if not unreal.EditorAssetLibrary.does_asset_exist(BEAM_PATH):
+        mat = tools.create_asset("M_RebusBeam", MATERIALS_DIR, unreal.Material, unreal.MaterialFactoryNew())
+        _build_beam_master(mat)
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+
+    unreal.log("RebusBaseLevel: beam material ensured.")
 
 
 def ensure_ground_materials(force=False):
@@ -354,6 +463,7 @@ def build():
     # instances we just deleted/recreated.
     ensure_ground_materials(force=True)
     ensure_lens_material(force=True)
+    ensure_beam_material(force=True)
 
     les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
 
@@ -377,6 +487,7 @@ def ensure_base_level():
     # Ground + lens materials self-heal independently of the map (cheap if already present).
     ensure_ground_materials()
     ensure_lens_material()
+    ensure_beam_material()
 
     if unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH):
         return False

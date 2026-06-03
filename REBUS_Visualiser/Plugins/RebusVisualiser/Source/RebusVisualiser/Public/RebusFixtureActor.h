@@ -112,6 +112,12 @@ public:
 	// Selection highlight (§5.3).
 	void SetSelected(bool bSelected, bool bPrimary);
 
+	// Toggle the hybrid cone-mesh volumetric beam on/off (SetSceneProperty bMeshBeams, §8.4a).
+	// When ON the mesh beam is the visible shaft and the SpotLight's fog VolumetricScatteringIntensity
+	// is forced to 0 (no competing noisy froxel beam). When OFF the cone mesh is hidden and the
+	// SpotLight's fog scattering is restored (the old fog beam), so the two can be A/B'd at runtime.
+	void SetMeshBeamEnabled(bool bEnabled);
+
 	// REST client used to lazily fetch gobo wheel images / IES bytes.
 	void SetRestClient(TSharedPtr<FRebusRestClient> InClient) { RestClient = InClient; }
 
@@ -144,6 +150,11 @@ private:
 	// fraction of the fixture dimensions (synthetic fallback so something always shows) -> -1
 	// (nothing resolvable). OutSrc names the resolved source for diagnostics.
 	double ResolveLensDiameterMeters(const TCHAR*& OutSrc) const;
+	// ---- Hybrid cone-mesh volumetric beam (Phase 1, §8.4a) ----
+	void BuildBeamCone();          // spawn the procedural cone mesh + per-fixture beam MID
+	void UpdateBeamConeGeometry(); // (re)generate the frustum: base=lens radius, far=Length*tan(half)
+	void RefreshBeamEmissive();    // drive BeamColor/BeamIntensity from live colour x dimmer x gate
+	float ResolveOuterHalfDeg() const; // current outer cone half-angle (zoom range + iris), degrees
 	void RefreshMotion();         // re-solve pan/tilt and push transforms to groups + light
 	void RefreshIntensity();      // fold dimmer * shutter-gate into the light intensity
 	void RecomputeConeAngles();   // from zoom + photometrics + iris/frost
@@ -203,6 +214,36 @@ private:
 	// falls back to a runtime load and logs which asset failed.
 	UPROPERTY() TObjectPtr<UStaticMesh> LensPlaneMesh = nullptr;
 	UPROPERTY() TObjectPtr<UMaterialInterface> LensMaterial = nullptr;
+
+	// Hybrid volumetric beam (Phase 1, §8.4a): a procedural TRUNCATED-CONE (frustum) mesh + an
+	// additive faux-volumetric MID (M_RebusBeam), sized to the IES distribution (base = the lens
+	// radius from ResolveLensDiameterMeters, far = Length*tan(fieldHalfAngle), length = the
+	// SpotLight throw) and parented under FixtureRoot so it rides the head exactly like the
+	// SpotLight + lens disc (BeamConeRest * Head). It coexists with the SpotLight (which keeps
+	// surface lighting + IES + soft shadows); the SpotLight's fog VolumetricScatteringIntensity is
+	// forced to 0 while the mesh beam is on. BeamMaterial is a hard CDO ref so the cooker packages
+	// the master (the runtime LoadObject-by-path is not a cook dependency on its own).
+	UPROPERTY() TObjectPtr<UProceduralMeshComponent> BeamCone = nullptr;
+	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> BeamMID = nullptr;
+	UPROPERTY() TObjectPtr<UMaterialInterface> BeamMaterial = nullptr;
+
+	// Cone-beam geometry/state. BeamConeRest is the rest transform (mesh +Z -> beam forward, at the
+	// beam origin) composed with the head motion each RefreshMotion. LastFarRadius lets zoom ticks
+	// skip a rebuild when the far radius is ~unchanged.
+	FTransform BeamConeRest = FTransform::Identity;
+	float BeamBaseRadiusUnreal = 2.f;    // cone base radius (lens radius), UE cm
+	float BeamLengthUnreal = 6000.f;     // cone length (= SpotLight AttenuationRadius), UE cm
+	float BeamConeLastFarRadius = -1.f;  // last-built far radius (rebuild gate), UE cm
+
+	// bMeshBeams runtime toggle (default true = mesh beam on, fog scattering suppressed). When the
+	// portal pushes bMeshBeams=false the cone hides and FogScatteringIntensity is restored on the
+	// SpotLight. MeshBeamUserScale is the SetFixtureBeamVolumetrics intensity multiplier on the
+	// mesh BeamIntensity; bWantsVolumetricShadow is the parsed castVolumetricShadow flag held for
+	// Phase 2 (true light-blocking volumetric shadows -- not acted on yet).
+	bool bMeshBeamEnabled = true;
+	float MeshBeamUserScale = 1.f;
+	float FogScatteringIntensity = 2.5f;
+	bool bWantsVolumetricShadow = false;
 
 	TSharedPtr<FRebusRestClient> RestClient;
 

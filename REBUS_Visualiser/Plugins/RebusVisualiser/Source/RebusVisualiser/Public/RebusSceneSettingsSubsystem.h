@@ -60,6 +60,11 @@ private:
 	// X=red, Y=green, Z=blue (Unreal convention). Toggled by the bShowOrigin scene property.
 	void SetOriginGizmo(bool bShow);
 
+	// Enable/disable the hybrid cone-mesh volumetric beam on every spawned fixture (bMeshBeams
+	// scene property, default true). When disabled the cone is hidden and each fixture restores
+	// its SpotLight fog VolumetricScatteringIntensity (the old froxel beam), for runtime A/B.
+	void SetMeshBeamsEnabled(bool bEnabled);
+
 	// Apply a MegaLights + volumetric-fog-volume quality tier at runtime ("live"/"previs"/
 	// "final", case-insensitive; unknown -> "live"). Re-tunes r.MegaLights.* via console
 	// override and stores the canonical tier name so SceneState round-trips it.

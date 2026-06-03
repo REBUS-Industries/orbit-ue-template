@@ -310,15 +310,22 @@ drive the same component and can override these at runtime.
 
 Each per-fixture `USpotLightComponent` (`BuildSpotLight`) gets:
 
-- `VolumetricScatteringIntensity = 2.5` — a beam-visible default for haze scatter.
+- `VolumetricScatteringIntensity = 0` while the **hybrid cone-mesh beam** is on (the default,
+  §8.4a) — the mesh shaft is the visible beam, so this light's fog scattering is suppressed to
+  avoid a competing noisy froxel beam. The fog value (2.5) is restored if `bMeshBeams` is toggled
+  off.
 - `bAllowMegaLights = true` — opts the light into MegaLights (5.7's per-light flag; defaults
   true, asserted so the project-level `r.MegaLights.Allow` governs the whole rig).
 - **Hero-beam volumetric-shadow cap**: `SetCastVolumetricShadow(true)` for only the **first 8**
   spotlights created per spawn batch (`RebusMaxVolumetricShadowBeams`); the rest still scatter
   but skip the volumetric shadow pass. The session subsystem resets the budget
   (`ARebusFixtureActor::ResetVolumetricShadowBudget`) before every (re)spawn, so each fresh
-  scene gets its own 8 hero beams. The portal can still override per fixture via
-  `SetFixtureBeamVolumetrics` (`ApplyBeamVolumetrics`).
+  scene gets its own 8 hero beams. (With the mesh beam on, scattering is 0 so the hero-beam
+  volumetric-shadow pass is effectively idle; it applies to the fog beam when `bMeshBeams` is off.)
+- `SetFixtureBeamVolumetrics` (`ApplyBeamVolumetrics`) is **re-pointed (§8.4a)**: it now tunes the
+  **mesh beam** intensity (a multiplier on `BeamIntensity`) rather than the fog scattering. The
+  same value is stored so a `bMeshBeams=false` toggle restores an equivalent fog beam; the
+  `castVolumetricShadow` flag is parsed + held for Phase 2 (true volumetric shadows).
 
 > **Caveat:** UE 5.7 MegaLights + volumetric fog can show artefacts with some sky / height-fog
 > and GPU/driver combinations (flicker, sample noise, banding in the fog volume). The tiers
@@ -470,6 +477,48 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
   is purely **additive** — it never reshapes the SpotLight/IES beam. `BuildLensDisc` logs a single
   consolidated diagnostics line (`lens disc: SPAWNED ... meshOk/matOk ... relScale ... SourceRadius`)
   so a missing asset or zero scale is provable from logs.
+- **Hybrid cone-mesh volumetric beam (§8.4a)** (`RebusFixtureActor::BuildBeamCone`) adds a visible
+  volumetric **shaft** rendered as a procedural mesh — *alongside* (not replacing) the
+  `USpotLightComponent`, which keeps surface lighting + IES + soft shadows. This gives an
+  accurate, **IES-sized beam without the froxel-fog noise**.
+  - **Geometry**: a **truncated cone (frustum)** built with `UProceduralMeshComponent` —
+    **base radius** = the lens radius (`ResolveLensDiameterMeters()/2`, the same value driving
+    `SourceRadius`/the lens disc, so the shaft starts exactly at the lens), **far radius** =
+    `Length × tan(fieldHalfAngle)` where `fieldHalfAngle` is the current outer/field cone
+    half-angle (`ResolveOuterHalfDeg`, shared with the SpotLight cone; zoom-range-clamped, iris-
+    pinched), **length** = the SpotLight `AttenuationRadius` (the throw). Open sides, no caps,
+    outward-radial smooth normals, collision **off**, `CastShadow(false)`. It is parented under
+    `FixtureRoot` and composed with the head motion (`BeamConeRest × Head`, mesh `+Z` → beam
+    forward) so it tracks pan/tilt and matches the v1.0.21 beam direction. The frustum is
+    **regenerated on zoom/iris** (`RecomputeConeAngles → UpdateBeamConeGeometry`, gated to skip
+    rebuilds when the far radius is ~unchanged).
+  - **Material** (`/Game/REBUS/Materials/M_RebusBeam`, authored in `build_rebus_base_level.py`,
+    baked + committed, CDO hard-ref + `/Game/REBUS` cook dir for cook-safety): an **unlit,
+    two-sided, ADDITIVE faux-volumetric** shader. `Emissive = BeamColor × BeamIntensity × mask`,
+    `mask = (1 − Fresnel(BeamSharpness)) × pow(1 − V, BeamFalloff) × DepthFade`. The
+    `(1 − Fresnel)` term gives a soft on-axis core falling off toward the silhouette (radial
+    falloff), `V` (0 at the lens → 1 at the throw) drives the **length attenuation**, and
+    **`DepthFade` + the translucent depth-test against the opaque scene** give the **scene-depth
+    occlusion** (the shaft disappears behind trusses/set pieces from the camera) and a near-face
+    soft-clip. MID params: `BeamColor`, `BeamIntensity`, `BeamSharpness`, `BeamFalloff`. *This
+    Phase-1 shader is a high-quality **faux-volumetric** cone (fresnel + length fade + depth
+    occlusion), not yet a true multi-step raymarch — see Phase 2 below.*
+  - **Driven live**: `SetFixtureColor` → `BeamColor`; `RefreshIntensity` (dimmer × shutter-gate)
+    → `BeamIntensity` (× `SetFixtureBeamVolumetrics` multiplier), so the shaft fades to nothing
+    when dimmed/closed and strobes in lockstep; zoom/iris → frustum + half-angle; pan/tilt → head
+    parenting. Initialised from current state at spawn.
+  - **Coexistence + toggle**: while the mesh beam is on, the SpotLight's fog
+    `VolumetricScatteringIntensity` is **forced to 0** (no competing noisy froxel beam). The
+    `SetSceneProperty` boolean **`bMeshBeams`** (default `true`,
+    `RebusSceneSettingsSubsystem::SetMeshBeamsEnabled`) toggles every fixture's cone on/off and,
+    when off, **restores** the SpotLight fog scattering (the old fog beam) for runtime A/B. The
+    lens-flare disc sits at the cone base (unchanged). `BuildBeamCone` logs a consolidated line
+    (`beam: SPAWNED matOk ... baseRadius/farRadius/length/halfAngle ... BeamIntensity ...
+    occlusion=depthtest+depthfade meshBeams=...`).
+  - **Phase 2 (deferred)**: a true raymarched beam body (N-step inscattering accumulation) and
+    **true light-blocking volumetric shadows** (a shaft that's occluded by geometry *inside* the
+    cone, not just from the camera). The `castVolumetricShadow` field is already parsed + held
+    (`bWantsVolumetricShadow`) for that; only camera/scene-depth occlusion ships in Phase 1.
 - **Mesh→axis bucketing** matches GDTF `affectedGeometryNames`; opaque MVR proxy names
   (`mvr-glb-<uuid>`) that match nothing fall to the static base. The guide's height-plane
   split (§7.6) is the more robust fallback to add if needed.

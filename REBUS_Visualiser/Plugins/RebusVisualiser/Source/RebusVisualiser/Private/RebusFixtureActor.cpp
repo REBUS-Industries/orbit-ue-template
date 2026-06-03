@@ -38,6 +38,15 @@ namespace
 	// by dimmer x shutter-gate so it blooms bright at full and goes dark when fully dimmed (§8.3a).
 	constexpr float RebusLensFlareMaxEmissive = 24.f;
 
+	// Hybrid cone-mesh volumetric beam (§8.4a). Segment count of the procedural frustum (radial
+	// resolution), and the additive beam intensity at FULL output (dimmer=1, gate open, user
+	// multiplier 1) -- scaled live by dimmer x gate x SetFixtureBeamVolumetrics. BeamSharpness =
+	// Fresnel exponent (edge softness), BeamFalloff = length-fade exponent; both seed the MID.
+	constexpr int32 RebusBeamConeSegments = 24;
+	constexpr float RebusMeshBeamMaxIntensity = 3.f;
+	constexpr float RebusBeamSharpness = 2.5f;
+	constexpr float RebusBeamFalloff = 1.6f;
+
 	// Rotation that lays a plane (engine /BasicShapes/Plane, local +Z normal) perpendicular to the
 	// beam: plane +Z -> Forward, plane +X -> Up. Guards a near-parallel up like MakeFromXZ does.
 	FQuat LensDiscRotationFromForward(const FVector& Forward, const FVector& Up)
@@ -79,6 +88,12 @@ ARebusFixtureActor::ARebusFixtureActor()
 	if (PlaneFinder.Succeeded()) LensPlaneMesh = PlaneFinder.Object;
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> LensMatFinder(TEXT("/Game/REBUS/Materials/M_RebusLensFlare.M_RebusLensFlare"));
 	if (LensMatFinder.Succeeded()) LensMaterial = LensMatFinder.Object;
+
+	// Same cook-safety hard-ref for the hybrid beam master (§8.4a): the cooker packages it because
+	// the CDO references it; the per-fixture BuildBeamCone then makes a MID from this (or a runtime
+	// LoadObject fallback). /Game/REBUS is also in DirectoriesToAlwaysCook (v1.0.30).
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> BeamMatFinder(TEXT("/Game/REBUS/Materials/M_RebusBeam.M_RebusBeam"));
+	if (BeamMatFinder.Succeeded()) BeamMaterial = BeamMatFinder.Object;
 }
 
 void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
@@ -149,6 +164,7 @@ void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
 	ResolveHeadAxisFromMeshes();
 	BuildSpotLight();
 	BuildLensDisc();   // emissive lens-flare disc at the beam origin (reuses the beam transform)
+	BuildBeamCone();   // hybrid cone-mesh volumetric beam (sized to IES + lens, rides the head)
 	RefreshMotion();
 	RecomputeConeAngles();
 	RefreshIntensity();
@@ -350,9 +366,12 @@ void ARebusFixtureActor::BuildSpotLight()
 	SpotLight->SetIntensityUnits(ELightUnits::Candelas);
 	SpotLight->SetAttenuationRadius(6000.f);
 
-	// Beam-visible default scattering for haze (§8.4). The fixture scatters into the level's
-	// volumetric height fog regardless of the global MegaLights mode.
-	SpotLight->SetVolumetricScatteringIntensity(2.5f);
+	// Hybrid mesh-beam (Phase 1, §8.4a): the visible shaft is now the cone-mesh beam (BuildBeamCone),
+	// so suppress THIS light's fog scattering to avoid a competing noisy froxel beam while keeping
+	// it for surface lighting + IES + soft shadows. FogScatteringIntensity (2.5) is the value
+	// restored on the SpotLight if the portal toggles bMeshBeams=false (back to the fog beam).
+	// Default mesh-beams-on => scattering 0 here.
+	SpotLight->SetVolumetricScatteringIntensity(bMeshBeamEnabled ? 0.f : FogScatteringIntensity);
 
 	// Opt this fixture light into MegaLights. bAllowMegaLights is the public uint32:1 per-light
 	// flag on ULightComponent (UE 5.7.4 has no Set* accessor for it) and defaults to true, but
@@ -601,6 +620,181 @@ void ARebusFixtureActor::RefreshLensDisc()
 		RebusLensFlareMaxEmissive * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate);
 }
 
+// ---- Hybrid cone-mesh volumetric beam (Phase 1, §8.4a) --------------------------------
+
+float ARebusFixtureActor::ResolveOuterHalfDeg() const
+{
+	// The CURRENT outer (field) cone half-angle, matching the SpotLight's lit cone so the mesh
+	// beam and the real light agree: the zoom half-angle clamped to the fixture's zoom range, then
+	// pinched by the iris (iris 1 = open). Frost is intentionally NOT applied here (it softens the
+	// inner cone + source radius, not the outer field extent).
+	float OuterHalf = ZoomDeg.Current;
+	if (Profile.Zoom.bValid)
+	{
+		OuterHalf = FMath::Clamp(OuterHalf, (float)(Profile.Zoom.MinDeg * 0.5), (float)(Profile.Zoom.MaxDeg * 0.5));
+	}
+	OuterHalf = FMath::Clamp(OuterHalf, 0.5f, 80.f);
+	const float IrisScale = FMath::Lerp(0.4f, 1.f, FMath::Clamp(Iris.Current, 0.f, 1.f));
+	return OuterHalf * IrisScale;
+}
+
+void ARebusFixtureActor::BuildBeamCone()
+{
+	// Base radius = the lens radius (same resolver as the SpotLight SourceRadius + lens disc so the
+	// cone starts exactly at the lens). When no lens size is resolvable, fall back to a small
+	// visible base so the shaft still originates from a finite disc rather than a mathematical apex.
+	const TCHAR* DiamSrc = TEXT("none");
+	const double DiamMeters = ResolveLensDiameterMeters(DiamSrc);
+	BeamBaseRadiusUnreal = (DiamMeters > KINDA_SMALL_NUMBER)
+		? (float)(DiamMeters * 0.5 * RebusCoords::METERS_TO_UNREAL)
+		: 2.f;
+
+	// Length = the SpotLight throw (AttenuationRadius) so the shaft matches the light's reach.
+	BeamLengthUnreal = SpotLight ? SpotLight->AttenuationRadius : 6000.f;
+
+	// Prefer the cook-safe CDO hard-ref; fall back to a runtime load by path (logged on failure).
+	UMaterialInterface* Mat = BeamMaterial
+		? BeamMaterial.Get()
+		: LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/REBUS/Materials/M_RebusBeam.M_RebusBeam"));
+	if (!Mat)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s beam: SKIP (M_RebusBeam failed to load -- ensure /Game/REBUS is cooked)."),
+			*FixtureId);
+		return;
+	}
+
+	BeamCone = NewObject<UProceduralMeshComponent>(this, TEXT("BeamCone"));
+	BeamCone->SetupAttachment(FixtureRoot);
+	BeamCone->RegisterComponent();
+	BeamCone->SetMobility(EComponentMobility::Movable);
+	BeamCone->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	BeamCone->SetCastShadow(false);
+	BeamCone->bCastDynamicShadow = false;
+	BeamCone->SetVisibility(bMeshBeamEnabled);
+
+	BeamMID = UMaterialInstanceDynamic::Create(Mat, this);
+	BeamMID->SetScalarParameterValue(TEXT("BeamSharpness"), RebusBeamSharpness);
+	BeamMID->SetScalarParameterValue(TEXT("BeamFalloff"), RebusBeamFalloff);
+
+	// Rest transform: mesh +Z (the cone axis) -> beam forward, co-located at the beam origin (same
+	// origin the SpotLight + lens disc use), scale 1 (the section is generated directly in cm).
+	BeamConeRest = FTransform(LensDiscRotationFromForward(BeamForwardLocal, BeamUpLocal),
+		BeamRestTransform.GetLocation());
+	BeamCone->SetRelativeTransform(BeamConeRest);
+
+	BeamConeLastFarRadius = -1.f; // force the first section build
+	UpdateBeamConeGeometry();
+	BeamCone->SetMaterial(0, BeamMID);
+	RefreshBeamEmissive();
+
+	const float OuterHalf = ResolveOuterHalfDeg();
+	const float CurIntensity = RebusMeshBeamMaxIntensity * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * MeshBeamUserScale;
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s beam: SPAWNED matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s)"),
+		*FixtureId, BeamBaseRadiusUnreal, BeamConeLastFarRadius, BeamLengthUnreal, OuterHalf,
+		CurIntensity, bMeshBeamEnabled ? 1 : 0, DiamSrc);
+}
+
+void ARebusFixtureActor::UpdateBeamConeGeometry()
+{
+	if (!BeamCone) return;
+
+	const float OuterHalf = ResolveOuterHalfDeg();
+	const float TanHalf = FMath::Tan(FMath::DegreesToRadians(OuterHalf));
+	const float FarRadius = FMath::Max(BeamLengthUnreal * TanHalf, BeamBaseRadiusUnreal + 0.1f);
+
+	// Skip the rebuild when the far radius is essentially unchanged (zoom fades tick every frame).
+	if (BeamConeLastFarRadius >= 0.f && FMath::Abs(FarRadius - BeamConeLastFarRadius) < 0.5f)
+	{
+		return;
+	}
+	BeamConeLastFarRadius = FarRadius;
+
+	const int32 Segs = RebusBeamConeSegments;
+	const float L = BeamLengthUnreal;
+	const float RB = BeamBaseRadiusUnreal;
+	const float RF = FarRadius;
+
+	TArray<FVector> Positions;
+	TArray<int32> Triangles;
+	TArray<FVector> Normals;
+	TArray<FVector2D> UVs;
+	Positions.Reserve(Segs * 2);
+	Normals.Reserve(Segs * 2);
+	UVs.Reserve(Segs * 2);
+	Triangles.Reserve(Segs * 6);
+
+	for (int32 S = 0; S < Segs; ++S)
+	{
+		const float Angle = (2.f * PI * S) / Segs;
+		const float C = FMath::Cos(Angle);
+		const float Sn = FMath::Sin(Angle);
+		Positions.Add(FVector(RB * C, RB * Sn, 0.f)); // base ring (at the lens)
+		Positions.Add(FVector(RF * C, RF * Sn, L));   // far ring (at the throw)
+		const FVector N = FVector(C, Sn, 0.f).GetSafeNormal(); // outward radial (Fresnel rim)
+		Normals.Add(N);
+		Normals.Add(N);
+		UVs.Add(FVector2D((float)S / Segs, 0.f)); // V=0 base
+		UVs.Add(FVector2D((float)S / Segs, 1.f)); // V=1 far (drives the length fade)
+	}
+	for (int32 S = 0; S < Segs; ++S)
+	{
+		const int32 B0 = 2 * S;
+		const int32 F0 = 2 * S + 1;
+		const int32 B1 = 2 * ((S + 1) % Segs);
+		const int32 F1 = 2 * ((S + 1) % Segs) + 1;
+		Triangles.Add(B0); Triangles.Add(F0); Triangles.Add(F1);
+		Triangles.Add(B0); Triangles.Add(F1); Triangles.Add(B1);
+	}
+
+	const TArray<FColor> NoColors;
+	const TArray<FProcMeshTangent> NoTangents;
+	BeamCone->ClearMeshSection(0);
+	BeamCone->CreateMeshSection(0, Positions, Triangles, Normals, UVs, NoColors, NoTangents, /*bCreateCollision*/ false);
+}
+
+void ARebusFixtureActor::RefreshBeamEmissive()
+{
+	if (!BeamMID) return;
+
+	// Same shutter-gate the SpotLight uses, so the beam strobes/blacks-out in lockstep.
+	float Gate = 1.f;
+	switch (ShutterMode)
+	{
+	case ERebusShutterMode::Closed: Gate = 0.f; break;
+	case ERebusShutterMode::Strobe: Gate = (ShutterPhase < 0.5f) ? 1.f : 0.f; break;
+	default: break;
+	}
+
+	const FLinearColor Linear(
+		FMath::Clamp(ColorR.Current, 0.f, 1.f),
+		FMath::Clamp(ColorG.Current, 0.f, 1.f),
+		FMath::Clamp(ColorB.Current, 0.f, 1.f), 1.f);
+	BeamMID->SetVectorParameterValue(TEXT("BeamColor"), Linear);
+	BeamMID->SetScalarParameterValue(TEXT("BeamIntensity"),
+		RebusMeshBeamMaxIntensity * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate * MeshBeamUserScale);
+}
+
+void ARebusFixtureActor::SetMeshBeamEnabled(bool bEnabled)
+{
+	bMeshBeamEnabled = bEnabled;
+	if (BeamCone)
+	{
+		BeamCone->SetVisibility(bEnabled);
+	}
+	if (SpotLight)
+	{
+		// Mesh on => suppress the fog beam; mesh off => restore it so the old froxel beam returns.
+		SpotLight->SetVolumetricScatteringIntensity(bEnabled ? 0.f : FogScatteringIntensity);
+		SpotLight->MarkRenderStateDirty();
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s mesh beam %s (SpotLight fog scattering=%.2f)."),
+		*FixtureId, bEnabled ? TEXT("ENABLED") : TEXT("DISABLED -> fog beam restored"),
+		bEnabled ? 0.f : FogScatteringIntensity);
+}
+
 void ARebusFixtureActor::RefreshMotion()
 {
 	if (!Profile.MotionRig.bValid || Profile.MotionRig.Axes.Num() == 0)
@@ -632,6 +826,15 @@ void ARebusFixtureActor::RefreshMotion()
 				DiscT.SetLocation(LensDiscRest.GetLocation());
 				DiscT.SetScale3D(LensDiscRest.GetScale3D());
 				LensDisc->SetRelativeTransform(DiscT);
+			}
+
+			// Cone-mesh beam rides the same synthetic aim (mesh +Z -> Dir at the beam origin).
+			if (BeamCone)
+			{
+				FTransform BeamT;
+				BeamT.SetRotation(LensDiscRotationFromForward(Dir, BeamUpLocal));
+				BeamT.SetLocation(BeamConeRest.GetLocation());
+				BeamCone->SetRelativeTransform(BeamT);
 			}
 		}
 		return;
@@ -665,6 +868,12 @@ void ARebusFixtureActor::RefreshMotion()
 		{
 			LensDisc->SetRelativeTransform(LensDiscRest * Head);
 		}
+
+		// Cone-mesh beam rides the SAME head transform so the shaft tracks pan/tilt identically.
+		if (BeamCone)
+		{
+			BeamCone->SetRelativeTransform(BeamConeRest * Head);
+		}
 	}
 }
 
@@ -672,18 +881,10 @@ void ARebusFixtureActor::RecomputeConeAngles()
 {
 	if (!SpotLight) return;
 
-	float OuterHalf = ZoomDeg.Current;
-
-	// Clamp to the fixture's zoom range (half-angles) when known (§8.1).
-	if (Profile.Zoom.bValid)
-	{
-		OuterHalf = FMath::Clamp(OuterHalf, (float)(Profile.Zoom.MinDeg * 0.5), (float)(Profile.Zoom.MaxDeg * 0.5));
-	}
-	OuterHalf = FMath::Clamp(OuterHalf, 0.5f, 80.f);
-
-	// Iris pinches the outer cone (iris 1 = open).
-	const float IrisScale = FMath::Lerp(0.4f, 1.f, FMath::Clamp(Iris.Current, 0.f, 1.f));
-	OuterHalf *= IrisScale;
+	// Outer (field) half-angle: zoom clamped to the fixture's zoom range (§8.1) then pinched by the
+	// iris. Shared with the cone-mesh beam (ResolveOuterHalfDeg) so the lit cone and the mesh shaft
+	// always agree.
+	const float OuterHalf = ResolveOuterHalfDeg();
 
 	// Inner cone from the beam/field ratio when available, else 80% of outer. Frost softens
 	// the inner cone toward the outer edge.
@@ -707,6 +908,10 @@ void ARebusFixtureActor::RecomputeConeAngles()
 	{
 		SpotLight->SetSourceRadius(BaseSourceRadiusUnreal * FMath::Lerp(1.f, 4.f, FMath::Clamp(Frost.Current, 0.f, 1.f)));
 	}
+
+	// Keep the cone-mesh beam sized to the same field half-angle (regenerates the frustum far
+	// radius only when zoom/iris actually changed it -- see the rebuild gate in UpdateBeamConeGeometry).
+	UpdateBeamConeGeometry();
 }
 
 void ARebusFixtureActor::RefreshIntensity()
@@ -732,6 +937,10 @@ void ARebusFixtureActor::RefreshIntensity()
 	// Keep the emissive lens disc in lockstep with the live output (same dimmer/colour/shutter
 	// path), so the glowing lens brightens/colours with the beam and darkens when dimmed (§8.3a).
 	RefreshLensDisc();
+
+	// Same for the cone-mesh beam: BeamColor follows the live colour, BeamIntensity follows
+	// dimmer x shutter-gate x SetFixtureBeamVolumetrics, so it fades to nothing when dimmed/closed.
+	RefreshBeamEmissive();
 }
 
 // ---- Control surface ------------------------------------------------------------------
@@ -818,10 +1027,25 @@ void ARebusFixtureActor::ApplyPrism(int32 Facets, float RotationDeg)
 
 void ARebusFixtureActor::ApplyBeamVolumetrics(float Intensity, bool bCastVolumetricShadow)
 {
-	if (!SpotLight) return;
-	SpotLight->SetVolumetricScatteringIntensity(FMath::Clamp(Intensity, 0.f, 10.f));
-	SpotLight->bCastVolumetricShadow = bCastVolumetricShadow;
-	SpotLight->MarkRenderStateDirty();
+	// Phase 1 re-point (§8.4a): this now tunes the MESH beam intensity (a multiplier on
+	// BeamIntensity) rather than the SpotLight fog scattering, since the cone-mesh beam is the
+	// visible shaft. The same value is stored as FogScatteringIntensity so a bMeshBeams=false
+	// toggle restores an equivalent fog beam. castVolumetricShadow is parsed + held for Phase 2
+	// (true light-blocking volumetric shadows) but not acted on yet.
+	const float Clamped = FMath::Clamp(Intensity, 0.f, 10.f);
+	MeshBeamUserScale = Clamped;
+	FogScatteringIntensity = Clamped;
+	bWantsVolumetricShadow = bCastVolumetricShadow;
+
+	if (SpotLight && !bMeshBeamEnabled)
+	{
+		// Only push to the light when the fog beam is the active mode; otherwise it stays at 0.
+		SpotLight->SetVolumetricScatteringIntensity(FogScatteringIntensity);
+		SpotLight->bCastVolumetricShadow = bCastVolumetricShadow;
+		SpotLight->MarkRenderStateDirty();
+	}
+
+	RefreshBeamEmissive();
 }
 
 void ARebusFixtureActor::ApplyGobo(int32 GoboIndex, bool bHasIndex, int32 WheelIndex, const FString& Wheel, float /*FadeSeconds*/)

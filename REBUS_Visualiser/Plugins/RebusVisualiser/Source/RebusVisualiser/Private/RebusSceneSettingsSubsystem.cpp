@@ -2,6 +2,7 @@
 #include "RebusSceneSettingsSubsystem.h"
 #include "RebusJson.h"
 #include "RebusVisualiserLog.h"
+#include "RebusFixtureActor.h"
 
 #include "EngineUtils.h"
 #include "Dom/JsonObject.h"
@@ -29,6 +30,9 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	Values.Add(TEXT("GroundSurface"), FRebusPropertyValue::MakeString(TEXT("Concrete")));
 	Values.Add(TEXT("bGroundVisible"), FRebusPropertyValue::MakeBool(true));
 	Values.Add(TEXT("bShowOrigin"), FRebusPropertyValue::MakeBool(false));
+	// Hybrid cone-mesh volumetric beam is the default beam mode (v1.0.31); seed it so SceneState
+	// round-trips the control and a respawn re-asserts it via ReapplyAll.
+	Values.Add(TEXT("bMeshBeams"), FRebusPropertyValue::MakeBool(true));
 
 	// Seed the lightest tier as the runtime default (live previs streaming). This overrides the
 	// heavier [SystemSettings] baseline from DefaultEngine.ini for the live stream; the portal
@@ -157,6 +161,26 @@ void URebusSceneSettingsSubsystem::SetOriginGizmo(bool bShow)
 #else
 	UE_LOG(LogRebusVisualiser, Warning, TEXT("Origin gizmo unavailable: debug draw is compiled out in this build."));
 #endif
+}
+
+void URebusSceneSettingsSubsystem::SetMeshBeamsEnabled(bool bEnabled)
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	int32 Count = 0;
+	for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+	{
+		if (ARebusFixtureActor* Fixture = *It)
+		{
+			Fixture->SetMeshBeamEnabled(bEnabled);
+			++Count;
+		}
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("bMeshBeams=%d applied to %d fixture(s) (%s)."),
+		bEnabled ? 1 : 0, Count,
+		bEnabled ? TEXT("cone-mesh beam") : TEXT("fog beam restored"));
 }
 
 void URebusSceneSettingsSubsystem::SetRenderQuality(const FString& Tier)
@@ -335,6 +359,11 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 	else if (Name == TEXT("bShowOrigin"))
 	{
 		SetOriginGizmo(Value.bBool);
+	}
+	// --- Hybrid beam mode: cone-mesh volumetric beam vs the old fog beam (§8.4a) ---
+	else if (Name == TEXT("bMeshBeams"))
+	{
+		SetMeshBeamsEnabled(Value.bBool);
 	}
 	// --- Stream Quality (Pixel Streaming encoder params) ---
 	else if (Name == TEXT("StreamStartBitrateMbps"))
