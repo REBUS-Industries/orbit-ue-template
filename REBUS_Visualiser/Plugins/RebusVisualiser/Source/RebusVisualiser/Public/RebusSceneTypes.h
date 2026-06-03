@@ -224,3 +224,40 @@ struct FRebusInlineIesPending
 	int32 Part = 0;
 	int32 PartCount = 1;
 };
+
+// ---- Inline gobos (RegisterFixtureGobos data-channel push) -----------------------------
+//
+// The portal can push gobo wheel images inline as base64 over the data channel (REST-free
+// alternative to fetching a signed imageUrl). One finalized image per (libraryId, wheel, slot);
+// the fixture actor decodes it to a UTexture2D lazily on selection and prefers it over a URL.
+
+struct FRebusInlineGobo
+{
+	FString Wheel;       // wheel id/name this slot belongs to
+	FString WheelKind;   // "gobo" | "color" | ... (lower-cased); used to find the gobo wheel
+	int32 Slot = 0;      // 0-based slot index within the wheel (correlates to goboIndex)
+	FString Name;
+	FString Mime;        // "image/png" | "image/jpeg" | ... (informational; decode auto-detects)
+	FString ImageUrl;    // absolute signed GCS url fallback when no inline bytes
+	TArray<uint8> Bytes; // decoded (base64 -> bytes) image data; empty => use ImageUrl
+};
+
+struct FRebusInlineGobos
+{
+	TArray<FRebusInlineGobo> Gobos; // finalized, one per (wheel, slot)
+};
+
+// Scratch accumulator entry for RegisterFixtureGobos before finalization: a single gobos[]
+// element from one (possibly chunked) message, holding one fragment of a (wheel,slot) image.
+struct FRebusInlineGoboPending
+{
+	FString Wheel;
+	FString WheelKind;
+	int32 Slot = 0;
+	FString Name;
+	FString Mime;
+	FString ImageUrl;
+	FString DataBase64;  // one fragment (part); concatenated by part before a single decode
+	int32 Part = 0;
+	int32 PartCount = 1;
+};

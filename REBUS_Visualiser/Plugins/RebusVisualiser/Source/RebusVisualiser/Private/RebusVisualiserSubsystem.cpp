@@ -18,6 +18,7 @@
 #include "Serialization/JsonSerializer.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/Pawn.h"
+#include "Misc/Base64.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #include "Misc/ConfigCacheIni.h"
@@ -366,6 +367,7 @@ void URebusVisualiserSubsystem::SpawnAllFixtures()
 	static const FRebusFixtureProfile EmptyProfile;
 	static const FRebusMeshBundle EmptyMeshes;
 	static const FRebusInlineIes EmptyInlineIes;
+	static const FRebusInlineGobos EmptyInlineGobos;
 
 	// Fresh "hero beam" volumetric-shadow budget per (re)spawn so the first N fixtures of this
 	// scene get volumetric shadows (the cap is enforced in ARebusFixtureActor::BuildSpotLight).
@@ -379,6 +381,8 @@ void URebusVisualiserSubsystem::SpawnAllFixtures()
 		if (!Meshes) Meshes = &EmptyMeshes;
 		const FRebusInlineIes* InlineIes = F.LibraryFixtureId.IsEmpty() ? &EmptyInlineIes : InlineIesCache.Find(F.LibraryFixtureId);
 		if (!InlineIes) InlineIes = &EmptyInlineIes;
+		const FRebusInlineGobos* InlineGobos = F.LibraryFixtureId.IsEmpty() ? &EmptyInlineGobos : InlineGoboCache.Find(F.LibraryFixtureId);
+		if (!InlineGobos) InlineGobos = &EmptyInlineGobos;
 
 		FActorSpawnParameters Params;
 		Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
@@ -386,7 +390,7 @@ void URebusVisualiserSubsystem::SpawnAllFixtures()
 		if (!Actor) continue;
 
 		Actor->SetRestClient(Rest);
-		Actor->Setup(F, *Profile, *Meshes, *InlineIes);
+		Actor->Setup(F, *Profile, *Meshes, *InlineIes, *InlineGobos);
 
 		Ctl->RegisterFixture(F.Id, Actor); // register under the Speckle node id (§3)
 		SpawnedFixtures.Add(Actor);
@@ -484,11 +488,14 @@ void URebusVisualiserSubsystem::HandleSceneDefinition(const FString& Type, const
 	if (Type == TEXT("ClearScene"))
 	{
 		ClearSpawnedFixtures();
-		// Drop the inline-IES cache + its accumulation scratch alongside the fixtures, so a
-		// subsequent push starts clean (mirrors clearing the pushed scene).
+		// Drop the inline-IES + inline-gobo caches and their accumulation scratch alongside the
+		// fixtures, so a subsequent push starts clean (mirrors clearing the pushed scene).
 		InlineIesCache.Empty();
 		PendingIesProfiles.Empty();
 		PendingIesChunksSeen.Empty();
+		InlineGoboCache.Empty();
+		PendingGoboEntries.Empty();
+		PendingGoboChunksSeen.Empty();
 		UE_LOG(LogRebusVisualiser, Log, TEXT("ClearScene: removed all pushed fixtures."));
 		if (bReadySent) BroadcastHandshake();
 		return;
@@ -726,6 +733,186 @@ void URebusVisualiserSubsystem::HandleSceneDefinition(const FString& Type, const
 		{
 			ClearSpawnedFixtures();
 			SpawnAllFixtures();
+		}
+		return;
+	}
+
+	if (Type == TEXT("RegisterFixtureGobos"))
+	{
+		// Inline base64 gobo wheel images pushed over the data channel (REST-free alternative to
+		// fetching a signed imageUrl). Same two-level accumulation as RegisterFixtureIes:
+		//   * message-level (chunkIndex/chunkCount): gobos[] are appended per libraryId,
+		//     order-independent, finalized once chunkCount messages arrive;
+		//   * per-image fragmentation (part/partCount): within the accumulated entries we group
+		//     by (wheel, slot) and concatenate dataBase64 fragments (sorted by part) BEFORE a
+		//     single base64 decode, otherwise the lone entry's dataBase64 is the whole image.
+		// { libraryId, gobos:[{ wheel, wheelKind|kind|type, slot, name, dataBase64|data,
+		//   mime|contentType, imageUrl|url, part?, partCount? }], chunkIndex?, chunkCount? }
+		//
+		// Field-name aliases are accepted because the authoritative contract lives in the portal
+		// docs; we log unknown variants by simply ignoring them (tolerant by design).
+		auto FirstString = [](const TSharedPtr<FJsonObject>& Obj, std::initializer_list<const TCHAR*> Keys, FString& Out) -> bool
+		{
+			for (const TCHAR* Key : Keys)
+			{
+				if (RebusJson::TryGetString(Obj, Key, Out) && !Out.IsEmpty()) return true;
+			}
+			return false;
+		};
+
+		FString LibraryId;
+		RebusJson::TryGetString(Msg, TEXT("libraryId"), LibraryId);
+		const TArray<TSharedPtr<FJsonValue>>* GobosArr = nullptr;
+		if (LibraryId.IsEmpty() || !Msg->TryGetArrayField(TEXT("gobos"), GobosArr) || !GobosArr)
+		{
+			UE_LOG(LogRebusVisualiser, Warning, TEXT("RegisterFixtureGobos missing libraryId/gobos; ignoring."));
+			return;
+		}
+
+		double ChunkCountD = 1.0;
+		double ChunkIndexD = 0.0;
+		RebusJson::TryGetNumber(Msg, TEXT("chunkCount"), ChunkCountD);
+		RebusJson::TryGetNumber(Msg, TEXT("chunkIndex"), ChunkIndexD);
+		const int32 ChunkCount = FMath::Max(1, (int32)ChunkCountD);
+		const int32 ChunkIndex = FMath::Max(0, (int32)ChunkIndexD);
+
+		// Append this message's gobos[] entries into the per-libraryId accumulator.
+		TArray<FRebusInlineGoboPending>& Accum = PendingGoboEntries.FindOrAdd(LibraryId);
+		int32 EntriesInMsg = 0;
+		for (const TSharedPtr<FJsonValue>& Val : *GobosArr)
+		{
+			const TSharedPtr<FJsonObject> GObj = Val.IsValid() ? Val->AsObject() : nullptr;
+			if (!GObj.IsValid()) continue;
+
+			FRebusInlineGoboPending Entry;
+			RebusJson::TryGetString(GObj, TEXT("wheel"), Entry.Wheel);
+			FirstString(GObj, { TEXT("wheelKind"), TEXT("kind"), TEXT("type") }, Entry.WheelKind);
+			Entry.WheelKind.ToLowerInline();
+			RebusJson::TryGetString(GObj, TEXT("name"), Entry.Name);
+			FirstString(GObj, { TEXT("mime"), TEXT("contentType") }, Entry.Mime);
+			FirstString(GObj, { TEXT("imageUrl"), TEXT("url") }, Entry.ImageUrl);
+			FirstString(GObj, { TEXT("dataBase64"), TEXT("data") }, Entry.DataBase64);
+
+			double Num = 0.0;
+			if (RebusJson::TryGetNumber(GObj, TEXT("slot"), Num)) Entry.Slot = (int32)Num;
+			if (RebusJson::TryGetNumber(GObj, TEXT("part"), Num)) Entry.Part = (int32)Num;
+			if (RebusJson::TryGetNumber(GObj, TEXT("partCount"), Num)) Entry.PartCount = FMath::Max(1, (int32)Num);
+
+			Accum.Add(MoveTemp(Entry));
+			++EntriesInMsg;
+		}
+
+		const int32 Seen = ++PendingGoboChunksSeen.FindOrAdd(LibraryId);
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("RegisterFixtureGobos '%s' chunk %d/%d (%d gobo entr(ies) in msg, %d accumulated)."),
+			*LibraryId, ChunkIndex + 1, ChunkCount, EntriesInMsg, Accum.Num());
+
+		// Complete when we've seen all messages (or this is a single non-chunked message).
+		if (Seen < ChunkCount)
+		{
+			return;
+		}
+
+		// Finalize: group by (wheel, slot), reassemble part fragments, base64-decode once each.
+		TArray<FRebusInlineGoboPending> Pending = MoveTemp(Accum);
+		PendingGoboEntries.Remove(LibraryId);
+		PendingGoboChunksSeen.Remove(LibraryId);
+
+		// Group by (wheel, slot), preserving first-seen order. The unit-separator key avoids
+		// collisions between e.g. wheel "1" slot "23" and wheel "12" slot "3".
+		TArray<FString> Order;
+		TMap<FString, TArray<FRebusInlineGoboPending>> ByKey;
+		for (FRebusInlineGoboPending& Entry : Pending)
+		{
+			const FString Key = FString::Printf(TEXT("%s\x1f%d"), *Entry.Wheel, Entry.Slot);
+			TArray<FRebusInlineGoboPending>& List = ByKey.FindOrAdd(Key);
+			if (List.Num() == 0) Order.Add(Key);
+			List.Add(MoveTemp(Entry));
+		}
+
+		FRebusInlineGobos Finalized;
+		int32 TotalBytes = 0;
+		TSet<FString> WheelSet;
+		for (const FString& Key : Order)
+		{
+			TArray<FRebusInlineGoboPending>& List = ByKey[Key];
+
+			// If any fragment declares partCount > 1, this image's dataBase64 was split: sort by
+			// part and concatenate to rebuild the full base64 string BEFORE decoding.
+			bool bFragmented = false;
+			for (const FRebusInlineGoboPending& E : List) { if (E.PartCount > 1) { bFragmented = true; break; } }
+			if (bFragmented)
+			{
+				List.Sort([](const FRebusInlineGoboPending& A, const FRebusInlineGoboPending& B)
+				{
+					return A.Part < B.Part;
+				});
+			}
+
+			FRebusInlineGobo Out;
+			FString FullBase64;
+			bool bMetaSet = false;
+			for (const FRebusInlineGoboPending& E : List)
+			{
+				FullBase64 += E.DataBase64;
+				if (!bMetaSet)
+				{
+					Out.Wheel = E.Wheel;
+					Out.WheelKind = E.WheelKind;
+					Out.Slot = E.Slot;
+					Out.Name = E.Name;
+					Out.Mime = E.Mime;
+					Out.ImageUrl = E.ImageUrl;
+					bMetaSet = true;
+				}
+				else if (Out.ImageUrl.IsEmpty() && !E.ImageUrl.IsEmpty())
+				{
+					Out.ImageUrl = E.ImageUrl; // keep a fallback url from any fragment
+				}
+			}
+
+			if (!FullBase64.IsEmpty())
+			{
+				if (!FBase64::Decode(FullBase64, Out.Bytes))
+				{
+					UE_LOG(LogRebusVisualiser, Warning,
+						TEXT("RegisterFixtureGobos '%s' wheel='%s' slot=%d: base64 decode failed; keeping url fallback."),
+						*LibraryId, *Out.Wheel, Out.Slot);
+					Out.Bytes.Reset();
+				}
+			}
+
+			// Keep the entry when it has either inline bytes or a url fallback.
+			if (Out.Bytes.Num() == 0 && Out.ImageUrl.IsEmpty())
+			{
+				continue;
+			}
+			TotalBytes += Out.Bytes.Num();
+			WheelSet.Add(Out.Wheel);
+			Finalized.Gobos.Add(MoveTemp(Out));
+		}
+
+		const int32 NumGobos = Finalized.Gobos.Num();
+		const int32 NumWheels = WheelSet.Num();
+		InlineGoboCache.Add(LibraryId, MoveTemp(Finalized));
+
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("RegisterFixtureGobos '%s' complete: %d gobo image(s) across %d wheel(s), %d total bytes."),
+			*LibraryId, NumGobos, NumWheels, TotalBytes);
+
+		// Targeted re-apply: push the new inline gobos into the already-spawned fixtures of this
+		// libraryId and re-assign their currently-selected gobo, so it appears without a reselect
+		// (no full re-spawn needed, which would otherwise drop the live gobo selection).
+		if (bFixturesSpawned)
+		{
+			const FRebusInlineGobos& Cached = InlineGoboCache[LibraryId];
+			for (ARebusFixtureActor* F : SpawnedFixtures)
+			{
+				if (F && F->GetLibraryFixtureId() == LibraryId)
+				{
+					F->SetInlineGobos(Cached);
+				}
+			}
 		}
 		return;
 	}

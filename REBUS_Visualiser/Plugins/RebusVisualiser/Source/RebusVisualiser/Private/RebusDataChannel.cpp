@@ -199,7 +199,7 @@ void FRebusDataChannel::HandleDescriptor(const FString& Descriptor)
 
 	// Portal-pushed scene/fixture definition (data-channel alternative to /api/ue/scene). The
 	// session owns scene parsing + fixture spawning, so route these straight to it.
-	if (Type == TEXT("LoadScene") || Type == TEXT("RegisterFixtureProfile") || Type == TEXT("RegisterFixtureMeshes") || Type == TEXT("RegisterFixtureIes") || Type == TEXT("ClearScene"))
+	if (Type == TEXT("LoadScene") || Type == TEXT("RegisterFixtureProfile") || Type == TEXT("RegisterFixtureMeshes") || Type == TEXT("RegisterFixtureIes") || Type == TEXT("RegisterFixtureGobos") || Type == TEXT("ClearScene"))
 	{
 		OnSceneDefinition.ExecuteIfBound(Type, Msg);
 		return;

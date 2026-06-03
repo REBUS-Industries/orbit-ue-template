@@ -55,9 +55,9 @@ void URebusFixtureControlSubsystem::SetFixtureZoom(const FString& Id, float Zoom
 {
 	if (ARebusFixtureActor* F = FindFixture(Id)) F->ApplyZoom(ZoomDeg, FadeSeconds);
 }
-void URebusFixtureControlSubsystem::SetFixtureGobo(const FString& Id, int32 GoboIndex, bool bHasIndex, float FadeSeconds)
+void URebusFixtureControlSubsystem::SetFixtureGobo(const FString& Id, int32 GoboIndex, bool bHasIndex, const FString& Wheel, float FadeSeconds)
 {
-	if (ARebusFixtureActor* F = FindFixture(Id)) F->ApplyGobo(GoboIndex, bHasIndex, FadeSeconds);
+	if (ARebusFixtureActor* F = FindFixture(Id)) F->ApplyGobo(GoboIndex, bHasIndex, Wheel, FadeSeconds);
 }
 void URebusFixtureControlSubsystem::SetFixtureIris(const FString& Id, float Iris01, float FadeSeconds)
 {
@@ -175,7 +175,11 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 		const TSharedPtr<FJsonValue> V = Msg->TryGetField(TEXT("goboIndex"));
 		const bool bHasIndex = V.IsValid() && V->Type == EJson::Number;
 		const int32 Index = bHasIndex ? (int32)V->AsNumber() : 0;
-		SetFixtureGobo(Id, Index, bHasIndex, Fade);
+		// Optional forward-compat wheel hint to disambiguate multi-wheel fixtures (the portal
+		// may add it later); absent => first gobo-kind wheel.
+		FString Wheel;
+		RebusJson::TryGetString(Msg, TEXT("wheel"), Wheel);
+		SetFixtureGobo(Id, Index, bHasIndex, Wheel, Fade);
 		return true;
 	}
 	if (Type == TEXT("SetFixtureIris"))

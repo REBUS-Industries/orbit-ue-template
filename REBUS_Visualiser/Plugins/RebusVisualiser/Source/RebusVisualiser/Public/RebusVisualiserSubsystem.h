@@ -125,6 +125,19 @@ private:
 	TMap<FString, TArray<FRebusInlineIesPending>> PendingIesProfiles;
 	TMap<FString, int32> PendingIesChunksSeen;
 
+	// Inline gobos (RegisterFixtureGobos): base64 wheel images pushed over the data channel,
+	// finalized per libraryId into a list of (wheel, slot) -> decoded image bytes. The fixture
+	// actor builds the UTexture2D lazily on selection and prefers these over a URL fetch.
+	TMap<FString, FRebusInlineGobos> InlineGoboCache;
+
+	// Two-level accumulation scratch for RegisterFixtureGobos (mirrors the IES/mesh members):
+	//   * PendingGoboEntries    -- raw gobos[] entries appended per libraryId across messages,
+	//   * PendingGoboChunksSeen -- message count per libraryId (finalize once chunkCount arrive).
+	// On finalize we group entries by (wheel, slot) and concatenate part fragments (part/
+	// partCount) of dataBase64 before a single decode.
+	TMap<FString, TArray<FRebusInlineGoboPending>> PendingGoboEntries;
+	TMap<FString, int32> PendingGoboChunksSeen;
+
 	UPROPERTY() TArray<TObjectPtr<ARebusFixtureActor>> SpawnedFixtures;
 
 	FTSTicker::FDelegateHandle TickHandle;

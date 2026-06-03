@@ -50,16 +50,19 @@ ARebusFixtureActor::ARebusFixtureActor()
 
 void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
 	const FRebusFixtureProfile& InProfile, const FRebusMeshBundle& InMeshes,
-	const FRebusInlineIes& InInlineIes)
+	const FRebusInlineIes& InInlineIes, const FRebusInlineGobos& InInlineGobos)
 {
 	FixtureId = InSceneFixture.Id;
 	LibraryFixtureId = InSceneFixture.LibraryFixtureId;
 	DisplayName = InSceneFixture.Name;
 	Profile = InProfile;
 	InlineIes = InInlineIes;
+	InlineGobos = InInlineGobos;
 
 	bHasPanTilt = Profile.MotionRig.bValid && Profile.MotionRig.Axes.Num() > 0;
-	bHasGobo = FindFirstGoboWheel(Profile) != INDEX_NONE;
+	// A fixture has gobos if its profile carries a gobo wheel OR the portal pushed inline gobo
+	// images for it over the data channel (RegisterFixtureGobos).
+	bHasGobo = FindFirstGoboWheel(Profile) != INDEX_NONE || InlineGobos.Gobos.Num() > 0;
 
 	// Place the fixture root from the instance matrix (genuinely Z-up, §7.4 step 7).
 	if (InSceneFixture.bHasMatrix)
@@ -619,17 +622,30 @@ void ARebusFixtureActor::ApplyBeamVolumetrics(float Intensity, bool bCastVolumet
 	SpotLight->MarkRenderStateDirty();
 }
 
-void ARebusFixtureActor::ApplyGobo(int32 GoboIndex, bool bHasIndex, float /*FadeSeconds*/)
+void ARebusFixtureActor::ApplyGobo(int32 GoboIndex, bool bHasIndex, const FString& Wheel, float /*FadeSeconds*/)
 {
 	// Discrete: switch the slot immediately (a wheel slot can't be half-selected, §11).
 	if (!bHasIndex)
 	{
 		CurrentGoboIndex = INDEX_NONE;
+		CurrentGoboWheel = Wheel;
 		if (SpotLight) SpotLight->SetLightFunctionMaterial(nullptr);
 		return;
 	}
 	CurrentGoboIndex = GoboIndex;
-	FetchAndAssignGobo(GoboIndex);
+	CurrentGoboWheel = Wheel; // remembered so a RegisterFixtureGobos re-push can re-apply it
+	AssignGobo(GoboIndex, Wheel);
+}
+
+void ARebusFixtureActor::SetInlineGobos(const FRebusInlineGobos& InInlineGobos)
+{
+	InlineGobos = InInlineGobos;
+	if (InlineGobos.Gobos.Num() > 0) bHasGobo = true;
+	// Refresh the live selection so the newly-pushed image appears without a reselect.
+	if (CurrentGoboIndex != INDEX_NONE)
+	{
+		AssignGobo(CurrentGoboIndex, CurrentGoboWheel);
+	}
 }
 
 // ---- IES / gobo fetch -----------------------------------------------------------------
@@ -748,39 +764,120 @@ void ARebusFixtureActor::FetchAndAssignIes(const FString& IesUrl)
 		}));
 }
 
+const FRebusInlineGobo* ARebusFixtureActor::SelectInlineGobo(int32 Slot, const FString& WheelHint) const
+{
+	if (InlineGobos.Gobos.Num() == 0) return nullptr;
+
+	// Resolve the target wheel: an explicit hint (forward-compat SetFixtureGobo.wheel) wins;
+	// otherwise the first gobo-kind wheel, falling back to the first wheel present. This mirrors
+	// the URL path's FindFirstGoboWheel selection.
+	FString TargetWheel = WheelHint;
+	if (TargetWheel.IsEmpty())
+	{
+		for (const FRebusInlineGobo& G : InlineGobos.Gobos)
+		{
+			if (G.WheelKind.Equals(TEXT("gobo"), ESearchCase::IgnoreCase)) { TargetWheel = G.Wheel; break; }
+		}
+		if (TargetWheel.IsEmpty()) TargetWheel = InlineGobos.Gobos[0].Wheel;
+	}
+
+	for (const FRebusInlineGobo& G : InlineGobos.Gobos)
+	{
+		if (G.Slot == Slot && G.Wheel.Equals(TargetWheel, ESearchCase::IgnoreCase))
+		{
+			return &G;
+		}
+	}
+	// No exact wheel match: when no hint was given, accept any wheel's matching slot.
+	if (WheelHint.IsEmpty())
+	{
+		for (const FRebusInlineGobo& G : InlineGobos.Gobos)
+		{
+			if (G.Slot == Slot) return &G;
+		}
+	}
+	return nullptr;
+}
+
+bool ARebusFixtureActor::ApplyGoboTextureFromBytes(const TArray<uint8>& Bytes)
+{
+	if (!SpotLight || Bytes.Num() == 0) return false;
+
+	// Decode the bytes to a transient UTexture2D (auto-detects PNG/JPEG/etc) and feed it into
+	// the light-function MID -- the SAME assignment path the URL fetch uses. Projecting it as a
+	// true light-function needs a light-function material in content (M_RebusGobo with a
+	// Texture2D param); see README "Gobo decode" for the wiring.
+	UTexture2D* Tex = FImageUtils::ImportBufferAsTexture2D(Bytes);
+	if (Tex && GoboMID)
+	{
+		GoboMID->SetTextureParameterValue(TEXT("GoboTexture"), Tex);
+		SpotLight->SetLightFunctionMaterial(GoboMID);
+		return true;
+	}
+	return false;
+}
+
+void ARebusFixtureActor::AssignGobo(int32 GoboIndex, const FString& WheelHint)
+{
+	if (!SpotLight) return;
+
+	// 1) Prefer an inline base64 image pushed via RegisterFixtureGobos (no REST fetch).
+	if (const FRebusInlineGobo* Inline = SelectInlineGobo(GoboIndex, WheelHint))
+	{
+		if (Inline->Bytes.Num() > 0 && ApplyGoboTextureFromBytes(Inline->Bytes))
+		{
+			UE_LOG(LogRebusVisualiser, Verbose,
+				TEXT("Fixture %s gobo assigned (source=inline wheel='%s' slot=%d, %d bytes)."),
+				*FixtureId, *Inline->Wheel, Inline->Slot, Inline->Bytes.Num());
+			return;
+		}
+		// 2) Inline entry carries only a signed url fallback (or its bytes failed to decode).
+		if (!Inline->ImageUrl.IsEmpty())
+		{
+			UE_LOG(LogRebusVisualiser, Verbose,
+				TEXT("Fixture %s gobo assigned (source=inline-url wheel='%s' slot=%d)."),
+				*FixtureId, *Inline->Wheel, Inline->Slot);
+			FetchAndAssignGoboFromUrl(Inline->ImageUrl);
+			return;
+		}
+	}
+
+	// 3) Fall back to the profile wheel's signed imageUrl (existing REST path).
+	FetchAndAssignGobo(GoboIndex);
+}
+
 void ARebusFixtureActor::FetchAndAssignGobo(int32 GoboIndex)
 {
-	if (!RestClient.IsValid() || !SpotLight) return;
+	if (!SpotLight) return;
 
 	const int32 WheelIdx = FindFirstGoboWheel(Profile);
-	if (WheelIdx == INDEX_NONE || !Profile.Wheels.IsValidIndex(WheelIdx)) return;
+	if (WheelIdx == INDEX_NONE || !Profile.Wheels.IsValidIndex(WheelIdx))
+	{
+		UE_LOG(LogRebusVisualiser, Verbose, TEXT("Fixture %s gobo: no inline image and no profile wheel (source=none)."), *FixtureId);
+		return;
+	}
 	const FRebusWheel& Wheel = Profile.Wheels[WheelIdx];
 	if (!Wheel.Slots.IsValidIndex(GoboIndex) || Wheel.Slots[GoboIndex].ImageUrl.IsEmpty())
 	{
 		SpotLight->SetLightFunctionMaterial(nullptr); // no media for this slot = clear
 		return;
 	}
+	FetchAndAssignGoboFromUrl(Wheel.Slots[GoboIndex].ImageUrl);
+}
 
-	const FString ImageUrl = Wheel.Slots[GoboIndex].ImageUrl;
+void ARebusFixtureActor::FetchAndAssignGoboFromUrl(const FString& ImageUrl)
+{
+	if (!RestClient.IsValid() || !SpotLight || ImageUrl.IsEmpty()) return;
+
 	TWeakObjectPtr<ARebusFixtureActor> WeakThis(this);
 	RestClient->FetchBytes(ImageUrl, FRebusBytesFetched::CreateLambda(
 		[WeakThis](bool bOk, const TArray<uint8>& Bytes)
 		{
 			ARebusFixtureActor* Self = WeakThis.Get();
 			if (!Self || !bOk || !Self->SpotLight) return;
-
-			// Decode the bytes to a transient UTexture2D and feed it into a light-function MID.
-			// Projecting it as a true light-function needs a light-function material in content
-			// (M_RebusGobo with a Texture2D param). See README "Gobo decode" for the wiring.
-			UTexture2D* Tex = Self->RestClient.IsValid()
-				? FImageUtils::ImportBufferAsTexture2D(Bytes) : nullptr;
-			if (Tex && Self->GoboMID)
-			{
-				Self->GoboMID->SetTextureParameterValue(TEXT("GoboTexture"), Tex);
-				Self->SpotLight->SetLightFunctionMaterial(Self->GoboMID);
-			}
-			UE_LOG(LogRebusVisualiser, Verbose, TEXT("Fixture %s gobo image fetched (%d bytes, decoded=%d)."),
-				*Self->FixtureId, Bytes.Num(), Tex != nullptr);
+			const bool bApplied = Self->ApplyGoboTextureFromBytes(Bytes);
+			UE_LOG(LogRebusVisualiser, Verbose, TEXT("Fixture %s gobo image fetched (%d bytes, applied=%d)."),
+				*Self->FixtureId, Bytes.Num(), bApplied);
 		}));
 }
 

@@ -76,18 +76,26 @@ public:
 
 	// Build the actor from the scene placement + profile. Meshes may be empty (light-only).
 	// InInlineIes carries any RegisterFixtureIes raw .ies profiles pushed for this libraryId
-	// (preferred over a URL fetch in SelectIesForZoom); may be empty.
+	// (preferred over a URL fetch in SelectIesForZoom); InInlineGobos carries any
+	// RegisterFixtureGobos base64 images (preferred over a URL fetch in ApplyGobo). Both empty.
 	void Setup(const FRebusSceneFixture& InSceneFixture,
 		const FRebusFixtureProfile& InProfile,
 		const FRebusMeshBundle& InMeshes,
-		const FRebusInlineIes& InInlineIes);
+		const FRebusInlineIes& InInlineIes,
+		const FRebusInlineGobos& InInlineGobos);
+
+	// Swap the inline gobo image set (RegisterFixtureGobos re-push) and re-apply the currently
+	// selected gobo so it refreshes without a reselect. Empty set clears nothing already shown.
+	void SetInlineGobos(const FRebusInlineGobos& InInlineGobos);
 
 	// ---- Control surface (§5.2). Each takes an optional fade in seconds (<=0 = snap). ----
 	void ApplyDimmer(float Intensity01, float FadeSeconds = 0.f);
 	void ApplyColor(const FLinearColor& SrgbColor, float FadeSeconds = 0.f);
 	void ApplyPanTilt(float PanDeg, float TiltDeg, float FadeSeconds = 0.f);
 	void ApplyZoom(float ZoomHalfAngleDeg, float FadeSeconds = 0.f);
-	void ApplyGobo(int32 GoboIndex, bool bHasIndex, float FadeSeconds = 0.f); // bHasIndex=false => clear
+	// bHasIndex=false => clear. Wheel is an optional hint to disambiguate multi-wheel fixtures
+	// (SetFixtureGobo may add it later); empty => first gobo-kind wheel.
+	void ApplyGobo(int32 GoboIndex, bool bHasIndex, const FString& Wheel = FString(), float FadeSeconds = 0.f);
 	void ApplyIris(float Iris01, float FadeSeconds = 0.f);
 	void ApplyFocus(float Focus01, float FadeSeconds = 0.f);
 	void ApplyFrost(float Frost01, float FadeSeconds = 0.f);
@@ -131,7 +139,18 @@ private:
 	// Pick the inline IES profile nearest the requested zoomDmx (null when none pushed).
 	const FRebusInlineIesProfile* SelectInlineIes(int32 ZoomDmx) const;
 	void FetchAndAssignIes(const FString& IesUrl);
-	void FetchAndAssignGobo(int32 GoboIndex);
+
+	// Assign the gobo for the selected slot, preferring an inline base64 image (no fetch) over
+	// the signed imageUrl fetch over nothing. WheelHint disambiguates multi-wheel fixtures.
+	void AssignGobo(int32 GoboIndex, const FString& WheelHint);
+	// Pick the inline gobo image for (slot, wheel hint); null when none pushed/match. Falls back
+	// to the first gobo-kind wheel when WheelHint is empty.
+	const FRebusInlineGobo* SelectInlineGobo(int32 Slot, const FString& WheelHint) const;
+	// Build + assign a gobo UTexture2D from decoded image bytes via the existing light-function
+	// MID path; returns true when a texture was applied.
+	bool ApplyGoboTextureFromBytes(const TArray<uint8>& Bytes);
+	void FetchAndAssignGobo(int32 GoboIndex);            // existing profile-wheel URL path
+	void FetchAndAssignGoboFromUrl(const FString& ImageUrl);
 
 	static int32 FindFirstGoboWheel(const FRebusFixtureProfile& Profile);
 
@@ -168,6 +187,10 @@ private:
 	// over the URL fetch in SelectIesForZoom; empty when none were pushed.
 	FRebusInlineIes InlineIes;
 
+	// Inline base64 gobo images pushed for this fixture's libraryId via RegisterFixtureGobos.
+	// Preferred over the URL fetch in AssignGobo; empty when none were pushed.
+	FRebusInlineGobos InlineGobos;
+
 	// Beam rest transform in fixture-local Unreal space (light placement before motion).
 	FTransform BeamRestTransform = FTransform::Identity;
 	int32 HeadAxisIndex = INDEX_NONE;
@@ -193,6 +216,7 @@ private:
 	float GoboRotationSpeed = 0.f; // -1..1
 	float GoboAngle = 0.f;
 	int32 CurrentGoboIndex = INDEX_NONE;
+	FString CurrentGoboWheel;      // optional wheel hint for the live gobo selection (re-apply)
 	int32 CurrentIesZoomDmx = -1;  // which IES entry (inline or URL) is loaded, by zoomDmx
 	bool bActiveIesInline = false; // true when the loaded IES came from an inline iesText push
 

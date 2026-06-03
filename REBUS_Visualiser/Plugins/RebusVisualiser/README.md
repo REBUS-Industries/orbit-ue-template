@@ -136,7 +136,25 @@ Send these as normal `UIInteraction` descriptors (same envelope as `SetFixturePa
   "chunkIndex": 0,        // optional, message-level; same model as RegisterFixtureMeshes
   "chunkCount": 1 }       // optional, message-level; total messages for this libraryId
 
-// Remove all pushed fixtures (also clears any inline-IES cache):
+// Inline base64 gobo wheel images (REST-free; no imageUrl fetch), keyed (libraryId, wheel, slot).
+// Field aliases accepted: dataBase64|data, mime|contentType, imageUrl|url, wheelKind|kind|type.
+{ "type": "RegisterFixtureGobos",
+  "libraryId": "<libraryFixtureId>",
+  "gobos": [
+    { "wheel": "<wheel id/name>",          // groups slots into a wheel
+      "wheelKind": "gobo",                 // wheelKind|kind|type; "gobo" wheel is the selectable one
+      "slot": 0,                           // 0-based slot index; correlates to SetFixtureGobo.goboIndex
+      "name": "...",
+      "dataBase64": "<base64 image bytes>",// dataBase64|data; base64 of the png/jpeg
+      "mime": "image/png",                 // mime|contentType (informational; decode auto-detects)
+      "imageUrl": "<absolute signed GCS url>", // imageUrl|url; fallback when no inline bytes
+      "part": 0,                           // optional, 0-based fragment index of THIS (wheel,slot) image
+      "partCount": 1 }                     // optional, total fragments for THIS (wheel,slot)
+  ],
+  "chunkIndex": 0,        // optional, message-level; same model as RegisterFixtureMeshes/Ies
+  "chunkCount": 1 }       // optional, message-level; total messages for this libraryId
+
+// Remove all pushed fixtures (also clears any inline-IES + inline-gobo caches):
 { "type": "ClearScene" }
 ```
 
@@ -179,11 +197,33 @@ Behaviour:
   **wins**; if a needed profile isn't inline, the signed `iesUrl`/`iesProfileUrl` is fetched
   (existing REST path); if neither exists, the **synthetic cone** is kept. The inline push never
   regresses the URL path.
-- Gobo images (and IES URLs when no inline IES is present) are still fetched lazily; if the
-  portal is unreachable they simply don't load, but dimmer/colour/pan-tilt/zoom still work.
-  Treat each IES URL value as **opaque**: over the data channel the portal sends **absolute
-  signed GCS URLs** (GET directly, no `x-api-key`, no redirect), while over REST `iesUrl` is a
-  relative `/ies` **307 redirect** fetched with `x-api-key`.
+- `RegisterFixtureGobos` delivers gobo wheel images **inline as base64** (no URL fetch), keyed
+  per `libraryId`. Same **two accumulation levels** as `RegisterFixtureIes`:
+  - **Message-level** (`chunkIndex`/`chunkCount`): `gobos[]` are appended per `libraryId`,
+    order-independent, finalized once `chunkCount` messages have arrived.
+  - **Per-image fragmentation** (`part`/`partCount`): the accumulated entries are grouped by
+    `(wheel, slot)`; when any entry has `partCount > 1`, its entries are sorted by `part` and
+    their `dataBase64` is **concatenated BEFORE a single `FBase64::Decode`** (so a base64 blob
+    split mid-string reassembles correctly). Otherwise the lone entry's `dataBase64` is decoded.
+  - On finalize the plugin caches the decoded bytes per `(libraryId, wheel, slot)`. The
+    `UTexture2D` is built lazily on selection via `FImageUtils::ImportBufferAsTexture2D` (engine
+    image utils, auto-detects png/jpeg — no `ImageWrapper` dependency) and fed into the **same**
+    light-function MID path the URL gobo fetch uses (texture swap only — no new render path). If
+    the fixture is already spawned, the currently-selected gobo is re-applied so it appears
+    without a reselect.
+- **Gobo selection correlation** (`SetFixtureGobo`): the descriptor carries only `goboIndex`
+  (0-based, no wheel field today). It resolves against the **first gobo-kind wheel** for the
+  fixture's `libraryId`, picking the entry whose `slot == goboIndex`. A null/empty/out-of-range
+  index clears the gobo. If a future `SetFixtureGobo` adds an optional `wheel` field, it is
+  honored to disambiguate **multi-wheel fixtures**; until then, multi-gobo-wheel fixtures are
+  ambiguous and the first gobo-kind wheel is assumed.
+- **Gobo precedence** (`AssignGobo`): an inline base64 image for the selected `(wheel, slot)`
+  **wins**; else its (or the profile wheel's) signed `imageUrl` is fetched; else nothing.
+- Gobo/IES URLs (when no inline data is present) are still fetched lazily; if the portal is
+  unreachable they simply don't load, but dimmer/colour/pan-tilt/zoom still work. Treat each URL
+  value as **opaque**: over the data channel the portal sends **absolute signed GCS URLs** (GET
+  directly, no `x-api-key`, no redirect), while over REST they are relative **307 redirects**
+  fetched with `x-api-key`.
 
 This is purely additive: the REST path (§Lifecycle 2) still runs, and a `LoadScene` push
 overrides it.
