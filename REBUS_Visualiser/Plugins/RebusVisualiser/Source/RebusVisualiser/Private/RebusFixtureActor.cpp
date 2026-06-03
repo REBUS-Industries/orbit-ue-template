@@ -677,10 +677,15 @@ void ARebusFixtureActor::BuildBeamCone()
 	BeamMID->SetScalarParameterValue(TEXT("BeamSharpness"), RebusBeamSharpness);
 	BeamMID->SetScalarParameterValue(TEXT("BeamFalloff"), RebusBeamFalloff);
 
-	// Rest transform: mesh +Z (the cone axis) -> beam forward, co-located at the beam origin (same
-	// origin the SpotLight + lens disc use), scale 1 (the section is generated directly in cm).
-	BeamConeRest = FTransform(LensDiscRotationFromForward(BeamForwardLocal, BeamUpLocal),
-		BeamRestTransform.GetLocation());
+	// Rest transform: the cone mesh is generated along its local +X (the SAME axis a
+	// USpotLightComponent emits along), so it must use the SAME rotation basis as the SpotLight
+	// (BeamRestTransform, built from MakeFromXZ(BeamForwardLocal, BeamUpLocal)) -- NOT the lens
+	// disc's MakeFromZX basis, which pointed the cone 180deg the wrong way. Reusing the SpotLight's
+	// rotation guarantees the cone's +X axis is identical to the spotlight's +X emission axis, so
+	// the cone opens downrange along the v1.0.21 beam forward (base/lens at the origin, far/wide
+	// end along +forward), exactly matching the lit cone. The cone is radially symmetric, so roll
+	// is irrelevant -- only the forward axis matters.
+	BeamConeRest = FTransform(BeamRestTransform.GetRotation(), BeamRestTransform.GetLocation());
 	BeamCone->SetRelativeTransform(BeamConeRest);
 
 	BeamConeLastFarRadius = -1.f; // force the first section build
@@ -690,10 +695,15 @@ void ARebusFixtureActor::BuildBeamCone()
 
 	const float OuterHalf = ResolveOuterHalfDeg();
 	const float CurIntensity = RebusMeshBeamMaxIntensity * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * MeshBeamUserScale;
+	// Report the cone forward vs the spotlight forward so a residual flip is provable from logs:
+	// both are the +X axis of their (now shared) rotation basis and must be identical.
+	const FVector ConeFwd = BeamConeRest.GetRotation().RotateVector(FVector::ForwardVector);
+	const FVector SpotFwd = BeamRestTransform.GetRotation().RotateVector(FVector::ForwardVector);
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s beam: SPAWNED matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s)"),
+		TEXT("Fixture %s beam: SPAWNED matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s) coneFwd=(%.3f,%.3f,%.3f) spotFwd=(%.3f,%.3f,%.3f)"),
 		*FixtureId, BeamBaseRadiusUnreal, BeamConeLastFarRadius, BeamLengthUnreal, OuterHalf,
-		CurIntensity, bMeshBeamEnabled ? 1 : 0, DiamSrc);
+		CurIntensity, bMeshBeamEnabled ? 1 : 0, DiamSrc,
+		ConeFwd.X, ConeFwd.Y, ConeFwd.Z, SpotFwd.X, SpotFwd.Y, SpotFwd.Z);
 }
 
 void ARebusFixtureActor::UpdateBeamConeGeometry()
@@ -725,14 +735,17 @@ void ARebusFixtureActor::UpdateBeamConeGeometry()
 	UVs.Reserve(Segs * 2);
 	Triangles.Reserve(Segs * 6);
 
+	// Generated along the local +X axis (the spotlight emission axis): base ring at x=0 (the lens)
+	// and far ring at x=+L (downrange). With BeamConeRest reusing the SpotLight rotation, +X maps to
+	// the beam forward, so the cone opens exactly along the spotlight aim. Rings lie in the YZ plane.
 	for (int32 S = 0; S < Segs; ++S)
 	{
 		const float Angle = (2.f * PI * S) / Segs;
 		const float C = FMath::Cos(Angle);
 		const float Sn = FMath::Sin(Angle);
-		Positions.Add(FVector(RB * C, RB * Sn, 0.f)); // base ring (at the lens)
-		Positions.Add(FVector(RF * C, RF * Sn, L));   // far ring (at the throw)
-		const FVector N = FVector(C, Sn, 0.f).GetSafeNormal(); // outward radial (Fresnel rim)
+		Positions.Add(FVector(0.f, RB * C, RB * Sn)); // base ring (at the lens)
+		Positions.Add(FVector(L,   RF * C, RF * Sn));  // far ring (at the throw)
+		const FVector N = FVector(0.f, C, Sn).GetSafeNormal(); // outward radial (Fresnel rim)
 		Normals.Add(N);
 		Normals.Add(N);
 		UVs.Add(FVector2D((float)S / Segs, 0.f)); // V=0 base
@@ -828,11 +841,13 @@ void ARebusFixtureActor::RefreshMotion()
 				LensDisc->SetRelativeTransform(DiscT);
 			}
 
-			// Cone-mesh beam rides the same synthetic aim (mesh +Z -> Dir at the beam origin).
+			// Cone-mesh beam rides the SAME synthetic aim as the spotlight: its local +X (the cone
+			// axis) -> Dir via MakeFromX, identical to the SpotLight rotation above, so it opens
+			// along the beam forward (not 180deg out). Roll is irrelevant (radially symmetric).
 			if (BeamCone)
 			{
 				FTransform BeamT;
-				BeamT.SetRotation(LensDiscRotationFromForward(Dir, BeamUpLocal));
+				BeamT.SetRotation(FRotationMatrix::MakeFromX(Dir).ToQuat());
 				BeamT.SetLocation(BeamConeRest.GetLocation());
 				BeamCone->SetRelativeTransform(BeamT);
 			}
