@@ -350,6 +350,10 @@ void URebusVisualiserSubsystem::SpawnAllFixtures()
 	static const FRebusMeshBundle EmptyMeshes;
 	static const FRebusInlineIes EmptyInlineIes;
 
+	// Fresh "hero beam" volumetric-shadow budget per (re)spawn so the first N fixtures of this
+	// scene get volumetric shadows (the cap is enforced in ARebusFixtureActor::BuildSpotLight).
+	ARebusFixtureActor::ResetVolumetricShadowBudget();
+
 	for (const FRebusSceneFixture& F : SceneData.Fixtures)
 	{
 		const FRebusFixtureProfile* Profile = F.LibraryFixtureId.IsEmpty() ? &EmptyProfile : ProfileCache.Find(F.LibraryFixtureId);
@@ -806,7 +810,13 @@ void URebusVisualiserSubsystem::EnsureSceneEnvironment()
 			{
 				C->SetFogDensity(0.02f);
 				C->SetFogHeightFalloff(0.2f);
-				C->SetVolumetricFog(true); // per-fixture beams scatter in this (§8.4)
+				// Volumetric fog tuned for haze/beam visibility so per-fixture spotlights
+				// scatter (§8.4). Mirrors the authoring-time defaults in
+				// build_rebus_base_level.py so a fresh spawn matches the baked level.
+				C->SetVolumetricFog(true);
+				C->SetVolumetricFogDistance(35000.f);            // cm; far enough for stage beams
+				C->SetVolumetricFogExtinctionScale(0.3f);        // subtle haze, not a wall of fog
+				C->SetVolumetricFogScatteringDistribution(0.4f); // mild forward scatter
 			}
 			UE_LOG(LogRebusVisualiser, Log, TEXT("Spawned default ExponentialHeightFog (volumetric)."));
 		}

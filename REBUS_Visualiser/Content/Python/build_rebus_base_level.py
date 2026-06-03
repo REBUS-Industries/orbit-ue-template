@@ -213,10 +213,13 @@ def _add_exponential_height_fog():
     _set(comp, "fog_density", 0.02)
     _set(comp, "fog_height_falloff", 0.2)
     _set(comp, "start_distance", 0.0)
-    # Volumetric fog ON so per-fixture beams scatter (§8.4).
+    # Volumetric fog ON so per-fixture beams scatter (§8.4). Tuned for haze/beam visibility:
+    # a far volumetric range with subtle extinction + mild forward scatter (matches the C++
+    # EnsureSceneEnvironment fallback so a fresh spawn renders the same).
     _set(comp, "volumetric_fog", True)
-    _set(comp, "volumetric_fog_scattering_distribution", 0.2)
-    _set(comp, "volumetric_fog_extinction_scale", 1.0)
+    _set(comp, "volumetric_fog_distance", 35000.0)             # cm; far enough for stage beams
+    _set(comp, "volumetric_fog_extinction_scale", 0.3)         # subtle haze, not a wall of fog
+    _set(comp, "volumetric_fog_scattering_distribution", 0.4)  # mild forward scatter
     unreal.log("RebusBaseLevel: ExponentialHeightFog added (volumetric fog on).")
 
 

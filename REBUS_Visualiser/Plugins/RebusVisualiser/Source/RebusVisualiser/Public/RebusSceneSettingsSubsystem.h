@@ -53,6 +53,11 @@ private:
 	// X=red, Y=green, Z=blue (Unreal convention). Toggled by the bShowOrigin scene property.
 	void SetOriginGizmo(bool bShow);
 
+	// Apply a MegaLights + volumetric-fog-volume quality tier at runtime ("live"/"previs"/
+	// "final", case-insensitive; unknown -> "live"). Re-tunes r.MegaLights.* via console
+	// override and stores the canonical tier name so SceneState round-trips it.
+	void SetRenderQuality(const FString& Tier);
+
 	void SetScalabilityBucket(const TCHAR* Group, int32 Bucket);
 	void SetCVarFloat(const TCHAR* CVar, float Value);
 	void SetCVarInt(const TCHAR* CVar, int32 Value);

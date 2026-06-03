@@ -177,6 +177,79 @@ Behaviour:
 This is purely additive: the REST path (§Lifecycle 2) still runs, and a `LoadScene` push
 overrides it.
 
+## Rendering: MegaLights + volumetric fog (§5.7)
+
+The visualiser renders concert/beam-heavy moving heads with **MegaLights** (stochastic local
+lighting) plus a **volumetric height fog** so beams read through haze. The baseline is enabled
+at startup and re-tunable at runtime per quality tier.
+
+### Baseline CVars (startup)
+
+`Config/DefaultEngine.ini` `[SystemSettings]` sets the stable baseline (read at startup; applies
+in `-game` / packaged):
+
+```
+r.MegaLights.Allow=1
+r.MegaLights.NumSamplesPerPixel=4
+r.MegaLights.DownsampleMode=1
+r.MegaLights.Volume=1
+r.MegaLights.Volume.GridPixelSize=4
+r.MegaLights.Volume.GridSizeZ=128
+```
+
+`r.MegaLights.Allow=1`, `r.MegaLights.DownsampleMode=1`, and `r.MegaLights.Volume=1` are
+**baselined** (the same for every tier — the runtime tiers always re-assert `Allow`/`Volume`).
+The remaining three (`NumSamplesPerPixel`, `Volume.GridPixelSize`, `Volume.GridSizeZ`) are
+**per-tier** (below).
+
+### `RenderQuality` scene property (runtime tiers)
+
+Push `SetSceneProperty name="RenderQuality" value="<tier>"` (case-insensitive; unknown values
+fall back to `live`). Each tier re-applies these `r.MegaLights.*` CVars at runtime via a console
+override:
+
+| Tier | `NumSamplesPerPixel` | `Volume.GridPixelSize` | `Volume.GridSizeZ` | Use |
+| --- | --- | --- | --- | --- |
+| **`live`** *(default)* | 2 | 8 | 64 | lightest — live previs streaming |
+| `previs` | 4 | 4 | 128 | the "start here" baseline |
+| `final` | 8 | 2 | 192 | heavy — final renders |
+
+`live` is the **runtime default**: it is seeded in `URebusSceneSettingsSubsystem::Initialize`
+(overriding the heavier `previs`-equivalent `[SystemSettings]` baseline for the live stream) and
+stored in `SceneState`, so the portal's control hydrates to `live` and every tier switch is
+logged. All tiers also re-assert `r.MegaLights.Allow=1` + `r.MegaLights.Volume=1`.
+
+### Volumetric fog + per-fixture beam scattering defaults
+
+The **ExponentialHeightFog** component is configured for haze/beam visibility, both at authoring
+time (`build_rebus_base_level.py`) and defensively on fresh spawn (`EnsureSceneEnvironment`):
+
+- `bEnableVolumetricFog = true` (`SetVolumetricFog`)
+- `VolumetricFogDistance = 35000` cm (`SetVolumetricFogDistance`)
+- `VolumetricFogExtinctionScale = 0.3` (`SetVolumetricFogExtinctionScale`)
+- `VolumetricFogScatteringDistribution = 0.4` (`SetVolumetricFogScatteringDistribution`)
+
+Existing fog density/colour scene properties (`FogDensity`, `InscatteringColor`,
+`bVolumetricFog`, `VolumetricScatteringDistribution`, `VolumetricExtinctionScale`, ...) still
+drive the same component and can override these at runtime.
+
+Each per-fixture `USpotLightComponent` (`BuildSpotLight`) gets:
+
+- `VolumetricScatteringIntensity = 2.5` — a beam-visible default for haze scatter.
+- `bAllowMegaLights = true` — opts the light into MegaLights (5.7's per-light flag; defaults
+  true, asserted so the project-level `r.MegaLights.Allow` governs the whole rig).
+- **Hero-beam volumetric-shadow cap**: `SetCastVolumetricShadow(true)` for only the **first 8**
+  spotlights created per spawn batch (`RebusMaxVolumetricShadowBeams`); the rest still scatter
+  but skip the volumetric shadow pass. The session subsystem resets the budget
+  (`ARebusFixtureActor::ResetVolumetricShadowBudget`) before every (re)spawn, so each fresh
+  scene gets its own 8 hero beams. The portal can still override per fixture via
+  `SetFixtureBeamVolumetrics` (`ApplyBeamVolumetrics`).
+
+> **Caveat:** UE 5.7 MegaLights + volumetric fog can show artefacts with some sky / height-fog
+> and GPU/driver combinations (flicker, sample noise, banding in the fog volume). The tiers
+> exist to dial cost vs quality — drop to `live` if the live stream shows noise, raise to
+> `final` for clean stills.
+
 ### Moving-head parity: the `profile` + `meshes` the portal must push
 
 The plugin already parses and drives the full GDTF rig — to make the **physical heads move**
@@ -291,8 +364,9 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
 - **Mesh→axis bucketing** matches GDTF `affectedGeometryNames`; opaque MVR proxy names
   (`mvr-glb-<uuid>`) that match nothing fall to the static base. The guide's height-plane
   split (§7.6) is the more robust fallback to add if needed.
-- **Volumetric beams require MegaLights OFF** (§8.4) — keep standard deferred shadowed local
-  lights in the level's render settings.
+- **Volumetric beams under MegaLights** (§5.7) — beams scatter through the level's volumetric
+  height fog with MegaLights + its lighting volume (`r.MegaLights.Volume=1`) enabled. See the
+  `RenderQuality` tiers and the artefact caveat above if the fog volume shows noise/banding.
 
 ## Acceptance mapping (§12)
 

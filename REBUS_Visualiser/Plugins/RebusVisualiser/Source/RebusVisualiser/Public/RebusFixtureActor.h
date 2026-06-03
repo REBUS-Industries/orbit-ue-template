@@ -113,6 +113,12 @@ public:
 	int32 GetMotionAxisCount() const { return Profile.MotionRig.Axes.Num(); }
 	int32 GetMeshComponentCount() const { return MeshComponents.Num(); }
 
+	// Reset the per-batch "hero beam" volumetric-shadow budget. Called by the session subsystem
+	// before each (re)spawn so the first N fixtures of every fresh scene get volumetric shadows
+	// (rather than the budget being permanently consumed by the very first scene). See
+	// BuildSpotLight + RebusMaxVolumetricShadowBeams.
+	static void ResetVolumetricShadowBudget();
+
 private:
 	void BuildComponentHierarchy();
 	void BuildMeshes(const FRebusMeshBundle& Meshes);
@@ -128,6 +134,9 @@ private:
 	void FetchAndAssignGobo(int32 GoboIndex);
 
 	static int32 FindFirstGoboWheel(const FRebusFixtureProfile& Profile);
+
+	// Count of spotlights granted volumetric shadows in the current spawn batch (hero-beam cap).
+	static int32 VolumetricShadowBeamCount;
 
 private:
 	UPROPERTY() TObjectPtr<USceneComponent> FixtureRoot = nullptr;

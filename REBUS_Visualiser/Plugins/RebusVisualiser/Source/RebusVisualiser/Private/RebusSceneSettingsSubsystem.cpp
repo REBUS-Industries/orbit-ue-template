@@ -29,6 +29,12 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	Values.Add(TEXT("GroundSurface"), FRebusPropertyValue::MakeString(TEXT("Concrete")));
 	Values.Add(TEXT("bGroundVisible"), FRebusPropertyValue::MakeBool(true));
 	Values.Add(TEXT("bShowOrigin"), FRebusPropertyValue::MakeBool(false));
+
+	// Seed the lightest tier as the runtime default (live previs streaming). This overrides the
+	// heavier [SystemSettings] baseline from DefaultEngine.ini for the live stream; the portal
+	// can push "previs"/"final" via the RenderQuality scene property. SetRenderQuality stores
+	// the canonical tier name so the first SceneState read-back hydrates the control.
+	SetRenderQuality(TEXT("live"));
 }
 
 // ---- Actor lookups (cached) -----------------------------------------------------------
@@ -151,6 +157,45 @@ void URebusSceneSettingsSubsystem::SetOriginGizmo(bool bShow)
 #else
 	UE_LOG(LogRebusVisualiser, Warning, TEXT("Origin gizmo unavailable: debug draw is compiled out in this build."));
 #endif
+}
+
+void URebusSceneSettingsSubsystem::SetRenderQuality(const FString& Tier)
+{
+	// Resolve the tier (case-insensitive; anything unrecognised falls back to the lightest
+	// "live" preset so a bad push can never make the stream heavier than the live baseline).
+	const FString Clean = Tier.TrimStartAndEnd();
+	int32 Samples = 2, GridPixelSize = 8, GridSizeZ = 64;   // live (default)
+	const TCHAR* Resolved = TEXT("live");
+	if (Clean.Equals(TEXT("final"), ESearchCase::IgnoreCase))
+	{
+		Samples = 8; GridPixelSize = 2; GridSizeZ = 192;
+		Resolved = TEXT("final");
+	}
+	else if (Clean.Equals(TEXT("previs"), ESearchCase::IgnoreCase))
+	{
+		Samples = 4; GridPixelSize = 4; GridSizeZ = 128;
+		Resolved = TEXT("previs");
+	}
+	else if (!Clean.Equals(TEXT("live"), ESearchCase::IgnoreCase))
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("RenderQuality '%s' unknown; falling back to 'live'."), *Clean);
+	}
+
+	// Always (re)assert MegaLights + its volume so a tier switch can never leave them off.
+	SetCVarInt(TEXT("r.MegaLights.Allow"), 1);
+	SetCVarInt(TEXT("r.MegaLights.Volume"), 1);
+	SetCVarInt(TEXT("r.MegaLights.NumSamplesPerPixel"), Samples);
+	SetCVarInt(TEXT("r.MegaLights.Volume.GridPixelSize"), GridPixelSize);
+	SetCVarInt(TEXT("r.MegaLights.Volume.GridSizeZ"), GridSizeZ);
+
+	// Store the canonical resolved name (overwriting whatever raw string was pushed) so the
+	// SceneState read-back always reports a valid tier.
+	Values.Add(TEXT("RenderQuality"), FRebusPropertyValue::MakeString(Resolved));
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("RenderQuality -> '%s' (MegaLights NumSamplesPerPixel=%d Volume.GridPixelSize=%d Volume.GridSizeZ=%d)."),
+		Resolved, Samples, GridPixelSize, GridSizeZ);
 }
 
 void URebusSceneSettingsSubsystem::SetScalabilityBucket(const TCHAR* Group, int32 Bucket)
@@ -313,6 +358,11 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 		SetCVarInt(TEXT("PixelStreaming2.Encoder.MinQuality"), Value.AsInt());
 	}
 	// --- Engine Quality ---
+	else if (Name == TEXT("RenderQuality"))
+	{
+		// MegaLights + volumetric-fog-volume cost/quality tier (live/previs/final).
+		SetRenderQuality(Value.String);
+	}
 	else if (Name == TEXT("ScreenPercentage"))
 	{
 		SetCVarFloat(TEXT("r.ScreenPercentage"), Value.AsFloat());

@@ -24,6 +24,18 @@ namespace
 
 	constexpr int32 RebusSelectionStencil = 252;        // primary
 	constexpr int32 RebusSelectionStencilSecondary = 251;
+
+	// Volumetric beam shadows are expensive, so only the first N spotlights of a spawn batch
+	// cast them ("hero beams"); the rest still scatter (VolumetricScatteringIntensity) but skip
+	// the per-light volumetric shadow pass (§8.4).
+	constexpr int32 RebusMaxVolumetricShadowBeams = 8;
+}
+
+int32 ARebusFixtureActor::VolumetricShadowBeamCount = 0;
+
+void ARebusFixtureActor::ResetVolumetricShadowBudget()
+{
+	VolumetricShadowBeamCount = 0;
 }
 
 ARebusFixtureActor::ARebusFixtureActor()
@@ -297,10 +309,23 @@ void ARebusFixtureActor::BuildSpotLight()
 	SpotLight->SetIntensityUnits(ELightUnits::Candelas);
 	SpotLight->SetAttenuationRadius(6000.f);
 
-	// Volumetric beams/shadows default-on (§8.4). Requires MegaLights OFF + a volumetric-fog
-	// PostProcessVolume in the level (the session subsystem ensures one).
-	SpotLight->SetVolumetricScatteringIntensity(1.f);
-	SpotLight->bCastVolumetricShadow = true;
+	// Beam-visible default scattering for haze (§8.4). The fixture scatters into the level's
+	// volumetric height fog regardless of the global MegaLights mode.
+	SpotLight->SetVolumetricScatteringIntensity(2.5f);
+
+	// Opt this light into MegaLights stochastic sampling (5.7's per-light flag; defaults true,
+	// but assert it so the project-level r.MegaLights.Allow=1 governs the whole rig).
+	SpotLight->bAllowMegaLights = 1;
+
+	// Hero-beam cap: volumetric shadows are costly, so only the first N spotlights of the spawn
+	// batch cast them; the rest still scatter but skip the volumetric shadow pass. The session
+	// subsystem resets the budget (ResetVolumetricShadowBudget) before each (re)spawn.
+	const bool bHeroBeam = (VolumetricShadowBeamCount < RebusMaxVolumetricShadowBeams);
+	SpotLight->SetCastVolumetricShadow(bHeroBeam);
+	if (bHeroBeam)
+	{
+		++VolumetricShadowBeamCount;
+	}
 	SpotLight->MarkRenderStateDirty();
 
 	// Source size: map source.radiusMeters -> SourceRadius (§8.3); leave default when null.
