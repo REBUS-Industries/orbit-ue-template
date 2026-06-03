@@ -74,10 +74,21 @@ never hardcoded), `-OrbitProject` (portal doc id), `-OrbitModel`, `-OrbitVersion
    profile + `/meshes`, then spawn one `ARebusFixtureActor` per fixture at its placement and
    register it.
 3. The data channel binds to the PS2 streamer and registers the `UIInteraction` handler.
-4. When both the scene is loaded **and** the channel is open, emit `Ready` (with
-   `loadedModel` counts + capability flags), one `FixtureRegistered` per fixture, and re-apply
-   the live selection. The portal then sends `RequestSceneState` → we answer `SceneState`.
+4. When the channel is open, the scene is loaded, **and** the scene environment has been
+   ensured, emit `Ready` (with `loadedModel` counts + capability flags), one `FixtureRegistered`
+   per fixture, and re-apply the live selection. The portal then sends `RequestSceneState` → we
+   answer `SceneState`.
 5. Periodic `FrameStats` while live.
+
+> **First-load state sync (no recycle needed).** `Ready` is gated on the scene environment being
+> ensured (`bEnvEnsured`) so the portal only starts pushing `SetSceneProperty`/`LoadScene` after
+> the fog/post-process/floor/sun/sky actors those pushes target actually exist — early pushes can
+> no longer hit missing actors and get dropped. The scene-settings subsystem keeps an
+> authoritative map of every applied value and **re-applies all of them** (`ReapplyAll`) whenever
+> the environment is ensured or fixtures (re)spawn, so portal state (and seeded defaults) sticks
+> on the first connection instead of only after a recycle. The ordering is verifiable in the log:
+> `Scene environment ensured.` → `Re-applied N scene property value(s)...` → `Handshake: Ready
+> (channel open, scene loaded, environment ensured) -> broadcasting.`
 
 ## Scene push over the data channel (REST-free fixtures)
 
@@ -193,31 +204,36 @@ r.MegaLights.Allow=1
 r.MegaLights.NumSamplesPerPixel=4
 r.MegaLights.DownsampleMode=1
 r.MegaLights.Volume=1
-r.MegaLights.Volume.GridPixelSize=4
+r.MegaLights.Volume.GridPixelSize=2
 r.MegaLights.Volume.GridSizeZ=128
+r.VolumetricFog.GridPixelSize=2
 ```
 
 `r.MegaLights.Allow=1`, `r.MegaLights.DownsampleMode=1`, and `r.MegaLights.Volume=1` are
 **baselined** (the same for every tier — the runtime tiers always re-assert `Allow`/`Volume`).
-The remaining three (`NumSamplesPerPixel`, `Volume.GridPixelSize`, `Volume.GridSizeZ`) are
-**per-tier** (below).
+The volumetric **grid pixel size is `2` on first load** (sharper volumetrics) for BOTH the
+MegaLights lighting volume (`r.MegaLights.Volume.GridPixelSize`) and the engine volumetric-fog
+froxel grid (`r.VolumetricFog.GridPixelSize`). `NumSamplesPerPixel`, `Volume.GridPixelSize` (+
+the matching `VolumetricFog.GridPixelSize`), and `Volume.GridSizeZ` are then **per-tier** (below).
 
 ### `RenderQuality` scene property (runtime tiers)
 
 Push `SetSceneProperty name="RenderQuality" value="<tier>"` (case-insensitive; unknown values
-fall back to `live`). Each tier re-applies these `r.MegaLights.*` CVars at runtime via a console
-override:
+fall back to `live`). Each tier re-applies these CVars at runtime via a console override.
+`Volume.GridPixelSize` and `VolumetricFog.GridPixelSize` are kept in lock-step (one value drives
+both grids):
 
-| Tier | `NumSamplesPerPixel` | `Volume.GridPixelSize` | `Volume.GridSizeZ` | Use |
+| Tier | `NumSamplesPerPixel` | `Volume.GridPixelSize` (= `VolumetricFog.GridPixelSize`) | `Volume.GridSizeZ` | Use |
 | --- | --- | --- | --- | --- |
-| **`live`** *(default)* | 2 | 8 | 64 | lightest — live previs streaming |
+| **`live`** *(default)* | 2 | 2 | 64 | lightest sampling, sharp grid — live previs streaming |
 | `previs` | 4 | 4 | 128 | the "start here" baseline |
 | `final` | 8 | 2 | 192 | heavy — final renders |
 
 `live` is the **runtime default**: it is seeded in `URebusSceneSettingsSubsystem::Initialize`
-(overriding the heavier `previs`-equivalent `[SystemSettings]` baseline for the live stream) and
-stored in `SceneState`, so the portal's control hydrates to `live` and every tier switch is
-logged. All tiers also re-assert `r.MegaLights.Allow=1` + `r.MegaLights.Volume=1`.
+(overriding the `[SystemSettings]` baseline for the live stream) and stored in `SceneState`, so
+the portal's control hydrates to `live` and every tier switch is logged. On first load the
+volumetric grid pixel size is therefore `2` with no tier switch. All tiers also re-assert
+`r.MegaLights.Allow=1` + `r.MegaLights.Volume=1`.
 
 ### Volumetric fog + per-fixture beam scattering defaults
 

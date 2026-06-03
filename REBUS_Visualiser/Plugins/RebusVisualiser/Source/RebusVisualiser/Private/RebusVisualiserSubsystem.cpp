@@ -143,6 +143,15 @@ bool URebusVisualiserSubsystem::Tick(float DeltaSeconds)
 		{
 			bEnvEnsured = true;
 			EnsureSceneEnvironment();
+			UE_LOG(LogRebusVisualiser, Log, TEXT("Scene environment ensured."));
+
+			// Now that the fog/post-process/floor (and sun/sky) actors exist, push every stored
+			// scene-property value (seeded defaults + anything the portal pushed before the
+			// actors were live) onto them so first-load state sticks without a recycle.
+			if (URebusSceneSettingsSubsystem* Sce = GetSceneSettings())
+			{
+				Sce->ReapplyAll();
+			}
 		}
 	}
 
@@ -182,6 +191,14 @@ bool URebusVisualiserSubsystem::Tick(float DeltaSeconds)
 				TrySendReady();
 			}
 		}
+	}
+
+	// Liveness: the Ready gates (channel open / scene loaded / environment ensured) can become
+	// true on different ticks and in any order, so poll here -- TrySendReady is idempotent and
+	// no-ops until every gate holds, then fires the handshake exactly once.
+	if (!bReadySent)
+	{
+		TrySendReady();
 	}
 
 	// Periodic FrameStats for the diagnostics strip (§6.6).
@@ -376,6 +393,14 @@ void URebusVisualiserSubsystem::SpawnAllFixtures()
 	}
 
 	UE_LOG(LogRebusVisualiser, Log, TEXT("Spawned %d fixtures."), SpawnedFixtures.Num());
+
+	// Reassert all stored scene-property values after a (re)spawn so the live state survives a
+	// portal re-push / LoadScene rebuild (the env actors persist, but this keeps ground/quality/
+	// fog authoritative and idempotent across rebuilds).
+	if (URebusSceneSettingsSubsystem* Sce = GetSceneSettings())
+	{
+		Sce->ReapplyAll();
+	}
 
 	// First load completes the handshake; a re-load (e.g. portal re-push) re-broadcasts it so
 	// the new FixtureRegistered set reaches viewers.
@@ -737,12 +762,18 @@ void URebusVisualiserSubsystem::OnChannelReady()
 
 void URebusVisualiserSubsystem::TrySendReady()
 {
-	// Ready requires both: scene loaded (so loadedModel counts are final) + channel open.
-	if (bReadySent || !bChannelReady || !bSceneLoaded || !Channel.IsValid())
+	// Ready requires ALL of: channel open + scene loaded (so loadedModel counts are final) + the
+	// scene environment ensured. The environment gate is the first-load fix: the portal starts
+	// pushing SetSceneProperty/LoadScene as soon as it sees Ready, so the fog/post-process/floor
+	// actors those pushes target MUST exist first -- otherwise early pushes hit missing actors,
+	// are stored-but-not-applied, and only "take" after a recycle.
+	if (bReadySent || !bChannelReady || !bSceneLoaded || !bEnvEnsured || !Channel.IsValid())
 	{
 		return;
 	}
 	bReadySent = true;
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Handshake: Ready (channel open, scene loaded, environment ensured) -> broadcasting."));
 	BroadcastHandshake();
 }
 

@@ -164,7 +164,10 @@ void URebusSceneSettingsSubsystem::SetRenderQuality(const FString& Tier)
 	// Resolve the tier (case-insensitive; anything unrecognised falls back to the lightest
 	// "live" preset so a bad push can never make the stream heavier than the live baseline).
 	const FString Clean = Tier.TrimStartAndEnd();
-	int32 Samples = 2, GridPixelSize = 8, GridSizeZ = 64;   // live (default)
+	// GridPixelSize drives BOTH the MegaLights lighting volume grid and the engine volumetric-fog
+	// froxel grid (smaller = sharper/heavier). live defaults to 2 so first-load volumetrics are
+	// sharp without a tier switch.
+	int32 Samples = 2, GridPixelSize = 2, GridSizeZ = 64;   // live (default)
 	const TCHAR* Resolved = TEXT("live");
 	if (Clean.Equals(TEXT("final"), ESearchCase::IgnoreCase))
 	{
@@ -188,14 +191,16 @@ void URebusSceneSettingsSubsystem::SetRenderQuality(const FString& Tier)
 	SetCVarInt(TEXT("r.MegaLights.NumSamplesPerPixel"), Samples);
 	SetCVarInt(TEXT("r.MegaLights.Volume.GridPixelSize"), GridPixelSize);
 	SetCVarInt(TEXT("r.MegaLights.Volume.GridSizeZ"), GridSizeZ);
+	// Keep the engine volumetric-fog froxel grid in lock-step with the lighting volume grid.
+	SetCVarInt(TEXT("r.VolumetricFog.GridPixelSize"), GridPixelSize);
 
 	// Store the canonical resolved name (overwriting whatever raw string was pushed) so the
 	// SceneState read-back always reports a valid tier.
 	Values.Add(TEXT("RenderQuality"), FRebusPropertyValue::MakeString(Resolved));
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("RenderQuality -> '%s' (MegaLights NumSamplesPerPixel=%d Volume.GridPixelSize=%d Volume.GridSizeZ=%d)."),
-		Resolved, Samples, GridPixelSize, GridSizeZ);
+		TEXT("RenderQuality -> '%s' (MegaLights NumSamplesPerPixel=%d Volume.GridPixelSize=%d Volume.GridSizeZ=%d, VolumetricFog.GridPixelSize=%d)."),
+		Resolved, Samples, GridPixelSize, GridSizeZ, GridPixelSize);
 }
 
 void URebusSceneSettingsSubsystem::SetScalabilityBucket(const TCHAR* Group, int32 Bucket)
@@ -381,7 +386,41 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 		UE_LOG(LogRebusVisualiser, Verbose, TEXT("SetSceneProperty '%s' stored without a live binding."), *Name);
 	}
 
+	if (bKnown)
+	{
+		UE_LOG(LogRebusVisualiser, Verbose, TEXT("Applied scene property '%s' to live actors."), *Name);
+	}
+
 	return bKnown;
+}
+
+void URebusSceneSettingsSubsystem::ReapplyAll()
+{
+	if (Values.Num() == 0) return;
+
+	// Snapshot first: ApplySceneProperty writes back into Values, so iterating it directly would
+	// mutate the container mid-iteration. The snapshot is the authoritative state to reassert.
+	TArray<TPair<FString, FRebusPropertyValue>> Snapshot;
+	Snapshot.Reserve(Values.Num());
+	for (const TPair<FString, FRebusPropertyValue>& Pair : Values)
+	{
+		Snapshot.Add(Pair);
+	}
+
+	// Drop the cached actor handles so each lookup re-resolves against the CURRENT world actors
+	// (the environment may have just been (re)spawned, invalidating an earlier null/stale cache).
+	CachedSun.Reset();
+	CachedSky.Reset();
+	CachedFog.Reset();
+	CachedPostProcess.Reset();
+	CachedFloor.Reset();
+
+	for (const TPair<FString, FRebusPropertyValue>& Pair : Snapshot)
+	{
+		ApplySceneProperty(Pair.Key, Pair.Value);
+	}
+
+	UE_LOG(LogRebusVisualiser, Log, TEXT("Re-applied %d scene property value(s) to live actors."), Snapshot.Num());
 }
 
 bool URebusSceneSettingsSubsystem::HandleSceneDescriptor(const FString& Type, const TSharedPtr<FJsonObject>& Msg)

@@ -33,6 +33,13 @@ public:
 	// Returns false for an unknown name (the caller may surface a Notice).
 	bool ApplySceneProperty(const FString& Name, const FRebusPropertyValue& Value);
 
+	// Re-apply every stored scene-property value (seeded defaults + everything the portal has
+	// pushed so far) to the live scene actors. Called by the session subsystem once the scene
+	// environment is (re)ensured / fixtures (re)spawn, so portal state "sticks" on first load
+	// without needing a recycle (values pushed before an actor existed, or actors rebuilt after
+	// a value was applied, are reasserted here). Iterates a snapshot so it is re-entrant-safe.
+	void ReapplyAll();
+
 	// Route a SetSceneProperty / SetSceneProperties descriptor. Returns true if handled.
 	bool HandleSceneDescriptor(const FString& Type, const TSharedPtr<FJsonObject>& Msg);
 
