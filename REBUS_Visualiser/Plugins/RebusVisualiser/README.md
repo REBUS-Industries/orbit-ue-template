@@ -593,6 +593,64 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Spotlight footprint gobo via mirrored M_Light_Master DMX params (v1.0.57).** User report:
+> "The Beam which is made from the Epic UE DMX fixture plugin works well with the GOBO sent from
+> our portal. The spotlight part of the fixture is not working with GOBOS. We need to take the
+> logic for gobos with the epic beam and apply the gobo to the other light element that makes up
+> the fixture." Root cause traced end-to-end:
+>
+> 1. **Epic beam (cone) works** because `UpdateEpicBeamParams` pushes the FULL DMX param set onto
+>    `EpicBeamMID` (`MI_Beam` / `M_Beam_Master`): `DMX Color`, `DMX Dimmer`, `DMX Max Light
+>    Intensity`, `DMX Max Light Distance`, `DMX Lens Radius`, `DMX Zoom`, `DMX Zoom Normalize`,
+>    `DMX Quality Level` -- plus the gobo atlas (`DMX Gobo Disk Frosted` / `Num Mask` / `Index` /
+>    `Disk Rotation Speed`) via `ApplyCurrentGoboToEpicBeam`. The beam material samples the gobo
+>    THEN multiplies by dimmer × colour × intensity, so all eight scalars contribute to the final
+>    visible cone -- and we set every one of them.
+> 2. **Spotlight cookie (footprint) was silently dark** because `ApplyCurrentGoboToLightFn` only
+>    pushed the **gobo atlas** params onto `GoboLightFnMID` (`MI_Light` / `M_Light_Master`,
+>    LightFunction domain). The DMX dimmer / colour / intensity scalars stayed at their MIC
+>    defaults of **0** (which a freshly-created MID inherits until a `SetScalarParameterValue` call
+>    overrides them). `M_Light_Master` internally multiplies the sampled gobo by `DMX Dimmer ×
+>    DMX Color × DMX Max Light Intensity` exactly like the beam, so cookie = gobo_pixel × 0 ×
+>    black × 0 = **0**. That's why every diagnostic from v1.0.49 through v1.0.56 showed
+>    `lightFn=MI_Light tex=<gobo>` set correctly on the proxy and yet no floor pattern projected.
+>    The v1.0.50 MegaLights opt-out + v1.0.51 reregister + v1.0.53 RT spin were all necessary
+>    but not sufficient -- they got the cookie texture to the GPU; the gating arithmetic still
+>    multiplied it to nothing.
+> 3. **Fix.** New `UpdateEpicLightFnParams()` mirrors the FULL `UpdateEpicBeamParams` push onto
+>    `GoboLightFnMID` (live colour / dimmer / shutter-gate / intensity / zoom / distance / lens
+>    radius / quality / zoom-units) so the cookie inherits identical brightness/colour gating.
+>    Wired in two places:
+>    - **`UpdateEpicBeamParams` tail-calls `UpdateEpicLightFnParams`** after pushing the beam
+>      scalars + gobo. Every dimmer / colour / shutter / zoom change already flows
+>      `RefreshIntensity -> RefreshBeamEmissive -> UpdateEpicBeamParams`, so the cookie now
+>      tracks live values automatically -- the cone and footprint can't diverge.
+>    - **`ApplyCurrentGoboToLightFn` calls `UpdateEpicLightFnParams`** immediately after pushing
+>      the gobo atlas, so the FIRST gobo apply (which lazy-MIDs `MI_Light` from disk on demand)
+>      primes the scalars in the same frame as the texture -- no one-frame "cookie still dark
+>      while we wait for the next param refresh" glitch.
+>    - `UpdateEpicLightFnParams` itself early-outs when `GoboLightFnMID` is null (no active gobo,
+>      nothing to push, no LightFunctionMaterial assigned).
+>
+> Diagnostic added: `Fixture <id> gobo cookie params: color=(r,g,b) dim=<d> gate=<g> zoomFullDeg=
+> <z> distCm=<l> -- mirrored from EpicBeamMID so M_Light_Master no longer multiplies the cookie
+> by 0.` (Verbose-tier; surface with `Log LogRebusVisualiser Verbose`). Together with the existing
+> `gobo cookie: lightFn=MI_Light tex=...` line at Log tier, you can confirm both the texture and
+> the gating scalars made it onto the MID. The cone+cookie scalar+texture mirroring is the
+> closest we can get to Epic stock `BP_MovingHead` behaviour without throwing out our hybrid
+> stack (custom Speckle/Orbit bodies, GDTF rig, runtime IES, motion solver) -- everything
+> upstream of the materials stays unchanged.
+>
+> **Potential follow-up (only if testing reports the cookie reads darker than the beam):** the
+> floor lighting is `(cookie_pixel × DMX_Color × DMX_Dimmer) × (SpotLightColor × SpotLightIntensity)`,
+> so the live dim/colour is multiplied TWICE -- once via the LightFn material, once via the
+> SpotLight's own `SetLightColor` + `SetIntensity` in `RefreshIntensity`. At typical operating
+> values the perceptual difference is negligible (the gamma curve absorbs the double-multiply
+> into a normal-looking pool), but if the user wants strict beam==cookie radiometric parity, the
+> minimal change is `UpdateEpicLightFnParams` pushing `Col = white` / `Dim = 1` and letting the
+> SpotLight be the sole colour/dim authority. Left as a one-line tweak rather than a default
+> because matching Epic's stock M_Light_Master vocabulary is what the user explicitly asked for.
+
 > **Gobo rotation via per-fixture render target (v1.0.53).** User feedback on v1.0.52: "You are
 > rotating the gobo around x instead of the z. Can you not just rotate gobo texture so it spins."
 > v1.0.52's component-roll approach (rolling the SpotLight around its local +X / emission axis)

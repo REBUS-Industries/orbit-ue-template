@@ -261,6 +261,17 @@ private:
 	// the gobo projects onto the lit floor pool. Lazily MIDs MI_Light on first call; sets
 	// SpotLight->LightFunctionMaterial. On clear (CurrentGoboTexture==null) nulls the light fn.
 	void ApplyCurrentGoboToLightFn();
+	// v1.0.57: mirror UpdateEpicBeamParams' DMX param push (DMX Color / DMX Dimmer / DMX Max Light
+	// Intensity / DMX Max Light Distance / DMX Lens Radius / DMX Zoom / DMX Zoom Normalize / DMX
+	// Quality Level) onto GoboLightFnMID. M_Light_Master internally MULTIPLIES the sampled gobo
+	// texture by these scalars, and unset MID params inherit MIC defaults of 0 -- the cookie was
+	// being multiplied by DMX Dimmer=0 (and color=black) which is why the floor pool never showed
+	// the gobo even after v1.0.50's MegaLights opt-out + v1.0.51's reregister landed. Pushing the
+	// same live values the Epic beam already gets makes the cookie inherit identical brightness/
+	// colour gating, so beam + footprint stay perfectly in sync. No-op when GoboLightFnMID is null
+	// (no gobo active). Called from UpdateEpicBeamParams (every refresh) and from
+	// ApplyCurrentGoboToLightFn (lazy-MID-creation primer + every gobo selection).
+	void UpdateEpicLightFnParams();
 	// v1.0.49: explicit clear path. Drops CurrentGoboTexture, reverts the Epic beam MID to its
 	// MI default, nulls the SpotLight light function, clears bGoboActive, and reasserts shadows.
 	void ClearGoboToOpen(const TCHAR* Reason);

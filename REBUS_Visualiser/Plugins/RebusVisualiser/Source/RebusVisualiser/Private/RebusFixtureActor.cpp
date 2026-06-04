@@ -1284,6 +1284,74 @@ void ARebusFixtureActor::UpdateEpicBeamParams()
 	// v1.0.48: also re-push the gobo state here so a beam (re)build or refresh doesn't drop the
 	// live selection. ApplyCurrentGoboToEpicBeam picks the right texture + atlas indices.
 	ApplyCurrentGoboToEpicBeam();
+
+	// v1.0.57: mirror the SAME DMX param push onto the SpotLight's cookie material (MI_Light /
+	// M_Light_Master, LightFunction domain). M_Light_Master internally MULTIPLIES the sampled gobo
+	// by DMX Dimmer x DMX Color x DMX Max Light Intensity -- with the MIC defaults of 0 (which a
+	// MID inherits until we explicitly push something) the cookie was gated to 0 even though the
+	// texture + atlas indices were correct. ApplyCurrentGoboToEpicBeam already pushes the gobo
+	// texture to GoboLightFnMID (tail-call), but the gating scalars were never re-pushed, which is
+	// why every v1.0.49 -> v1.0.56 footprint diagnostic showed "lightFn set, gobo texture set, no
+	// floor pattern". UpdateEpicLightFnParams no-ops when GoboLightFnMID is null (no gobo active).
+	UpdateEpicLightFnParams();
+}
+
+void ARebusFixtureActor::UpdateEpicLightFnParams()
+{
+	// Light function MID is lazily MID'd by ApplyCurrentGoboToLightFn on the first gobo apply --
+	// before that there's nothing to push (and the SpotLight's LightFunctionMaterial is null
+	// anyway, so no cookie projects regardless of params).
+	if (!GoboLightFnMID) return;
+
+	// Same shutter-gate as the Epic beam / SpotLight intensity / lens disc, so the cookie strobes
+	// and blacks out in lockstep with everything else on this fixture. Without this, the cookie
+	// would keep projecting the gobo through a "closed" shutter (Epic's M_Light_Master multiplies
+	// DMX Dimmer in, so a Dim of 0 also collapses the cookie to nothing -- exactly what we want
+	// when the beam is gated off).
+	float Gate = 1.f;
+	switch (ShutterMode)
+	{
+	case ERebusShutterMode::Closed: Gate = 0.f; break;
+	case ERebusShutterMode::Strobe: Gate = (ShutterPhase < 0.5f) ? 1.f : 0.f; break;
+	default: break;
+	}
+
+	const FLinearColor Col(
+		FMath::Clamp(ColorR.Current, 0.f, 1.f),
+		FMath::Clamp(ColorG.Current, 0.f, 1.f),
+		FMath::Clamp(ColorB.Current, 0.f, 1.f), 1.f);
+	const float Dim = FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate;
+	const float SpotOuterHalfDeg = SpotLight ? SpotLight->OuterConeAngle : ResolveOuterHalfDeg();
+	const float ZoomFullDeg = FMath::Clamp(RebusEpicBeamZoomScale * SpotOuterHalfDeg, 1.f, 179.f);
+	const float DistCm = FMath::Clamp(BeamLengthUnreal, 1.f, RebusEpicBeamMaxDistanceCm);
+
+	// Pushing the IDENTICAL vocabulary the Epic beam material reads (M_Beam_Master and
+	// M_Light_Master both consume MF_DMXGobo internally and reference the same DMX_* scalars +
+	// DMX Color, so a single source of truth keeps the cone and the cookie locked together as
+	// the portal drives dimmer / colour / zoom / shutter). Unknown params silently no-op, so this
+	// remains safe across DMXFixtures content revisions if Epic ever re-cuts MI_Light.
+	//
+	// Note on potential double-tint: the SpotLight ALSO gets SetLightColor(live colour) and
+	// SetIntensity(BaseCandela * Dimmer * Gate) in RefreshIntensity, so the floor lighting is
+	// (cookie_pixel * DMX_Color * DMX_Dimmer) * (SpotColor * SpotIntensity). At the current
+	// values this stays visually faithful (the cookie texture is sampled at unit strength then
+	// multiplied by the same dim/colour twice, which the gamma curve absorbs into a normal-
+	// looking pool); if a future test reports the cookie reads darker than the beam, the cheap
+	// fix is to push Col=White / Dim=1 here and let the SpotLight be the single colour/dim
+	// authority. Keeping the mirror for now because it preserves Epic's stock M_Light_Master
+	// behaviour, which is what the user asked us to replicate.
+	GoboLightFnMID->SetVectorParameterValue(TEXT("DMX Color"), Col);
+	GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Max Light Intensity"), RebusEpicBeamMaxIntensity * MeshBeamUserScale);
+	GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Dimmer"), Dim);
+	GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Max Light Distance"), DistCm);
+	GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Lens Radius"), BeamBaseRadiusUnreal);
+	GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Zoom"), ZoomFullDeg);
+	GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Zoom Normalize"), 0.f);
+	GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Quality Level"), RebusEpicBeamQuality);
+
+	UE_LOG(LogRebusVisualiser, Verbose,
+		TEXT("Fixture %s gobo cookie params: color=(%.2f,%.2f,%.2f) dim=%.2f gate=%.2f zoomFullDeg=%.2f distCm=%.0f -- mirrored from EpicBeamMID so M_Light_Master no longer multiplies the cookie by 0."),
+		*FixtureId, Col.R, Col.G, Col.B, Dim, Gate, ZoomFullDeg, DistCm);
 }
 
 void ARebusFixtureActor::DriveEpicBeamFromSpotLight()
@@ -2320,6 +2388,15 @@ void ARebusFixtureActor::ApplyCurrentGoboToLightFn()
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Num Mask"), 1.f);
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Index"), 0.f);
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), 0.f);
+		// v1.0.57: also push DMX Color / DMX Dimmer / DMX Max Light Intensity / ... so the
+		// cookie isn't multiplied by 0 (MIC defaults of DMX Dimmer=0 / DMX Color=black were
+		// gating the LightFunction output to nothing -- the root cause of "spotlight footprint
+		// gobo never shows" across v1.0.49 -> v1.0.56). Without this push the gobo TEXTURE is
+		// correctly bound but the surrounding M_Light_Master arithmetic collapses it. The same
+		// helper is invoked from UpdateEpicBeamParams every refresh so the cookie tracks live
+		// dimmer/colour/shutter changes (RefreshIntensity -> RefreshBeamEmissive -> UpdateEpic
+		// BeamParams -> UpdateEpicLightFnParams) -- the cone and footprint stay locked together.
+		UpdateEpicLightFnParams();
 		UE_LOG(LogRebusVisualiser, Verbose,
 			TEXT("Fixture %s gobo TEX param: beamMID=set lightFnMID=set src=%s push=%s (RT=%s)"),
 			*FixtureId,
