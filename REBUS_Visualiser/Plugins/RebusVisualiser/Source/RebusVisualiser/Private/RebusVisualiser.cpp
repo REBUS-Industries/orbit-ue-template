@@ -13,6 +13,8 @@
 #include "Components/LightComponent.h"
 #include "Engine/DirectionalLight.h"
 #include "Engine/SkyLight.h"
+#include "Interfaces/IPluginManager.h"
+#include "Misc/CoreDelegates.h"
 
 DEFINE_LOG_CATEGORY(LogRebusVisualiser);
 
@@ -23,6 +25,68 @@ namespace
 	IConsoleCommand* GDriveOrbitModelsCommand = nullptr;
 	IConsoleCommand* GMeshBeamsCommand = nullptr;
 	IConsoleCommand* GDumpFixtureLightsCommand = nullptr;
+
+	// v1.0.55: Pixel Streaming console-command gate. v1.0.54 set only the PS1 CVar
+	// ("PixelStreaming.AllowPixelStreamingCommands") and had no effect because this project enables
+	// the **PS2** plugin (verified: REBUS_Visualiser.uproject -> "PixelStreaming2": enabled). PS2
+	// uses a completely different CVar ("PixelStreaming2.AllowPixelStreamingCommands") that gates
+	// BOTH the streamer's Command/ConsoleCommand handler AND the InitialSettings JSON the streamer
+	// sends to the frontend (the frontend ALSO refuses to send commands when its mirror of the gate
+	// is false). v1.0.55 layers three defences:
+	//   1. .ini config (DefaultEngine.ini [SystemSettings] + [ConsoleVariables],
+	//      DefaultGame.ini [/Script/PixelStreaming2Settings.PixelStreaming2PluginSettings]).
+	//   2. Force the CVar to 1 at RebusVisualiser StartupModule (and re-force on
+	//      FCoreDelegates::OnPostEngineInit so the PS2 plugin is definitely loaded).
+	//   3. Diagnostic log line so the user can grep LogRebusVisualiser for "PixelStreaming console
+	//      gate status:" and see the final resolved value plus which plugin is active.
+	// We poke BOTH the PS1 and PS2 CVars defensively (whichever plugin is actually loaded picks up
+	// the right one; the other CVar simply won't exist and we log a benign "not registered" note).
+	const TCHAR* GPixelStreamingGateCVars[] = {
+		TEXT("PixelStreaming2.AllowPixelStreamingCommands"), // PS2 - active in this project
+		TEXT("PixelStreaming.AllowPixelStreamingCommands"),  // PS1 - defensive
+	};
+
+	void TryForcePixelStreamingGate(const TCHAR* Phase)
+	{
+		for (const TCHAR* Name : GPixelStreamingGateCVars)
+		{
+			IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(Name);
+			if (!CVar)
+			{
+				UE_LOG(LogRebusVisualiser, Log,
+					TEXT("Pixel Streaming CVar %s NOT REGISTERED at phase=%s (plugin module not loaded -- benign if the other PS plugin is active)."),
+					Name, Phase);
+				continue;
+			}
+			const int32 Before = CVar->GetInt();
+			CVar->Set(1, ECVF_SetByProjectSetting);
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Forced %s=1 at phase=%s (was=%d, now=%d)"),
+				Name, Phase, Before, CVar->GetInt());
+		}
+	}
+
+	void LogPixelStreamingGateStatus()
+	{
+		const bool bPS1 = IPluginManager::Get().FindPlugin(TEXT("PixelStreaming")).IsValid() && IPluginManager::Get().FindPlugin(TEXT("PixelStreaming"))->IsEnabled();
+		const bool bPS2 = IPluginManager::Get().FindPlugin(TEXT("PixelStreaming2")).IsValid() && IPluginManager::Get().FindPlugin(TEXT("PixelStreaming2"))->IsEnabled();
+		const TCHAR* PluginStr = (bPS1 && bPS2) ? TEXT("both")
+			: bPS2 ? TEXT("PS2")
+			: bPS1 ? TEXT("PS1")
+			: TEXT("none");
+
+		auto ReadCVar = [](const TCHAR* Name) -> FString
+		{
+			IConsoleVariable* C = IConsoleManager::Get().FindConsoleVariable(Name);
+			return C ? FString::Printf(TEXT("%d"), C->GetInt()) : FString(TEXT("<unregistered>"));
+		};
+
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("PixelStreaming console gate status: PixelStreaming.AllowPixelStreamingCommands=%s PixelStreaming2.AllowPixelStreamingCommands=%s plugin=%s -- expected =1 for the active plugin so the portal's console pane works (run 'stat fps' from the portal console to verify)."),
+			*ReadCVar(TEXT("PixelStreaming.AllowPixelStreamingCommands")),
+			*ReadCVar(TEXT("PixelStreaming2.AllowPixelStreamingCommands")),
+			PluginStr);
+	}
 
 	// v1.0.51: `Rebus.DumpFixtureLights` -- enumerate every fixture's SpotLight and ANY sibling
 	// light components for cookie debugging. Also reports world-level competing lights (sky /
@@ -144,6 +208,18 @@ namespace
 void FRebusVisualiserModule::StartupModule()
 {
 	UE_LOG(LogRebusVisualiser, Log, TEXT("RebusVisualiser module started."));
+
+	// v1.0.55: force the Pixel Streaming console-command gate. First attempt at StartupModule
+	// (may be too early -- if the PS module hasn't loaded yet the CVar isn't registered and the
+	// "not registered" log fires; that's fine). Second attempt on OnPostEngineInit after every
+	// plugin is up, which always wins, followed by the gate-status diagnostic so the user can
+	// confirm from one grep ("PixelStreaming console gate status:") whether the gate is now 1.
+	TryForcePixelStreamingGate(TEXT("StartupModule"));
+	FCoreDelegates::OnPostEngineInit.AddLambda([]()
+	{
+		TryForcePixelStreamingGate(TEXT("PostEngineInit"));
+		LogPixelStreamingGateStatus();
+	});
 
 	GDriveOrbitModelsCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Rebus.DriveOrbitModels"),

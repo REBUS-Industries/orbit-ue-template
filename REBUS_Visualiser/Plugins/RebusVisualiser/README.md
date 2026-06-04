@@ -67,14 +67,12 @@ never hardcoded), `-OrbitProject` (portal doc id), `-OrbitModel`, `-OrbitVersion
 
 > Quote the URL in `.ini` — UE strips `//` from unquoted values (§4.0).
 
-### Pixel Streaming console commands (v1.0.54)
+### Pixel Streaming console commands (v1.0.54 → multi-layer fix v1.0.55)
 
 The Pixel Streaming 2 streamer silently DROPS portal-sent `Command` / `ConsoleCommand` messages
-unless `PixelStreaming.AllowPixelStreamingCommands=1` is set (defaults off for security). This
-is project-side config, not a plugin code path — Epic's built-in `PixelStreamingInput`
-component routes the command, and the CVar is what gates it. v1.0.54 adds the line to the
-project's `REBUS_Visualiser/Config/DefaultEngine.ini` under `[SystemSettings]` so the running
-streamer accepts them. With this enabled the portal's console pane can drive:
+unless a CVar gate is set to 1 (defaults off for security). Epic's built-in `PixelStreamingInput`
+component routes the command; the CVar is what gates it. With it enabled the portal's console
+pane can drive:
 
 - Any built-in UE console command, e.g. `stat fps`, `stat unit`, `r.ScreenPercentage 75`.
 - Every `Rebus.*` console command this plugin registers: `Rebus.DumpFixtureLights`,
@@ -82,9 +80,73 @@ streamer accepts them. With this enabled the portal's console pane can drive:
   `Rebus.HeroShadowScatter <float>`.
 - Any other CVar relevant to runtime tuning (e.g. `r.MegaLights.Allow`, `r.SkyLight.RealTimeReflectionCapture`).
 
-The change takes effect at next process launch (no rebuild). Quick verify: with a fresh build
-running, send `stat fps` from the portal console pane — the FPS overlay appears in the
-streamed view. Pre-v1.0.54 the message was silently dropped on the streamer side.
+> **v1.0.55 — wrong CVar in v1.0.54.** v1.0.54 set `PixelStreaming.AllowPixelStreamingCommands=1`,
+> which is the **legacy PS1** CVar. This project ships the **PS2** plugin
+> (`REBUS_Visualiser.uproject` → `"PixelStreaming2": enabled`), which gates on a **completely
+> different CVar**: `PixelStreaming2.AllowPixelStreamingCommands`. Engine source (UE 5.7):
+>
+> - PS1 gate: `Engine/Plugins/Media/PixelStreaming/Source/PixelStreamingInput/Private/Settings.cpp:8`
+>   `CVarPixelStreamingInputAllowConsoleCommands("PixelStreaming.AllowPixelStreamingCommands")`.
+> - PS2 gate: `Engine/Plugins/Media/PixelStreaming2/Source/PixelStreaming2Settings/Private/PixelStreaming2PluginSettings.cpp:621`
+>   `CVarInputAllowConsoleCommands("PixelStreaming2.AllowPixelStreamingCommands")`.
+> - PS2 Command handler: `PixelStreaming2/Source/PixelStreaming2RTC/Private/RTCInputHandler.cpp:627`
+>   reads the PS2 CVar on every incoming message (so a late `Set` works, BUT — see next bullet).
+> - **Frontend gate sticks early.** The PS2 streamer (`EpicRtcStreamer.cpp:923-926`) bakes the
+>   CVar value into the `InitialSettings` JSON it sends to the browser **once** when the data
+>   channel opens; the frontend (`PixelStreaming.ts:568`) reads
+>   `PixelStreamingSettings.AllowPixelStreamingCommands` from that payload and **refuses to send
+>   commands at all** if it was `false`. So the gate must be 1 *before* the first data-channel
+>   handshake, not just before each Command arrives.
+>
+> v1.0.55 therefore layers **three** defences so the gate is true no matter which load order /
+> config phase runs first:
+>
+> 1. **Config (defence in depth).** `REBUS_Visualiser/Config/DefaultEngine.ini` carries the line
+>    in BOTH `[SystemSettings]` AND `[ConsoleVariables]` (the latter is applied very early in
+>    engine boot, before plugin StartupModule). Both PS1 and PS2 CVar names are set. The PS2
+>    UDeveloperSettings UPROPERTY backing is also set in `DefaultGame.ini` under
+>    `[/Script/PixelStreaming2Settings.PixelStreaming2PluginSettings]` →
+>    `InputAllowConsoleCommands=True`.
+> 2. **Force at module startup.** `RebusVisualiser.cpp::StartupModule()` looks up both PS1 and
+>    PS2 CVars and calls `Set(1, ECVF_SetByProjectSetting)` immediately. If the relevant PS
+>    module hasn't loaded yet (CVar not registered), it logs a benign "NOT REGISTERED" line and
+>    retries from `FCoreDelegates::OnPostEngineInit` (all plugins are up by then), which always
+>    succeeds.
+> 3. **Diagnostic log line.** After the post-engine-init retry, the module logs a one-shot
+>    status line:
+>
+>    ```
+>    LogRebusVisualiser: PixelStreaming console gate status: PixelStreaming.AllowPixelStreamingCommands=<v> PixelStreaming2.AllowPixelStreamingCommands=<v> plugin=<PS2|PS1|both|none> ...
+>    ```
+>
+>    Grep `LogRebusVisualiser` for `PixelStreaming console gate status:` after relaunching. For
+>    this project, expect `PixelStreaming2.AllowPixelStreamingCommands=1 ... plugin=PS2`. If
+>    instead you see `=0` for PS2 the gate never landed (file a bug with the surrounding
+>    `Forced PixelStreaming2.* at phase=...` lines so we can see which phase actually ran).
+>
+> **Manual fallbacks** if all three layers somehow miss:
+> `-execcmds="PixelStreaming2.AllowPixelStreamingCommands 1"` on the editor / cooked-game
+> command line (highest CVar priority short of console). For PS1 builds the legacy launch arg
+> `-AllowPixelStreamingCommands` is also parsed by `PixelStreamingInput/Settings.cpp:79`.
+>
+> **If the gate is 1 but the portal console still does nothing**, the diagnosis moves to the
+> streamer/frontend protocol side:
+>
+> - Frontend: confirm the browser's PS frontend actually emits a `ConsoleCommand` JSON on the
+>   data channel (check the page DevTools console for the `Logger.Info` line "Sending UE
+>   ConsoleCommand" or watch the WebRTC data channel). If the InitialSettings handshake handed
+>   it `AllowPixelStreamingCommands=false` it'll silently no-op (`PixelStreaming.ts:568-573`).
+> - Streamer: PS2 maps the `ConsoleCommand` toStreamer opcode in
+>   `RTCInputHandler.cpp:626`; if the opcode isn't in the protocol map the message never
+>   reaches the handler. Mismatched PS1/PS2 frontend ↔ streamer pairings can cause this.
+> - Portal-side: confirm the portal is using its PS2-compatible frontend bundle (matching the
+>   `EpicRtcStreamer` protocol version) — a PS1 frontend talking to a PS2 streamer will not
+>   propagate commands.
+
+The change takes effect at next process launch (no rebuild needed for config-only re-issues,
+but v1.0.55 carries a C++ change so a rebuild is required for it). Quick verify: with the
+fresh build running, send `stat fps` from the portal console pane — the FPS overlay appears in
+the streamed view, and the gate-status log line confirms `=1` for the active plugin.
 
 ## Lifecycle
 
