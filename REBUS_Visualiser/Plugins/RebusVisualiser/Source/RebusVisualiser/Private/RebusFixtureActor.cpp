@@ -60,12 +60,24 @@ namespace
 	// (just a little frustum-cull headroom for the elongated shaft), reduced from the v1.0.38 3x.
 	constexpr float RebusBeamBoundsScale = 1.5f;
 
-	// v1.0.43: Epic DMX beam (M_Beam_Master) "DMX Quality Level" feed = the raymarch step-size factor
-	// (lower is better). 1.0 == Epic's High quality (see ADMXFixtureActor::FeedFixtureData). The Epic
-	// beam canvas (SM_Beam_RM) is scaled UP by this margin so it always encloses our cone -- the
-	// world-space raymarch shape is param-driven, so over-coverage is free of visual distortion.
-	constexpr float RebusEpicBeamQuality = 1.0f;
-	constexpr float RebusEpicBeamCoverMargin = 1.15f;
+	// v1.0.44: Epic DMX beam (M_Beam_Master) correct conventions, verified by introspecting the
+	// installed content (SM_Beam_RM + MI_Beam):
+	//  * SM_Beam_RM is a NORMALIZED unit tube whose LOCAL LENGTH AXIS is -Z (geometry spans Z 0..-1,
+	//    pivot/apex at the Z=0 lens end) with bounds extended to +/-10000 so it's never culled. The
+	//    material expands it into the actual cone via WORLD POSITION OFFSET from its params, so the
+	//    canvas component MUST stay at scale (1,1,1) -- any component scale breaks the WPO cone (this
+	//    was the v1.0.43 misalignment). ADMXFixtureActor::InitializeFixture forces WorldScale (1,1,1)
+	//    for exactly this reason.
+	//  * Cone ANGLE comes from "DMX Zoom" (full beam angle in DEGREES; MI default 32.77), LENGTH from
+	//    "DMX Max Light Distance" (cm, <= the ~10000 canvas length), start radius from "DMX Lens
+	//    Radius", brightness from "DMX Max Light Intensity" (Epic scale ~1000) x "DMX Dimmer" (0..1).
+	constexpr float RebusEpicBeamQuality = 1.0f;     // "DMX Quality Level" (1 == Epic High)
+	const FVector RebusEpicBeamLocalEmission(0.f, 0.f, -1.f); // SM_Beam_RM local emission axis
+	constexpr float RebusEpicBeamMaxDistanceCm = 10000.f;     // canvas length cap (mesh built length)
+	// Beam brightness base for M_Beam_Master ("DMX Max Light Intensity"). Epic's scale is ~1000s of
+	// candela (MI default 1000), NOT our M_RebusBeam 0..4 range -- a small value here is invisible.
+	// Multiplied by the live SetFixtureBeamVolumetrics user scale; modulated by "DMX Dimmer".
+	constexpr float RebusEpicBeamMaxIntensity = 2000.f;
 	// Verified-on-disk object paths for Epic's UE 5.7 DMX Fixtures content (mount /DMXFixtures). A
 	// config override ([RebusVisualiser] EpicDmxBeamMaterial/EpicDmxBeamMesh in DefaultGame.ini) lets
 	// a differing install relocate them without a recompile.
@@ -1017,29 +1029,23 @@ bool ARebusFixtureActor::TryBuildEpicBeam()
 	EpicBeamComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	EpicBeamComp->SetCastShadow(false);
 	EpicBeamComp->bCastDynamicShadow = false;
-	// Parity with the procedural cone (v1.0.36/v1.0.38): never occlude, use own bounds, no
-	// self-volumetric-shadow into its own beam, and a modest bounds margin against frustum culling.
+	// Parity with the procedural cone (v1.0.36): never occlude + no self-volumetric-shadow into its
+	// own beam. The mesh already carries huge (+/-10000) bounds so the WPO cone is never culled --
+	// we DON'T add a bounds scale (and crucially DON'T scale the component; see below).
 	EpicBeamComp->bUseAttachParentBound = false;
 	EpicBeamComp->bUseAsOccluder = false;
-	EpicBeamComp->SetBoundsScale(RebusBeamBoundsScale);
 	EpicBeamComp->SetVisibility(bMeshBeamEnabled);
 	DisableSelfBeamVolumetricShadow(EpicBeamComp);
 
 	EpicBeamMID = UMaterialInstanceDynamic::Create(EpicMat, this);
 	EpicBeamComp->SetMaterial(0, EpicBeamMID);
 
-	// Pick the mesh-local axis that represents the beam length (largest local extent) so we can align
-	// SM_Beam_RM to the live emission regardless of how Epic authored its local orientation.
-	const FVector Ext = EpicMesh->GetBounds().BoxExtent;
-	EpicBeamLocalFwd = (Ext.X >= Ext.Y && Ext.X >= Ext.Z) ? FVector::ForwardVector
-		: (Ext.Y >= Ext.Z) ? FVector::RightVector : FVector::UpVector;
-
 	UpdateEpicBeamParams();
 	DriveEpicBeamFromSpotLight();
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s beam: using Epic M_LightBeam (MI_Beam + SM_Beam_RM) localExt=(%.1f,%.1f,%.1f) localFwd=(%.0f,%.0f,%.0f) src=%s."),
-		*FixtureId, Ext.X, Ext.Y, Ext.Z, EpicBeamLocalFwd.X, EpicBeamLocalFwd.Y, EpicBeamLocalFwd.Z,
+		TEXT("Fixture %s beam: using Epic M_LightBeam (MI_Beam + SM_Beam_RM) localEmission=(%.0f,%.0f,%.0f) scale=1,1,1 (WPO cone) src=%s."),
+		*FixtureId, RebusEpicBeamLocalEmission.X, RebusEpicBeamLocalEmission.Y, RebusEpicBeamLocalEmission.Z,
 		EpicBeamMaterial ? TEXT("CDO") : TEXT("LoadObject"));
 	return true;
 }
@@ -1061,14 +1067,22 @@ void ARebusFixtureActor::UpdateEpicBeamParams()
 		FMath::Clamp(ColorR.Current, 0.f, 1.f),
 		FMath::Clamp(ColorG.Current, 0.f, 1.f),
 		FMath::Clamp(ColorB.Current, 0.f, 1.f), 1.f);
-	const float Intensity = RebusMeshBeamMaxIntensity * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate * MeshBeamUserScale;
+	// Epic separates brightness into a candela-scale "DMX Max Light Intensity" x a 0..1 "DMX Dimmer".
+	const float Dim = FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate;
+	// Cone angle: "DMX Zoom" is the FULL beam angle in degrees (= 2 x our outer half angle), so the
+	// WPO cone half-angle matches the lit spotlight cone. Length capped to the canvas mesh extent.
+	const float ZoomFullDeg = FMath::Clamp(2.f * ResolveOuterHalfDeg(), 1.f, 179.f);
+	const float DistCm = FMath::Clamp(BeamLengthUnreal, 1.f, RebusEpicBeamMaxDistanceCm);
 
-	// Epic M_Beam_Master param vocabulary (mirrors ADMXFixtureActor::FeedFixtureData). Unknown params
-	// silently no-op, so this is safe across DMX content revisions.
+	// Epic M_Beam_Master param vocabulary (mirrors ADMXFixtureActor::FeedFixtureData + the BP zoom
+	// feed). Unknown params silently no-op, so this is safe across DMX content revisions.
 	EpicBeamMID->SetVectorParameterValue(TEXT("DMX Color"), Col);
-	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Max Light Intensity"), Intensity);
-	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Max Light Distance"), BeamLengthUnreal);
+	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Max Light Intensity"), RebusEpicBeamMaxIntensity * MeshBeamUserScale);
+	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Dimmer"), Dim);
+	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Max Light Distance"), DistCm);
 	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Lens Radius"), BeamBaseRadiusUnreal);
+	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Zoom"), ZoomFullDeg);
+	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Zoom Normalize"), 0.f); // DMX Zoom is in degrees
 	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Quality Level"), RebusEpicBeamQuality);
 }
 
@@ -1076,36 +1090,34 @@ void ARebusFixtureActor::DriveEpicBeamFromSpotLight()
 {
 	if (!SpotLight || !EpicBeamComp) return;
 
-	// Origin = lens (SpotLight world location); orient the mesh-local length axis onto the live
-	// emission forward (ground truth, exactly like DriveBeamConeFromSpotLight does for the cone).
+	// Place EXACTLY like ADMXFixtureActor: apex/lens at the SpotLight world location, the canvas's
+	// LOCAL emission axis (SM_Beam_RM's -Z) aimed along the live spotlight world forward (v1.0.34
+	// ground truth), and -- critically -- world scale (1,1,1) so the material's World-Position-Offset
+	// cone (built from DMX Zoom / Distance / Lens Radius) is not distorted. FindBetweenNormals maps
+	// local -Z onto the emission; the cone is radially symmetric so the residual roll is irrelevant.
 	const FVector SpotFwd = SpotLight->GetForwardVector().GetSafeNormal();
 	const FVector SpotLoc = SpotLight->GetComponentLocation();
-	const FQuat Rot = FQuat::FindBetweenNormals(EpicBeamLocalFwd, SpotFwd);
+	const FQuat Rot = FQuat::FindBetweenNormals(RebusEpicBeamLocalEmission, SpotFwd);
 	EpicBeamComp->SetWorldLocationAndRotation(SpotLoc, Rot);
-
-	// Scale Epic's canvas so it ENCLOSES our cone (length L along the local fwd axis, far radius RF
-	// laterally). M_Beam_Master raymarches the cone in world space from its params + the component's
-	// transform, so an over-sized canvas only adds coverage headroom -- it never distorts the beam.
-	if (UStaticMesh* SM = EpicBeamComp->GetStaticMesh())
-	{
-		const FVector Ext = SM->GetBounds().BoxExtent; // local half-extents
-		const float OuterHalf = ResolveOuterHalfDeg();
-		const float RF = FMath::Max(BeamLengthUnreal * FMath::Tan(FMath::DegreesToRadians(OuterHalf)),
-			BeamBaseRadiusUnreal + 0.1f);
-
-		const bool bFwdX = (EpicBeamLocalFwd.X != 0.f);
-		const bool bFwdY = (EpicBeamLocalFwd.Y != 0.f);
-		const float FwdExt = FMath::Max(bFwdX ? Ext.X : (bFwdY ? Ext.Y : Ext.Z), 1.f);
-		const float LatExt = FMath::Max(FMath::Min3(Ext.X, Ext.Y, Ext.Z), 1.f);
-		const float SFwd = (BeamLengthUnreal * RebusEpicBeamCoverMargin) / (2.f * FwdExt);
-		const float SLat = (RF * RebusEpicBeamCoverMargin) / (2.f * LatExt);
-
-		FVector S(SLat, SLat, SLat); // relative (mesh-local) scale; the fwd axis gets the length scale
-		if (bFwdX) S.X = SFwd; else if (bFwdY) S.Y = SFwd; else S.Z = SFwd;
-		EpicBeamComp->SetRelativeScale3D(S);
-	}
+	EpicBeamComp->SetWorldScale3D(FVector::OneVector);
 
 	UpdateEpicBeamParams();
+
+	// Alignment proof (throttled to meaningful aim changes): the canvas's driven emission axis (world
+	// -Z) must equal the spotlight forward (dot ~= +1), and the apex (canvas world origin) must sit
+	// on the lens (spotlight location).
+	const FVector CanvasEmission = Rot.RotateVector(RebusEpicBeamLocalEmission).GetSafeNormal();
+	if (FVector::DotProduct(CanvasEmission, EpicLastLoggedFwd) < 0.999f)
+	{
+		EpicLastLoggedFwd = CanvasEmission;
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s Epic beam align: spotFwd=(%.3f,%.3f,%.3f) canvasFwd=(%.3f,%.3f,%.3f) dot=%.3f apex=(%.0f,%.0f,%.0f) lens=(%.0f,%.0f,%.0f) |apex-lens|=%.2fcm"),
+			*FixtureId, SpotFwd.X, SpotFwd.Y, SpotFwd.Z, CanvasEmission.X, CanvasEmission.Y, CanvasEmission.Z,
+			FVector::DotProduct(CanvasEmission, SpotFwd),
+			EpicBeamComp->GetComponentLocation().X, EpicBeamComp->GetComponentLocation().Y, EpicBeamComp->GetComponentLocation().Z,
+			SpotLoc.X, SpotLoc.Y, SpotLoc.Z,
+			(float)FVector::Dist(EpicBeamComp->GetComponentLocation(), SpotLoc));
+	}
 }
 
 void ARebusFixtureActor::RefreshBeamShadowMode()

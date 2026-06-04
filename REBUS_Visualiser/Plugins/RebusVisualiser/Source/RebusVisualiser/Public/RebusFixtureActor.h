@@ -300,7 +300,9 @@ private:
 	UPROPERTY() TObjectPtr<class UStaticMeshComponent> EpicBeamComp = nullptr;
 	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> EpicBeamMID = nullptr;
 	bool bUsingEpicBeam = false;
-	FVector EpicBeamLocalFwd = FVector::ForwardVector;
+	// Last canvas emission axis we logged the Epic-beam alignment proof for (throttles the per-tick
+	// dot/apex log to meaningful aim changes). SM_Beam_RM's local emission axis is a fixed -Z.
+	FVector EpicLastLoggedFwd = FVector::ZeroVector;
 
 	// Cone-beam geometry/state. BeamConeRest is the rest transform (mesh +Z -> beam forward, at the
 	// beam origin) composed with the head motion each RefreshMotion. LastFarRadius lets zoom ticks

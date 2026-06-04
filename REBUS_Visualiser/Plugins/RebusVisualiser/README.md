@@ -412,6 +412,26 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 > `[RebusVisualiser] EpicDmxBeamMaterial=…` / `EpicDmxBeamMesh=…`. If the content is ever absent the
 > actor falls back cleanly to `M_RebusBeam` — no fabricated assets, fully reversible.
 
+> **Epic beam alignment fix (v1.0.44).** v1.0.43 misaligned/reversed the Epic beam. Introspecting the
+> installed content revealed how `M_Beam_Master` actually works: **`SM_Beam_RM` is a normalized unit
+> tube** (local **length axis = −Z**, geometry spans Z `0..−1`, **pivot/apex at the Z=0 lens end**,
+> bounds extended to ±10000 so it never culls), and the material builds the real cone with **World
+> Position Offset** from its params — so the canvas component **must stay at scale (1,1,1)** (exactly
+> why `ADMXFixtureActor::InitializeFixture` forces `WorldScale(1,1,1)`). The v1.0.43 bugs were: (1)
+> **auto-scaling** the canvas (broke the WPO cone → misplaced), (2) **wrong local axis** (auto-picked
+> +X instead of −Z → wrong way round), (3) **missing `DMX Zoom`/`DMX Dimmer` and wrong intensity
+> scale**. `DriveEpicBeamFromSpotLight` now places the apex at the spotlight location, aims local −Z
+> along the live spotlight forward (`FindBetweenNormals`), and sets `WorldScale(1,1,1)` — no scaling.
+> Param mapping corrected to Epic's real vocabulary (verified defaults in `MI_Beam`):
+> - cone **angle** → **`DMX Zoom`** = full beam angle in degrees (`2 × outer half`), `DMX Zoom Normalize=0`
+> - **length** → **`DMX Max Light Distance`** (cm, capped to the ~10000 canvas length)
+> - start radius → **`DMX Lens Radius`**; colour → **`DMX Color`**
+> - brightness → **`DMX Max Light Intensity`** (Epic candela scale ~2000, not our `4`) × **`DMX Dimmer`** (0..1 = dimmer × shutter-gate)
+>
+> Verify with the log `Epic beam align: … dot=1.000 … |apex-lens|=0.00cm`. Live tuning knob:
+> `RebusEpicBeamMaxIntensity` (beam brightness). The pan/tilt/head, IES spotlight, no-self-shadow and
+> `M_RebusBeam` fallback are all preserved.
+
 ### `RenderQuality` scene property (runtime tiers)
 
 Push `SetSceneProperty name="RenderQuality" value="<tier>"` (case-insensitive; unknown values
