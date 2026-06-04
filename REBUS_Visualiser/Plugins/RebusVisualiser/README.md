@@ -449,6 +449,44 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Gobo Open-slot clear + lit-pool cookie (v1.0.49).** Two follow-ups to v1.0.48:
+>
+> 1. **Open slot** — picking the no-gobo position used to leave the LAST gobo stuck in the cone.
+>    Root cause: the v1.0.48 finalizer dropped any inline entry with empty bytes AND empty url (so
+>    Open entries disappeared from the cache), then `AssignGobo` fell to `FetchAndAssignGobo`,
+>    which on a missing profile URL only nulled the legacy (always-null) `GoboMID`'s light
+>    function — the Epic cone's `DMX Gobo Disk Frosted` was never reverted. Fix: detect Open from
+>    `slotName/name` via the new `ARebusFixtureActor::IsOpenSlotName` (recognises
+>    `"Open"/"None"/"Empty"/"Clear"/"No Gobo"/"NoGobo"/"Open Hole"/"OpenHole"/"Off"/"0"`,
+>    case-insensitive, trimmed exact match), KEEP Open entries in the finalize cache with a new
+>    `bIsOpen=true` flag, and route every clear path (`SetFixtureGobo(!bHasIndex)`, inline Open
+>    entry, inline empty entry, missing profile URL, missing profile wheel) through a single
+>    `ClearGoboToOpen(reason)` helper that drops `CurrentGoboTexture`, reverts the Epic beam MID to
+>    its MI parent default (Epic's open frosted disc), nulls the SpotLight cookie, clears
+>    `bGoboActive`, and re-asserts `RefreshBeamShadowMode`. The finalize log now reports
+>    `isOpen=1` so Open detection is provable per slot.
+>
+> 2. **Lit-pool cookie** — the gobo was visible in the cone (v1.0.48) but not projected on the lit
+>    pool. Pre-v1.0.48 the legacy `GoboMID` (declared but never instantiated, no `M_RebusGobo`
+>    asset existed) silently no-oped the cookie path. Fix: instantiate Epic's **`MI_Light`** (MID
+>    of `M_Light_Master`, `MD_LightFunction` domain, samples the SAME `MF_DMXGobo` material
+>    function as `M_Beam_Master`) lazily on first gobo apply and assign it as
+>    `SpotLight->LightFunctionMaterial`. A new `ApplyCurrentGoboToLightFn` pushes the SAME
+>    single-cell atlas params (`DMX Gobo Disk Frosted` + `Num Mask=1` + `Index=0` +
+>    `Disk Rotation Speed`) so one decoded texture drives both the cone and the cookie. On Open
+>    the cookie is set to `nullptr` (a transparent light function would dim the lit pool — null is
+>    the true "no gobo"). `RefreshBeamShadowMode` now ORs `bGoboActive` into
+>    `SpotLight->SetCastShadows(…)` so every fixture with an active gobo gets shadow-casting on
+>    (a SpotLight light function only projects when the light is also casting regular shadows —
+>    it's sampled via the shadow render target), regardless of hero-beam status. Cleared back when
+>    the gobo clears.
+>
+> **Diagnostics.** New cookie + Open lines listed in the §"Gobo pipeline diagnostics" recipe —
+> twelve lines total now cover wire arrival → finalize+isOpen → SetFixtureGobo → Open-detect →
+> clear → AssignGobo source → decode → cookie MID lazy-create → cookie apply (with `castShadows`
+> reported) → cookie clear → URL fetch fallback. The first missing or off line identifies the
+> failing link.
+
 > **Gobos through Epic's beam + full pipeline diagnostics (v1.0.48).** Two co-existing breaks made
 > gobos invisible since the v1.0.43 Epic beam swap. (1) `GoboMID` (the legacy SpotLight light-function
 > MID) was declared but **never instantiated** — `M_RebusGobo` doesn't exist in content, so
@@ -692,33 +730,80 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
   data it uses the `Source` path; cooked builds fill platform data directly. If a shipping
   build can't load IES at runtime, pre-bake the profiles or fall back to the synthesized cone
   (already the default when no IES exists).
-- **Gobo projection** (v1.0.48: visible in the Epic beam cone, no light-function asset needed).
-  `RebusFixtureActor::ApplyGoboTextureFromBytes` decodes the inline (or fetched) wheel image to a
-  `UTexture2D`, caches it as `CurrentGoboTexture`, and `ApplyCurrentGoboToEpicBeam` pushes it into
-  the **Epic `M_Beam_Master` MID** (`MI_Beam`) as a **single-cell atlas**:
-  `DMX Gobo Disk Frosted = <our texture>`, `DMX Gobo Num Mask = 1`, `DMX Gobo Index = 0`, and
-  `DMX Gobo Disk Rotation Speed = ApplyGoboRotation(speed)`. The gobo therefore appears **in the
-  visible beam cone** (Epic's raymarch sees it directly). On a beam (re)build/refresh,
-  `UpdateEpicBeamParams` re-pushes the cached gobo so motion/zoom changes don't drop it. On
-  `SetFixtureGobo` clear, the MI parent's default `DMX Gobo Disk Frosted` (snapshotted at
-  `TryBuildEpicBeam` into `EpicBeamDefaultGoboTex`) is restored — Epic's open disc, beam unmasked.
-  The LEGACY SpotLight light-function path (`GoboMID` + `M_RebusGobo`) is still declared but the
-  MID is never instantiated (no content asset), so it remains a no-op; the cpp writes are guarded
-  so a future `M_RebusGobo` asset would light up automatically.
-- **Gobo pipeline diagnostics** (v1.0.48). Always-on `LogRebusVisualiser` lines, in order of arrival:
+- **Gobo projection** (v1.0.48 cone, v1.0.49 cookie). One decoded texture drives both the visible
+  beam cone (Epic's `M_Beam_Master` via `MI_Beam`) AND the SpotLight cookie projected on the lit
+  floor (Epic's `M_Light_Master` via `MI_Light` — `MD_LightFunction` domain). Both materials sample
+  the same `MF_DMXGobo` material function, so a single set of texture + atlas + rotation params
+  fans out to both surfaces.
+  - `RebusFixtureActor::ApplyGoboTextureFromBytes` decodes the inline (or fetched) wheel image to a
+    `UTexture2D`, caches it as `CurrentGoboTexture`, latches `bGoboActive=true`, and calls
+    `ApplyCurrentGoboToEpicBeam` which:
+    1. Pushes `DMX Gobo Disk Frosted = <our texture>`, `DMX Gobo Num Mask = 1`, `DMX Gobo Index = 0`,
+       `DMX Gobo Disk Rotation Speed = ApplyGoboRotation(speed)` onto `EpicBeamMID` (the cone).
+    2. Tail-calls `ApplyCurrentGoboToLightFn`, which lazily MIDs `MI_Light` on first use and pushes
+       the same four params, then assigns `SpotLight->LightFunctionMaterial = GoboLightFnMID` so the
+       cookie projects identically.
+  - `RefreshBeamShadowMode` ORs `bGoboActive` into `SpotLight->SetCastShadows(…)`. A SpotLight light
+    function only renders when the light is also casting regular shadows (it's sampled via the
+    shadow render target), so every fixture with an active gobo gets `CastShadows=true` regardless
+    of hero-beam status. Cleared back when the gobo clears.
+  - `UpdateEpicBeamParams` re-pushes the cached gobo on every beam refresh, so motion/zoom changes
+    don't drop the cone or the cookie.
+  - `EpicBeamDefaultGoboTex` snapshots the MI parent's default `DMX Gobo Disk Frosted` at
+    `TryBuildEpicBeam`, so a `SetFixtureGobo` clear reverts the cone to Epic's open frosted disc.
+    The cookie clears by nulling `SpotLight->LightFunctionMaterial` (a transparent light function
+    would dim the lit pool — null is the true "no gobo").
+  - The legacy `GoboMID` member is preserved (no-op when its `M_RebusGobo` content asset doesn't
+    exist) so a future light-fn material can light up without re-wiring.
+- **Open-slot detection** (v1.0.49). Real fixtures have an OPEN slot on every gobo wheel (the
+  no-gobo position) that carries no image data. Pre-v1.0.49 the finalizer DROPPED entries with no
+  bytes + no url, so Open vanished from the cache and selecting it silently fell through to the
+  LAST gobo (cone never cleared). Now:
+  1. `ARebusFixtureActor::IsOpenSlotName` recognises `"Open" | "None" | "Empty" | "Clear" | "No Gobo"
+     | "NoGobo" | "Open Hole" | "OpenHole" | "Off" | "0"` (case-insensitive, trimmed exact match).
+  2. `URebusVisualiserSubsystem` finalize sets `FRebusInlineGobo::bIsOpen` on slots whose `slotName`
+     or `name` matches, and KEEPS them in the cache even with empty bytes/url. The finalize log
+     reports the marker: `… slot=N slotName='Open' bytes=0 urlFallback=0 isOpen=1`.
+  3. `AssignGobo` detects `Inline->bIsOpen` (or a slotName match, or an inline entry with no bytes
+     and no url and no tag) and routes through `ClearGoboToOpen("inline Open slot")`, which drops
+     `CurrentGoboTexture`, reverts the cone to its MI default, nulls the cookie, clears
+     `bGoboActive`, and re-asserts `RefreshBeamShadowMode`.
+  4. `FetchAndAssignGobo` (profile-URL fallback path) ALSO routes through `ClearGoboToOpen` on a
+     missing slot URL — pre-v1.0.49 it only nulled the (always-null) legacy `GoboMID`, so the cone
+     kept the last gobo. Now both surfaces revert together.
+  5. `SetFixtureGobo(!bHasIndex)` likewise routes through `ClearGoboToOpen` for the explicit clear
+     path. A spawn-with-Open also reaches the same clear via `AssignGobo` ↔ inline Open entry.
+- **Gobo pipeline diagnostics** (v1.0.48 + v1.0.49 cookie/Open). Always-on `LogRebusVisualiser`
+  lines, in order of arrival:
   1. `RegisterFixtureGobos '<libraryId>' chunk N/M (E entr(ies) in msg, A accumulated).`
-  2. `RegisterFixtureGobos '<libraryId>' finalized: wheelIndex=W wheel='WN'(kind=K) slot=S slotName='SN' bytes=B urlFallback=0|1` — one line per slot the worker assembled.
+  2. `RegisterFixtureGobos '<libraryId>' finalized: wheelIndex=W wheel='WN'(kind=K) slot=S slotName='SN' bytes=B urlFallback=0|1 isOpen=0|1` — one line per slot the worker assembled (v1.0.49 adds `isOpen`).
   3. `RegisterFixtureGobos '<libraryId>' complete: N gobo image(s) across W wheel(s), B total bytes.`
-  4. `Fixture <id> SetFixtureGobo: bHasIndex=… goboIndex=… wheelIndex=… wheelName=… inlineGobos=N epicBeamMID=set|absent legacyGoboMID=absent (never instantiated)` — every wire-side `SetFixtureGobo` arrival.
-  5. `Fixture <id> AssignGobo: source=inline|inline-url|fallback …` — which path resolved.
-  6. `Fixture <id> gobo decode OK: B bytes -> texture(W×H) -> epicBeamMID=set|absent legacyGoboMID=…` — decode + Epic MID push receipt.
-  7. (On URL fallback) `Fixture <id> gobo URL fetched: B bytes, applied=0|1`.
-  Recipe: open the editor's Output Log, filter `LogRebusVisualiser`, change a gobo on a fixture in
-  Orbit, and read top-to-bottom. The first missing line identifies the broken link (no chunk = wire
-  not arriving; chunk but no finalize = base64/parse failure; finalize but no `SetFixtureGobo` =
-  control-channel `setFixtureGobo` not being sent; `SetFixtureGobo` but `inlineGobos=0` = the
-  fixture's `libraryFixtureId` doesn't match any cached library; `AssignGobo source=fallback` and
-  no decode = no inline match for `(wheelIndex, slot)` so it falls to the REST URL fetch).
+  4. `Fixture <id> SetFixtureGobo: bHasIndex=… goboIndex=… wheelIndex=… wheelName=… inlineGobos=N epicBeamMID=set|absent lightFnMID=set|lazy` — every wire-side `SetFixtureGobo` arrival.
+  5. (Open slot) `Fixture <id> gobo OPEN slot detected (wheelIndex=W slot=S slotName='SN' name='N') -> applying clear.`
+  6. (Clear) `Fixture <id> gobo OPEN: clearing cone+cookie (reason=…)` — explains which path drove the clear (`SetFixtureGobo(!bHasIndex)`, `inline Open slot`, `inline empty slot`, `profile slot has no media (Open)`, `no profile wheel`).
+  7. `Fixture <id> AssignGobo: source=inline|inline-url|fallback …` — which path resolved.
+  8. `Fixture <id> gobo decode OK: B bytes -> texture(W×H) -> epicBeamMID=set|absent lightFnMID=set|lazy` — decode + Epic MID push receipt.
+  9. (Cookie MID lazy-create, once per fixture) `Fixture <id> gobo cookie: MID'd /DMXFixtures/LightFixtures/DMX_Materials/MI_Light.MI_Light for SpotLight->LightFunctionMaterial.`
+  10. `Fixture <id> gobo cookie: lightFn=MI_Light tex=<name>(W×H) rot=<r> castShadows=0|1` — per cookie apply.
+  11. (On clear) `Fixture <id> gobo cookie: lightFn=nullptr (Open / clear).`
+  12. (URL fallback only) `Fixture <id> gobo URL fetched: B bytes, applied=0|1`.
+
+  **Recipe.** Open the editor's Output Log, filter `LogRebusVisualiser`, change a gobo on a fixture
+  in Orbit, and read top-to-bottom. The first missing line identifies the broken link:
+  - no chunk = wire not arriving;
+  - chunk but no finalize = base64/parse failure;
+  - finalize but `isOpen=0` on what should be Open = portal `slotName/name` doesn't match any of
+    the recognised "no-gobo" strings — add a portal-side rename or extend `IsOpenSlotName`;
+  - finalize but no `SetFixtureGobo` = control-channel `setFixtureGobo` not being sent;
+  - `SetFixtureGobo` but `inlineGobos=0` = the fixture's `libraryFixtureId` doesn't match any
+    cached library;
+  - `AssignGobo source=fallback` and no decode = no inline match for `(wheelIndex, slot)` so it
+    falls to the REST URL fetch;
+  - cookie line says `lightFn=nullptr` and you expected one = `CurrentGoboTexture` is null (Open
+    path), check the preceding lines for which clear triggered;
+  - cookie applied but no projection visible on the floor = either `MI_Light` failed to load
+    (warning line says so) or `SpotLight->CastShadows` is false (the cookie line reports it; if 0
+    we missed a refresh path).
 - **Spotlight source size (§8.3)** (`RebusFixtureActor::BuildSpotLight`) sizes the
   `USpotLightComponent` emitter so the **beam starts at the lens diameter** (a finite disc, not a
   point) — the beam and its volumetric scattering emanate from the lens and gain soft-shadow

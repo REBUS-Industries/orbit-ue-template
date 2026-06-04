@@ -913,17 +913,26 @@ void URebusVisualiserSubsystem::HandleSceneDefinition(const FString& Type, const
 				}
 			}
 
-			// Keep the entry when it has either inline bytes or a url fallback.
-			if (Out.Bytes.Num() == 0 && Out.ImageUrl.IsEmpty())
+			// v1.0.49: detect the OPEN slot (no-gobo position) from the slotName/Name so the runtime
+			// can clear the gobo when the user selects it. Pre-v1.0.49 we DROPPED entries with no
+			// payload, so Open vanished from the cache and the cone kept the last gobo. Now we KEEP
+			// Open entries with bIsOpen=true (no bytes, no url), and only drop slots that have no
+			// payload AND no Open marker (e.g. a wheel the portal hasn't pushed images for yet).
+			const bool bIsOpen = ARebusFixtureActor::IsOpenSlotName(Out.SlotName)
+				|| ARebusFixtureActor::IsOpenSlotName(Out.Name);
+			Out.bIsOpen = bIsOpen;
+
+			if (Out.Bytes.Num() == 0 && Out.ImageUrl.IsEmpty() && !bIsOpen)
 			{
 				continue;
 			}
 			// v1.0.48: per-slot finalize log so the user can see EXACTLY which (wheel, slot)
 			// entries actually assembled, with their byte counts and url fallback presence.
+			// v1.0.49: also reports the bIsOpen marker so the user can confirm Open-slot detection.
 			UE_LOG(LogRebusVisualiser, Log,
-				TEXT("RegisterFixtureGobos '%s' finalized: wheelIndex=%d wheel='%s'(kind=%s) slot=%d slotName='%s' bytes=%d urlFallback=%d"),
+				TEXT("RegisterFixtureGobos '%s' finalized: wheelIndex=%d wheel='%s'(kind=%s) slot=%d slotName='%s' bytes=%d urlFallback=%d isOpen=%d"),
 				*LibraryId, Out.WheelIndex, *Out.Wheel, *Out.WheelKind, Out.Slot, *Out.SlotName,
-				Out.Bytes.Num(), Out.ImageUrl.IsEmpty() ? 0 : 1);
+				Out.Bytes.Num(), Out.ImageUrl.IsEmpty() ? 0 : 1, bIsOpen ? 1 : 0);
 			TotalBytes += Out.Bytes.Num();
 			WheelSet.Add(Out.Wheel);
 			Finalized.Gobos.Add(MoveTemp(Out));

@@ -247,6 +247,13 @@ struct FRebusInlineGobo
 	FString Mime;        // "image/png" | "image/jpeg" | ... (informational; decode auto-detects)
 	FString ImageUrl;    // absolute signed GCS url fallback when no inline bytes
 	TArray<uint8> Bytes; // decoded (base64 -> bytes) image data; empty => use ImageUrl
+	// v1.0.49: explicit "Open" slot marker. Real fixtures have an OPEN slot on every gobo wheel
+	// (the no-gobo position) that carries no image data. Pre-v1.0.49 we DROPPED entries with no
+	// bytes + no url at finalize, so the Open slot disappeared from the cache and selecting it
+	// silently fell through to the LAST gobo (cone never cleared). When the portal flags it via
+	// slotName/Name == "Open"/"None"/"Empty" (case-insensitive) we now KEEP the entry with this
+	// marker so the runtime can recognise the request and explicitly clear the gobo state.
+	bool bIsOpen = false;
 };
 
 struct FRebusInlineGobos

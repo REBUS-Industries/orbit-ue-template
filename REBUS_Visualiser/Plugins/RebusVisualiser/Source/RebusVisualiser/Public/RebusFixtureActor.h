@@ -247,6 +247,19 @@ private:
 	// M_Beam_Master MID -- the actual visible cone -- so the user sees the gobo inside the beam.
 	// When CurrentGoboTexture is null, reverts to the MI parent's default (EpicBeamDefaultGoboTex).
 	void ApplyCurrentGoboToEpicBeam();
+	// v1.0.49: same texture/rotation also drives Epic's M_Light_Master (LightFunction domain) so
+	// the gobo projects onto the lit floor pool. Lazily MIDs MI_Light on first call; sets
+	// SpotLight->LightFunctionMaterial. On clear (CurrentGoboTexture==null) nulls the light fn.
+	void ApplyCurrentGoboToLightFn();
+	// v1.0.49: explicit clear path. Drops CurrentGoboTexture, reverts the Epic beam MID to its
+	// MI default, nulls the SpotLight light function, clears bGoboActive, and reasserts shadows.
+	void ClearGoboToOpen(const TCHAR* Reason);
+public:
+	// v1.0.49: case-insensitive match against known "no-gobo" slot names. Trimmed; returns true
+	// for "Open"/"None"/"Empty"/"Clear"/"No Gobo"/"Open Hole"/"Off" and a few common variants.
+	// Public so RebusVisualiserSubsystem's RegisterFixtureGobos finalizer can tag Open entries.
+	static bool IsOpenSlotName(const FString& Name);
+private:
 	void FetchAndAssignGobo(int32 GoboIndex);            // existing profile-wheel URL path
 	void FetchAndAssignGoboFromUrl(const FString& ImageUrl);
 
@@ -285,6 +298,16 @@ private:
 	UPROPERTY() TObjectPtr<UTexture2D> CurrentGoboTexture = nullptr;
 	UPROPERTY() TObjectPtr<UTexture> EpicBeamDefaultGoboTex = nullptr;
 	float CurrentGoboRotationSpeed = 0.f;
+
+	// v1.0.49 COOKIE state. M_Light_Master (Epic's DMXFixtures LightFunction-domain master) is
+	// MID'd once on first gobo apply and assigned to SpotLight->LightFunctionMaterial so the
+	// SAME gobo also projects on the lit pool. It shares the M_Beam_Master gobo params
+	// (DMX Gobo Disk Frosted + Num Mask + Index + Disk Rotation Speed) via MF_DMXGobo, so a
+	// single texture + rotation feeds both the cone and the cookie. bGoboActive latches whenever
+	// a non-Open texture is live; RefreshBeamShadowMode ORs it into SpotLight->SetCastShadows
+	// because a SpotLight light-function only projects when the light is also casting shadows.
+	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> GoboLightFnMID = nullptr;
+	bool bGoboActive = false;
 
 	// Emissive "glowing lens" flare disc: a thin plane at the beam origin, normal along the beam
 	// forward, parented under FixtureRoot and driven by BeamRest/head motion like the SpotLight so

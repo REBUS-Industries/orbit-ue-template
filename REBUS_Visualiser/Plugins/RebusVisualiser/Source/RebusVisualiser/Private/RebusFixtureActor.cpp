@@ -1247,13 +1247,17 @@ void ARebusFixtureActor::RefreshBeamShadowMode()
 		SpotLight->SetVolumetricScatteringIntensity(bShadowActive ? GRebusHeroShadowScatter : 0.f);
 		// Cast Volumetric Shadow only meaningfully carves the fog when the SpotLight is also casting
 		// regular shadows -- VSM needs the per-light shadow data to derive the volumetric shadow.
-		SpotLight->SetCastShadows(bShadowActive);
+		// v1.0.49: also enable CastShadows when a gobo is active -- a SpotLight LightFunctionMaterial
+		// only projects when the light is also casting shadows (the function is sampled via the
+		// shadow render target). Without this, the cookie wouldn't render on non-hero fixtures.
+		SpotLight->SetCastShadows(bShadowActive || bGoboActive);
 		SpotLight->SetCastVolumetricShadow(bShadowActive);
 	}
 	else
 	{
 		// Fog-beam A/B mode: restore the froxel beam; hero beams still cast volumetric shadow.
 		SpotLight->SetVolumetricScatteringIntensity(FogScatteringIntensity);
+		SpotLight->SetCastShadows(bShadowActive || bGoboActive);
 		SpotLight->SetCastVolumetricShadow(bShadowActive);
 	}
 	SpotLight->MarkRenderStateDirty();
@@ -1719,11 +1723,11 @@ void ARebusFixtureActor::ApplyGobo(int32 GoboIndex, bool bHasIndex, int32 WheelI
 {
 	// v1.0.48: always-on log so the user can see SetFixtureGobo arrivals + which path they took.
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s SetFixtureGobo: bHasIndex=%d goboIndex=%d wheelIndex=%d wheelName='%s' inlineGobos=%d epicBeamMID=%s legacyGoboMID=%s"),
+		TEXT("Fixture %s SetFixtureGobo: bHasIndex=%d goboIndex=%d wheelIndex=%d wheelName='%s' inlineGobos=%d epicBeamMID=%s lightFnMID=%s"),
 		*FixtureId, bHasIndex ? 1 : 0, GoboIndex, WheelIndex, *Wheel,
 		InlineGobos.Gobos.Num(),
 		EpicBeamMID ? TEXT("set") : TEXT("absent"),
-		GoboMID ? TEXT("set") : TEXT("absent (never instantiated)"));
+		GoboLightFnMID ? TEXT("set") : TEXT("lazy"));
 
 	// Discrete: switch the slot immediately (a wheel slot can't be half-selected, §11).
 	if (!bHasIndex)
@@ -1731,11 +1735,8 @@ void ARebusFixtureActor::ApplyGobo(int32 GoboIndex, bool bHasIndex, int32 WheelI
 		CurrentGoboIndex = INDEX_NONE;
 		CurrentGoboWheelIndex = WheelIndex;
 		CurrentGoboWheel = Wheel;
-		// v1.0.48: clear the Epic-beam gobo back to Epic's default (open frosted disc), AND clear
-		// the legacy light-function (no-op when GoboMID is null, which it always is today).
-		CurrentGoboTexture = nullptr;
-		ApplyCurrentGoboToEpicBeam();
-		if (SpotLight) SpotLight->SetLightFunctionMaterial(nullptr);
+		// v1.0.49: route through ClearGoboToOpen so both the cone AND the cookie revert in lockstep.
+		ClearGoboToOpen(TEXT("SetFixtureGobo(!bHasIndex)"));
 		return;
 	}
 	// Remember the full selection so a RegisterFixtureGobos re-push can re-apply it.
@@ -1965,47 +1966,139 @@ bool ARebusFixtureActor::ApplyGoboTextureFromBytes(const TArray<uint8>& Bytes)
 	}
 
 	CurrentGoboTexture = Tex;
+	bGoboActive = true; // v1.0.49: forces SpotLight->CastShadows on so the cookie projects.
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s gobo decode OK: %d bytes -> texture(%dx%d) -> epicBeamMID=%s legacyGoboMID=%s"),
+		TEXT("Fixture %s gobo decode OK: %d bytes -> texture(%dx%d) -> epicBeamMID=%s lightFnMID=%s"),
 		*FixtureId, Bytes.Num(), Tex->GetSizeX(), Tex->GetSizeY(),
 		EpicBeamMID ? TEXT("set") : TEXT("absent"),
-		GoboMID ? TEXT("set") : TEXT("absent (never instantiated)"));
+		GoboLightFnMID ? TEXT("set") : TEXT("lazy"));
 
-	ApplyCurrentGoboToEpicBeam();
-
-	// LEGACY: write the same texture to the light-function MID if (one day) it gets wired. Today
-	// GoboMID is always null, so this is a no-op; left here so a future M_RebusGobo can light up.
-	if (GoboMID && SpotLight)
-	{
-		GoboMID->SetTextureParameterValue(TEXT("GoboTexture"), Tex);
-		SpotLight->SetLightFunctionMaterial(GoboMID);
-	}
+	ApplyCurrentGoboToEpicBeam(); // tail-calls ApplyCurrentGoboToLightFn (cone + cookie).
+	RefreshBeamShadowMode();      // enables CastShadows now that bGoboActive is true.
 	return true;
 }
 
 void ARebusFixtureActor::ApplyCurrentGoboToEpicBeam()
 {
-	if (!EpicBeamMID) return;
-
-	// Single-cell atlas mapping: each of our per-slot images becomes the WHOLE "atlas" with one
-	// cell ("DMX Gobo Num Mask=1, DMX Gobo Index=0"), so MF_DMXGobo samples the entire texture.
-	// On "clear" (CurrentGoboTexture==null) revert to Epic's MI default (T_GoboDisk_01_Frosted,
-	// the open disc that lets the beam through unmasked) cached at TryBuildEpicBeam time.
-	UTexture* TexToPush = CurrentGoboTexture ? static_cast<UTexture*>(CurrentGoboTexture.Get()) : EpicBeamDefaultGoboTex.Get();
-	if (TexToPush)
+	if (EpicBeamMID)
 	{
-		EpicBeamMID->SetTextureParameterValue(TEXT("DMX Gobo Disk Frosted"), TexToPush);
-	}
-	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Num Mask"), 1.f);
-	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Index"), 0.f);
-	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), CurrentGoboRotationSpeed);
+		// Single-cell atlas mapping: each of our per-slot images becomes the WHOLE "atlas" with one
+		// cell ("DMX Gobo Num Mask=1, DMX Gobo Index=0"), so MF_DMXGobo samples the entire texture.
+		// On "clear" (CurrentGoboTexture==null) revert to Epic's MI default (T_GoboDisk_01_Frosted,
+		// the open disc that lets the beam through unmasked) cached at TryBuildEpicBeam time.
+		UTexture* TexToPush = CurrentGoboTexture ? static_cast<UTexture*>(CurrentGoboTexture.Get()) : EpicBeamDefaultGoboTex.Get();
+		if (TexToPush)
+		{
+			EpicBeamMID->SetTextureParameterValue(TEXT("DMX Gobo Disk Frosted"), TexToPush);
+		}
+		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Num Mask"), 1.f);
+		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Index"), 0.f);
+		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), CurrentGoboRotationSpeed);
 
-	UE_LOG(LogRebusVisualiser, Verbose,
-		TEXT("Fixture %s epic-beam gobo: tex=%s default=%s rot=%.2f"),
-		*FixtureId,
-		CurrentGoboTexture ? *CurrentGoboTexture->GetName() : TEXT("<default>"),
-		EpicBeamDefaultGoboTex ? *EpicBeamDefaultGoboTex->GetName() : TEXT("(none)"),
-		CurrentGoboRotationSpeed);
+		UE_LOG(LogRebusVisualiser, Verbose,
+			TEXT("Fixture %s epic-beam gobo: tex=%s default=%s rot=%.2f"),
+			*FixtureId,
+			CurrentGoboTexture ? *CurrentGoboTexture->GetName() : TEXT("<default>"),
+			EpicBeamDefaultGoboTex ? *EpicBeamDefaultGoboTex->GetName() : TEXT("(none)"),
+			CurrentGoboRotationSpeed);
+	}
+
+	// v1.0.49: same texture/rotation also drives the SpotLight cookie via M_Light_Master.
+	// Kept as a tail-call so every existing caller (UpdateEpicBeamParams, ApplyGoboTextureFromBytes,
+	// ClearGoboToOpen) updates both the cone AND the lit-pool gobo in one shot.
+	ApplyCurrentGoboToLightFn();
+}
+
+void ARebusFixtureActor::ApplyCurrentGoboToLightFn()
+{
+	if (!SpotLight) return;
+
+	// Lazy MID creation: load Epic's MI_Light (parent = M_Light_Master, MD_LightFunction, samples
+	// MF_DMXGobo) on first use. Same atlas convention as MI_Beam (DMX Gobo Disk Frosted + Num Mask
+	// + Index + Rotation Speed) so the cone and the cookie share one source of truth. If Epic's
+	// DMXFixtures content is missing, we log once and leave the light function unchanged.
+	if (!GoboLightFnMID)
+	{
+		UMaterialInterface* LightFnSrc = LoadObject<UMaterialInterface>(nullptr,
+			TEXT("/DMXFixtures/LightFixtures/DMX_Materials/MI_Light.MI_Light"));
+		if (!LightFnSrc)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Fixture %s gobo cookie: MI_Light not found at /DMXFixtures/LightFixtures/DMX_Materials/MI_Light -- ensure the DMX Fixtures plugin content is installed. Lit pool will not show the gobo."),
+				*FixtureId);
+			return;
+		}
+		GoboLightFnMID = UMaterialInstanceDynamic::Create(LightFnSrc, this);
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s gobo cookie: MID'd %s for SpotLight->LightFunctionMaterial."),
+			*FixtureId, *LightFnSrc->GetPathName());
+	}
+
+	if (!GoboLightFnMID)
+	{
+		return;
+	}
+
+	if (CurrentGoboTexture)
+	{
+		// Push the same single-cell atlas params as the cone. The MF_DMXGobo inside M_Light_Master
+		// reads the texture identically; "Num Mask = 1, Index = 0" sweeps the entire texture.
+		GoboLightFnMID->SetTextureParameterValue(TEXT("DMX Gobo Disk Frosted"), CurrentGoboTexture);
+		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Num Mask"), 1.f);
+		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Index"), 0.f);
+		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), CurrentGoboRotationSpeed);
+		SpotLight->SetLightFunctionMaterial(GoboLightFnMID);
+
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s gobo cookie: lightFn=MI_Light tex=%s(%dx%d) rot=%.2f castShadows=%d"),
+			*FixtureId, *CurrentGoboTexture->GetName(),
+			CurrentGoboTexture->GetSizeX(), CurrentGoboTexture->GetSizeY(),
+			CurrentGoboRotationSpeed, SpotLight->CastShadows ? 1 : 0);
+	}
+	else
+	{
+		// Open / clear: drop the light function so the lit pool shows no gobo. (We don't push the
+		// MI default here because for a LightFunction material the default would project a frosted
+		// disc onto the entire lit cone, dimming it noticeably -- null is the true "no gobo".)
+		SpotLight->SetLightFunctionMaterial(nullptr);
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s gobo cookie: lightFn=nullptr (Open / clear)."),
+			*FixtureId);
+	}
+}
+
+void ARebusFixtureActor::ClearGoboToOpen(const TCHAR* Reason)
+{
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s gobo OPEN: clearing cone+cookie (reason=%s)."),
+		*FixtureId, Reason ? Reason : TEXT("unspecified"));
+
+	CurrentGoboTexture = nullptr;
+	bGoboActive = false;
+	// Push the cleared state into BOTH the cone (reverts EpicBeamMID to its MI default) and the
+	// cookie (nulls SpotLight->LightFunctionMaterial). Then reassert CastShadows so the now-cleared
+	// bGoboActive removes any gobo-driven shadow override on non-hero beams.
+	ApplyCurrentGoboToEpicBeam();
+	RefreshBeamShadowMode();
+}
+
+bool ARebusFixtureActor::IsOpenSlotName(const FString& Name)
+{
+	const FString Trimmed = Name.TrimStartAndEnd();
+	if (Trimmed.IsEmpty()) return false;
+	// Common portal/GDTF "no gobo" slot names. Case-insensitive, exact-match (a slot literally
+	// called e.g. "Open Star" is NOT Open). "0" and "Off" are belt-and-braces for portals that
+	// use a numeric/legacy convention.
+	static const TCHAR* const Names[] = {
+		TEXT("Open"), TEXT("None"), TEXT("Empty"), TEXT("Clear"),
+		TEXT("No Gobo"), TEXT("NoGobo"), TEXT("Open Hole"), TEXT("OpenHole"),
+		TEXT("Off"), TEXT("0")
+	};
+	for (const TCHAR* Candidate : Names)
+	{
+		if (Trimmed.Equals(Candidate, ESearchCase::IgnoreCase)) return true;
+	}
+	return false;
 }
 
 void ARebusFixtureActor::AssignGobo(int32 GoboIndex, int32 WheelIndex, const FString& WheelName)
@@ -2016,6 +2109,17 @@ void ARebusFixtureActor::AssignGobo(int32 GoboIndex, int32 WheelIndex, const FSt
 	//    wheel is resolved from the selectors (wheelIndex > wheel name > first gobo wheel).
 	if (const FRebusInlineGobo* Inline = SelectInlineGobo(GoboIndex, WheelIndex, WheelName))
 	{
+		// v1.0.49: explicit OPEN slot wins. The portal flags it via slotName/Name; finalize keeps
+		// the entry with bIsOpen=true even though it has no bytes/url, so a "clear gobo" arrives
+		// here as a real match rather than a "no inline -> fallback" miss.
+		if (Inline->bIsOpen || IsOpenSlotName(Inline->SlotName) || IsOpenSlotName(Inline->Name))
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Fixture %s gobo OPEN slot detected (wheelIndex=%d slot=%d slotName='%s' name='%s') -> applying clear."),
+				*FixtureId, Inline->WheelIndex, Inline->Slot, *Inline->SlotName, *Inline->Name);
+			ClearGoboToOpen(TEXT("inline Open slot"));
+			return;
+		}
 		if (Inline->Bytes.Num() > 0 && ApplyGoboTextureFromBytes(Inline->Bytes))
 		{
 			UE_LOG(LogRebusVisualiser, Log,
@@ -2032,6 +2136,13 @@ void ARebusFixtureActor::AssignGobo(int32 GoboIndex, int32 WheelIndex, const FSt
 			FetchAndAssignGoboFromUrl(Inline->ImageUrl);
 			return;
 		}
+		// 3) Inline entry matched but has neither payload nor url and isn't tagged Open. Treat as
+		// "empty slot" (same effect as Open) so the cone+cookie don't keep the last image stuck.
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s AssignGobo: inline entry empty (no bytes, no url, no Open tag) for wheelIndex=%d slot=%d slotName='%s' -> treating as Open."),
+			*FixtureId, Inline->WheelIndex, Inline->Slot, *Inline->SlotName);
+		ClearGoboToOpen(TEXT("inline empty slot"));
+		return;
 	}
 
 	UE_LOG(LogRebusVisualiser, Log,
@@ -2050,13 +2161,19 @@ void ARebusFixtureActor::FetchAndAssignGobo(int32 GoboIndex)
 	const int32 WheelIdx = FindFirstGoboWheel(Profile);
 	if (WheelIdx == INDEX_NONE || !Profile.Wheels.IsValidIndex(WheelIdx))
 	{
-		UE_LOG(LogRebusVisualiser, Verbose, TEXT("Fixture %s gobo: no inline image and no profile wheel (source=none)."), *FixtureId);
+		// v1.0.49: also clear the live gobo here. The fixture has no gobo wheel at all, so any
+		// previously-applied texture must be wiped from both the cone and the cookie.
+		UE_LOG(LogRebusVisualiser, Log, TEXT("Fixture %s gobo: no inline image and no profile wheel (source=none) -> clearing."), *FixtureId);
+		ClearGoboToOpen(TEXT("no profile wheel"));
 		return;
 	}
 	const FRebusWheel& Wheel = Profile.Wheels[WheelIdx];
 	if (!Wheel.Slots.IsValidIndex(GoboIndex) || Wheel.Slots[GoboIndex].ImageUrl.IsEmpty())
 	{
-		SpotLight->SetLightFunctionMaterial(nullptr); // no media for this slot = clear
+		// v1.0.49: pre-v1.0.48 nulled only SpotLight->SetLightFunctionMaterial (which was the
+		// stub light-fn path); the Epic cone kept the last gobo. Now route through the proper
+		// clear so cone + cookie revert together.
+		ClearGoboToOpen(TEXT("profile slot has no media (Open)"));
 		return;
 	}
 	FetchAndAssignGoboFromUrl(Wheel.Slots[GoboIndex].ImageUrl);
