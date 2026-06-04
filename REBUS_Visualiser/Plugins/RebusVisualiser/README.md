@@ -449,6 +449,16 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Epic beam emission axis (v1.0.46).** v1.0.45 inferred the canvas's emission axis as **−Z** from
+> the vertex extent (`SM_Beam_RM` geometry spans `Z 0..−1`), but with that sign the beam emitted
+> **180° out the back** of the lens while pan/tilt still tracked the head correctly. In practice
+> `M_Beam_Master` raymarches along canvas-local **+Z** — the pivot/apex is the `Z=−1` end and the tube
+> extends downstream toward `+Z`. v1.0.46 flips `RebusEpicBeamLocalEmission` from `(0,0,−1)` to
+> `(0,0,+1)` so the fixed relative `+Z → +X` mapping aims the beam through the lens. The existing
+> v1.0.45 alignment log still reads `dot=1.000` (it measures the *configured* emission axis, which
+> now matches both the math and the rendered output); the visible change is that the beam exits
+> forward through the lens instead of backwards.
+
 ### `RenderQuality` scene property (runtime tiers)
 
 Push `SetSceneProperty name="RenderQuality" value="<tier>"` (case-insensitive; unknown values

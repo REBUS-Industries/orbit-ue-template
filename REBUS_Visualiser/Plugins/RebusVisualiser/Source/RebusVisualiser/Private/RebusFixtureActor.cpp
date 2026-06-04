@@ -60,19 +60,23 @@ namespace
 	// (just a little frustum-cull headroom for the elongated shaft), reduced from the v1.0.38 3x.
 	constexpr float RebusBeamBoundsScale = 1.5f;
 
-	// v1.0.44: Epic DMX beam (M_Beam_Master) correct conventions, verified by introspecting the
-	// installed content (SM_Beam_RM + MI_Beam):
-	//  * SM_Beam_RM is a NORMALIZED unit tube whose LOCAL LENGTH AXIS is -Z (geometry spans Z 0..-1,
-	//    pivot/apex at the Z=0 lens end) with bounds extended to +/-10000 so it's never culled. The
-	//    material expands it into the actual cone via WORLD POSITION OFFSET from its params, so the
-	//    canvas component MUST stay at scale (1,1,1) -- any component scale breaks the WPO cone (this
-	//    was the v1.0.43 misalignment). ADMXFixtureActor::InitializeFixture forces WorldScale (1,1,1)
-	//    for exactly this reason.
+	// v1.0.44/45/46: Epic DMX beam (M_Beam_Master) conventions, verified by introspecting the
+	// installed content (SM_Beam_RM + MI_Beam) plus runtime visual feedback:
+	//  * SM_Beam_RM is a NORMALIZED unit tube whose geometry spans Z 0..-1, with bounds extended to
+	//    +/-10000 so it's never culled. The material expands it into the actual cone via WORLD
+	//    POSITION OFFSET from its params, so the canvas component MUST stay at scale (1,1,1) -- any
+	//    component scale breaks the WPO cone (this was the v1.0.43 misalignment).
+	//    ADMXFixtureActor::InitializeFixture forces WorldScale (1,1,1) for exactly this reason.
+	//  * EMISSION AXIS is canvas-local +Z (v1.0.46 fix). v1.0.45 inferred -Z from the vertex extent
+	//    (Z 0..-1) but had the sign inverted -- the beam emitted 180deg out the BACK of the fixture
+	//    even though pan/tilt tracked the head correctly. M_Beam_Master raymarches along +Z (the
+	//    pivot/apex is the Z=-1 end, the tube extends downstream toward +Z). Mapping +Z onto the
+	//    spotlight's local +X via the constant relative rotation now points the beam through the lens.
 	//  * Cone ANGLE comes from "DMX Zoom" (full beam angle in DEGREES; MI default 32.77), LENGTH from
 	//    "DMX Max Light Distance" (cm, <= the ~10000 canvas length), start radius from "DMX Lens
 	//    Radius", brightness from "DMX Max Light Intensity" (Epic scale ~1000) x "DMX Dimmer" (0..1).
 	constexpr float RebusEpicBeamQuality = 1.0f;     // "DMX Quality Level" (1 == Epic High)
-	const FVector RebusEpicBeamLocalEmission(0.f, 0.f, -1.f); // SM_Beam_RM local emission axis
+	const FVector RebusEpicBeamLocalEmission(0.f, 0.f, 1.f); // SM_Beam_RM emits along +Z (v1.0.46)
 	constexpr float RebusEpicBeamMaxDistanceCm = 10000.f;     // canvas length cap (mesh built length)
 	// v1.0.45: "DMX Zoom" feed = this scale x the SpotLight's live OUTER cone HALF-angle (degrees).
 	// The footprint is defined by the SpotLight's outer cone, so we drive the beam angle from the
@@ -1056,12 +1060,12 @@ bool ARebusFixtureActor::TryBuildEpicBeam()
 	EpicBeamComp->SetMaterial(0, EpicBeamMID);
 
 	// Fixed local transform relative to the SpotLight: apex/lens at the spotlight origin (relLoc 0),
-	// canvas local emission (-Z) mapped onto the spotlight's local +X emission, scale 1 (the WPO cone
-	// is built in unit space; any component scale breaks it). When there's no SpotLight to ride, fall
-	// back to FixtureRoot + a per-frame world aim (DriveEpicBeamFromSpotLight).
+	// canvas local emission (+Z, see comment block at top) mapped onto the spotlight's local +X
+	// emission, scale 1 (the WPO cone is built in unit space; any component scale breaks it). When
+	// there's no SpotLight to ride, fall back to FixtureRoot + a per-frame world aim.
 	if (SpotLight)
 	{
-		const FQuat RelRot = FQuat::FindBetweenNormals(RebusEpicBeamLocalEmission, FVector::ForwardVector); // -Z -> +X
+		const FQuat RelRot = FQuat::FindBetweenNormals(RebusEpicBeamLocalEmission, FVector::ForwardVector); // +Z -> +X
 		EpicBeamComp->SetRelativeLocationAndRotation(FVector::ZeroVector, RelRot);
 		EpicBeamComp->SetRelativeScale3D(FVector::OneVector);
 	}
