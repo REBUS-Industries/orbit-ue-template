@@ -148,6 +148,69 @@ but v1.0.55 carries a C++ change so a rebuild is required for it). Quick verify:
 fresh build running, send `stat fps` from the portal console pane — the FPS overlay appears in
 the streamed view, and the gate-status log line confirms `=1` for the active plugin.
 
+### ConsoleCommand via UIInteraction (v1.0.56) — recommended path
+
+v1.0.55 verified the UE-side PS2 gate is correctly latched to `1`
+(`PixelStreaming console gate status: ... PixelStreaming2.AllowPixelStreamingCommands=1
+plugin=PS2`). Despite that, the user's logs show the protocol-level PS2 `Command` /
+`ConsoleCommand` messages never reach the streamer — the portal frontend either doesn't emit
+the opcode, emits the wrong one, or the path drops them silently. UIInteraction descriptors
+(`SelectFixtures`, `RegisterFixture*`, `LoadScene`, etc.) demonstrably arrive on the same
+session, so v1.0.56 piggy-backs console-command execution onto the UIInteraction descriptor
+channel that already works. **This is the recommended path for any portal using a non-Epic-stock
+PS2 frontend.**
+
+**Portal-side descriptor** (send over the existing `UIInteraction` data channel — exactly the
+same transport you use for `SelectFixtures`):
+
+```json
+{
+  "type": "ConsoleCommand",
+  "command": "stat fps",
+  "silent": false
+}
+```
+
+| Field     | Type   | Required | Default | Notes                                                                                          |
+| --------- | ------ | -------- | ------- | ---------------------------------------------------------------------------------------------- |
+| `type`    | string | yes      | —       | Must be the exact string `"ConsoleCommand"`.                                                   |
+| `command` | string | yes      | —       | The full console line, e.g. `"stat fps"`, `"Rebus.DumpFixtureLights"`, `"r.ScreenPercentage 75"`. |
+| `silent`  | bool   | no       | `false` | When `true`, suppresses the success log line. Use for high-frequency telemetry commands.       |
+
+The handler lives in
+`REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusDataChannel.cpp`
+inside `FRebusDataChannel::HandleDescriptor` (added as a peer of the `Ping` branch). It runs on
+the game thread (the input-handler callback already marshals onto `ENamedThreads::GameThread`
+before dispatching), picks the first live Game/PIE world, and calls
+`GEngine->Exec(World, *Cmd, *GLog)` — UE's canonical entry point for console commands. Empty /
+whitespace `command` is rejected with a warning; otherwise the command string is **not**
+filtered (matching Epic's PS2 design — the gate is the portal's own authentication, not a
+server-side allowlist).
+
+**Examples** that round-trip cleanly:
+
+- `stat fps`, `stat unit`, `stat gpu` — built-in stat overlays.
+- `Rebus.DumpFixtureLights` — per-fixture light/cookie diagnostic (v1.0.51).
+- `Rebus.MeshBeams 0` / `Rebus.MeshBeams 1` — toggle Epic's beam canvas.
+- `Rebus.DriveOrbitModels 1` — Phase-1 Orbit-model motion sync.
+- `Rebus.HeroShadowScatter 4` — hero light shadow softness tunable.
+- `r.VolumetricFog.GridPixelSize 1` — fog grid live-tweak.
+- `r.MegaLights.Allow 0` — disable MegaLights at runtime.
+
+**Verify after rebuild + relaunch.** Send `{"type":"ConsoleCommand","command":"stat fps"}` from
+the portal; you should see exactly this in `LogRebusVisualiser`:
+
+```
+LogRebusVisualiser: Descriptor type 'ConsoleCommand'.
+LogRebusVisualiser: Fixture-channel ConsoleCommand: 'stat fps' (success=1)
+```
+
+If `success=0` the command is unknown / refused by `GEngine->Exec`; if the log line never
+appears at all the portal didn't actually emit the descriptor (open browser DevTools and watch
+the data-channel send). The protocol-level PS2 Command path remains supported (the v1.0.55 gate
+is still in place) — if the portal frontend ever does start sending native `ConsoleCommand`
+opcodes, both paths will work simultaneously.
+
 ## Lifecycle
 
 1. Subsystem reads config + tokens, configures the REST client, creates the data channel.

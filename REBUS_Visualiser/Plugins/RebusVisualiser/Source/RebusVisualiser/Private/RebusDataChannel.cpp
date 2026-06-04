@@ -11,6 +11,9 @@
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
+#include "Engine/Engine.h"
+#include "Engine/World.h"
+#include "Engine/EngineTypes.h"
 
 // Pixel Streaming 2 public surface (UE 5.5+). If a future engine drop shifts these headers,
 // this is the single translation unit that needs touching.
@@ -237,6 +240,65 @@ void FRebusDataChannel::HandleDescriptor(const FString& Descriptor)
 		double Ts = 0.0;
 		RebusJson::TryGetNumber(Msg, TEXT("ts"), Ts);
 		SendPong(Ts);
+		return;
+	}
+
+	// v1.0.56: ConsoleCommand bypass. The PS2 protocol-level "Command" / "ConsoleCommand" message
+	// (gated by PixelStreaming2.AllowPixelStreamingCommands, forced to 1 in v1.0.55) is the
+	// "blessed" path, but it requires the portal's PS2 frontend to actually emit the opcode on
+	// the data channel. The user's logs show the gate is 1 (UE-side is ready) yet ZERO
+	// protocol-level Command messages arrive -- the PRISM portal frontend either doesn't send
+	// them, sends a wrong opcode, or they're dropped before reaching the streamer handler. We
+	// can't fix the portal from here, so v1.0.56 piggy-backs console-command execution onto the
+	// UIInteraction descriptor channel that demonstrably works (SelectFixtures, RegisterFixture*,
+	// LoadScene all flow over it). The portal sends:
+	//   { "type": "ConsoleCommand", "command": "<console line>", "silent": false }
+	// and we run it on the game thread via GEngine->Exec. SAFETY: we deliberately do NOT filter
+	// the command string -- matching Epic's PS2 design, the gate is the portal's existing
+	// authentication, not a server-side allowlist. We only refuse empty/whitespace input.
+	if (Type == TEXT("ConsoleCommand"))
+	{
+		FString Cmd;
+		RebusJson::TryGetString(Msg, TEXT("command"), Cmd);
+		Cmd = Cmd.TrimStartAndEnd();
+		if (Cmd.IsEmpty())
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Fixture-channel ConsoleCommand: dropped (empty 'command' field). Expected payload: {\"type\":\"ConsoleCommand\",\"command\":\"<line>\",\"silent\":false}"));
+			return;
+		}
+
+		bool bSilent = false;
+		RebusJson::TryGetBool(Msg, TEXT("silent"), bSilent);
+
+		// Pick a live Game / PIE world to scope the exec against, matching the world-selection
+		// pattern the existing `Rebus.*` console commands use (RebusVisualiser.cpp
+		// HandleMeshBeams/HandleDriveOrbitModels). Falling back to nullptr is fine for
+		// engine-scoped commands like `stat fps`, but a real world lets per-world handlers
+		// (`Rebus.MeshBeams`, scalability tweaks, etc.) resolve correctly.
+		UWorld* ExecWorld = nullptr;
+		if (GEngine)
+		{
+			for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+			{
+				if (Ctx.WorldType == EWorldType::Game || Ctx.WorldType == EWorldType::PIE)
+				{
+					if (UWorld* W = Ctx.World())
+					{
+						ExecWorld = W;
+						break;
+					}
+				}
+			}
+		}
+
+		const bool bOk = GEngine ? GEngine->Exec(ExecWorld, *Cmd, *GLog) : false;
+		if (!bSilent)
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Fixture-channel ConsoleCommand: '%s' (success=%d)"),
+				*Cmd, bOk ? 1 : 0);
+		}
 		return;
 	}
 
