@@ -163,13 +163,76 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 	if (!Msg.IsValid()) return false;
 
 	const float Fade = ReadFadeSeconds(Msg);
+
+	// v1.0.62: SelectFixtures is a selection-state descriptor, not a per-fixture command --
+	// route it before id resolution (the descriptor doesn't carry a single fixtureId).
+	if (Type == TEXT("SelectFixtures"))
+	{
+		TArray<FString> Ids;
+		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+		if (Msg->TryGetArrayField(TEXT("fixtureIds"), Arr) && Arr)
+		{
+			for (const TSharedPtr<FJsonValue>& V : *Arr)
+			{
+				if (V->Type == EJson::String) Ids.Add(V->AsString());
+			}
+		}
+		FString Primary;
+		RebusJson::TryGetString(Msg, TEXT("primaryFixtureId"), Primary);
+		SelectFixtures(Ids, Primary);
+		return true;
+	}
+
+	// v1.0.62: resolve the target fixture ids. The portal sends per-fixture commands in two
+	// shapes, both common in lighting consoles:
+	//   (a) Explicit single id under fixtureId / id / fixture / nodeId (first non-empty wins).
+	//   (b) NO id (or empty string) -> broadcast to the currently-selected fixtures (Current
+	//       Selection from SelectFixtures). The user's v1.0.61 logs showed exactly this:
+	//       "SetFixtureShutter parsed: id='' mode=2(Strobe) rate=5.00Hz" with the portal
+	//       expecting the command to apply to its 4 selected fixtures (Known ids: [...]).
+	//       Without this fallback, every per-fixture command from a portal that uses
+	//       selection-based dispatch silently no-ops.
+	// We also gracefully accept the alternate field names because v1.0.61 made mode/rate
+	// alias-tolerant -- doing the same for the id field closes the last silent failure path.
 	FString Id;
-	RebusJson::TryGetString(Msg, TEXT("fixtureId"), Id);
+	const TCHAR* IdSrc = TEXT("(none)");
+	if      (RebusJson::TryGetString(Msg, TEXT("fixtureId"), Id) && !Id.IsEmpty()) { IdSrc = TEXT("fixtureId"); }
+	else if (RebusJson::TryGetString(Msg, TEXT("id"),        Id) && !Id.IsEmpty()) { IdSrc = TEXT("id"); }
+	else if (RebusJson::TryGetString(Msg, TEXT("fixture"),   Id) && !Id.IsEmpty()) { IdSrc = TEXT("fixture"); }
+	else if (RebusJson::TryGetString(Msg, TEXT("nodeId"),    Id) && !Id.IsEmpty()) { IdSrc = TEXT("nodeId"); }
+	else                                                                            { Id.Reset(); IdSrc = TEXT("(empty -> selection broadcast)"); }
+
+	TArray<FString> TargetIds;
+	if (!Id.IsEmpty())
+	{
+		TargetIds.Add(Id);
+	}
+	else if (CurrentSelection.Num() > 0)
+	{
+		TargetIds = CurrentSelection;
+	}
+	if (TargetIds.Num() == 0)
+	{
+		// Only log Warning for the descriptor types we actually route below -- otherwise an
+		// unrelated message (e.g. a scene-only descriptor) with no id would log noise here.
+		// Cheap prefix check: any per-fixture control type starts with "SetFixture".
+		if (Type.StartsWith(TEXT("SetFixture")))
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("%s: no target -- id field is empty (id-src=%s) AND current selection is empty. Portal should send {\"fixtureId\":\"<id>\"} OR call SelectFixtures first."),
+				*Type, IdSrc);
+		}
+		return false; // not handled -- let downstream descriptor handlers try.
+	}
+
+	// Single-target convenience for branches that still log with a single Id string -- in
+	// broadcast mode this names the first target, with TargetIds.Num() noting the full breadth.
+	const bool bBroadcast = (TargetIds.Num() > 1) || Id.IsEmpty();
 
 	if (Type == TEXT("SetFixtureIntensity"))
 	{
 		double Intensity = 0.0; RebusJson::TryGetNumber(Msg, TEXT("intensity"), Intensity);
-		SetFixtureDimmer(Id, (float)Intensity, Fade);
+		for (const FString& T : TargetIds) SetFixtureDimmer(T, (float)Intensity, Fade);
 		return true;
 	}
 	if (Type == TEXT("SetFixtureColor"))
@@ -178,7 +241,7 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 		if (Msg->TryGetArrayField(TEXT("rgb"), Rgb) && Rgb && Rgb->Num() >= 3)
 		{
 			const FLinearColor C((float)(*Rgb)[0]->AsNumber(), (float)(*Rgb)[1]->AsNumber(), (float)(*Rgb)[2]->AsNumber(), 1.f);
-			SetFixtureColor(Id, C, Fade);
+			for (const FString& T : TargetIds) SetFixtureColor(T, C, Fade);
 		}
 		return true;
 	}
@@ -187,13 +250,13 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 		double Pan = 0.0, Tilt = 0.0;
 		RebusJson::TryGetNumber(Msg, TEXT("panDeg"), Pan);
 		RebusJson::TryGetNumber(Msg, TEXT("tiltDeg"), Tilt);
-		SetFixturePanTilt(Id, (float)Pan, (float)Tilt, Fade);
+		for (const FString& T : TargetIds) SetFixturePanTilt(T, (float)Pan, (float)Tilt, Fade);
 		return true;
 	}
 	if (Type == TEXT("SetFixtureZoom"))
 	{
 		double Zoom = 0.0; RebusJson::TryGetNumber(Msg, TEXT("zoomDeg"), Zoom);
-		SetFixtureZoom(Id, (float)Zoom, Fade);
+		for (const FString& T : TargetIds) SetFixtureZoom(T, (float)Zoom, Fade);
 		return true;
 	}
 	if (Type == TEXT("SetFixtureGobo"))
@@ -209,31 +272,31 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 		if (WIdx.IsValid() && WIdx->Type == EJson::Number) WheelIndex = (int32)WIdx->AsNumber();
 		FString Wheel;
 		RebusJson::TryGetString(Msg, TEXT("wheel"), Wheel);
-		SetFixtureGobo(Id, Index, bHasIndex, WheelIndex, Wheel, Fade);
+		for (const FString& T : TargetIds) SetFixtureGobo(T, Index, bHasIndex, WheelIndex, Wheel, Fade);
 		return true;
 	}
 	if (Type == TEXT("SetFixtureIris"))
 	{
 		double Iris = 1.0; RebusJson::TryGetNumber(Msg, TEXT("iris"), Iris);
-		SetFixtureIris(Id, (float)Iris, Fade);
+		for (const FString& T : TargetIds) SetFixtureIris(T, (float)Iris, Fade);
 		return true;
 	}
 	if (Type == TEXT("SetFixtureFocus"))
 	{
 		double Focus = 0.0; RebusJson::TryGetNumber(Msg, TEXT("focus"), Focus);
-		SetFixtureFocus(Id, (float)Focus, Fade);
+		for (const FString& T : TargetIds) SetFixtureFocus(T, (float)Focus, Fade);
 		return true;
 	}
 	if (Type == TEXT("SetFixtureFrost"))
 	{
 		double Frost = 0.0; RebusJson::TryGetNumber(Msg, TEXT("frost"), Frost);
-		SetFixtureFrost(Id, (float)Frost, Fade);
+		for (const FString& T : TargetIds) SetFixtureFrost(T, (float)Frost, Fade);
 		return true;
 	}
 	if (Type == TEXT("SetFixtureColorTemp"))
 	{
 		double K = 6500.0; RebusJson::TryGetNumber(Msg, TEXT("kelvin"), K);
-		SetFixtureColorTemp(Id, (float)K);
+		for (const FString& T : TargetIds) SetFixtureColorTemp(T, (float)K);
 		return true;
 	}
 	if (Type == TEXT("SetFixtureShutter"))
@@ -291,13 +354,14 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 
 		const TCHAR* ModeName = (ModeInt == 0) ? TEXT("Open") : (ModeInt == 1 ? TEXT("Closed") : TEXT("Strobe"));
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("SetFixtureShutter parsed: id='%s' mode=%d(%s) [source=%s raw=%s] rate=%.2fHz [source=%s] fadeIgnored=%.2f"),
-			*Id, ModeInt, ModeName,
+			TEXT("SetFixtureShutter parsed: id-src=%s targetCount=%d (broadcast=%s) firstId='%s' mode=%d(%s) [mode-src=%s raw=%s] rate=%.2fHz [rate-src=%s] fadeIgnored=%.2f"),
+			IdSrc, TargetIds.Num(), bBroadcast ? TEXT("yes") : TEXT("no"),
+			*TargetIds[0], ModeInt, ModeName,
 			bModeAsNumber ? TEXT("number") : (bModeAsString ? TEXT("string") : TEXT("(missing -> Open)")),
 			bModeAsNumber ? *FString::Printf(TEXT("%.2f"), ModeNum) : (bModeAsString ? *ModeStr : TEXT("<absent>")),
 			Rate, RateKey, Fade);
 
-		SetFixtureShutter(Id, ModeInt, (float)Rate);
+		for (const FString& T : TargetIds) SetFixtureShutter(T, ModeInt, (float)Rate);
 		return true;
 	}
 	if (Type == TEXT("SetFixtureGoboRotation"))
@@ -310,7 +374,7 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 		int32 WheelIndex = INDEX_NONE;
 		const TSharedPtr<FJsonValue> WIdx = Msg->TryGetField(TEXT("wheelIndex"));
 		if (WIdx.IsValid() && WIdx->Type == EJson::Number) WheelIndex = (int32)WIdx->AsNumber();
-		SetFixtureGoboRotation(Id, (float)Speed, WheelIndex);
+		for (const FString& T : TargetIds) SetFixtureGoboRotation(T, (float)Speed, WheelIndex);
 		return true;
 	}
 	if (Type == TEXT("SetFixtureAnimationRotation"))
@@ -320,7 +384,7 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 		// the visualiser folds this into the gobo MID's rotation as a best-effort fallback (logged
 		// once as a Warning per fixture on first non-zero apply).
 		double Speed = 0.0; RebusJson::TryGetNumber(Msg, TEXT("speed"), Speed);
-		SetFixtureAnimationRotation(Id, (float)Speed);
+		for (const FString& T : TargetIds) SetFixtureAnimationRotation(T, (float)Speed);
 		return true;
 	}
 	if (Type == TEXT("SetFixturePrism"))
@@ -328,7 +392,7 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 		double Facets = 0.0, Rot = 0.0;
 		RebusJson::TryGetNumber(Msg, TEXT("facets"), Facets);
 		RebusJson::TryGetNumber(Msg, TEXT("rotationDeg"), Rot);
-		SetFixturePrism(Id, (int32)Facets, (float)Rot);
+		for (const FString& T : TargetIds) SetFixturePrism(T, (int32)Facets, (float)Rot);
 		return true;
 	}
 	if (Type == TEXT("SetFixtureBeamVolumetrics"))
@@ -336,23 +400,7 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 		double Intensity = 1.0; bool bShadow = true;
 		RebusJson::TryGetNumber(Msg, TEXT("intensity"), Intensity);
 		RebusJson::TryGetBool(Msg, TEXT("castVolumetricShadow"), bShadow);
-		SetFixtureBeamVolumetrics(Id, (float)Intensity, bShadow);
-		return true;
-	}
-	if (Type == TEXT("SelectFixtures"))
-	{
-		TArray<FString> Ids;
-		const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
-		if (Msg->TryGetArrayField(TEXT("fixtureIds"), Arr) && Arr)
-		{
-			for (const TSharedPtr<FJsonValue>& V : *Arr)
-			{
-				if (V->Type == EJson::String) Ids.Add(V->AsString());
-			}
-		}
-		FString Primary;
-		RebusJson::TryGetString(Msg, TEXT("primaryFixtureId"), Primary);
-		SelectFixtures(Ids, Primary);
+		for (const FString& T : TargetIds) SetFixtureBeamVolumetrics(T, (float)Intensity, bShadow);
 		return true;
 	}
 

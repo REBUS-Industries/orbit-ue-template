@@ -593,6 +593,84 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Empty-id descriptors now broadcast to current selection (v1.0.62).** User retest of v1.0.61
+> with the new diagnostics finally surfaced the actual portal contract: every `SetFixtureShutter`
+> message arrives with `id=''` (empty string), `mode` and `rateHz` populated correctly. The
+> portal expects per-fixture commands to be applied to the **currently-selected fixtures**, a
+> standard lighting-console convention — the v1.0.61 trace line `SetFixtureShutter parsed:
+> id='' mode=2(Strobe) [source=number raw=2.00] rate=5.00Hz` followed by `NO FIXTURE FOUND.
+> Known ids: [...4 valid ids...]` made the mismatch unambiguous: descriptor was well-formed,
+> selection was non-empty, but `FindFixture('')` returned null and we silently bailed.
+>
+> **What v1.0.62 changes in `HandleControlDescriptor`.** Target resolution now lives at the
+> top of the descriptor handler, before any per-type branch:
+>
+> 1. Try `fixtureId` (canonical) → `id` → `fixture` → `nodeId` for an explicit non-empty id.
+>    First non-empty wins; logged source name is captured in `id-src` for the trace line.
+> 2. If still empty, fall back to `CurrentSelection` (managed by `SelectFixtures`). All ids
+>    in that array are guaranteed to be registered fixtures, so the per-id dispatch loop won't
+>    trigger the v1.0.61 `NO FIXTURE FOUND` warning in the broadcast path.
+> 3. If still empty (no explicit id AND empty selection), log a single Warning naming the
+>    descriptor type and explaining how to fix the payload — then return false so downstream
+>    handlers (scene/keepalive) can still try.
+>
+> Every per-fixture branch (`SetFixtureIntensity`, `SetFixtureColor`, `SetFixturePanTilt`,
+> `SetFixtureZoom`, `SetFixtureGobo`, `SetFixtureIris`, `SetFixtureFocus`, `SetFixtureFrost`,
+> `SetFixtureColorTemp`, `SetFixtureShutter`, `SetFixtureGoboRotation`, `SetFixtureAnimation
+> Rotation`, `SetFixturePrism`, `SetFixtureBeamVolumetrics`) loops over the resolved list:
+>
+> ```cpp
+> for (const FString& T : TargetIds) SetFixtureShutter(T, ModeInt, (float)Rate);
+> ```
+>
+> So a single descriptor "shutter to Strobe@5Hz" hitting a 4-fixture selection now calls
+> `ApplyShutter` 4× in the same Tick. `SelectFixtures` is routed FIRST, before id resolution,
+> because its descriptor body carries a `fixtureIds[]` array (not a single id) — selection state
+> is the input to the broadcast fallback, not a per-fixture command.
+>
+> **Updated diagnostic chain.** The trace line now exposes the resolution machinery so the
+> portal team can immediately see which shape arrived:
+>
+> ```
+> Descriptor type 'SetFixtureShutter'.
+> SetFixtureShutter parsed: id-src=(empty -> selection broadcast) targetCount=4 (broadcast=yes) firstId='090be834b3d5ddc368799972e799e570' mode=2(Strobe) [mode-src=number raw=2.00] rate=5.00Hz [rate-src=rateHz] fadeIgnored=0.00
+> SetFixtureShutter dispatch: id='090be834...' fixture=BP_RebusFixture_0 mode=2 rate=5.00Hz.
+> Fixture 090be834... ApplyShutter: mode=Strobe rate=5.00Hz (changed: mode=yes rate=yes) -- gate now drives SpotLight->SetIntensity ...
+> SetFixtureShutter dispatch: id='981d1fad...' fixture=BP_RebusFixture_1 mode=2 rate=5.00Hz.
+> Fixture 981d1fad... ApplyShutter: ...
+> ...(2 more for the remaining selected fixtures)
+> ```
+>
+> If neither an explicit id nor a non-empty selection is present, a single line:
+>
+> ```
+> SetFixtureShutter: no target -- id field is empty (id-src=(empty -> selection broadcast)) AND current selection is empty. Portal should send {"fixtureId":"<id>"} OR call SelectFixtures first.
+> ```
+>
+> **Field-name aliases now in effect across every per-fixture descriptor.** Combined with the
+> v1.0.61 mode/rate flexibility, the visualiser now accepts both the canonical contract and
+> common variants without silent failure:
+>
+> | Field   | Canonical    | Accepted aliases                                                |
+> | ------- | ------------ | --------------------------------------------------------------- |
+> | id      | `fixtureId`  | `id`, `fixture`, `nodeId` (first non-empty wins; missing/empty → broadcast to `CurrentSelection`) |
+> | mode    | `mode` (int) | `mode` as string (`"open" \| "closed" \| "strobe"` + aliases, case-insensitive) -- shutter only |
+> | rate    | `rateHz`     | `rate`, `frequency`, `hz`, `freq` -- shutter only               |
+> | fade    | `fadeMs`     | (no aliases) — absent ⇒ snap                                    |
+>
+> Canonical contract still favoured (zero alias-tax, predictable trace lines):
+>
+> ```json
+> { "type": "SetFixtureShutter", "fixtureId": "<id>", "mode": 2, "rateHz": 5 }
+> ```
+>
+> Or for the broadcast-to-selection convention the portal already uses:
+>
+> ```json
+> { "type": "SelectFixtures", "fixtureIds": ["abc", "def"], "primaryFixtureId": "abc" }
+> { "type": "SetFixtureShutter", "mode": 2, "rateHz": 5 }
+> ```
+
 > **Shutter / strobe diagnostics + field-name flexibility + Strobe-with-0Hz safety net (v1.0.61).**
 > User report: "We cannot control strobe, here are the logs." Logs showed `Descriptor type
 > 'SetFixtureShutter'` arriving correctly but no shutter effect, with absolutely nothing
