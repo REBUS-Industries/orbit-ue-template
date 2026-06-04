@@ -449,6 +449,46 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Footprint gobo via MegaLights opt-out + gobo/animation-wheel rotation wire (v1.0.50).** Two
+> deliverables:
+>
+> 1. **Lit-pool cookie now actually projects.** v1.0.49 MID'd `MI_Light` and assigned it to
+>    `SpotLight->LightFunctionMaterial`, but the cookie still wasn't visible on the floor. Root
+>    cause: every fixture light is `bAllowMegaLights=1` (asserted in `BuildSpotLight`), and
+>    MegaLights in UE 5.7 renders light functions **only** through `LightFunctionAtlas` — gated
+>    by `r.MegaLights.LightFunctions` AND `FMaterial::MaterialIsLightFunctionAtlasCompatible`
+>    (engine source: `Engine/Source/Runtime/Renderer/Private/LightFunctionAtlas.cpp` lines
+>    218–490 + `MegaLights.cpp` line 172 / 1457). `M_Light_Master`'s `MF_DMXGobo` (runtime UV
+>    rotation + texture sampling) is NOT atlas-compatible, so the cookie was silently dropped
+>    even though MID creation succeeded. Fix: `ApplyCurrentGoboToLightFn` now sets
+>    `SpotLight->bAllowMegaLights = 0` + `MarkRenderStateDirty()` while a gobo is active so the
+>    light routes through the standard deferred path, which renders `LightFunctionMaterial`
+>    directly. Restored to `1` on Open/clear. Trade-off: that light loses MegaLights' clustering
+>    perf while a gobo is up — acceptable; gobo lights are typically hero fixtures.
+>
+> 2. **`SetFixtureGoboRotation` + new `SetFixtureAnimationRotation` wire descriptors.** Both are
+>    per-fixture signed normalised speeds in `[-1, 1]` (clamped); sign = direction (+ CW looking
+>    down the beam, − CCW), 0 = stop. `SetFixtureGoboRotation` adds an optional `wheelIndex`
+>    field (0-based into the full `wheels[]`, matches `RegisterFixtureGobos`; informational/logged
+>    today since the actor pushes one rotation to Epic's single `DMX Gobo Disk Rotation Speed`).
+>    `SetFixtureAnimationRotation` is new; Epic's reference materials don't model a separate
+>    animation-wheel disc, so the visualiser folds it into the same MID rotation as a best-effort
+>    fallback (combined = gobo + anim; a Warning fires once per fixture on first non-zero apply
+>    so the user knows the cone+pool won't show a stacked two-disc effect). Both push to BOTH the
+>    cone MID (`EpicBeamMID`) AND the cookie MID (`GoboLightFnMID`) so the in-cone gobo and the
+>    lit-pool gobo always rotate together. `UpdateEpicBeamParams` already re-applies via
+>    `ApplyCurrentGoboToEpicBeam`, so beam (re)builds, zoom changes, and re-aims don't drop the
+>    rotation. JSON examples + sign/unit contract are in the README §"Gobo / animation-wheel
+>    rotation wire" bullet.
+>
+> **Diagnostics.** Existing gobo pipeline lines extended with `bAllowMegaLights=<new> (was <prev>,
+> toggled for light function)` on every cookie apply/clear and per-component rotation values
+> (`gobo=… anim=… combined=…`) on every cone/cookie push. Two new always-on lines per fixture:
+> `SetFixtureGoboRotation: wheelIndex=… speed=… -> combined=… (gobo=… anim=…) beamMID=… lightFnMID=…`
+> and `SetFixtureAnimationRotation: speed=… -> combined=… (gobo=… anim=…) …`. The Warning on
+> first non-zero animation speed: `SetFixtureAnimationRotation: speed=… -- Epic M_Beam_Master has
+> no animation-wheel param, folding into DMX Gobo Disk Rotation Speed as a best-effort fallback…`
+
 > **Gobo Open-slot clear + lit-pool cookie (v1.0.49).** Two follow-ups to v1.0.48:
 >
 > 1. **Open slot** — picking the no-gobo position used to leave the LAST gobo stuck in the cone.
@@ -747,6 +787,19 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
     function only renders when the light is also casting regular shadows (it's sampled via the
     shadow render target), so every fixture with an active gobo gets `CastShadows=true` regardless
     of hero-beam status. Cleared back when the gobo clears.
+  - **MegaLights opt-out while a gobo is active (v1.0.50).** Every fixture light is normally
+    `bAllowMegaLights=1` (asserted in `BuildSpotLight`). MegaLights in UE 5.7 renders light
+    functions ONLY through `LightFunctionAtlas` (gated by `r.MegaLights.LightFunctions` AND
+    `FMaterial::MaterialIsLightFunctionAtlasCompatible` — see
+    `Engine/Source/Runtime/Renderer/Private/LightFunctionAtlas.cpp` lines 218–490). Epic's
+    `M_Light_Master` uses `MF_DMXGobo`'s runtime UV rotation + texture sampling, which is **not**
+    atlas-compatible — so the cookie pre-v1.0.50 was silently dropped even though `MI_Light` MID
+    creation + `SetLightFunctionMaterial` succeeded. Fix: `ApplyCurrentGoboToLightFn` now sets
+    `SpotLight->bAllowMegaLights=0` + `MarkRenderStateDirty()` while a gobo is active so the light
+    routes through the standard deferred path, which renders `LightFunctionMaterial` directly.
+    Restored to `1` on Open/clear. Cost: this light loses MegaLights' clustering perf while a gobo
+    is up — acceptable; gobo lights are typically heroes. Every cookie log line reports
+    `bAllowMegaLights=<new> (was <prev>, …)` for verification.
   - `UpdateEpicBeamParams` re-pushes the cached gobo on every beam refresh, so motion/zoom changes
     don't drop the cone or the cookie.
   - `EpicBeamDefaultGoboTex` snapshots the MI parent's default `DMX Gobo Disk Frosted` at
@@ -755,6 +808,38 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
     would dim the lit pool — null is the true "no gobo").
   - The legacy `GoboMID` member is preserved (no-op when its `M_RebusGobo` content asset doesn't
     exist) so a future light-fn material can light up without re-wiring.
+- **Gobo / animation-wheel rotation wire** (v1.0.50). Two descriptors drive the rotation of the
+  in-cone gobo and (via the v1.0.50 cookie) the lit-pool gobo. Both are signed normalised speeds
+  in `[-1, 1]` (clamped at the visualiser); sign is direction (+ = CW looking down the beam,
+  − = CCW), `0` = stop. The visualiser clamps and folds them into Epic's `DMX Gobo Disk Rotation
+  Speed` scalar on both `EpicBeamMID` (cone) and `GoboLightFnMID` (cookie); a beam (re)build or
+  refresh (`UpdateEpicBeamParams` → `ApplyCurrentGoboToEpicBeam` → `ApplyCurrentGoboToLightFn`)
+  re-pushes both, so motion/zoom changes never drop the rotation.
+
+  ```jsonc
+  // Gobo wheel rotation. Signed normalised speed in [-1, 1].
+  // wheelIndex is optional, 0-based into the full wheels[] (matches RegisterFixtureGobos);
+  // today the actor pushes one rotation per fixture so wheelIndex is logged for debugging.
+  { "type": "SetFixtureGoboRotation",
+    "fixtureId": "<id>",
+    "speed": 0.5,            // -1..+1; 0 = stop, sign = direction
+    "wheelIndex": 0          // optional, default 0 (first gobo-kind wheel)
+  }
+
+  // Animation-wheel rotation. Same units. Epic's reference materials don't model a separate
+  // animation-wheel disc, so the visualiser folds this into the gobo MID's rotation as a
+  // best-effort fallback (a Warning fires once per fixture on first non-zero apply; the cone
+  // and pool rotate at gobo+anim combined).
+  { "type": "SetFixtureAnimationRotation",
+    "fixtureId": "<id>",
+    "speed": -0.25            // -1..+1; 0 = stop, sign = direction
+  }
+  ```
+
+  Combined rotation = `Clamp(speed_gobo, -1, 1) + Clamp(speed_anim, -1, 1)` (so the wire range
+  effectively widens to `[-2, 2]` only when both wheels are simultaneously driven). When a future
+  material adds a real second disc we'll split the push and the wire contract stays unchanged.
+
 - **Open-slot detection** (v1.0.49). Real fixtures have an OPEN slot on every gobo wheel (the
   no-gobo position) that carries no image data. Pre-v1.0.49 the finalizer DROPPED entries with no
   bytes + no url, so Open vanished from the cache and selecting it silently fell through to the

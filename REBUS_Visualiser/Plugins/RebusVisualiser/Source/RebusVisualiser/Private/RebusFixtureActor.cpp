@@ -1665,16 +1665,46 @@ void ARebusFixtureActor::ApplyShutter(ERebusShutterMode Mode, float RateHz)
 	if (Mode == ERebusShutterMode::Strobe) bAnimating = true;
 }
 
-void ARebusFixtureActor::ApplyGoboRotation(float Speed)
+void ARebusFixtureActor::ApplyGoboRotation(float Speed, int32 WheelIndex)
 {
 	GoboRotationSpeed = FMath::Clamp(Speed, -1.f, 1.f);
-	// v1.0.48: route the rotation into Epic's M_Beam_Master MID so the in-cone gobo actually spins.
 	CurrentGoboRotationSpeed = GoboRotationSpeed;
-	if (EpicBeamMID)
-	{
-		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), CurrentGoboRotationSpeed);
-	}
+	// v1.0.50: push the COMBINED gobo+animation rotation into BOTH the cone and the cookie via
+	// the shared apply path. Pre-v1.0.50 only the cone MID was updated and the cookie kept its
+	// last-written rotation -- cone and pool drifted out of sync as soon as a new speed arrived.
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s SetFixtureGoboRotation: wheelIndex=%d speed=%.3f -> combined=%.3f (gobo=%.3f anim=%.3f) beamMID=%p lightFnMID=%p"),
+		*FixtureId, WheelIndex, Speed,
+		CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed,
+		CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed,
+		EpicBeamMID.Get(), GoboLightFnMID.Get());
+	ApplyCurrentGoboToEpicBeam();
 	if (!FMath::IsNearlyZero(GoboRotationSpeed)) bAnimating = true;
+}
+
+void ARebusFixtureActor::ApplyAnimationWheelRotation(float Speed)
+{
+	const float Prev = CurrentAnimationWheelSpeed;
+	CurrentAnimationWheelSpeed = FMath::Clamp(Speed, -1.f, 1.f);
+	// Epic's M_Beam_Master / M_Light_Master only expose "DMX Gobo Disk Rotation Speed" -- there's
+	// no separate animation-wheel disc, so we fold the animation speed into the same scalar
+	// (added to the gobo speed). The portal still drives them independently on the wire; the
+	// visualiser collapses to one rotation as a best-effort fallback until a future material adds
+	// a second disc. Logged as a Warning the first time we receive a non-zero animation speed so
+	// the user knows the cone+cookie won't show a "stacked" two-disc effect.
+	if (!FMath::IsNearlyZero(CurrentAnimationWheelSpeed) && FMath::IsNearlyZero(Prev))
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s SetFixtureAnimationRotation: speed=%.3f -- Epic M_Beam_Master has no animation-wheel param, folding into DMX Gobo Disk Rotation Speed as a best-effort fallback (cone+pool will rotate at gobo+anim combined)."),
+			*FixtureId, CurrentAnimationWheelSpeed);
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s SetFixtureAnimationRotation: speed=%.3f -> combined=%.3f (gobo=%.3f anim=%.3f) beamMID=%p lightFnMID=%p"),
+		*FixtureId, Speed, CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed,
+		CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed,
+		EpicBeamMID.Get(), GoboLightFnMID.Get());
+	ApplyCurrentGoboToEpicBeam();
+	if (!FMath::IsNearlyZero(CurrentAnimationWheelSpeed)) bAnimating = true;
 }
 
 void ARebusFixtureActor::ApplyPrism(int32 Facets, float RotationDeg)
@@ -1993,14 +2023,17 @@ void ARebusFixtureActor::ApplyCurrentGoboToEpicBeam()
 		}
 		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Num Mask"), 1.f);
 		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Index"), 0.f);
-		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), CurrentGoboRotationSpeed);
+		// v1.0.50: combined = gobo + animation. Epic's reference materials only model one rotating
+		// disc, so the animation-wheel speed (when sent independently by the portal) is added here.
+		const float CombinedRot = CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed;
+		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), CombinedRot);
 
 		UE_LOG(LogRebusVisualiser, Verbose,
-			TEXT("Fixture %s epic-beam gobo: tex=%s default=%s rot=%.2f"),
+			TEXT("Fixture %s epic-beam gobo: tex=%s default=%s gobo=%.2f anim=%.2f combined=%.2f"),
 			*FixtureId,
 			CurrentGoboTexture ? *CurrentGoboTexture->GetName() : TEXT("<default>"),
 			EpicBeamDefaultGoboTex ? *EpicBeamDefaultGoboTex->GetName() : TEXT("(none)"),
-			CurrentGoboRotationSpeed);
+			CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed, CombinedRot);
 	}
 
 	// v1.0.49: same texture/rotation also drives the SpotLight cookie via M_Light_Master.
@@ -2041,29 +2074,47 @@ void ARebusFixtureActor::ApplyCurrentGoboToLightFn()
 
 	if (CurrentGoboTexture)
 	{
+		// v1.0.50: MegaLights (enabled per-fixture via bAllowMegaLights=1 in BuildSpotLight) only
+		// renders light functions through LightFunctionAtlas (gated by r.MegaLights.LightFunctions
+		// AND atlas-compatibility of the material). M_Light_Master's MF_DMXGobo sampling pattern
+		// is NOT atlas-compatible, so the cookie silently never projects. Opt this specific light
+		// OUT of MegaLights while a gobo is active so the standard deferred path renders the
+		// LightFunctionMaterial directly. Restored to MegaLights on clear (ClearGoboToOpen).
+		// Cost: this light loses MegaLights' clustering perf while a gobo is up -- acceptable;
+		// fixtures with gobos are typically hero lights.
+		const bool bPrevMegaLights = SpotLight->bAllowMegaLights != 0;
+		SpotLight->bAllowMegaLights = 0;
 		// Push the same single-cell atlas params as the cone. The MF_DMXGobo inside M_Light_Master
 		// reads the texture identically; "Num Mask = 1, Index = 0" sweeps the entire texture.
+		const float CombinedRot = CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed;
 		GoboLightFnMID->SetTextureParameterValue(TEXT("DMX Gobo Disk Frosted"), CurrentGoboTexture);
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Num Mask"), 1.f);
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Index"), 0.f);
-		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), CurrentGoboRotationSpeed);
+		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), CombinedRot);
 		SpotLight->SetLightFunctionMaterial(GoboLightFnMID);
+		SpotLight->MarkRenderStateDirty(); // bAllowMegaLights + LightFunctionMaterial proxy refresh
 
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("Fixture %s gobo cookie: lightFn=MI_Light tex=%s(%dx%d) rot=%.2f castShadows=%d"),
+			TEXT("Fixture %s gobo cookie: lightFn=MI_Light tex=%s(%dx%d) gobo=%.2f anim=%.2f combined=%.2f castShadows=%d bAllowMegaLights=%d (was %d, toggled for light function)"),
 			*FixtureId, *CurrentGoboTexture->GetName(),
 			CurrentGoboTexture->GetSizeX(), CurrentGoboTexture->GetSizeY(),
-			CurrentGoboRotationSpeed, SpotLight->CastShadows ? 1 : 0);
+			CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed, CombinedRot,
+			SpotLight->CastShadows ? 1 : 0,
+			SpotLight->bAllowMegaLights ? 1 : 0, bPrevMegaLights ? 1 : 0);
 	}
 	else
 	{
 		// Open / clear: drop the light function so the lit pool shows no gobo. (We don't push the
 		// MI default here because for a LightFunction material the default would project a frosted
 		// disc onto the entire lit cone, dimming it noticeably -- null is the true "no gobo".)
+		// v1.0.50: also re-enable MegaLights so this light goes back to the perf-optimised path.
+		const bool bPrevMegaLights = SpotLight->bAllowMegaLights != 0;
+		SpotLight->bAllowMegaLights = 1;
 		SpotLight->SetLightFunctionMaterial(nullptr);
+		SpotLight->MarkRenderStateDirty();
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("Fixture %s gobo cookie: lightFn=nullptr (Open / clear)."),
-			*FixtureId);
+			TEXT("Fixture %s gobo cookie: lightFn=nullptr (Open / clear). bAllowMegaLights=%d (was %d, restored to MegaLights path)."),
+			*FixtureId, SpotLight->bAllowMegaLights ? 1 : 0, bPrevMegaLights ? 1 : 0);
 	}
 }
 

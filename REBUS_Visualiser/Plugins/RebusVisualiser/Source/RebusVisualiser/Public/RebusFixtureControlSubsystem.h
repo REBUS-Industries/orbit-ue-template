@@ -37,7 +37,14 @@ public:
 	void SetFixtureFrost(const FString& Id, float Frost01, float FadeSeconds = 0.f);
 	void SetFixtureColorTemp(const FString& Id, float Kelvin);
 	void SetFixtureShutter(const FString& Id, int32 Mode, float RateHz);
-	void SetFixtureGoboRotation(const FString& Id, float Speed);
+	// Gobo wheel rotation, signed normalised [-1..1]. wheelIndex is optional (0-based into the
+	// full wheels[]); the actor pushes one rotation to Epic's single DMX Gobo Disk Rotation Speed
+	// param today, so wheelIndex is informational/logged.
+	void SetFixtureGoboRotation(const FString& Id, float Speed, int32 WheelIndex = INDEX_NONE);
+	// v1.0.50: animation-wheel rotation, signed normalised [-1..1]. Folded into the gobo MID
+	// rotation as a best-effort fallback (Epic's reference materials don't expose a separate
+	// animation-wheel disc -- see ARebusFixtureActor::ApplyAnimationWheelRotation).
+	void SetFixtureAnimationRotation(const FString& Id, float Speed);
 	void SetFixturePrism(const FString& Id, int32 Facets, float RotationDeg);
 	void SetFixtureBeamVolumetrics(const FString& Id, float Intensity, bool bCastVolumetricShadow);
 

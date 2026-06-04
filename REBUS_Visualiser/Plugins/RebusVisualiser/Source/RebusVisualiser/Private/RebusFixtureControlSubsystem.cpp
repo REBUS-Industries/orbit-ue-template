@@ -87,9 +87,13 @@ void URebusFixtureControlSubsystem::SetFixtureShutter(const FString& Id, int32 M
 		F->ApplyShutter(static_cast<ERebusShutterMode>(FMath::Clamp(Mode, 0, 2)), RateHz);
 	}
 }
-void URebusFixtureControlSubsystem::SetFixtureGoboRotation(const FString& Id, float Speed)
+void URebusFixtureControlSubsystem::SetFixtureGoboRotation(const FString& Id, float Speed, int32 WheelIndex)
 {
-	if (ARebusFixtureActor* F = FindFixture(Id)) F->ApplyGoboRotation(Speed);
+	if (ARebusFixtureActor* F = FindFixture(Id)) F->ApplyGoboRotation(Speed, WheelIndex);
+}
+void URebusFixtureControlSubsystem::SetFixtureAnimationRotation(const FString& Id, float Speed)
+{
+	if (ARebusFixtureActor* F = FindFixture(Id)) F->ApplyAnimationWheelRotation(Speed);
 }
 void URebusFixtureControlSubsystem::SetFixturePrism(const FString& Id, int32 Facets, float RotationDeg)
 {
@@ -225,8 +229,25 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 	}
 	if (Type == TEXT("SetFixtureGoboRotation"))
 	{
+		// v1.0.50: 'speed' is a signed normalised rotation speed in [-1..1]; the visualiser clamps.
+		// Sign = direction (+ CW looking down the beam, - CCW), 0 = stop. Optional 'wheelIndex'
+		// (0-based into the full wheels[]) lets the portal disambiguate multi-wheel fixtures;
+		// today the actor pushes one rotation to Epic's single DMX Gobo Disk Rotation Speed.
 		double Speed = 0.0; RebusJson::TryGetNumber(Msg, TEXT("speed"), Speed);
-		SetFixtureGoboRotation(Id, (float)Speed);
+		int32 WheelIndex = INDEX_NONE;
+		const TSharedPtr<FJsonValue> WIdx = Msg->TryGetField(TEXT("wheelIndex"));
+		if (WIdx.IsValid() && WIdx->Type == EJson::Number) WheelIndex = (int32)WIdx->AsNumber();
+		SetFixtureGoboRotation(Id, (float)Speed, WheelIndex);
+		return true;
+	}
+	if (Type == TEXT("SetFixtureAnimationRotation"))
+	{
+		// v1.0.50: animation-wheel rotation, signed normalised [-1..1]; same sign+stop convention
+		// as SetFixtureGoboRotation. Epic's reference materials only model one rotating disc, so
+		// the visualiser folds this into the gobo MID's rotation as a best-effort fallback (logged
+		// once as a Warning per fixture on first non-zero apply).
+		double Speed = 0.0; RebusJson::TryGetNumber(Msg, TEXT("speed"), Speed);
+		SetFixtureAnimationRotation(Id, (float)Speed);
 		return true;
 	}
 	if (Type == TEXT("SetFixturePrism"))

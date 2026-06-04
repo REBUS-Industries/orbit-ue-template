@@ -106,7 +106,15 @@ public:
 	void ApplyFrost(float Frost01, float FadeSeconds = 0.f);
 	void ApplyColorTemp(float Kelvin);
 	void ApplyShutter(ERebusShutterMode Mode, float RateHz);
-	void ApplyGoboRotation(float Speed);
+	// Gobo wheel rotation; signed normalised speed in [-1..1] (clamped). Sign = direction:
+	// positive = CW (looking down the beam), negative = CCW, zero = stop. WheelIndex is the
+	// portal's selector (currently informational, logged; the actor pushes one rotation to the
+	// single Epic gobo param).
+	void ApplyGoboRotation(float Speed, int32 WheelIndex = INDEX_NONE);
+	// v1.0.50: animation-wheel rotation; same units as ApplyGoboRotation. Stored separately and
+	// added to the gobo rotation when pushing to Epic's DMX Gobo Disk Rotation Speed (Epic's
+	// reference materials don't model a dedicated animation-wheel disc -- see header note above).
+	void ApplyAnimationWheelRotation(float Speed);
 	void ApplyPrism(int32 Facets, float RotationDeg);
 	void ApplyBeamVolumetrics(float Intensity, bool bCastVolumetricShadow);
 
@@ -298,6 +306,12 @@ private:
 	UPROPERTY() TObjectPtr<UTexture2D> CurrentGoboTexture = nullptr;
 	UPROPERTY() TObjectPtr<UTexture> EpicBeamDefaultGoboTex = nullptr;
 	float CurrentGoboRotationSpeed = 0.f;
+	// v1.0.50: animation-wheel rotation, signed normalised [-1..1]. Epic's M_Beam_Master has no
+	// dedicated animation-wheel param (only DMX Gobo Disk Rotation Speed), so we add this to the
+	// gobo rotation when pushing to the MID -- a best-effort fallback so the user sees SOME
+	// rotation change for animation-wheel commands. Tracked separately so the portal can drive
+	// either independently and we keep the per-channel state correct for future per-wheel materials.
+	float CurrentAnimationWheelSpeed = 0.f;
 
 	// v1.0.49 COOKIE state. M_Light_Master (Epic's DMXFixtures LightFunction-domain master) is
 	// MID'd once on first gobo apply and assigned to SpotLight->LightFunctionMaterial so the
