@@ -432,6 +432,23 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 > `RebusEpicBeamMaxIntensity` (beam brightness). The pan/tilt/head, IES spotlight, no-self-shadow and
 > `M_RebusBeam` fallback are all preserved.
 
+> **Epic beam pan direction + footprint size (v1.0.45).** Two follow-up fixes:
+> - **Pan was mirrored.** v1.0.44 world-aimed the canvas every frame with `FindBetweenNormals(−Z,
+>   spotFwd)`, whose roll varies with the aim; because `M_Beam_Master` derives the cone from the whole
+>   object basis (not just the forward axis), that varying roll mirrored the yaw (and the v1.0.44
+>   "dot≈+1" log was tautological — it compared the build quat to itself). Fix: the canvas is now
+>   **parented to the `SpotLight`** with a **constant** relative transform (apex at the spotlight
+>   origin, local −Z → spotlight local +X, scale 1) — exactly how `ADMXFixtureActor`'s beam rides its
+>   `Head`. All pan/tilt now comes from the one basis that creates the footprint, so the beam tracks
+>   **with** the pool. The alignment log now reads the canvas's **actual** world transform (real
+>   proof): `dot≈+1` across the whole pan sweep, `|apex-lens|≈0`.
+> - **Far end too wide.** `DMX Zoom` is now driven from the **SpotLight's live `OuterConeAngle`** (the
+>   exact half-angle that defines the lit footprint — single source of truth) × `RebusEpicBeamZoomScale`
+>   (default 1.0), instead of `2 × ResolveOuterHalfDeg()`. Empirically `M_Beam_Master` reads `DMX Zoom`
+>   as ~the half-angle, so feeding the doubled value made the cone ~2× too wide; the beam edge now
+>   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
+>   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
+
 ### `RenderQuality` scene property (runtime tiers)
 
 Push `SetSceneProperty name="RenderQuality" value="<tier>"` (case-insensitive; unknown values

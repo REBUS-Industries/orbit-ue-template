@@ -74,6 +74,13 @@ namespace
 	constexpr float RebusEpicBeamQuality = 1.0f;     // "DMX Quality Level" (1 == Epic High)
 	const FVector RebusEpicBeamLocalEmission(0.f, 0.f, -1.f); // SM_Beam_RM local emission axis
 	constexpr float RebusEpicBeamMaxDistanceCm = 10000.f;     // canvas length cap (mesh built length)
+	// v1.0.45: "DMX Zoom" feed = this scale x the SpotLight's live OUTER cone HALF-angle (degrees).
+	// The footprint is defined by the SpotLight's outer cone, so we drive the beam angle from the
+	// exact same value (single source of truth) -- they can't diverge. Empirically M_Beam_Master's
+	// "DMX Zoom" reads ~the half-angle (feeding the full 2x angle made the far end ~2x too wide), so
+	// the default is 1.0 x the half-angle. Tunable: lower to hug the brighter IES core, raise to
+	// widen toward the geometric field edge.
+	constexpr float RebusEpicBeamZoomScale = 1.0f;
 	// Beam brightness base for M_Beam_Master ("DMX Max Light Intensity"). Epic's scale is ~1000s of
 	// candela (MI default 1000), NOT our M_RebusBeam 0..4 range -- a small value here is invisible.
 	// Multiplied by the live SetFixtureBeamVolumetrics user scale; modulated by "DMX Dimmer".
@@ -1022,7 +1029,15 @@ bool ARebusFixtureActor::TryBuildEpicBeam()
 	}
 
 	EpicBeamComp = NewObject<UStaticMeshComponent>(this, TEXT("EpicBeamCanvas"));
-	EpicBeamComp->SetupAttachment(FixtureRoot);
+	// v1.0.45 (Issue 1 fix): ride the SpotLight EXACTLY like ADMXFixtureActor's beam rides its Head --
+	// parent the canvas to the SpotLight with a CONSTANT relative rotation, so ALL pan/tilt comes from
+	// the single basis that actually creates the lit footprint (the SpotLight's own transform). The
+	// v1.0.44 approach world-aimed the canvas every frame with FindBetweenNormals, whose roll varies
+	// with the aim; because M_Beam_Master derives the cone from the object basis (not just one axis),
+	// that varying roll mirrored the yaw. Inheriting the SpotLight basis can't mirror -- the beam and
+	// the footprint are now driven by the same rotation.
+	USceneComponent* BeamParent = SpotLight ? static_cast<USceneComponent*>(SpotLight) : static_cast<USceneComponent*>(FixtureRoot);
+	EpicBeamComp->SetupAttachment(BeamParent);
 	EpicBeamComp->RegisterComponent();
 	EpicBeamComp->SetStaticMesh(EpicMesh);
 	EpicBeamComp->SetMobility(EComponentMobility::Movable);
@@ -1031,7 +1046,7 @@ bool ARebusFixtureActor::TryBuildEpicBeam()
 	EpicBeamComp->bCastDynamicShadow = false;
 	// Parity with the procedural cone (v1.0.36): never occlude + no self-volumetric-shadow into its
 	// own beam. The mesh already carries huge (+/-10000) bounds so the WPO cone is never culled --
-	// we DON'T add a bounds scale (and crucially DON'T scale the component; see below).
+	// we DON'T add a bounds scale (and crucially DON'T scale the component).
 	EpicBeamComp->bUseAttachParentBound = false;
 	EpicBeamComp->bUseAsOccluder = false;
 	EpicBeamComp->SetVisibility(bMeshBeamEnabled);
@@ -1040,12 +1055,24 @@ bool ARebusFixtureActor::TryBuildEpicBeam()
 	EpicBeamMID = UMaterialInstanceDynamic::Create(EpicMat, this);
 	EpicBeamComp->SetMaterial(0, EpicBeamMID);
 
+	// Fixed local transform relative to the SpotLight: apex/lens at the spotlight origin (relLoc 0),
+	// canvas local emission (-Z) mapped onto the spotlight's local +X emission, scale 1 (the WPO cone
+	// is built in unit space; any component scale breaks it). When there's no SpotLight to ride, fall
+	// back to FixtureRoot + a per-frame world aim (DriveEpicBeamFromSpotLight).
+	if (SpotLight)
+	{
+		const FQuat RelRot = FQuat::FindBetweenNormals(RebusEpicBeamLocalEmission, FVector::ForwardVector); // -Z -> +X
+		EpicBeamComp->SetRelativeLocationAndRotation(FVector::ZeroVector, RelRot);
+		EpicBeamComp->SetRelativeScale3D(FVector::OneVector);
+	}
+
 	UpdateEpicBeamParams();
 	DriveEpicBeamFromSpotLight();
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s beam: using Epic M_LightBeam (MI_Beam + SM_Beam_RM) localEmission=(%.0f,%.0f,%.0f) scale=1,1,1 (WPO cone) src=%s."),
-		*FixtureId, RebusEpicBeamLocalEmission.X, RebusEpicBeamLocalEmission.Y, RebusEpicBeamLocalEmission.Z,
+		TEXT("Fixture %s beam: using Epic M_LightBeam (MI_Beam + SM_Beam_RM) attached=%s localEmission=(%.0f,%.0f,%.0f) scale=1 (WPO cone) src=%s."),
+		*FixtureId, SpotLight ? TEXT("SpotLight") : TEXT("FixtureRoot"),
+		RebusEpicBeamLocalEmission.X, RebusEpicBeamLocalEmission.Y, RebusEpicBeamLocalEmission.Z,
 		EpicBeamMaterial ? TEXT("CDO") : TEXT("LoadObject"));
 	return true;
 }
@@ -1069,9 +1096,12 @@ void ARebusFixtureActor::UpdateEpicBeamParams()
 		FMath::Clamp(ColorB.Current, 0.f, 1.f), 1.f);
 	// Epic separates brightness into a candela-scale "DMX Max Light Intensity" x a 0..1 "DMX Dimmer".
 	const float Dim = FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate;
-	// Cone angle: "DMX Zoom" is the FULL beam angle in degrees (= 2 x our outer half angle), so the
-	// WPO cone half-angle matches the lit spotlight cone. Length capped to the canvas mesh extent.
-	const float ZoomFullDeg = FMath::Clamp(2.f * ResolveOuterHalfDeg(), 1.f, 179.f);
+	// Cone angle: drive "DMX Zoom" from the SpotLight's LIVE outer cone HALF-angle (the very angle
+	// that defines the lit footprint -- single source of truth, so beam edge == pool edge and they
+	// can't diverge). Empirically M_Beam_Master reads ~the half-angle (feeding 2x made it too wide),
+	// hence RebusEpicBeamZoomScale defaults to 1.0. Length capped to the canvas mesh extent.
+	const float SpotOuterHalfDeg = SpotLight ? SpotLight->OuterConeAngle : ResolveOuterHalfDeg();
+	const float ZoomFullDeg = FMath::Clamp(RebusEpicBeamZoomScale * SpotOuterHalfDeg, 1.f, 179.f);
 	const float DistCm = FMath::Clamp(BeamLengthUnreal, 1.f, RebusEpicBeamMaxDistanceCm);
 
 	// Epic M_Beam_Master param vocabulary (mirrors ADMXFixtureActor::FeedFixtureData + the BP zoom
@@ -1088,35 +1118,38 @@ void ARebusFixtureActor::UpdateEpicBeamParams()
 
 void ARebusFixtureActor::DriveEpicBeamFromSpotLight()
 {
-	if (!SpotLight || !EpicBeamComp) return;
+	if (!EpicBeamComp) return;
 
-	// Place EXACTLY like ADMXFixtureActor: apex/lens at the SpotLight world location, the canvas's
-	// LOCAL emission axis (SM_Beam_RM's -Z) aimed along the live spotlight world forward (v1.0.34
-	// ground truth), and -- critically -- world scale (1,1,1) so the material's World-Position-Offset
-	// cone (built from DMX Zoom / Distance / Lens Radius) is not distorted. FindBetweenNormals maps
-	// local -Z onto the emission; the cone is radially symmetric so the residual roll is irrelevant.
-	const FVector SpotFwd = SpotLight->GetForwardVector().GetSafeNormal();
-	const FVector SpotLoc = SpotLight->GetComponentLocation();
-	const FQuat Rot = FQuat::FindBetweenNormals(RebusEpicBeamLocalEmission, SpotFwd);
-	EpicBeamComp->SetWorldLocationAndRotation(SpotLoc, Rot);
-	EpicBeamComp->SetWorldScale3D(FVector::OneVector);
+	// v1.0.45: the canvas is parented to the SpotLight with a fixed relative transform (see
+	// TryBuildEpicBeam), so pan/tilt + apex-at-lens are inherited automatically from the same basis
+	// that creates the footprint -- no per-frame world re-aim (that was the v1.0.44 mirror). We only
+	// refresh the WPO/colour params here. Fallback: if there's no SpotLight to ride, world-aim once.
+	if (!SpotLight)
+	{
+		const FVector Fwd = EpicBeamComp->GetForwardVector(); // best-effort with no spotlight
+		EpicBeamComp->SetWorldRotation(FQuat::FindBetweenNormals(RebusEpicBeamLocalEmission, Fwd));
+		UpdateEpicBeamParams();
+		return;
+	}
 
 	UpdateEpicBeamParams();
 
-	// Alignment proof (throttled to meaningful aim changes): the canvas's driven emission axis (world
-	// -Z) must equal the spotlight forward (dot ~= +1), and the apex (canvas world origin) must sit
-	// on the lens (spotlight location).
-	const FVector CanvasEmission = Rot.RotateVector(RebusEpicBeamLocalEmission).GetSafeNormal();
+	// REAL alignment proof (not tautological): read the canvas's ACTUAL world transform (from the
+	// attachment) and compare its emission axis to the live spotlight forward -- dot must be ~+1 at
+	// every pan/tilt, and the apex (canvas world origin) must sit on the lens (spotlight location).
+	const FVector SpotFwd = SpotLight->GetForwardVector().GetSafeNormal();
+	const FVector SpotLoc = SpotLight->GetComponentLocation();
+	const FVector CanvasEmission = EpicBeamComp->GetComponentTransform().TransformVectorNoScale(RebusEpicBeamLocalEmission).GetSafeNormal();
 	if (FVector::DotProduct(CanvasEmission, EpicLastLoggedFwd) < 0.999f)
 	{
 		EpicLastLoggedFwd = CanvasEmission;
+		const FVector Apex = EpicBeamComp->GetComponentLocation();
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("Fixture %s Epic beam align: spotFwd=(%.3f,%.3f,%.3f) canvasFwd=(%.3f,%.3f,%.3f) dot=%.3f apex=(%.0f,%.0f,%.0f) lens=(%.0f,%.0f,%.0f) |apex-lens|=%.2fcm"),
+			TEXT("Fixture %s Epic beam align: spotFwd=(%.3f,%.3f,%.3f) canvasFwd=(%.3f,%.3f,%.3f) dot=%.3f apex=(%.0f,%.0f,%.0f) lens=(%.0f,%.0f,%.0f) |apex-lens|=%.2fcm zoomHalf=%.1fdeg"),
 			*FixtureId, SpotFwd.X, SpotFwd.Y, SpotFwd.Z, CanvasEmission.X, CanvasEmission.Y, CanvasEmission.Z,
 			FVector::DotProduct(CanvasEmission, SpotFwd),
-			EpicBeamComp->GetComponentLocation().X, EpicBeamComp->GetComponentLocation().Y, EpicBeamComp->GetComponentLocation().Z,
-			SpotLoc.X, SpotLoc.Y, SpotLoc.Z,
-			(float)FVector::Dist(EpicBeamComp->GetComponentLocation(), SpotLoc));
+			Apex.X, Apex.Y, Apex.Z, SpotLoc.X, SpotLoc.Y, SpotLoc.Z,
+			(float)FVector::Dist(Apex, SpotLoc), SpotLight->OuterConeAngle);
 	}
 }
 
