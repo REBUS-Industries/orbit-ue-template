@@ -261,22 +261,28 @@ private:
 	// the gobo projects onto the lit floor pool. Lazily MIDs MI_Light on first call; sets
 	// SpotLight->LightFunctionMaterial. On clear (CurrentGoboTexture==null) nulls the light fn.
 	void ApplyCurrentGoboToLightFn();
-	// v1.0.57 introduced, v1.0.58 corrected vocabulary, v1.0.59 collapsed shutter into DMX Dimmer:
-	// push the verified M_Light_Master vocabulary onto GoboLightFnMID -- now just DMX Dimmer (set
-	// to Dim * Gate, i.e. the combined dimmer-and-shutter envelope, identical to how UpdateEpic
-	// BeamParams gates the volumetric beam) and DMX Frost (live frost fade). The v1.0.58 pushes
-	// of DMX Strobe Open / DMX Strobe Frequency / DMX Strobe Disable Burst are REMOVED because
-	// those scalars feed M_Light_Master's MF_DMXStrobe sub-function, which combines them with an
-	// internal Time-driven Sine to PRODUCE strobe oscillation -- pushing Gate=1 into DMX Strobe
-	// Open while leaving Frequency/Disable Burst at their MID defaults caused MF_DMXStrobe to
-	// modulate the cookie independently of our ShutterMode state machine, which the user observed
-	// as the footprint gobo flashing even when shutter was logically Open. The beam (M_Beam_Master
-	// also references MF_DMXStrobe) has never pushed those params and is steady, so the cookie
-	// now mirrors that approach: shutter goes through DMX Dimmer alone, which makes Set
-	// FixtureShutter the single source of truth across beam + cookie + SpotLight intensity (all
-	// three multiply by the same Gate computed in the same Tick). No-op when GoboLightFnMID is
-	// null (no gobo active). Called from UpdateEpicBeamParams (every refresh) and from
-	// ApplyCurrentGoboToLightFn (lazy-MID-creation primer + every gobo selection).
+	// v1.0.57 introduced, v1.0.58 corrected vocabulary, v1.0.59 collapsed shutter into DMX Dimmer,
+	// v1.0.60 forced DMX Dimmer = 1 to stop double-dimming: push the verified M_Light_Master
+	// vocabulary onto GoboLightFnMID -- now just DMX Dimmer (FORCED to 1.0 so the cookie is a
+	// pure spatial pattern) and DMX Frost (live frost fade). The v1.0.59 push of DMX Dimmer =
+	// Dim * Gate was double-dimming the footprint: a LightFunction material in UE is multiplied
+	// with the light's per-pixel illumination contribution, and that contribution already has
+	// SpotLight->SetIntensity (= BaseCandela * Dim * Gate, see RefreshIntensity) baked in. The
+	// footprint was therefore brightness ~ Dim^2 * Gate^2 while the volumetric beam mesh fades
+	// linearly with Dim * Gate -- at Dim=0.5 the beam was 50% but the footprint collapsed to
+	// 25%, which the user observed as "intensity doesn't match the beam" and "doesn't allow for
+	// distance change" (1/r^2 was being applied via the SpotLight's Candelas-mode physical
+	// attenuation, but at low Dim the double-dim crushed the pattern to near-black regardless
+	// of distance). v1.0.60 makes the SpotLight the SINGLE source of truth for dimmer + shutter
+	// + IES + 1/r^2 + colour; the cookie just modulates the pre-attenuated illumination by the
+	// gobo pattern. Footprint per-pixel = BaseCandela * Dim * Gate * IES * (1/r^2) * pattern --
+	// linear in Dim, physically correct in distance, IES-accurate in angle. SetFixtureShutter
+	// is still the unified shutter control: Gate is multiplied into SpotLight->SetIntensity in
+	// RefreshIntensity, into EpicBeamMID DMX Dimmer in UpdateEpicBeamParams, and -- crucially --
+	// NOT into the cookie here, because the cookie inherits Gate transitively via the SpotLight
+	// intensity it modulates. No-op when GoboLightFnMID is null (no gobo active). Called from
+	// UpdateEpicBeamParams (every refresh) and from ApplyCurrentGoboToLightFn (lazy-MID-creation
+	// primer + every gobo selection).
 	void UpdateEpicLightFnParams();
 	// v1.0.49: explicit clear path. Drops CurrentGoboTexture, reverts the Epic beam MID to its
 	// MI default, nulls the SpotLight light function, clears bGoboActive, and reasserts shadows.

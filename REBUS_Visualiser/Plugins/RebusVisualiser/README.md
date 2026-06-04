@@ -593,6 +593,80 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Cookie footprint double-dim fix: IES + 1/r² + dimmer now linear (v1.0.60).** User retest of
+> v1.0.59: "can we look at the fade intensity of the footprint. Is this following the IES? The
+> intensity doesnt match the beam or allow for distance change." Three observations, one root
+> cause -- the cookie material was double-dimming the footprint.
+>
+> **What was actually happening.** A `LightFunctionMaterial` in UE is multiplied with the light's
+> per-pixel illumination contribution. The SpotLight's `SetIntensity` (set by `RefreshIntensity`
+> to `BaseCandela * Dim * Gate`) already contains the full dimmer + shutter envelope, and
+> `SetIntensityUnits(Candelas)` engages physical inverse-square attenuation, while
+> `SetIESTexture(prof) + bUseIESBrightness=false` handles the angular distribution. v1.0.59
+> additionally pushed `DMX Dimmer = Dim * Gate` into `GoboLightFnMID`, so the per-pixel cookie
+> result was:
+>
+> ```
+> Footprint = (BaseCandela * Dim * Gate * IES(angle) * 1/r²) * (pattern * Dim * Gate)
+>           =  BaseCandela * Dim² * Gate² * IES * 1/r² * pattern
+> ```
+>
+> while the volumetric cone-mesh beam (`M_Beam_Master`) fades linearly via its own
+> `DMX Dimmer = Dim * Gate` push, scaled by the artistic `DMX Max Light Intensity =
+> RebusEpicBeamMaxIntensity (2000) * MeshBeamUserScale`. Concretely:
+>
+> | Dimmer | Beam mesh brightness | Cookie footprint brightness | Ratio |
+> | -----: | -------------------: | --------------------------: | ----: |
+> |    1.0 |               100 % |                       100 % |  1.00 |
+> |    0.5 |                50 % |                        25 % |  0.50 |
+> |    0.1 |                10 % |                         1 % |  0.10 |
+> |   0.01 |                 1 % |                      0.01 % |  0.01 |
+>
+> The 1/r² falloff WAS being applied (it's an engine-level feature of `ELightUnits::Candelas`),
+> but at low dimmer values the double-dim crushed the pattern to near-black regardless of where
+> the floor was. The user read this as "footprint doesn't follow IES / doesn't match the beam /
+> doesn't allow for distance change" -- IES was being respected, the cookie was just being
+> scaled into invisibility before the IES distribution could be perceived.
+>
+> **Fix in `UpdateEpicLightFnParams`.** Make the SpotLight the **single source of truth** for
+> dimmer + shutter + IES + 1/r² + colour. The cookie is now a pure spatial pattern: `DMX
+> Dimmer = 1.0` is forced unconditionally, and the cookie just modulates the pre-attenuated
+> per-pixel illumination by the gobo texture. Frost is still pushed live (`DMX Frost =
+> Frost.Current`) because frost is a per-pixel material blur, not a light-source-level control:
+>
+> ```cpp
+> GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Dimmer"), 1.f);     // cookie is pure pattern
+> GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Frost"),  FrostNorm); // per-pixel blur
+> ```
+>
+> Resulting per-pixel maths after v1.0.60:
+>
+> ```
+> Footprint = BaseCandela * Dim * Gate * IES(angle) * (1/r²) * pattern
+>           ↑ linear in Dim    ↑ shutter   ↑ angular  ↑ distance  ↑ gobo shape
+> ```
+>
+> All four signals come from canonical UE engine paths (Candelas-mode SetIntensity, IES texture,
+> physical inverse-square, LightFunction multiply). Shutter is still unified across the fixture
+> (`SetFixtureShutter` from v1.0.56) -- the cookie inherits Gate **transitively** via the
+> SpotLight intensity it modulates, instead of having Gate baked into the material a second time.
+>
+> **What about the beam-vs-footprint absolute brightness match?** With the double-dim removed,
+> both now track the dimmer linearly so the *relative* fade matches. The *absolute* per-pixel
+> intensities are different scales by design -- the beam mesh is an artistic emissive
+> (`RebusEpicBeamMaxIntensity = 2000.f * MeshBeamUserScale`) tuned for the volumetric shaft
+> look, while the footprint is physical candelas from `Profile.Photometrics.LuminousFlux /
+> (2π * (1 - cos(FieldAngle/2)))`. If a specific scene needs them closer in absolute brightness,
+> `MeshBeamUserScale` (`SetFixtureBeamVolumetrics`) is the per-fixture lever -- everything
+> downstream of dimmer × shutter is now correctly proportional.
+>
+> Diagnostic line: `Fixture <id> gobo cookie params (v1.0.60): cookie is pure spatial pattern
+> (DMX Dimmer=1 forced, no Dim/Gate baked into the material); SpotLight->SetIntensity =
+> BaseCandela * <dim> * <gate> handles all dimmer + shutter + IES + 1/r^2 falloff. Frost=<f>
+> (live).` Enable with `Log LogRebusVisualiser Verbose`. To confirm IES is loaded on a given
+> fixture: `Rebus.DumpFixtureLights` prints `IES=<asset>` (or `IES=<none>`) and
+> `intensity=<candelas>` -- the cookie now perfectly tracks both.
+
 > **Cookie footprint flashing during fades + unified shutter (v1.0.59).** User retest of v1.0.58:
 > "it working but the gobo on the floor is flashing. I think this is to do with Shutter. Can we
 > we control shutter as a sperate parameter. The shutter applies to the beam as well as footprint
