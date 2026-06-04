@@ -63,7 +63,10 @@ private:
 	// Enable/disable the hybrid cone-mesh volumetric beam on every spawned fixture (bMeshBeams
 	// scene property, default true). When disabled the cone is hidden and each fixture restores
 	// its SpotLight fog VolumetricScatteringIntensity (the old froxel beam), for runtime A/B.
+	// Public so the v1.0.47 `Rebus.MeshBeams [0|1]` console command can drive the same path.
+public:
 	void SetMeshBeamsEnabled(bool bEnabled);
+private:
 
 	// Enable/disable driving Orbit-imported fixture models from fixture motion (bDriveOrbitModels
 	// scene property, default false). Routes to the fixture control subsystem, which binds the

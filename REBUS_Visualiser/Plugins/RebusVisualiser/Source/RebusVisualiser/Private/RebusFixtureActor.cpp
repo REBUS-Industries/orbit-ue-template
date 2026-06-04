@@ -17,6 +17,10 @@
 #include "ImageUtils.h"
 #include "UObject/ConstructorHelpers.h"
 #include "Misc/ConfigCacheIni.h"
+#include "EngineUtils.h"
+#include "Engine/Engine.h"
+#include "Engine/World.h"
+#include "HAL/IConsoleManager.h"
 
 namespace
 {
@@ -110,12 +114,6 @@ namespace
 	// Volumetric Shadow to carve real truss gaps in the fog, while the mesh cone provides the crisp
 	// shaft. Gated by SetFixtureBeamVolumetrics(castVolumetricShadow) + this per-batch hero budget.
 	constexpr int32 RebusMaxShadowFogBeams = 6;
-	// v1.0.37: lowered 1.5 -> 0.8 so the SMOOTH analytic mesh-cone raymarch (M_RebusBeam, which has
-	// no noise term) dominates the beam look, while the froxel fog contributes just enough to carve
-	// the real truss shadow gaps -- the coarse froxel grid was the source of the "patchy" beam, so
-	// we lean on the crisp raymarch and keep the fog subtle (paired with the finer VolumetricFog
-	// grid + higher HistoryWeight in DefaultEngine.ini).
-	constexpr float RebusHeroShadowScatter = 0.8f;
 
 	// Rotation that lays a plane (engine /BasicShapes/Plane, local +Z normal) perpendicular to the
 	// beam: plane +Z -> Forward, plane +X -> Up. Guards a near-parallel up like MakeFromXZ does.
@@ -135,10 +133,73 @@ namespace
 int32 ARebusFixtureActor::VolumetricShadowBeamCount = 0;
 int32 ARebusFixtureActor::ShadowFogBeamCount = 0;
 
+// v1.0.47: hero SpotLight VolumetricScatteringIntensity used for the VSM-shadowed fog beam that
+// produces visible truss-gap shafts INSIDE the Epic M_Beam_Master cone. The Epic cone is a very
+// bright (~2000-candela) unshadowed additive raymarch, so the fog scattering has to be lifted from
+// the v1.0.37 default of 0.8 to clearly read through it. Live-tunable via `Rebus.HeroShadowScatter
+// <float>`; default 4.0 is paired with RebusEpicBeamMaxIntensity=2000 and our current fog tuning
+// (r.VolumetricFog.GridPixelSize=4, r.VolumetricFog.HistoryWeight=0.95).
+float GRebusHeroShadowScatter = 4.0f;
+FAutoConsoleVariableRef CVarRebusHeroShadowScatter(
+	TEXT("Rebus.HeroShadowScatter"),
+	GRebusHeroShadowScatter,
+	TEXT("Hero-beam SpotLight VolumetricScatteringIntensity for VSM-shadowed fog (truss gaps inside the Epic cone). Live."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		// Refresh every live fixture so the new scatter is picked up immediately.
+		if (!GEngine) return;
+		int32 Refreshed = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					F->RefreshBeamShadowMode();
+					++Refreshed;
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.HeroShadowScatter -> %.2f, refreshed %d fixture(s)."),
+			CVar->GetFloat(), Refreshed);
+	}),
+	ECVF_Default);
+
 void ARebusFixtureActor::ResetVolumetricShadowBudget()
 {
 	VolumetricShadowBeamCount = 0;
 	ShadowFogBeamCount = 0;
+}
+
+void ARebusFixtureActor::LogVolumetricShadowBudget(int32 SpawnedTotal)
+{
+	// v1.0.47 diagnostic: per-spawn-batch summary so the user can tell at a glance whether the
+	// portal is sending castVolumetricShadow=true and whether the hero budget is filtering anyone
+	// out. Emitted from URebusVisualiserSubsystem after each (re)spawn.
+	int32 WantShadow = 0;
+	int32 Hero = 0;
+	if (GEngine)
+	{
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (const ARebusFixtureActor* F = *It)
+				{
+					if (F->bWantsVolumetricShadow) ++WantShadow;
+					if (F->bGrantedShadowHero) ++Hero;
+				}
+			}
+		}
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Spawn batch shadow budget: spawned=%d wantsShadow=%d grantedHero=%d/%d (Rebus.HeroShadowScatter=%.2f). If wantsShadow=0 the portal isn't sending castVolumetricShadow=true; if grantedHero<wantsShadow the budget is filtering."),
+		SpawnedTotal, WantShadow, Hero, RebusMaxShadowFogBeams, GRebusHeroShadowScatter);
 }
 
 ARebusFixtureActor::ARebusFixtureActor()
@@ -1170,7 +1231,10 @@ void ARebusFixtureActor::RefreshBeamShadowMode()
 		// with Cast Volumetric Shadow so VSM (which works on runtime-imported glTF meshes that lack
 		// distance fields) carves real truss gaps into the volume. Non-hero beams stay mesh-only
 		// (scattering 0) so there's no competing froxel noise.
-		SpotLight->SetVolumetricScatteringIntensity(bShadowActive ? RebusHeroShadowScatter : 0.f);
+		SpotLight->SetVolumetricScatteringIntensity(bShadowActive ? GRebusHeroShadowScatter : 0.f);
+		// Cast Volumetric Shadow only meaningfully carves the fog when the SpotLight is also casting
+		// regular shadows -- VSM needs the per-light shadow data to derive the volumetric shadow.
+		SpotLight->SetCastShadows(bShadowActive);
 		SpotLight->SetCastVolumetricShadow(bShadowActive);
 	}
 	else
@@ -1201,7 +1265,7 @@ void ARebusFixtureActor::SetMeshBeamEnabled(bool bEnabled)
 		TEXT("Fixture %s mesh beam %s (shadowHero=%d wantsShadow=%d fogScatter=%.2f)."),
 		*FixtureId, bEnabled ? TEXT("ENABLED") : TEXT("DISABLED -> fog beam restored"),
 		bGrantedShadowHero ? 1 : 0, bWantsVolumetricShadow ? 1 : 0,
-		bEnabled ? (bWantsVolumetricShadow && bGrantedShadowHero ? RebusHeroShadowScatter : 0.f) : FogScatteringIntensity);
+		bEnabled ? (bWantsVolumetricShadow && bGrantedShadowHero ? GRebusHeroShadowScatter : 0.f) : FogScatteringIntensity);
 }
 
 void ARebusFixtureActor::RefreshMotion()
@@ -1620,11 +1684,16 @@ void ARebusFixtureActor::ApplyBeamVolumetrics(float Intensity, bool bCastVolumet
 	RefreshBeamShadowMode();
 	RefreshBeamEmissive();
 
+	// v1.0.47 diagnostic: explicit per-call log so the user can see in real time whether the wire
+	// flag is reaching us, whether the hero budget granted this fixture, and what fog scatter the
+	// SpotLight is actually emitting (the source of the truss-gap shafts inside the Epic cone).
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s beam volumetrics: scale=%.2f wantsShadow=%d shadowHero=%d (fog=%.2f, heroBudget=%d/%d)."),
-		*FixtureId, Clamped, bCastVolumetricShadow ? 1 : 0, bGrantedShadowHero ? 1 : 0,
-		(bMeshBeamEnabled && bWantsVolumetricShadow && bGrantedShadowHero) ? RebusHeroShadowScatter : 0.f,
-		ShadowFogBeamCount, RebusMaxShadowFogBeams);
+		TEXT("Fixture %s SetFixtureBeamVolumetrics: intensity=%.2f castVolumetricShadow=%d -> bWantsVolumetricShadow=%d bGrantedShadowHero=%d (heroBudget=%d/%d, activeFogScatter=%.2f, Rebus.HeroShadowScatter=%.2f)"),
+		*FixtureId, Clamped, bCastVolumetricShadow ? 1 : 0,
+		bWantsVolumetricShadow ? 1 : 0, bGrantedShadowHero ? 1 : 0,
+		ShadowFogBeamCount, RebusMaxShadowFogBeams,
+		(bMeshBeamEnabled && bWantsVolumetricShadow && bGrantedShadowHero) ? GRebusHeroShadowScatter : 0.f,
+		GRebusHeroShadowScatter);
 }
 
 void ARebusFixtureActor::ApplyGobo(int32 GoboIndex, bool bHasIndex, int32 WheelIndex, const FString& Wheel, float /*FadeSeconds*/)

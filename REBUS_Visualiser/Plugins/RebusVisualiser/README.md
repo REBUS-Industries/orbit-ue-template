@@ -449,6 +449,40 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Visible beam shadow gaps (v1.0.47).** Epic's `M_Beam_Master` is a pure unshadowed additive
+> raymarch (no `DistanceField`/VSM/`SceneTexture` sampling — verified by inspection), so the truss
+> "gap" shafts inside the cone come **exclusively** from the SpotLight's VSM-shadowed fog
+> scattering coincident with the cone (our v1.0.36 hero-beam hybrid). Three changes pair this with
+> the ~2000-candela Epic cone so the gaps actually read:
+> - **`RebusHeroShadowScatter` lifted 0.8 → 4.0** (default), now CVar-backed and live-tunable via
+>   **`Rebus.HeroShadowScatter <float>`**. The OnChanged sink walks every live `ARebusFixtureActor`
+>   and re-applies `RefreshBeamShadowMode()` so a new value takes effect without restart.
+> - `RefreshBeamShadowMode` now also enables **`SpotLight->SetCastShadows(true)`** on hero beams.
+>   `bCastVolumetricShadow` only carves the fog when the light is also casting regular shadows —
+>   without this, the flag was a no-op. (Cleared back to `false` when the beam isn't a hero.)
+> - **`Rebus.MeshBeams [0|1]`** (default 1) — live A/B toggle that hides the Epic canvas on every
+>   fixture, so only the SpotLight's shadowed-fog beam renders and the truss shafts are obvious.
+>   Routes through the existing `URebusSceneSettingsSubsystem::SetMeshBeamsEnabled` path (same
+>   plumbing as the `SetSceneProperty bMeshBeams` wire toggle — they don't fight).
+>
+> **Diagnostics.** Two log lines tell you whether shadow gaps are blocked upstream:
+> - Per-call: `Fixture %s SetFixtureBeamVolumetrics: intensity=… castVolumetricShadow=… -> bWantsVolumetricShadow=… bGrantedShadowHero=… (heroBudget=N/6, activeFogScatter=…, Rebus.HeroShadowScatter=…)`
+> - Per spawn batch (in `URebusVisualiserSubsystem` after the `Spawned %d fixtures` line):
+>   `Spawn batch shadow budget: spawned=… wantsShadow=… grantedHero=N/6 (Rebus.HeroShadowScatter=…)`.
+>   If `wantsShadow=0` the portal isn't sending `castVolumetricShadow=true`. If `grantedHero<wantsShadow`,
+>   the hero budget (`RebusMaxShadowFogBeams = 6`) is filtering some beams out.
+>
+> **How to see shadow gaps (recipe):**
+> 1. Send `castVolumetricShadow=true` for the fixtures you want shadowed (via `SetFixtureBeamVolumetrics`).
+> 2. Watch the spawn-batch log for `grantedHero≥1`. If it's 0 either the wire flag isn't true or all
+>    six budget slots are already claimed.
+> 3. Tune `Rebus.HeroShadowScatter` upward if the Epic cone overwhelms the gaps (try 4–8); downward
+>    if the fog itself reads too bright.
+> 4. `Rebus.MeshBeams 0` to confirm the shadowed-fog beam in isolation; `Rebus.MeshBeams 1` to restore.
+> 5. The existing `r.VolumetricFog.GridPixelSize=4` + `HistoryWeight=0.95` (v1.0.37) give crisp
+>    enough froxels; if gap edges look soft, try `r.VolumetricFog.GridPixelSize 2` at the console
+>    (cost goes up).
+
 > **Epic beam emission axis (v1.0.46).** v1.0.45 inferred the canvas's emission axis as **−Z** from
 > the vertex extent (`SM_Beam_RM` geometry spans `Z 0..−1`), but with that sign the beam emitted
 > **180° out the back** of the lens while pan/tilt still tracked the head correctly. In practice

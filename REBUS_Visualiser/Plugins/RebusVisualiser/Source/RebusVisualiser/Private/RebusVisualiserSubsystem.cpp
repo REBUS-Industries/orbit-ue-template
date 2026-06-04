@@ -415,6 +415,11 @@ void URebusVisualiserSubsystem::SpawnAllFixtures()
 
 	UE_LOG(LogRebusVisualiser, Log, TEXT("Spawned %d fixtures."), SpawnedFixtures.Num());
 
+	// v1.0.47: one-shot batch summary of how many fixtures asked for / were granted volumetric
+	// shadows, so the user can immediately diagnose missing truss-gap shafts (portal not sending
+	// castVolumetricShadow=true, or the hero budget filtering beams out). Emitted always.
+	ARebusFixtureActor::LogVolumetricShadowBudget(SpawnedFixtures.Num());
+
 	// Reassert all stored scene-property values after a (re)spawn so the live state survives a
 	// portal re-push / LoadScene rebuild (the env actors persist, but this keeps ground/quality/
 	// fog authoritative and idempotent across rebuilds).

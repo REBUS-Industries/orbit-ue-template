@@ -156,6 +156,10 @@ public:
 	// (rather than the budget being permanently consumed by the very first scene). See
 	// BuildSpotLight + RebusMaxVolumetricShadowBeams.
 	static void ResetVolumetricShadowBudget();
+	// v1.0.47: per-spawn-batch diagnostic. Reports how many fixtures asked for volumetric shadows
+	// vs how many were granted hero slots, so the user can immediately see whether the portal is
+	// sending castVolumetricShadow=true and whether the hero budget is filtering anyone out.
+	static void LogVolumetricShadowBudget(int32 SpawnedTotal);
 
 private:
 	void BuildComponentHierarchy();
@@ -196,8 +200,11 @@ private:
 	// Resolve the SpotLight's volumetric state for Phase-2 light-blocking shadows: hero shadow
 	// beams (bWantsVolumetricShadow + budget) get a modest fog VolumetricScatteringIntensity + Cast
 	// Volumetric Shadow (native VSM carves truss gaps on runtime meshes); everyone else is mesh-only
-	// (scattering 0). When the mesh beam is toggled off the fog beam is restored.
+	// (scattering 0). When the mesh beam is toggled off the fog beam is restored. Public so the
+	// v1.0.47 `Rebus.HeroShadowScatter` CVar's OnChanged sink can re-apply the new scatter live.
+public:
 	void RefreshBeamShadowMode();
+private:
 	float ResolveOuterHalfDeg() const; // current outer cone half-angle (zoom range + iris), degrees
 	void RefreshMotion();         // re-solve pan/tilt and push transforms to groups + light
 	// Apply the fixture's current head motion (HeadLocal = the head axis' cumulative fixture-local
