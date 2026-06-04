@@ -866,16 +866,27 @@ float ARebusFixtureActor::ResolveOuterHalfDeg() const
 {
 	// The CURRENT outer (field) cone half-angle, matching the SpotLight's lit cone so the mesh
 	// beam and the real light agree: the zoom half-angle clamped to the fixture's zoom range, then
-	// pinched by the iris (iris 1 = open). Frost is intentionally NOT applied here (it softens the
-	// inner cone + source radius, not the outer field extent).
+	// (depending on cookie state) pinched by the iris. Frost is intentionally NOT applied here
+	// (it softens the inner cone + source radius, not the outer field extent).
 	float OuterHalf = ZoomDeg.Current;
 	if (Profile.Zoom.bValid)
 	{
 		OuterHalf = FMath::Clamp(OuterHalf, (float)(Profile.Zoom.MinDeg * 0.5), (float)(Profile.Zoom.MaxDeg * 0.5));
 	}
 	OuterHalf = FMath::Clamp(OuterHalf, 0.5f, 80.f);
-	const float IrisScale = FMath::Lerp(0.4f, 1.f, FMath::Clamp(Iris.Current, 0.f, 1.f));
-	return OuterHalf * IrisScale;
+	// v1.0.63: when a gobo cookie is live, iris is applied as a circular alpha mask baked into
+	// GoboRT (see OnGoboRTUpdate + EnsureIrisMaskTexture). Also pinching the SpotLight outer cone
+	// here would double-iris the footprint AND -- more visibly -- scale the gobo pattern with
+	// the cone (the user's "iris is zooming instead of circular cropping" report -- shrinking the
+	// cone maps the same RT onto a smaller floor area, making gobo features look bigger). With
+	// NO gobo, there is no RT to mask, so the cone-pinch is preserved so iris-only still has an
+	// effect on the lit pool (back-compatible with the pre-v1.0.63 behaviour).
+	if (!bGoboActive)
+	{
+		const float IrisScale = FMath::Lerp(0.4f, 1.f, FMath::Clamp(Iris.Current, 0.f, 1.f));
+		OuterHalf *= IrisScale;
+	}
+	return OuterHalf;
 }
 
 void ARebusFixtureActor::BuildBeamCone()
@@ -1814,6 +1825,14 @@ void ARebusFixtureActor::ApplyIris(float Iris01, float FadeSeconds)
 	Iris.SetTarget(FMath::Clamp(Iris01, 0.f, 1.f), FadeSeconds);
 	bAnimating = true;
 	if (FadeSeconds <= 0.f) RecomputeConeAngles();
+	// v1.0.63: iris now bakes a circular mask into GoboRT (in OnGoboRTUpdate). Without a kick
+	// here, a single-shot iris change (FadeSeconds == 0) would update the SpotLight cone but
+	// NOT the cookie until the next gobo-spin/Tick redraw, leaving the floor stencil stale. With
+	// a fade, the Tick fall-through (bConeAnim path) will keep the RT in sync.
+	if (bGoboActive && GoboRT && FadeSeconds <= 0.f)
+	{
+		GoboRT->UpdateResource();
+	}
 }
 
 void ARebusFixtureActor::ApplyFocus(float Focus01, float FadeSeconds)
@@ -1828,6 +1847,13 @@ void ARebusFixtureActor::ApplyFrost(float Frost01, float FadeSeconds)
 	Frost.SetTarget(FMath::Clamp(Frost01, 0.f, 1.f), FadeSeconds);
 	bAnimating = true;
 	if (FadeSeconds <= 0.f) RecomputeConeAngles();
+	// v1.0.63: frost now also drives a multi-tap blur of the gobo INSIDE GoboRT (in
+	// OnGoboRTUpdate). Same redraw-kick rationale as ApplyIris -- a single-shot frost change
+	// must refresh the cookie so the new tap count / offset takes effect immediately.
+	if (bGoboActive && GoboRT && FadeSeconds <= 0.f)
+	{
+		GoboRT->UpdateResource();
+	}
 }
 
 void ARebusFixtureActor::ApplyColorTemp(float Kelvin)
@@ -2294,6 +2320,21 @@ void ARebusFixtureActor::OnGoboRTUpdate(UCanvas* Canvas, int32 Width, int32 Heig
 	// the texture rotates clockwise (looking down the beam). That matches the portal contract.
 	// If a future test shows the pattern rotating opposite, negate `Rotation` below -- the rest
 	// of the pipeline (GoboAngle integration, wire-signed speed) stays identical.
+	//
+	// v1.0.63: this single draw is now extended with TWO baking passes:
+	//   1. Multi-tap FROST blur: M_Light_Master's "DMX Frost" scalar (pushed in
+	//      UpdateEpicLightFnParams) does NOT visibly soften the gobo edges -- it governs the
+	//      surrounding penumbra fall-off (RecomputeConeAngles also widens the source radius +
+	//      contracts the inner cone), so frost without a gobo softens the lit pool but with a
+	//      gobo the projected stencil stays razor-sharp. We compensate by box-blurring the gobo
+	//      INSIDE the RT: one centre tap (1/N alpha) + (N-1) ring taps at sub-pixel offsets,
+	//      where N and the offset radius both scale with Frost.Current. At Frost=0 only the
+	//      centre tap runs (identical to pre-v1.0.63 behaviour).
+	//   2. Circular IRIS crop: a procedurally-generated white-on-transparent disc
+	//      (EnsureIrisMaskTexture) is drawn full-RT-size with BLEND_Modulate so dst.alpha *=
+	//      mask.alpha -- the cookie projects through a circular aperture matching the iris
+	//      position instead of pinching the SpotLight outer cone (which had the side-effect of
+	//      ZOOMING the gobo pattern). The mask is skipped entirely at Iris >= ~1.0 (open).
 	if (!Canvas || !CurrentGoboTexture) return;
 	const float Side = (float)FMath::Min(Width, Height);
 	if (Side <= 0.f) return;
@@ -2301,14 +2342,128 @@ void ARebusFixtureActor::OnGoboRTUpdate(UCanvas* Canvas, int32 Width, int32 Heig
 	const FVector2D ScreenSize(Side, Side);
 	const FVector2D CoordPos(0.f, 0.f);
 	const FVector2D CoordSize(1.f, 1.f);
+	const FVector2D Pivot(0.5f, 0.5f);
+
+	// ---- Pass 1: gobo draw (centre tap + frost-scaled ring taps) ----------------------------
+	const float FrostNorm = FMath::Clamp(Frost.Current, 0.f, 1.f);
+	const int32 RingTaps = (FrostNorm > KINDA_SMALL_NUMBER) ? 8 : 0;
+	const int32 TotalTaps = 1 + RingTaps;
+	// Offset is a fraction of the RT side -- small at low frost, ~2.5% of RT (~13 px on a 512 RT,
+	// which projects to a noticeable halo at typical throws) at max frost. Keep small enough not
+	// to bleed off the gobo's circular boundary.
+	const float TapOffsetPx = FrostNorm * (Side * 0.025f);
+	const float TapAlpha = 1.f / (float)TotalTaps;
+	const FLinearColor TapTint(1.f, 1.f, 1.f, TapAlpha);
+
 	Canvas->K2_DrawTexture(
 		CurrentGoboTexture.Get(),
 		ScreenPos, ScreenSize,
 		CoordPos, CoordSize,
-		FLinearColor::White,
+		TapTint,
 		BLEND_Translucent,
 		GoboAngle,
-		FVector2D(0.5f, 0.5f));
+		Pivot);
+	for (int32 i = 0; i < RingTaps; ++i)
+	{
+		const float Ang = (float)i / (float)RingTaps * 2.f * PI;
+		const float Ox = FMath::Cos(Ang) * TapOffsetPx;
+		const float Oy = FMath::Sin(Ang) * TapOffsetPx;
+		Canvas->K2_DrawTexture(
+			CurrentGoboTexture.Get(),
+			ScreenPos + FVector2D(Ox, Oy), ScreenSize,
+			CoordPos, CoordSize,
+			TapTint,
+			BLEND_Translucent,
+			GoboAngle,
+			Pivot);
+	}
+
+	// ---- Pass 2: iris circular crop (BLEND_Modulate) ----------------------------------------
+	const float IrisNorm = FMath::Clamp(Iris.Current, 0.f, 1.f);
+	if (IrisNorm < 0.999f)
+	{
+		EnsureIrisMaskTexture(IrisNorm); // cheap no-op when quantised value hasn't changed
+		if (IrisMaskTex)
+		{
+			Canvas->K2_DrawTexture(
+				IrisMaskTex.Get(),
+				FVector2D(0.f, 0.f), FVector2D((float)Width, (float)Height),
+				CoordPos, CoordSize,
+				FLinearColor::White,
+				BLEND_Modulate,
+				0.f,
+				FVector2D(0.5f, 0.5f));
+		}
+	}
+}
+
+void ARebusFixtureActor::EnsureIrisMaskTexture(float Iris01)
+{
+	// v1.0.63: lazy / debounced procedural circular mask for the iris pass in OnGoboRTUpdate.
+	// We quantise to 0.01 so a 1 s iris fade only regenerates ~100 times (~50 us each at 128 px),
+	// avoiding per-frame allocations. The mask is 128 BGRA8 -- bilinear sampling on the RT
+	// smooths the disc edge nicely when drawn at 512 RT-side. ALL FOUR channels are set to the
+	// same circular alpha value so BLEND_Modulate (`Dst *= Src` on RGBA) zeroes RGB and A
+	// outside the iris circle in lockstep: that matters because `M_Light_Master` samples the
+	// cookie's RGB (not alpha) to weight the light function output -- a pure alpha mask would
+	// leave the gobo pattern bright in the cropped area, breaking the iris effect.
+	const float Q = FMath::Clamp(FMath::RoundToFloat(Iris01 * 100.f) / 100.f, 0.f, 1.f);
+	if (IrisMaskTex && FMath::IsNearlyEqual(LastIrisMaskValue, Q))
+	{
+		return;
+	}
+	constexpr int32 Size = 128;
+	if (!IrisMaskTex)
+	{
+		IrisMaskTex = UTexture2D::CreateTransient(Size, Size, PF_B8G8R8A8,
+			FName(*FString::Printf(TEXT("RebusIrisMask_%s"), *FixtureId)));
+		if (!IrisMaskTex)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Fixture %s iris mask: UTexture2D::CreateTransient returned null; iris-crop disabled."),
+				*FixtureId);
+			return;
+		}
+		IrisMaskTex->SRGB = false;
+		IrisMaskTex->Filter = TF_Bilinear;
+		IrisMaskTex->AddressX = TA_Clamp;
+		IrisMaskTex->AddressY = TA_Clamp;
+		IrisMaskTex->NeverStream = true;
+	}
+	LastIrisMaskValue = Q;
+
+	FTexturePlatformData* PD = IrisMaskTex->GetPlatformData();
+	if (!PD || PD->Mips.Num() == 0) return;
+	FTexture2DMipMap& Mip = PD->Mips[0];
+	uint8* Data = (uint8*)Mip.BulkData.Lock(LOCK_READ_WRITE);
+	if (!Data) return;
+
+	const float Cx = (float)Size * 0.5f;
+	const float Cy = (float)Size * 0.5f;
+	const float MaxR = (float)Size * 0.5f - 0.5f;
+	// Iris radius spans 0..MaxR. A floor of 0.5 px stops the disc collapsing to no pixels at
+	// Iris=0 (the cookie is already alpha-zeroed everywhere then, but the BLEND_Modulate pass
+	// still expects a sane texture).
+	const float IrisR = FMath::Max(MaxR * Q, 0.5f);
+	constexpr float EdgePx = 1.5f; // soft anti-alias edge in mask pixels (~6 RT pixels at 512)
+	for (int32 y = 0; y < Size; ++y)
+	{
+		for (int32 x = 0; x < Size; ++x)
+		{
+			const float Dx = (float)x + 0.5f - Cx;
+			const float Dy = (float)y + 0.5f - Cy;
+			const float D = FMath::Sqrt(Dx * Dx + Dy * Dy);
+			const float A = FMath::Clamp((IrisR - D) / EdgePx, 0.f, 1.f);
+			const uint8 Au = (uint8)FMath::RoundToInt(A * 255.f);
+			uint8* Px = &Data[(y * Size + x) * 4];
+			Px[0] = Au; // B
+			Px[1] = Au; // G
+			Px[2] = Au; // R
+			Px[3] = Au; // A
+		}
+	}
+	Mip.BulkData.Unlock();
+	IrisMaskTex->UpdateResource();
 }
 
 void ARebusFixtureActor::ApplyCurrentGoboToEpicBeam()
@@ -2760,6 +2915,17 @@ void ARebusFixtureActor::Tick(float DeltaSeconds)
 	if (bMotionAnim) { RefreshMotion(); bStillAnimating = true; }
 	if (bIntensityAnim) { RefreshIntensity(); bStillAnimating = true; }
 	if (bConeAnim) { RecomputeConeAngles(); SelectIesForZoom(); bStillAnimating = true; }
+
+	// v1.0.63: bConeAnim covers zoom/iris/frost. Iris + frost now bake into the GoboRT (circular
+	// mask + multi-tap blur in OnGoboRTUpdate), so the cookie has to redraw whenever either
+	// fades -- without this kick the cone-angle/source-radius would update each frame but the
+	// floor stencil would freeze until the next gobo selection / spin tick. Only redraws while
+	// a real gobo is loaded (bGoboActive + non-null GoboRT); when no gobo is in, the cone-pinch
+	// path in ResolveOuterHalfDeg already handles iris and there's nothing to bake.
+	if (bConeAnim && bGoboActive && GoboRT)
+	{
+		GoboRT->UpdateResource();
+	}
 
 	// Strobe gating.
 	if (ShutterMode == ERebusShutterMode::Strobe && ShutterRateHz > KINDA_SMALL_NUMBER)

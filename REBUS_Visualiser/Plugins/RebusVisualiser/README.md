@@ -593,6 +593,71 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Iris circular crop + Frost gobo blur (v1.0.63).** User report after the v1.0.62 shutter
+> fix: *"When we have a gobo in. Iris is zooming instead of circular cropping like an iris
+> would. Frost is not working when a gobo is in."* Both effects had the same root cause — the
+> cookie LightFunction (M_Light_Master) only exposes `DMX Frost` (which governs the surrounding
+> penumbra fall-off, not the gobo-texture sample), and iris was being applied as a SpotLight
+> outer-cone pinch (`ResolveOuterHalfDeg` scaled `OuterHalf` by `Lerp(0.4, 1, Iris)`), so:
+>
+> - **Iris closing didn't crop the gobo, it shrank the cone.** A narrower cone projects the
+>   SAME `GoboRT` onto a smaller floor area, so gobo features look BIGGER → exactly what the
+>   user saw as "zooming". A real iris is an aperture stop inside the fixture: the gobo image
+>   stays the same scale, but the outer rim is occluded so the projected pattern shows inside a
+>   smaller circle, surrounded by darkness.
+> - **Frost did nothing visible on the gobo.** `DMX Frost` on `M_Light_Master` (verified via
+>   asset inspection) modulates penumbra/source-radius softening, not the cookie texture sample,
+>   so a sharp stencil stays razor-sharp on the floor regardless of frost.
+>
+> **What v1.0.63 changes.** The fix bakes BOTH effects directly into the `UCanvasRenderTarget2D`
+> (`GoboRT`) we already use for in-plane gobo rotation, so the projected cookie carries the
+> iris crop and frost halo whatever cookie material the SpotLight is using.
+>
+> 1. **`OnGoboRTUpdate` pass 1 (multi-tap frost blur).** The gobo is no longer a single
+>    `K2_DrawTexture` call. We do `N = 1 + 8·step(Frost > 0)` taps: one centre tap plus eight
+>    ring taps at sub-pixel offsets, each drawn at `1/N` alpha so they additively average. The
+>    ring offset scales with `Frost.Current` up to `~2.5%` of the RT side (~13 px on a 512 RT,
+>    which projects to a noticeable halo at typical throws). At `Frost=0` only the centre tap
+>    runs — identical to the pre-v1.0.63 single draw.
+> 2. **`OnGoboRTUpdate` pass 2 (circular iris mask).** A new helper
+>    `EnsureIrisMaskTexture(Iris01)` lazily generates a 128×128 `PF_B8G8R8A8` transient texture
+>    (`IrisMaskTex`) with an anti-aliased disc whose radius scales with `Iris01`. All four
+>    channels (RGBA) are set to the SAME circular alpha value so `BLEND_Modulate` (`Dst *= Src`
+>    across all components) zeroes RGB and A in lockstep — `M_Light_Master` samples the cookie's
+>    RGB to weight the light function output, so a pure alpha mask would leave the gobo pattern
+>    bright in the cropped area. It's debounced — only regenerated when the quantised (`0.01`)
+>    iris value changes, so a 1 s iris fade allocates ~100 frames of mask data instead of every
+>    frame. The mask is drawn full-RT with `BLEND_Modulate`. Result: inside the iris circle, the
+>    gobo passes through unchanged; outside the circle, the RT pixel collapses to (0,0,0,0) so
+>    the cookie projects black at that position → SpotLight emits no light at that azimuth in
+>    the cone. At `Iris >= 0.999` the mask pass is skipped entirely (fully open, no draw cost).
+> 3. **`ResolveOuterHalfDeg` cone-pinch is conditional on `bGoboActive == false`.** When a
+>    gobo is live, iris is now handled exclusively by the GoboRT mask — pinching the cone here
+>    would DOUBLE-iris the footprint AND re-introduce the "gobo zooms" artefact. Without a
+>    gobo, the cone-pinch is preserved (back-compatible) so iris-only still has a visible
+>    effect on the lit pool.
+> 4. **Redraw kicks.** Iris + frost previously only ran `RecomputeConeAngles` on change. Now
+>    `ApplyIris` / `ApplyFrost` also call `GoboRT->UpdateResource()` on instant single-shot
+>    changes (`FadeSeconds <= 0`), and `Tick` kicks the same redraw on every `bConeAnim` frame
+>    while `bGoboActive` is true. Without these, the cookie stencil would freeze the moment
+>    iris or frost changed and only refresh on the next gobo-spin / gobo-selection event.
+>
+> **Why bake into the RT instead of pushing more material params.** `M_Light_Master` has no
+> iris parameter at all (verified via the `DMXFixtures` content inspection done for v1.0.58)
+> and `DMX Frost` doesn't touch the cookie texture sample. Authoring our own cookie material
+> with circular-mask + blur nodes would require shipping a new `.uasset`; doing it in the RT
+> reuses the already-allocated 512×512 `UCanvasRenderTarget2D` and leaves the material binding
+> untouched, so the cookie path stays a drop-in replacement for the Epic default. The volumetric
+> beam mesh sees no change — it samples the same RT, so the iris-cropped + frost-blurred gobo
+> projects through both the cone and the cookie consistently.
+>
+> **Diagnostics.** No new log lines; the existing gobo-RT redraw cadence implicitly traces the
+> iris/frost changes (`OnGoboRTUpdate` already runs on every `UpdateResource()` call). If the
+> floor stencil ever lags behind the iris/frost target, watch for missing `Iris.Tick`/`Frost.
+> Tick` returning true (would mean `FAnimatedFloat` is being snapped without queuing a tick) or
+> for `bGoboActive` being false (would mean iris is going through the cone-pinch back-compat
+> path — the gobo state should always force `bGoboActive=true` in `ApplyCurrentGoboToEpicBeam`).
+
 > **Empty-id descriptors now broadcast to current selection (v1.0.62).** User retest of v1.0.61
 > with the new diagnostics finally surfaced the actual portal contract: every `SetFixtureShutter`
 > message arrives with `id=''` (empty string), `mode` and `rateHz` populated correctly. The

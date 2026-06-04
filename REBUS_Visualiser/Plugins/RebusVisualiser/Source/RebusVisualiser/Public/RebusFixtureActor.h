@@ -354,6 +354,19 @@ private:
 	// 1-frame gap better than a hard-edged LightFunction projection. Compare-pointer (not equals)
 	// is sufficient -- CurrentGoboTexture is a TObjectPtr so == checks the underlying UObject*.
 	UPROPERTY() TObjectPtr<UTexture2D> LastGoboRTUpdateTex = nullptr;
+
+	// v1.0.63: per-fixture procedural circular IRIS MASK texture. Drawn on top of the gobo into
+	// GoboRT (BLEND_Modulate) so the cookie projects through a circular aperture instead of
+	// pinching the SpotLight outer-cone angle (which had been zooming the gobo pattern -- the
+	// user reported "iris is zooming instead of circular cropping like an iris would").
+	// EnsureIrisMaskTexture lazily allocates the texture (128x128 BGRA8) and re-fills it with an
+	// anti-aliased white-on-transparent disc when Iris.Current changes (quantised to 0.01 to
+	// avoid per-frame regen during a fade). Only used while bGoboActive -- no cookie -> no RT to
+	// modulate, so iris falls back to the cone-angle scaling path in ResolveOuterHalfDeg.
+	UPROPERTY() TObjectPtr<UTexture2D> IrisMaskTex = nullptr;
+	float LastIrisMaskValue = -1.f; // sentinel -1 = uninitialised; else quantised 0..1
+	void EnsureIrisMaskTexture(float Iris01);
+
 	float CurrentGoboRotationSpeed = 0.f;
 	// v1.0.50: animation-wheel rotation, signed normalised [-1..1]. Epic's M_Beam_Master has no
 	// dedicated animation-wheel param (only DMX Gobo Disk Rotation Speed), so we add this to the
