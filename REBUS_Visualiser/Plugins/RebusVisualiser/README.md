@@ -593,6 +593,82 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Spotlight footprint gobo: corrected to actual M_Light_Master vocabulary (v1.0.58).** User
+> retest of v1.0.57: "we are still seeing no gobos in the footprint of the light on the floor."
+> v1.0.57's diagnosis (cookie multiplied by 0 by an unset gating scalar) was the right shape but
+> the wrong vocabulary -- we mirrored `M_Beam_Master`'s param list verbatim, but verified by
+> unpacking the on-disk `M_Light_Master.uasset` string table at
+> `/DMXFixtures/LightFixtures/DMX_Materials/Masters/M_Light_Master` that the actual scalar /
+> vector inputs on the light function material are:
+>
+> ```
+> DMX Dimmer
+> DMX Frost
+> DMX Strobe Open                 (binary gate, set by Strobe_Component in stock Epic BPs)
+> DMX Strobe Frequency
+> DMX Strobe Disable Burst
+> DMX Gobo Disk                    (MF_DMXGobo clean disc texture)
+> DMX Gobo Disk Frosted            (MF_DMXGobo frosted disc texture)
+> DMX Gobo Num Mask
+> DMX Gobo Index
+> DMX Gobo Disk Rotation Speed
+> Use Gobo                         (StaticSwitchParameter, ON in MI_Light per the existence of
+>                                   a separate MI_LightNoGobo override 5441 bytes larger)
+> ```
+>
+> `DMX Color` / `DMX Max Light Intensity` / `DMX Max Light Distance` / `DMX Lens Radius` /
+> `DMX Zoom` / `DMX Zoom Normalize` / `DMX Quality Level` -- which v1.0.57 pushed -- DO NOT
+> EXIST on `M_Light_Master`. UE silently no-ops `SetScalarParameterValue` on an unknown
+> parameter (which is normally a safety feature) so v1.0.57's pushes wrote to nothing and never
+> moved the needle, even though the trace logs printed values. Cross-referenced by reading
+> Epic's `Strobe_Component`, `Dimmer_Component`, `Frost_Component`, and `Color_Component`
+> Blueprint binaries:
+>
+> | Component        | Pushes to DynamicMaterialBeam | DynamicMaterialLens | DynamicMaterialSpotLight |
+> | ---------------- | :---------------------------: | :-----------------: | :----------------------: |
+> | Strobe_Component | yes (Open/Freq/Burst)         | yes                 | yes (Open/Freq/Burst)    |
+> | Dimmer_Component | yes (Dimmer)                  | yes                 | yes (Dimmer)             |
+> | Frost_Component  | yes (Frost)                   | yes                 | yes (Frost)              |
+> | Color_Component  | yes (Color)                   | yes                 | **NO** (omitted by design) |
+>
+> So Epic deliberately does NOT push `DMX Color` at the SpotLight light function -- the cookie
+> picks up its tint from the SpotLight's own `SetLightColor`. That matches our `RefreshIntensity`
+> path; pushing `DMX Color` on `GoboLightFnMID` was harmless (no-op) but redundant in concept.
+>
+> **The actual gate** that was killing the cookie all along: **`DMX Strobe Open`**. Epic's
+> stock `Strobe_Component` writes it on every shutter-state change, defaulting to 1 (open)
+> when not strobing. We never set it, so the MID held the implicit 0 (closed) and
+> `M_Light_Master` multiplied its entire output by 0 -- no cookie, regardless of the gobo
+> texture / dimmer / atlas / cast-shadows / MegaLights opt-out / reregister machinery being
+> correct. This is why every previous diagnostic from v1.0.49 through v1.0.57 showed
+> "lightFn=MI_Light tex=<gobo>" set correctly on the proxy and yet no floor pattern projected.
+>
+> **v1.0.58 fix** in `ARebusFixtureActor::UpdateEpicLightFnParams()`:
+> - Drops the `M_Beam_Master`-only pushes (Color / Max Light Intensity / Max Light Distance /
+>   Lens Radius / Zoom / Zoom Normalize / Quality Level).
+> - Pushes the verified `M_Light_Master` vocabulary: `DMX Dimmer` = live `Dimmer.Current`, `DMX
+>   Strobe Open` = our existing `Gate` variable (1 when shutter open, 0 closed, oscillating
+>   during strobe), `DMX Strobe Frequency` = 0 (we drive strobe at the SpotLight intensity
+>   level, not at the material level), `DMX Strobe Disable Burst` = 0, `DMX Frost` = live
+>   `Frost.Current`. Multiplying `DMX Dimmer * DMX Strobe Open` inside the material reproduces
+>   Epic's stock cookie-gating arithmetic exactly: cookie brightness now tracks dimmer in
+>   lockstep with the SpotLight's own `SetIntensity`, and a closed/strobed shutter blacks out
+>   the cookie in the same frame the spotlight goes dark.
+> - In `ApplyCurrentGoboToLightFn` also pushes `DMX Gobo Disk` (the clean disc texture) in
+>   addition to `DMX Gobo Disk Frosted` -- Epic's stock `GoboWheel_Component` writes BOTH, and
+>   the `Use Gobo` static switch in `MI_Light` might route through either, depending on the
+>   asset's internal blend (verified Use Gobo is ON; the separate `MI_LightNoGobo` carries a
+>   `StaticSwitchParameter Use Gobo=false` override and an extra ~5KB of static shader
+>   permutation cache, so the default has Use Gobo on).
+>
+> Diagnostic line updated: `Fixture <id> gobo cookie params (v1.0.58 corrected): dim=<d>
+> strobeOpen=<so> frost=<f> gate=<g> -- M_Light_Master vocabulary (DMX Strobe Open was the
+> missing gate that multiplied the cookie by 0 in v1.0.49->v1.0.57).` Surface with
+> `Log LogRebusVisualiser Verbose` to confirm. If on the next test the cookie is now visible
+> but at the wrong brightness / colour, the per-fixture
+> `Rebus.HeroShadowScatter` / `SetLightColor` paths in `RefreshIntensity` are the levers
+> -- the cookie is now passing through the same gate the user-visible beam already uses.
+
 > **Spotlight footprint gobo via mirrored M_Light_Master DMX params (v1.0.57).** User report:
 > "The Beam which is made from the Epic UE DMX fixture plugin works well with the GOBO sent from
 > our portal. The spotlight part of the fixture is not working with GOBOS. We need to take the

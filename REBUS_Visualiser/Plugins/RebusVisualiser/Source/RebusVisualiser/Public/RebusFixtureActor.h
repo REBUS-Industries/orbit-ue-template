@@ -261,16 +261,21 @@ private:
 	// the gobo projects onto the lit floor pool. Lazily MIDs MI_Light on first call; sets
 	// SpotLight->LightFunctionMaterial. On clear (CurrentGoboTexture==null) nulls the light fn.
 	void ApplyCurrentGoboToLightFn();
-	// v1.0.57: mirror UpdateEpicBeamParams' DMX param push (DMX Color / DMX Dimmer / DMX Max Light
-	// Intensity / DMX Max Light Distance / DMX Lens Radius / DMX Zoom / DMX Zoom Normalize / DMX
-	// Quality Level) onto GoboLightFnMID. M_Light_Master internally MULTIPLIES the sampled gobo
-	// texture by these scalars, and unset MID params inherit MIC defaults of 0 -- the cookie was
-	// being multiplied by DMX Dimmer=0 (and color=black) which is why the floor pool never showed
-	// the gobo even after v1.0.50's MegaLights opt-out + v1.0.51's reregister landed. Pushing the
-	// same live values the Epic beam already gets makes the cookie inherit identical brightness/
-	// colour gating, so beam + footprint stay perfectly in sync. No-op when GoboLightFnMID is null
-	// (no gobo active). Called from UpdateEpicBeamParams (every refresh) and from
-	// ApplyCurrentGoboToLightFn (lazy-MID-creation primer + every gobo selection).
+	// v1.0.57 introduced + v1.0.58 corrected: push the verified M_Light_Master vocabulary onto
+	// GoboLightFnMID -- DMX Dimmer / DMX Strobe Open / DMX Strobe Frequency / DMX Strobe Disable
+	// Burst / DMX Frost. The CRITICAL gate is DMX Strobe Open: M_Light_Master multiplies its
+	// entire light-function output by it, and the MID default is 0, so the cookie was being
+	// completely zeroed until we set it -- the actual root cause of v1.0.49 through v1.0.57
+	// "spotlight footprint gobo never shows". v1.0.57 wrongly pushed M_Beam_Master vocabulary
+	// (DMX Color / DMX Max Light Intensity / DMX Max Light Distance / DMX Lens Radius / DMX Zoom
+	// / DMX Zoom Normalize / DMX Quality Level) verbatim, but those scalars don't exist on
+	// M_Light_Master (verified by unpacking the on-disk .uasset string table at /DMXFixtures/
+	// LightFixtures/DMX_Materials/Masters/M_Light_Master) so they silently no-oped. v1.0.58
+	// drops them and pushes the CORRECT vocabulary that Epic's stock Strobe_Component +
+	// Dimmer_Component + Frost_Component fire at DynamicMaterialSpotLight in BP_MovingHead.
+	// No-op when GoboLightFnMID is null (no gobo active). Called from UpdateEpicBeamParams
+	// (every refresh) and from ApplyCurrentGoboToLightFn (lazy-MID-creation primer + every gobo
+	// selection).
 	void UpdateEpicLightFnParams();
 	// v1.0.49: explicit clear path. Drops CurrentGoboTexture, reverts the Epic beam MID to its
 	// MI default, nulls the SpotLight light function, clears bGoboActive, and reasserts shadows.
