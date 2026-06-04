@@ -67,6 +67,25 @@ never hardcoded), `-OrbitProject` (portal doc id), `-OrbitModel`, `-OrbitVersion
 
 > Quote the URL in `.ini` — UE strips `//` from unquoted values (§4.0).
 
+### Pixel Streaming console commands (v1.0.54)
+
+The Pixel Streaming 2 streamer silently DROPS portal-sent `Command` / `ConsoleCommand` messages
+unless `PixelStreaming.AllowPixelStreamingCommands=1` is set (defaults off for security). This
+is project-side config, not a plugin code path — Epic's built-in `PixelStreamingInput`
+component routes the command, and the CVar is what gates it. v1.0.54 adds the line to the
+project's `REBUS_Visualiser/Config/DefaultEngine.ini` under `[SystemSettings]` so the running
+streamer accepts them. With this enabled the portal's console pane can drive:
+
+- Any built-in UE console command, e.g. `stat fps`, `stat unit`, `r.ScreenPercentage 75`.
+- Every `Rebus.*` console command this plugin registers: `Rebus.DumpFixtureLights`,
+  `Rebus.MeshBeams [0|1]`, `Rebus.DriveOrbitModels [0|1]`, and tunables like
+  `Rebus.HeroShadowScatter <float>`.
+- Any other CVar relevant to runtime tuning (e.g. `r.MegaLights.Allow`, `r.SkyLight.RealTimeReflectionCapture`).
+
+The change takes effect at next process launch (no rebuild). Quick verify: with a fresh build
+running, send `stat fps` from the portal console pane — the FPS overlay appears in the
+streamed view. Pre-v1.0.54 the message was silently dropped on the streamer side.
+
 ## Lifecycle
 
 1. Subsystem reads config + tokens, configures the REST client, creates the data channel.
