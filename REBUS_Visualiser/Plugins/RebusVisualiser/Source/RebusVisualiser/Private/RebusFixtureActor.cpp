@@ -1839,9 +1839,50 @@ void ARebusFixtureActor::ApplyColorTemp(float Kelvin)
 
 void ARebusFixtureActor::ApplyShutter(ERebusShutterMode Mode, float RateHz)
 {
+	// v1.0.61: harden against three field bugs the user hit:
+	//   (1) Strobe + RateHz=0 silently did nothing (the Tick branch advancing ShutterPhase
+	//       requires ShutterRateHz > KINDA_SMALL_NUMBER), so the portal could request a
+	//       strobe and see the light just stay continuously lit. We now coerce to a sensible
+	//       default (RebusDefaultStrobeHz, 5Hz) and log a Warning so the portal team can
+	//       see they need to send rateHz alongside mode=2.
+	//   (2) Every call reset ShutterPhase = 0, which combined with portals that re-send the
+	//       SAME shutter state every tick (the user's logs show 4 duplicates per ms) meant
+	//       the strobe never progressed past phase 0 (Gate = 1 throughout). Now we only
+	//       reset ShutterPhase when Mode or Rate actually changed, so duplicate "stay
+	//       strobing" pushes are no-ops on the phase accumulator.
+	//   (3) No echo log: previously ApplyShutter was silent; the user could only see
+	//       "Descriptor type 'SetFixtureShutter'" with nothing after. Now we log the
+	//       resolved (Mode, Rate) so the chain is fully visible.
+	constexpr float RebusDefaultStrobeHz = 5.f;
+	constexpr float RebusMaxStrobeHz = 30.f;
+
+	float ResolvedRate = FMath::Clamp(RateHz, 0.f, RebusMaxStrobeHz);
+	if (Mode == ERebusShutterMode::Strobe && ResolvedRate <= KINDA_SMALL_NUMBER)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s ApplyShutter(Strobe) with rateHz=%.2f -- defaulting to %.1fHz so the strobe actually progresses. Portal should send {\"mode\":2,\"rateHz\":<1..30>} for explicit control."),
+			*FixtureId, RateHz, RebusDefaultStrobeHz);
+		ResolvedRate = RebusDefaultStrobeHz;
+	}
+
+	const bool bModeChanged = (ShutterMode != Mode);
+	const bool bRateChanged = !FMath::IsNearlyEqual(ShutterRateHz, ResolvedRate);
 	ShutterMode = Mode;
-	ShutterRateHz = FMath::Clamp(RateHz, 0.f, 30.f);
-	ShutterPhase = 0.f;
+	ShutterRateHz = ResolvedRate;
+	if (bModeChanged || bRateChanged)
+	{
+		ShutterPhase = 0.f;
+	}
+
+	const TCHAR* ModeName =
+		(Mode == ERebusShutterMode::Open)   ? TEXT("Open")   :
+		(Mode == ERebusShutterMode::Closed) ? TEXT("Closed") : TEXT("Strobe");
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s ApplyShutter: mode=%s rate=%.2fHz (changed: mode=%s rate=%s) -- gate now drives SpotLight->SetIntensity in RefreshIntensity + EpicBeamMID DMX Dimmer in UpdateEpicBeamParams (cookie inherits transitively)."),
+		*FixtureId, ModeName, ShutterRateHz,
+		bModeChanged ? TEXT("yes") : TEXT("no"),
+		bRateChanged ? TEXT("yes") : TEXT("no"));
+
 	RefreshIntensity();
 	if (Mode == ERebusShutterMode::Strobe) bAnimating = true;
 }

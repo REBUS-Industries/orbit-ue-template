@@ -82,10 +82,27 @@ void URebusFixtureControlSubsystem::SetFixtureColorTemp(const FString& Id, float
 }
 void URebusFixtureControlSubsystem::SetFixtureShutter(const FString& Id, int32 Mode, float RateHz)
 {
-	if (ARebusFixtureActor* F = FindFixture(Id))
+	// v1.0.61: log fixture-match outcome. Previously the call silently no-oped when the portal
+	// sent an unknown id, leaving the user with only the "Descriptor type 'SetFixtureShutter'"
+	// log line and no clue why nothing happened. Now: warn if id doesn't match anything in the
+	// Fixtures map (with a snapshot of known ids for debugging), info if it matched.
+	ARebusFixtureActor* F = FindFixture(Id);
+	if (!F)
 	{
-		F->ApplyShutter(static_cast<ERebusShutterMode>(FMath::Clamp(Mode, 0, 2)), RateHz);
+		TArray<FString> Known;
+		Fixtures.GetKeys(Known);
+		const FString KnownList = Known.Num() > 0
+			? FString::Join(Known, TEXT(", "))
+			: FString(TEXT("(none registered)"));
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("SetFixtureShutter id='%s' mode=%d rate=%.2fHz: NO FIXTURE FOUND. Known ids: [%s]."),
+			*Id, Mode, RateHz, *KnownList);
+		return;
 	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("SetFixtureShutter dispatch: id='%s' fixture=%s mode=%d rate=%.2fHz."),
+		*Id, *GetNameSafe(F), Mode, RateHz);
+	F->ApplyShutter(static_cast<ERebusShutterMode>(FMath::Clamp(Mode, 0, 2)), RateHz);
 }
 void URebusFixtureControlSubsystem::SetFixtureGoboRotation(const FString& Id, float Speed, int32 WheelIndex)
 {
@@ -221,10 +238,66 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 	}
 	if (Type == TEXT("SetFixtureShutter"))
 	{
-		double Mode = 0.0, Rate = 0.0;
-		RebusJson::TryGetNumber(Msg, TEXT("mode"), Mode);
-		RebusJson::TryGetNumber(Msg, TEXT("rateHz"), Rate);
-		SetFixtureShutter(Id, (int32)Mode, (float)Rate);
+		// v1.0.61: accept multiple field/value conventions and log every parse step. The user
+		// reported logs showed "Descriptor type 'SetFixtureShutter'" arriving but no shutter
+		// effect; previously we parsed only `mode` (numeric) and `rateHz` (numeric) and silently
+		// no-oped if the portal used a string for mode ("open"/"closed"/"strobe") or used a
+		// different field name for the rate (rate / frequency / hz / freq). Now: try numeric
+		// first, then string, then alternate rate names. Log raw + resolved values + fixture
+		// match outcome so the portal team can immediately see exactly what's arriving.
+		int32 ModeInt = 0;
+		FString ModeStr;
+		bool bModeAsNumber = false;
+		bool bModeAsString = false;
+		double ModeNum = 0.0;
+		if (RebusJson::TryGetNumber(Msg, TEXT("mode"), ModeNum))
+		{
+			bModeAsNumber = true;
+			ModeInt = FMath::Clamp((int32)ModeNum, 0, 2);
+		}
+		else if (RebusJson::TryGetString(Msg, TEXT("mode"), ModeStr))
+		{
+			bModeAsString = true;
+			const FString Lower = ModeStr.ToLower().TrimStartAndEnd();
+			if (Lower == TEXT("open") || Lower == TEXT("on") || Lower == TEXT("1") || Lower == TEXT("true"))
+			{
+				ModeInt = 0;
+			}
+			else if (Lower == TEXT("closed") || Lower == TEXT("close") || Lower == TEXT("off") || Lower == TEXT("0") || Lower == TEXT("false"))
+			{
+				ModeInt = 1;
+			}
+			else if (Lower == TEXT("strobe") || Lower == TEXT("strobing") || Lower == TEXT("flash") || Lower == TEXT("pulse") || Lower == TEXT("2"))
+			{
+				ModeInt = 2;
+			}
+			else
+			{
+				UE_LOG(LogRebusVisualiser, Warning,
+					TEXT("SetFixtureShutter id='%s': unrecognised mode string '%s' (expected open/closed/strobe or 0/1/2); falling back to Open."),
+					*Id, *ModeStr);
+				ModeInt = 0;
+			}
+		}
+
+		// Rate: rateHz (canonical) -> rate -> frequency -> hz -> freq. Whichever lands first wins.
+		double Rate = 0.0;
+		const TCHAR* RateKey = TEXT("(none)");
+		if      (RebusJson::TryGetNumber(Msg, TEXT("rateHz"),    Rate)) { RateKey = TEXT("rateHz"); }
+		else if (RebusJson::TryGetNumber(Msg, TEXT("rate"),      Rate)) { RateKey = TEXT("rate"); }
+		else if (RebusJson::TryGetNumber(Msg, TEXT("frequency"), Rate)) { RateKey = TEXT("frequency"); }
+		else if (RebusJson::TryGetNumber(Msg, TEXT("hz"),        Rate)) { RateKey = TEXT("hz"); }
+		else if (RebusJson::TryGetNumber(Msg, TEXT("freq"),      Rate)) { RateKey = TEXT("freq"); }
+
+		const TCHAR* ModeName = (ModeInt == 0) ? TEXT("Open") : (ModeInt == 1 ? TEXT("Closed") : TEXT("Strobe"));
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("SetFixtureShutter parsed: id='%s' mode=%d(%s) [source=%s raw=%s] rate=%.2fHz [source=%s] fadeIgnored=%.2f"),
+			*Id, ModeInt, ModeName,
+			bModeAsNumber ? TEXT("number") : (bModeAsString ? TEXT("string") : TEXT("(missing -> Open)")),
+			bModeAsNumber ? *FString::Printf(TEXT("%.2f"), ModeNum) : (bModeAsString ? *ModeStr : TEXT("<absent>")),
+			Rate, RateKey, Fade);
+
+		SetFixtureShutter(Id, ModeInt, (float)Rate);
 		return true;
 	}
 	if (Type == TEXT("SetFixtureGoboRotation"))

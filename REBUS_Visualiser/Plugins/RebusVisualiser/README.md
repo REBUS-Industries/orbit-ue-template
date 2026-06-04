@@ -593,6 +593,87 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Shutter / strobe diagnostics + field-name flexibility + Strobe-with-0Hz safety net (v1.0.61).**
+> User report: "We cannot control strobe, here are the logs." Logs showed `Descriptor type
+> 'SetFixtureShutter'` arriving correctly but no shutter effect, with absolutely nothing
+> downstream — no parsed values, no fixture-match, no `ApplyShutter` echo. Three concrete bugs
+> were hiding behind that silence, plus the diagnostic gap that prevented us from telling which
+> of the three was actually firing in any given run.
+>
+> **Bug 1 — Strobe + `rateHz=0` was a silent no-op.** `ApplyShutter` stored the mode and rate but
+> the per-Tick block that advances `ShutterPhase` requires `ShutterRateHz > KINDA_SMALL_NUMBER`:
+>
+> ```cpp
+> if (ShutterMode == ERebusShutterMode::Strobe && ShutterRateHz > KINDA_SMALL_NUMBER)
+> {
+>     ShutterPhase += DeltaSeconds * ShutterRateHz;
+>     ShutterPhase = FMath::Fmod(ShutterPhase, 1.f);
+>     RefreshIntensity();
+> }
+> ```
+>
+> If the portal sent `{"mode": 2}` without `rateHz`, `ShutterRateHz = 0` and the branch never
+> ran. `ShutterPhase` stayed at 0, `Gate = (ShutterPhase < 0.5f) ? 1.f : 0.f = 1`, light stayed
+> continuously lit. v1.0.61 detects Strobe + non-positive rate and coerces to a sensible default
+> (`RebusDefaultStrobeHz = 5.f`), logging a Warning so the portal team can see they need to send
+> `rateHz` alongside `mode=2` for explicit control. Max is still 30Hz.
+>
+> **Bug 2 — every duplicate descriptor reset `ShutterPhase = 0`.** The user's logs show 4
+> identical `SetFixtureShutter` messages arriving in the same millisecond (likely a Pixel
+> Streaming duplication or multi-fixture broadcast). Previously `ApplyShutter` unconditionally
+> reset `ShutterPhase = 0.f` on every call. With duplicates at ~700ms intervals AND a re-send
+> every Tick from a portal that mirrors selection state, `ShutterPhase` was being whacked back
+> to 0 faster than Tick could advance it. v1.0.61 only resets phase when **Mode or Rate actually
+> changes** — "stay strobing at 5Hz" pushes are now phase-preserving no-ops on the accumulator.
+>
+> **Bug 3 — silent field-name mismatch.** The handler parsed only `mode` (numeric 0/1/2) and
+> `rateHz` (numeric). If the portal used a string `"strobe"` for mode, or a different field
+> name for the rate (`rate`, `frequency`, `hz`, `freq`), `TryGetNumber` returned false and the
+> values silently fell back to `mode=0 (Open), rateHz=0` — descriptor "succeeded" but did
+> nothing. v1.0.61 accepts both, in this precedence:
+>
+> | Field   | Accepted values                                                          |
+> | ------- | ------------------------------------------------------------------------ |
+> | `mode`  | `0/1/2` numeric, OR string `"open" \| "closed" \| "strobe"` (also `on`/`off`/`flash`/`pulse`/`true`/`false` aliases, case-insensitive, trimmed) |
+> | rate    | `rateHz` (canonical) → `rate` → `frequency` → `hz` → `freq` (first match wins) |
+>
+> Unrecognised mode strings log a Warning and fall back to Open. Canonical contract still favoured:
+>
+> ```json
+> { "type": "SetFixtureShutter", "id": "<fixtureId>", "mode": 2, "rateHz": 5 }
+> ```
+>
+> **Full diagnostic chain.** Where there used to be only `Descriptor type 'SetFixtureShutter'`,
+> we now log every step. Trace at `Log` level:
+>
+> ```
+> Descriptor type 'SetFixtureShutter'.
+> SetFixtureShutter parsed: id='ABC' mode=2(Strobe) [source=number raw=2.00] rate=5.00Hz [source=rateHz] fadeIgnored=0.00
+> SetFixtureShutter dispatch: id='ABC' fixture=BP_RebusFixture_42 mode=2 rate=5.00Hz.
+> Fixture ABC ApplyShutter: mode=Strobe rate=5.00Hz (changed: mode=yes rate=yes) -- gate now drives SpotLight->SetIntensity in RefreshIntensity + EpicBeamMID DMX Dimmer in UpdateEpicBeamParams (cookie inherits transitively).
+> ```
+>
+> When the fixture id doesn't match anything in the `Fixtures` map (the silent failure mode that
+> bit us in v1.0.49→v1.0.60), we now log a Warning with a snapshot of every known id:
+>
+> ```
+> SetFixtureShutter id='wrong-id' mode=2 rate=5.00Hz: NO FIXTURE FOUND. Known ids: [ABC, DEF, GHI, JKL].
+> ```
+>
+> When Strobe is requested without a usable rate, a Warning before the defaulting:
+>
+> ```
+> Fixture ABC ApplyShutter(Strobe) with rateHz=0.00 -- defaulting to 5.0Hz so the strobe actually progresses. Portal should send {"mode":2,"rateHz":<1..30>} for explicit control.
+> ```
+>
+> **Why we didn't see this before.** v1.0.56 wired `SetFixtureShutter` correctly for `mode + rateHz`
+> exactly as the portal contract was originally agreed. v1.0.59 unified the shutter envelope across
+> beam + cookie + SpotLight. v1.0.60 fixed the cookie double-dim. Through all three the path
+> assumed the portal would always send a numeric `mode` AND a numeric `rateHz` for strobe — but
+> when the portal team tested with the strobe-only payload they had on hand, the silent fallback
+> defeated everything. v1.0.61 closes the silence on the visualiser side and is forgiving about
+> the field names.
+
 > **Cookie footprint double-dim fix: IES + 1/r² + dimmer now linear (v1.0.60).** User retest of
 > v1.0.59: "can we look at the fade intensity of the footprint. Is this following the IES? The
 > intensity doesnt match the beam or allow for distance change." Three observations, one root
