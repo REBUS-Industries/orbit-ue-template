@@ -12,6 +12,8 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/TextureLightProfile.h"
 #include "Engine/Texture2D.h"
+#include "Engine/Canvas.h"
+#include "Engine/CanvasRenderTarget2D.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "ImageUtils.h"
@@ -1396,12 +1398,15 @@ void ARebusFixtureActor::RefreshMotion()
 
 			FTransform T = BeamRestTransform; // keep the rest origin
 			T.SetRotation(FRotationMatrix::MakeFromX(Dir).ToQuat());
-			// v1.0.52: compose the gobo image roll on the inside (local +X = SpotLight emission
-			// axis), so the rolled cookie projection follows the synthetic aim through pan/tilt.
-			// Roll around emission axis is invisible to the beam's WORLD direction (X stays X),
-			// but rotates the SpotLight's local frame -> cookie UV / IES rotates with it.
-			const FQuat GoboRoll(FVector::ForwardVector, FMath::DegreesToRadians(GoboAngle));
-			SpotLight->SetRelativeTransform(T * FTransform(GoboRoll));
+			// v1.0.53: gobo image rotation is now done in the texture itself (per-fixture
+			// UCanvasRenderTarget2D redrawn rotated by GoboAngle each tick), NOT by rolling the
+			// SpotLight. v1.0.52 rolled the SpotLight around its local +X (emission axis) on the
+			// assumption that the cookie / inherited canvas roll would rotate the gobo, but the
+			// user reported "rotating around x instead of z" -- the desired axis is the cookie's
+			// in-plane Z (perpendicular to the projected pattern), which a texture UV rotation
+			// hits cleanly without disturbing the SpotLight transform. So the SpotLight's
+			// relative rotation is restored to just the head-tracking rotation.
+			SpotLight->SetRelativeTransform(T);
 
 			// Lens disc tracks the same synthetic aim: plane normal along the beam Dir.
 			if (LensDisc)
@@ -1446,15 +1451,14 @@ void ARebusFixtureActor::RefreshMotion()
 		// local-within-head transform, then the head motion: BeamRest * Head (§7.7).
 		const FTransform Head = (HeadAxisIndex != INDEX_NONE && Cumulative.IsValidIndex(HeadAxisIndex))
 			? Cumulative[HeadAxisIndex] : FTransform::Identity;
-		// v1.0.52: compose the gobo image roll on the inside (SpotLight local +X = emission axis).
-		// FTransform composition (A * B).TransformVector(v) = A(B(v)), so writing
-		// (BeamRestTransform * Head) * FTransform(GoboRoll) means the roll is applied FIRST in
-		// local space (rotates the SpotLight's local frame around its emission axis), then the
-		// head transform places that rolled frame in fixture-local space. Result: the SpotLight's
-		// world emission DIRECTION is unchanged (X stays X under a roll around X), but its local
-		// frame is rolled -- so the cookie's projected UV / IES rotates by GoboAngle on the floor.
-		const FQuat GoboRoll(FVector::ForwardVector, FMath::DegreesToRadians(GoboAngle));
-		SpotLight->SetRelativeTransform((BeamRestTransform * Head) * FTransform(GoboRoll));
+		// v1.0.53: gobo image rotation moved off the SpotLight transform (was a local +X roll in
+		// v1.0.52) and into a per-fixture UCanvasRenderTarget2D that redraws the source gobo
+		// texture rotated by GoboAngle each tick. The RT is bound as Epic's "DMX Gobo Disk
+		// Frosted" texture param on EpicBeamMID + GoboLightFnMID, so the projected pattern spins
+		// in plane (around the cookie's Z / out-of-screen axis) without rolling the SpotLight or
+		// inheriting any motion via the parented EpicBeamComp. SpotLight relative transform is
+		// just the head-tracking rotation again.
+		SpotLight->SetRelativeTransform(BeamRestTransform * Head);
 
 		// Lens disc rides the SAME head transform (LensDiscRest * Head), so it stays co-located
 		// with the beam origin and perpendicular to the v1.0.21 beam direction through pan/tilt.
@@ -1786,12 +1790,12 @@ void ARebusFixtureActor::ApplyGoboRotation(float Speed, int32 WheelIndex)
 	// pool (cookie UV is computed in the light's local space). Material rotation param is pinned
 	// to 0 in ApplyCurrentGoboToEpicBeam / ApplyCurrentGoboToLightFn so no U-scroll happens.
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s SetFixtureGoboRotation: wheelIndex=%d speed=%.3f (signed[-1,1]) -> per-tick SpotLight roll around emission axis (gobo=%.3f anim=%.3f combined=%.3f max=%.0fdeg/sec at speed=1) (no material param: Epic's 'DMX Gobo Disk Rotation Speed' is a U-scroll, not an image rotation) beamMID=%p lightFnMID=%p"),
+		TEXT("Fixture %s SetFixtureGoboRotation: wheelIndex=%d speed=%.3f (signed[-1,1]) -> per-tick TEXTURE rotation in GoboRT (gobo=%.3f anim=%.3f combined=%.3f max=%.0fdeg/sec at speed=1) (no material param: Epic's 'DMX Gobo Disk Rotation Speed' is a U-scroll) beamMID=%p lightFnMID=%p GoboRT=%p"),
 		*FixtureId, WheelIndex, Speed,
 		CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed,
 		CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed,
 		RebusGoboMaxRotRateDegPerSec,
-		EpicBeamMID.Get(), GoboLightFnMID.Get());
+		EpicBeamMID.Get(), GoboLightFnMID.Get(), GoboRT.Get());
 	// Push 0 to the material rotation param so the wheel-scroll is silenced even if a prior
 	// material-MID push left it non-zero. Cookie MID gets the same via the tail call.
 	ApplyCurrentGoboToEpicBeam();
@@ -1812,16 +1816,16 @@ void ARebusFixtureActor::ApplyAnimationWheelRotation(float Speed)
 	if (!FMath::IsNearlyZero(CurrentAnimationWheelSpeed) && FMath::IsNearlyZero(Prev))
 	{
 		UE_LOG(LogRebusVisualiser, Warning,
-			TEXT("Fixture %s SetFixtureAnimationRotation: speed=%.3f -- Epic M_Beam_Master has no animation-wheel disc param, folding into the same SpotLight roll as gobo rotation (cone+cookie will spin at gobo+anim combined rate)."),
+			TEXT("Fixture %s SetFixtureAnimationRotation: speed=%.3f -- Epic M_Beam_Master has no animation-wheel disc param, folding into the same texture rotation as gobo (cone+cookie will spin at gobo+anim combined rate in the GoboRT)."),
 			*FixtureId, CurrentAnimationWheelSpeed);
 	}
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s SetFixtureAnimationRotation: speed=%.3f (signed[-1,1]) -> per-tick SpotLight roll (gobo=%.3f anim=%.3f combined=%.3f max=%.0fdeg/sec at speed=1) beamMID=%p lightFnMID=%p"),
+		TEXT("Fixture %s SetFixtureAnimationRotation: speed=%.3f (signed[-1,1]) -> per-tick TEXTURE rotation in GoboRT (gobo=%.3f anim=%.3f combined=%.3f max=%.0fdeg/sec at speed=1) beamMID=%p lightFnMID=%p GoboRT=%p"),
 		*FixtureId, Speed,
 		CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed,
 		CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed,
 		RebusGoboMaxRotRateDegPerSec,
-		EpicBeamMID.Get(), GoboLightFnMID.Get());
+		EpicBeamMID.Get(), GoboLightFnMID.Get(), GoboRT.Get());
 	ApplyCurrentGoboToEpicBeam();
 	if (!FMath::IsNearlyZero(CurrentAnimationWheelSpeed)) bAnimating = true;
 }
@@ -2127,19 +2131,108 @@ bool ARebusFixtureActor::ApplyGoboTextureFromBytes(const TArray<uint8>& Bytes)
 	return true;
 }
 
+void ARebusFixtureActor::EnsureGoboRT()
+{
+	// v1.0.53: lazy per-fixture RT used to redraw the source gobo texture rotated by GoboAngle.
+	// 512x512 is a balance: large enough to look crisp through Epic's MF_DMXGobo sampling, small
+	// enough to UpdateResource each tick without measurable cost. ClearColor = transparent so a
+	// rotated quad doesn't smear into the previous frame (UCanvasRenderTarget2D::UpdateResource
+	// clears to ClearColor BEFORE firing OnCanvasRenderTargetUpdate when
+	// bShouldClearRenderTargetOnReceiveUpdate is true, which is the default). Bind our UFUNCTION
+	// to the OnCanvasRenderTargetUpdate dynamic delegate; UE marshals the canvas-draw to the
+	// render thread internally, so the bound function runs on the game thread with a UCanvas
+	// proxy and writes are safe. Immediately UpdateResource() once so the first material param
+	// push (in the caller) doesn't bind a blank RT.
+	if (GoboRT) return;
+
+	GoboRT = UCanvasRenderTarget2D::CreateCanvasRenderTarget2D(this, UCanvasRenderTarget2D::StaticClass(), 512, 512);
+	if (!GoboRT)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s gobo RT: CreateCanvasRenderTarget2D returned null; falling back to direct CurrentGoboTexture push (no in-plane rotation)."),
+			*FixtureId);
+		return;
+	}
+	GoboRT->ClearColor = FLinearColor::Transparent;
+	GoboRT->OnCanvasRenderTargetUpdate.AddDynamic(this, &ARebusFixtureActor::OnGoboRTUpdate);
+	GoboRT->UpdateResource(); // first redraw so the param push isn't blank
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s gobo RT allocated %dx%d at %p (src=%s GoboAngle=%.1fdeg)"),
+		*FixtureId, GoboRT->SizeX, GoboRT->SizeY, GoboRT.Get(),
+		CurrentGoboTexture ? *CurrentGoboTexture->GetName() : TEXT("<null>"),
+		GoboAngle);
+}
+
+void ARebusFixtureActor::OnGoboRTUpdate(UCanvas* Canvas, int32 Width, int32 Height)
+{
+	// v1.0.53: bound to GoboRT->OnCanvasRenderTargetUpdate. The RT has already been cleared to
+	// transparent by UpdateResource (bShouldClearRenderTargetOnReceiveUpdate default true), so
+	// we just draw the source gobo texture once, centered and square (largest square that fits
+	// the RT), rotated by GoboAngle around its centre. The cookie / cone sample the resulting
+	// translucent RT, so the projected pattern spins in plane.
+	//
+	// Sign convention: portal sends +speed = clockwise looking DOWN the beam (audience-side CCW
+	// because the perspectives are mirrored across the projection plane). UCanvas::K2_DrawTexture
+	// applies the Rotation as a screen-space yaw via FRotator(0, Rotation, 0); in UE's screen
+	// space (X right, Y down), a +yaw rotates the quad clockwise on screen. The cookie projects
+	// "with" the texture orientation onto the floor, so the floor pattern rotates clockwise as
+	// the texture rotates clockwise (looking down the beam). That matches the portal contract.
+	// If a future test shows the pattern rotating opposite, negate `Rotation` below -- the rest
+	// of the pipeline (GoboAngle integration, wire-signed speed) stays identical.
+	if (!Canvas || !CurrentGoboTexture) return;
+	const float Side = (float)FMath::Min(Width, Height);
+	if (Side <= 0.f) return;
+	const FVector2D ScreenPos(((float)Width - Side) * 0.5f, ((float)Height - Side) * 0.5f);
+	const FVector2D ScreenSize(Side, Side);
+	const FVector2D CoordPos(0.f, 0.f);
+	const FVector2D CoordSize(1.f, 1.f);
+	Canvas->K2_DrawTexture(
+		CurrentGoboTexture.Get(),
+		ScreenPos, ScreenSize,
+		CoordPos, CoordSize,
+		FLinearColor::White,
+		BLEND_Translucent,
+		GoboAngle,
+		FVector2D(0.5f, 0.5f));
+}
+
 void ARebusFixtureActor::ApplyCurrentGoboToEpicBeam()
 {
 	if (EpicBeamMID)
 	{
-		// Single-cell atlas mapping: each of our per-slot images becomes the WHOLE "atlas" with one
-		// cell ("DMX Gobo Num Mask=1, DMX Gobo Index=0"), so MF_DMXGobo samples the entire texture.
-		// On "clear" (CurrentGoboTexture==null) revert to Epic's MI default (T_GoboDisk_01_Frosted,
-		// the open disc that lets the beam through unmasked) cached at TryBuildEpicBeam time.
-		UTexture* TexToPush = CurrentGoboTexture ? static_cast<UTexture*>(CurrentGoboTexture.Get()) : EpicBeamDefaultGoboTex.Get();
+		// v1.0.53: when a real gobo is loaded, push the per-fixture RENDER TARGET (drawn rotated
+		// every tick in OnGoboRTUpdate) instead of CurrentGoboTexture directly. The RT IS-A
+		// UTexture (UTextureRenderTarget2D base), so Epic's "DMX Gobo Disk Frosted" param accepts
+		// it. EnsureGoboRT lazily allocates + binds the OnCanvasRenderTargetUpdate callback and
+		// does an immediate redraw so the first param push isn't blank. On "clear"
+		// (CurrentGoboTexture == null) revert to Epic's MI default (T_GoboDisk_01_Frosted, the
+		// open disc that lets the beam through unmasked) cached at TryBuildEpicBeam time.
+		UTexture* TexToPush = nullptr;
+		if (CurrentGoboTexture)
+		{
+			EnsureGoboRT();
+			// v1.0.53: even when the RT was already allocated from a previous gobo, the source
+			// texture may have just changed (new SetFixtureGobo); kick a redraw so the RT
+			// contains the NEW gobo BEFORE we push it to the material -- otherwise the cone +
+			// cookie would project the previous gobo for one frame before the Tick spin block
+			// would refresh it.
+			if (GoboRT) GoboRT->UpdateResource();
+			TexToPush = GoboRT ? static_cast<UTexture*>(GoboRT.Get()) : static_cast<UTexture*>(CurrentGoboTexture.Get());
+		}
+		else
+		{
+			TexToPush = EpicBeamDefaultGoboTex.Get();
+		}
 		if (TexToPush)
 		{
 			EpicBeamMID->SetTextureParameterValue(TEXT("DMX Gobo Disk Frosted"), TexToPush);
 		}
+		UE_LOG(LogRebusVisualiser, Verbose,
+			TEXT("Fixture %s gobo TEX param: beamMID=%s lightFnMID=lazy src=%s push=%s (RT=%s)"),
+			*FixtureId, EpicBeamMID ? TEXT("set") : TEXT("absent"),
+			CurrentGoboTexture ? *CurrentGoboTexture->GetName() : TEXT("<default>"),
+			TexToPush ? *TexToPush->GetName() : TEXT("<none>"),
+			GoboRT ? TEXT("ready") : TEXT("none"));
 		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Num Mask"), 1.f);
 		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Index"), 0.f);
 		// v1.0.52: pin DMX Gobo Disk Rotation Speed to 0. Per the HLSL inside M_Beam_Master:
@@ -2217,13 +2310,22 @@ void ARebusFixtureActor::ApplyCurrentGoboToLightFn()
 		// Push the same single-cell atlas params as the cone. The MF_DMXGobo inside M_Light_Master
 		// reads the texture identically; "Num Mask = 1, Index = 0" sweeps the entire texture.
 		// v1.0.52: as on EpicBeamMID, pin "DMX Gobo Disk Rotation Speed" to 0 -- it's a U-scroll
-		// not an image rotation. True image rotation comes from the per-tick SpotLight roll
-		// applied in RefreshMotion (rolls the cookie projection on the lit pool around the
-		// emission axis).
-		GoboLightFnMID->SetTextureParameterValue(TEXT("DMX Gobo Disk Frosted"), CurrentGoboTexture);
+		// not an image rotation.
+		// v1.0.53: push the per-fixture GoboRT (drawn rotated every tick in OnGoboRTUpdate)
+		// instead of CurrentGoboTexture directly, so the cookie spins in plane around the
+		// projection's out-of-screen axis. EnsureGoboRT was already called by
+		// ApplyCurrentGoboToEpicBeam (this is its tail call), so GoboRT is ready.
+		UTexture* CookieTex = GoboRT ? static_cast<UTexture*>(GoboRT.Get()) : static_cast<UTexture*>(CurrentGoboTexture.Get());
+		GoboLightFnMID->SetTextureParameterValue(TEXT("DMX Gobo Disk Frosted"), CookieTex);
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Num Mask"), 1.f);
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Index"), 0.f);
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), 0.f);
+		UE_LOG(LogRebusVisualiser, Verbose,
+			TEXT("Fixture %s gobo TEX param: beamMID=set lightFnMID=set src=%s push=%s (RT=%s)"),
+			*FixtureId,
+			CurrentGoboTexture ? *CurrentGoboTexture->GetName() : TEXT("<none>"),
+			CookieTex ? *CookieTex->GetName() : TEXT("<none>"),
+			GoboRT ? TEXT("ready") : TEXT("none"));
 		SpotLight->SetLightFunctionMaterial(GoboLightFnMID);
 		// v1.0.51: bAllowMegaLights is read by FLightSceneInfo at proxy-creation time
 		// (LightSceneInfo.cpp:55 -> Proxy->AllowMegaLights()), so the value MUST be present on a
@@ -2308,6 +2410,14 @@ void ARebusFixtureActor::ClearGoboToOpen(const TCHAR* Reason)
 
 	CurrentGoboTexture = nullptr;
 	bGoboActive = false;
+	// v1.0.53: clear the gobo RT to transparent so the next non-Open assignment doesn't briefly
+	// flash the previous gobo. We keep the RT allocated (cheap to keep, expensive to recreate
+	// every gobo change) -- just blank it. OnGoboRTUpdate early-outs on CurrentGoboTexture==null
+	// (just-set above), so the UpdateResource here only fires the default clear-to-transparent.
+	if (GoboRT)
+	{
+		GoboRT->UpdateResource();
+	}
 	// Push the cleared state into BOTH the cone (reverts EpicBeamMID to its MI default) and the
 	// cookie (nulls SpotLight->LightFunctionMaterial). Then reassert CastShadows so the now-cleared
 	// bGoboActive removes any gobo-driven shadow override on non-hero beams.
@@ -2467,27 +2577,31 @@ void ARebusFixtureActor::Tick(float DeltaSeconds)
 	const bool bConeAnim = ZoomDeg.Tick(DeltaSeconds) | Iris.Tick(DeltaSeconds) | Frost.Tick(DeltaSeconds);
 	Focus.Tick(DeltaSeconds);
 
-	// v1.0.52: integrate the gobo IMAGE rotation FIRST so any RefreshMotion called below picks up
-	// the latest GoboAngle. Per the v1.0.52 fix, Epic's M_Beam_Master has no image-rotation param
-	// (DMX Gobo Disk Rotation Speed is a U-axis scroll = wheel-cycle, which is what the user saw
-	// in v1.0.50), so the only path to actually SPIN the selected gobo is a per-tick component
-	// roll: the SpotLight rolls the cookie projection on the floor, and the Epic beam canvas
-	// mesh rolls around its local +Z emission axis to rotate the in-cone gobo via its mesh-local
-	// GoboUV sampling. Combined speed = gobo + animation, both signed normalised [-1, +1].
+	// v1.0.53: integrate the gobo image rotation into a per-tick angle that is consumed by the
+	// gobo RT redraw (OnGoboRTUpdate draws CurrentGoboTexture into GoboRT rotated by GoboAngle).
+	// Epic's stock materials expose no image-rotation parameter (verified v1.0.52: only DMX Gobo
+	// Disk Frosted/Index/Num Mask + the U-scroll "Disk Rotation Speed"), and v1.0.52's SpotLight
+	// component roll didn't satisfy the user ("rotating around x instead of z"). v1.0.53 spins
+	// the TEXTURE itself in a transparent-clear UCanvasRenderTarget2D, which is bound as the
+	// "DMX Gobo Disk Frosted" texture param on both cone + cookie MIDs, so the projected pattern
+	// rotates in plane around the cookie's out-of-screen axis without touching any transform.
 	const float CombinedSpin = FMath::Clamp(CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed, -2.f, 2.f);
 	const bool bGoboSpinActive = !FMath::IsNearlyZero(CombinedSpin);
 	if (bGoboSpinActive)
 	{
 		GoboAngle = FMath::Fmod(GoboAngle + DeltaSeconds * CombinedSpin * RebusGoboMaxRotRateDegPerSec, 360.f);
 		bStillAnimating = true;
+		// Trigger the RT redraw with the new angle. UpdateResource synchronously clears the RT
+		// (ClearColor = transparent) and fires OnCanvasRenderTargetUpdate -> OnGoboRTUpdate,
+		// which draws the source texture rotated by GoboAngle. Only meaningful when a real gobo
+		// is loaded (CurrentGoboTexture != null) -- on Open/clear the RT was released.
+		if (GoboRT && CurrentGoboTexture)
+		{
+			GoboRT->UpdateResource();
+		}
 	}
 
-	// v1.0.52: when only the spin is animating (no pan/tilt), still re-push the SpotLight + beam
-	// canvas transforms so the rolled angle takes effect. RefreshMotion now bakes GoboAngle into
-	// the SpotLight's relative rotation (around local +X emission axis) and DriveEpicBeamFromSpotLight
-	// rolls the canvas around its local +Z (also emission axis). Both are rotationally symmetric
-	// so the geometry / lit-pool footprint don't visually shift -- only the gobo image spins.
-	if (bMotionAnim || bGoboSpinActive) { RefreshMotion(); bStillAnimating = true; }
+	if (bMotionAnim) { RefreshMotion(); bStillAnimating = true; }
 	if (bIntensityAnim) { RefreshIntensity(); bStillAnimating = true; }
 	if (bConeAnim) { RecomputeConeAngles(); SelectIesForZoom(); bStillAnimating = true; }
 

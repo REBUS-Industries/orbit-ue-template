@@ -23,6 +23,8 @@ class UStaticMesh;
 class UMaterialInterface;
 class UProceduralMeshComponent;
 class UTextureLightProfile;
+class UCanvas;
+class UCanvasRenderTarget2D;
 class FRebusRestClient;
 
 UENUM()
@@ -308,6 +310,16 @@ private:
 	// speed mirrors ApplyGoboRotation's input and feeds the MI's "DMX Gobo Disk Rotation Speed".
 	UPROPERTY() TObjectPtr<UTexture2D> CurrentGoboTexture = nullptr;
 	UPROPERTY() TObjectPtr<UTexture> EpicBeamDefaultGoboTex = nullptr;
+
+	// v1.0.53: per-fixture canvas render target that holds the SOURCE gobo texture redrawn
+	// rotated by GoboAngle each tick. Bound (instead of CurrentGoboTexture itself) as Epic's
+	// "DMX Gobo Disk Frosted" texture param on EpicBeamMID + GoboLightFnMID, so the projected
+	// pattern spins in plane around the cookie's out-of-screen axis. Lazily allocated on first
+	// non-Open gobo apply (EnsureGoboRT) and torn down with the actor. Update is driven by
+	// UCanvasRenderTarget2D::UpdateResource() -> OnCanvasRenderTargetUpdate -> OnGoboRTUpdate.
+	UPROPERTY() TObjectPtr<UCanvasRenderTarget2D> GoboRT = nullptr;
+	UFUNCTION() void OnGoboRTUpdate(UCanvas* Canvas, int32 Width, int32 Height);
+	void EnsureGoboRT();
 	float CurrentGoboRotationSpeed = 0.f;
 	// v1.0.50: animation-wheel rotation, signed normalised [-1..1]. Epic's M_Beam_Master has no
 	// dedicated animation-wheel param (only DMX Gobo Disk Rotation Speed), so we add this to the
