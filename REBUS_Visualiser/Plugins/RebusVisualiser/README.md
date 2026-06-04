@@ -449,6 +449,80 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Gobo rotation spins the SELECTED image, not the wheel slot (v1.0.52).** User feedback on
+> v1.0.50: "Gobo rotate, rotates through the various gobos. It's meant to rotate the actual gobo
+> selected so it spins clockwise or anti-clockwise." Root cause: `SetFixtureGoboRotation` was
+> wired to Epic's `DMX Gobo Disk Rotation Speed` scalar. Re-introspected
+> `M_Beam_Master.uasset`, `MF_DMXGobo.uasset`, and `M_Light_Master.uasset` and enumerated their
+> full parameter sets via the uasset string tables. Epic exposes only these gobo params:
+>
+> | Param | Role |
+> | --- | --- |
+> | `DMX Gobo Disk Frosted` (texture) | the gobo "wheel sheet" texture; in our single-slot atlas mapping this IS the selected gobo image |
+> | `DMX Gobo Disk Rotation Speed` (scalar) | NOT an image rotation. HLSL: `GoboUV.x = GoboUV.x + (Time * GoboScrollingSpeed); GoboUV.x = GoboUV.x / NumGobos;` -- a U-axis SCROLL through the wheel slots. With `NumMask=1` this slides the single gobo image horizontally and wraps -- exactly what the user described as "rotates through the various gobos" |
+> | `DMX Gobo Index` (scalar) | picks which slot on the wheel to display (`GoboUV.x += GoboIndex/NumGobos`); we always set 0 |
+> | `DMX Gobo Num Mask` (scalar) | total slots on the wheel; we always set 1 (single-slot atlas) |
+>
+> **There is no image-rotation parameter in Epic's stock materials.** The same enumeration of
+> `MF_DMXGobo` and `M_Light_Master` returns the same list (no separate `Index Rotation` /
+> `Image Rotation` / `Spin` / `Anim Disk Rotation` parameter). Material edits + re-bake are out
+> of scope for this fix, so the only path to actually SPIN the selected gobo is at the COMPONENT
+> level. The fix:
+>
+> 1. **`DMX Gobo Disk Rotation Speed` is now pinned to 0** in both `ApplyCurrentGoboToEpicBeam`
+>    (cone) and `ApplyCurrentGoboToLightFn` (cookie). This stops the U-scroll cycling regardless
+>    of wire speed.
+>
+> 2. **Tick integrates the combined signed speed into `GoboAngle`** (`deg`, modulo 360):
+>    `GoboAngle += DeltaSeconds * (CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed) *
+>    RebusGoboMaxRotRateDegPerSec` (default 360 deg/sec at speed=1 = 1 revolution per second per
+>    wire). The spin block runs BEFORE the motion-refresh block so the next `RefreshMotion` call
+>    picks up the new angle.
+>
+> 3. **`RefreshMotion` composes a roll around the SpotLight's local +X (its emission axis)** onto
+>    its relative transform: `SpotLight->SetRelativeTransform((BeamRestTransform * Head) *
+>    FTransform(FQuat(FVector::ForwardVector, FMath::DegreesToRadians(GoboAngle))))`. FTransform
+>    composition order: the roll is applied FIRST in SpotLight-local space (rotates the local
+>    Y/Z axes around X; X stays X), then the head transform places the rolled frame in
+>    fixture-local space. The SpotLight's WORLD emission direction is unchanged (X axis is the
+>    axis of roll, so it's invariant) -- only the local frame around the beam is rolled.
+>
+> 4. **The cookie projection on the lit floor rotates because** the `LightFunctionMaterial`'s UV
+>    is sampled in the SpotLight's local-projection space; rolling the local frame around +X
+>    rolls the cookie UV → the cookie image rotates on the floor at the integrated angle. The
+>    IES roll too, but spotlight IES profiles are typically rotationally symmetric so it's a
+>    no-op visually.
+>
+> 5. **The in-cone gobo rotates because** the Epic beam canvas (`EpicBeamComp`) is PARENTED
+>    UNDER the SpotLight (`TryBuildEpicBeam:1195` -- `SetupAttachment(BeamParent=SpotLight)`) with
+>    a fixed `FindBetweenNormals(+Z, +X)` relative rotation. When the SpotLight rolls around its
+>    +X, the canvas's world transform inherits the roll. `M_Beam_Master`'s GoboUV samples in the
+>    canvas's mesh-local transverse plane (`float2 GoboUV = pos.xy`), so the in-cone gobo image
+>    rotates with the canvas mesh's local frame. The canvas mesh is rotationally symmetric about
+>    its own emission axis (a cone), so the geometry doesn't visibly shift -- only the gobo
+>    rotates.
+>
+> 6. **`Tick` also triggers `RefreshMotion()` when the spin is active even if pan/tilt is
+>    stable**, so the rolled angle takes effect tick by tick without needing motion input. When
+>    speed returns to 0, `GoboAngle` holds at its last value and no further work is done.
+>
+> 7. **`SetFixtureAnimationRotation` keeps the v1.0.50 fold-into-combined fallback** -- Epic
+>    still has no separate animation-wheel disc parameter, so the animation speed adds to the
+>    gobo speed (`CombinedSpin = CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed`,
+>    clamped to `[-2, +2]`). One-time Warning still fires on first non-zero animation speed.
+>
+> **Sign convention unchanged**: `+1.0` = clockwise looking down the beam at full speed (1 rps),
+> `-1.0` = counter-clockwise at full speed, `0.0` = stop. Combined gobo+animation maxes at ±2
+> wire units (= ±2 rps).
+>
+> **Per-call log updated** to make the mapping unambiguous:
+> `Fixture <id> SetFixtureGoboRotation: wheelIndex=<i> speed=<s> (signed[-1,1]) -> per-tick
+> SpotLight roll around emission axis (gobo=<s_gobo> anim=<s_anim> combined=<s_sum>
+> max=360deg/sec at speed=1) (no material param: Epic's 'DMX Gobo Disk Rotation Speed' is a
+> U-scroll, not an image rotation) beamMID=<p> lightFnMID=<p>`. The cone/cookie apply lines now
+> end with `(rotation via component-roll, material wheel-scroll pinned to 0)` so the diagnostic
+> trail proves we're no longer touching the wheel-scroll param.
+
 > **Footprint cookie diagnostics + MegaLights reregister + verified-no-aux-lights (v1.0.51).**
 > v1.0.50 set `bAllowMegaLights=0` + `MarkRenderStateDirty()` to route the SpotLight through the
 > standard deferred path so `LightFunctionMaterial` (the `MI_Light` cookie MID) would actually
@@ -873,13 +947,25 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
     would dim the lit pool — null is the true "no gobo").
   - The legacy `GoboMID` member is preserved (no-op when its `M_RebusGobo` content asset doesn't
     exist) so a future light-fn material can light up without re-wiring.
-- **Gobo / animation-wheel rotation wire** (v1.0.50). Two descriptors drive the rotation of the
-  in-cone gobo and (via the v1.0.50 cookie) the lit-pool gobo. Both are signed normalised speeds
-  in `[-1, 1]` (clamped at the visualiser); sign is direction (+ = CW looking down the beam,
-  − = CCW), `0` = stop. The visualiser clamps and folds them into Epic's `DMX Gobo Disk Rotation
-  Speed` scalar on both `EpicBeamMID` (cone) and `GoboLightFnMID` (cookie); a beam (re)build or
-  refresh (`UpdateEpicBeamParams` → `ApplyCurrentGoboToEpicBeam` → `ApplyCurrentGoboToLightFn`)
-  re-pushes both, so motion/zoom changes never drop the rotation.
+- **Gobo / animation-wheel rotation wire** (v1.0.50 wire, v1.0.52 mapping fix). Two descriptors
+  drive the in-plane rotation of the SELECTED gobo image -- both in the in-cone (Epic beam) and
+  on the lit-pool cookie. Both are signed normalised speeds in `[-1, 1]` (clamped); sign is
+  direction (+ = CW looking down the beam, − = CCW), `0` = stop. **v1.0.52 correction**: the
+  visualiser used to push the speeds to Epic's `DMX Gobo Disk Rotation Speed` material scalar,
+  but per `M_Beam_Master`'s HLSL (`GoboUV.x = GoboUV.x + (Time * GoboScrollingSpeed); GoboUV.x =
+  GoboUV.x / NumGobos`) that param is a U-axis SCROLL that cycles through wheel slots -- exactly
+  what the user reported in v1.0.50 ("rotates through the various gobos"). Epic's stock
+  materials (`M_Beam_Master`, `MF_DMXGobo`, `M_Light_Master`) expose NO image-rotation parameter
+  (verified by enumerating the uasset string tables). The visualiser now pins `DMX Gobo Disk
+  Rotation Speed = 0` and instead composes a **per-tick component-level roll** on the SpotLight's
+  relative rotation (around its local +X = beam emission axis). The roll rotates the cookie
+  projection on the floor (cookie UV is sampled in the light's local space). The Epic beam
+  canvas (`EpicBeamComp`) is parented under the SpotLight, so its world frame inherits the roll;
+  `M_Beam_Master` samples GoboUV in the canvas's mesh-local transverse plane, so the in-cone
+  gobo image rotates with the canvas mesh's local frame (the cone is rotationally symmetric so
+  the geometry doesn't shift). Integration rate: 360 deg/sec per wire unit (= 1 rev/sec at
+  speed=1); combined gobo+anim maxes at ±2 rps. See v1.0.52 release block above for the engine
+  / HLSL / parenting details.
 
   ```jsonc
   // Gobo wheel rotation. Signed normalised speed in [-1, 1].
@@ -892,9 +978,11 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
   }
 
   // Animation-wheel rotation. Same units. Epic's reference materials don't model a separate
-  // animation-wheel disc, so the visualiser folds this into the gobo MID's rotation as a
-  // best-effort fallback (a Warning fires once per fixture on first non-zero apply; the cone
-  // and pool rotate at gobo+anim combined).
+  // animation-wheel disc (no animation-disc rotation param in M_Beam_Master / MF_DMXGobo /
+  // M_Light_Master, verified v1.0.52), so the visualiser folds this into the same SpotLight
+  // roll as the gobo wire (combined = gobo + anim). A Warning fires once per fixture on first
+  // non-zero apply so the user knows the cone and pool spin at the combined rate rather than
+  // showing a stacked two-disc effect.
   { "type": "SetFixtureAnimationRotation",
     "fixtureId": "<id>",
     "speed": -0.25            // -1..+1; 0 = stop, sign = direction
@@ -902,8 +990,11 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
   ```
 
   Combined rotation = `Clamp(speed_gobo, -1, 1) + Clamp(speed_anim, -1, 1)` (so the wire range
-  effectively widens to `[-2, 2]` only when both wheels are simultaneously driven). When a future
-  material adds a real second disc we'll split the push and the wire contract stays unchanged.
+  effectively widens to `[-2, 2]` only when both wheels are simultaneously driven). v1.0.52
+  routes this into a per-tick SpotLight roll (see v1.0.52 release block above), so a combined
+  ±1 = 1 rev/sec and a combined ±2 = 2 rev/sec around the beam emission axis. When a future
+  material adds a real second animation disc with its own image-rotation parameter we'll split
+  the push and the wire contract stays unchanged.
 
 - **Open-slot detection** (v1.0.49). Real fixtures have an OPEN slot on every gobo wheel (the
   no-gobo position) that carries no image data. Pre-v1.0.49 the finalizer DROPPED entries with no

@@ -81,6 +81,13 @@ namespace
 	//    Radius", brightness from "DMX Max Light Intensity" (Epic scale ~1000) x "DMX Dimmer" (0..1).
 	constexpr float RebusEpicBeamQuality = 1.0f;     // "DMX Quality Level" (1 == Epic High)
 	const FVector RebusEpicBeamLocalEmission(0.f, 0.f, 1.f); // SM_Beam_RM emits along +Z (v1.0.46)
+
+	// v1.0.52: gobo image rotation rate. The signed normalised gobo+animation speed in [-1, +1]
+	// (each in [-1, 1] -> combined in [-2, +2]) is multiplied by this to drive the per-tick angle
+	// step (deg). 360 deg/sec at speed=1.0 = one full revolution per second per wire, so a
+	// combined speed of +1 (gobo only) or +2 (gobo+anim maxed) spins one or two revolutions per
+	// second respectively. Tunable: lower if 1 rps feels too fast for typical fixture content.
+	constexpr float RebusGoboMaxRotRateDegPerSec = 360.f;
 	constexpr float RebusEpicBeamMaxDistanceCm = 10000.f;     // canvas length cap (mesh built length)
 	// v1.0.45: "DMX Zoom" feed = this scale x the SpotLight's live OUTER cone HALF-angle (degrees).
 	// The footprint is defined by the SpotLight's outer cone, so we drive the beam angle from the
@@ -1389,7 +1396,12 @@ void ARebusFixtureActor::RefreshMotion()
 
 			FTransform T = BeamRestTransform; // keep the rest origin
 			T.SetRotation(FRotationMatrix::MakeFromX(Dir).ToQuat());
-			SpotLight->SetRelativeTransform(T);
+			// v1.0.52: compose the gobo image roll on the inside (local +X = SpotLight emission
+			// axis), so the rolled cookie projection follows the synthetic aim through pan/tilt.
+			// Roll around emission axis is invisible to the beam's WORLD direction (X stays X),
+			// but rotates the SpotLight's local frame -> cookie UV / IES rotates with it.
+			const FQuat GoboRoll(FVector::ForwardVector, FMath::DegreesToRadians(GoboAngle));
+			SpotLight->SetRelativeTransform(T * FTransform(GoboRoll));
 
 			// Lens disc tracks the same synthetic aim: plane normal along the beam Dir.
 			if (LensDisc)
@@ -1434,7 +1446,15 @@ void ARebusFixtureActor::RefreshMotion()
 		// local-within-head transform, then the head motion: BeamRest * Head (§7.7).
 		const FTransform Head = (HeadAxisIndex != INDEX_NONE && Cumulative.IsValidIndex(HeadAxisIndex))
 			? Cumulative[HeadAxisIndex] : FTransform::Identity;
-		SpotLight->SetRelativeTransform(BeamRestTransform * Head);
+		// v1.0.52: compose the gobo image roll on the inside (SpotLight local +X = emission axis).
+		// FTransform composition (A * B).TransformVector(v) = A(B(v)), so writing
+		// (BeamRestTransform * Head) * FTransform(GoboRoll) means the roll is applied FIRST in
+		// local space (rotates the SpotLight's local frame around its emission axis), then the
+		// head transform places that rolled frame in fixture-local space. Result: the SpotLight's
+		// world emission DIRECTION is unchanged (X stays X under a roll around X), but its local
+		// frame is rolled -- so the cookie's projected UV / IES rotates by GoboAngle on the floor.
+		const FQuat GoboRoll(FVector::ForwardVector, FMath::DegreesToRadians(GoboAngle));
+		SpotLight->SetRelativeTransform((BeamRestTransform * Head) * FTransform(GoboRoll));
 
 		// Lens disc rides the SAME head transform (LensDiscRest * Head), so it stays co-located
 		// with the beam origin and perpendicular to the v1.0.21 beam direction through pan/tilt.
@@ -1752,15 +1772,28 @@ void ARebusFixtureActor::ApplyGoboRotation(float Speed, int32 WheelIndex)
 {
 	GoboRotationSpeed = FMath::Clamp(Speed, -1.f, 1.f);
 	CurrentGoboRotationSpeed = GoboRotationSpeed;
-	// v1.0.50: push the COMBINED gobo+animation rotation into BOTH the cone and the cookie via
-	// the shared apply path. Pre-v1.0.50 only the cone MID was updated and the cookie kept its
-	// last-written rotation -- cone and pool drifted out of sync as soon as a new speed arrived.
+	// v1.0.52: the rotation no longer routes to a material param. Epic's M_Beam_Master,
+	// MF_DMXGobo, and M_Light_Master expose NO image-rotation parameter (verified by enumerating
+	// the uasset string tables: only DMX Gobo Disk Frosted / DMX Gobo Disk Rotation Speed / DMX
+	// Gobo Index / DMX Gobo Num Mask exist, and "Disk Rotation Speed" is a U-axis scroll that
+	// cycles through wheel slots -- exactly the bug the user reported in v1.0.50). Instead, the
+	// per-tick combined speed (CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed) is
+	// integrated into GoboAngle (deg, modulo 360) in Tick(), and that angle is composed onto the
+	// SpotLight's relative rotation as a roll around its local +X emission axis in RefreshMotion.
+	// The Epic beam canvas is PARENTED UNDER the SpotLight (TryBuildEpicBeam:1195), so its local
+	// frame inherits the roll for free -- which rolls its mesh-local GoboUV sampling and spins
+	// the in-cone gobo image. The SpotLight roll also rotates the cookie projection on the lit
+	// pool (cookie UV is computed in the light's local space). Material rotation param is pinned
+	// to 0 in ApplyCurrentGoboToEpicBeam / ApplyCurrentGoboToLightFn so no U-scroll happens.
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s SetFixtureGoboRotation: wheelIndex=%d speed=%.3f -> combined=%.3f (gobo=%.3f anim=%.3f) beamMID=%p lightFnMID=%p"),
+		TEXT("Fixture %s SetFixtureGoboRotation: wheelIndex=%d speed=%.3f (signed[-1,1]) -> per-tick SpotLight roll around emission axis (gobo=%.3f anim=%.3f combined=%.3f max=%.0fdeg/sec at speed=1) (no material param: Epic's 'DMX Gobo Disk Rotation Speed' is a U-scroll, not an image rotation) beamMID=%p lightFnMID=%p"),
 		*FixtureId, WheelIndex, Speed,
-		CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed,
 		CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed,
+		CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed,
+		RebusGoboMaxRotRateDegPerSec,
 		EpicBeamMID.Get(), GoboLightFnMID.Get());
+	// Push 0 to the material rotation param so the wheel-scroll is silenced even if a prior
+	// material-MID push left it non-zero. Cookie MID gets the same via the tail call.
 	ApplyCurrentGoboToEpicBeam();
 	if (!FMath::IsNearlyZero(GoboRotationSpeed)) bAnimating = true;
 }
@@ -1769,22 +1802,25 @@ void ARebusFixtureActor::ApplyAnimationWheelRotation(float Speed)
 {
 	const float Prev = CurrentAnimationWheelSpeed;
 	CurrentAnimationWheelSpeed = FMath::Clamp(Speed, -1.f, 1.f);
-	// Epic's M_Beam_Master / M_Light_Master only expose "DMX Gobo Disk Rotation Speed" -- there's
-	// no separate animation-wheel disc, so we fold the animation speed into the same scalar
-	// (added to the gobo speed). The portal still drives them independently on the wire; the
-	// visualiser collapses to one rotation as a best-effort fallback until a future material adds
-	// a second disc. Logged as a Warning the first time we receive a non-zero animation speed so
-	// the user knows the cone+cookie won't show a "stacked" two-disc effect.
+	// v1.0.52: same routing as gobo rotation -- composed into the SpotLight roll in Tick +
+	// RefreshMotion. Epic's stock materials don't model a separate animation-wheel disc, so the
+	// animation speed STILL folds into the same component roll (combined = gobo + anim), which
+	// matches Epic's reference fixture behaviour where animation and gobo share the same disc
+	// in M_Beam_Master. Logged as a Warning the first time we receive a non-zero animation speed
+	// so the user knows the cone+cookie won't show a "stacked" two-disc effect with a separate
+	// animation disc -- they spin together at the combined rate.
 	if (!FMath::IsNearlyZero(CurrentAnimationWheelSpeed) && FMath::IsNearlyZero(Prev))
 	{
 		UE_LOG(LogRebusVisualiser, Warning,
-			TEXT("Fixture %s SetFixtureAnimationRotation: speed=%.3f -- Epic M_Beam_Master has no animation-wheel param, folding into DMX Gobo Disk Rotation Speed as a best-effort fallback (cone+pool will rotate at gobo+anim combined)."),
+			TEXT("Fixture %s SetFixtureAnimationRotation: speed=%.3f -- Epic M_Beam_Master has no animation-wheel disc param, folding into the same SpotLight roll as gobo rotation (cone+cookie will spin at gobo+anim combined rate)."),
 			*FixtureId, CurrentAnimationWheelSpeed);
 	}
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s SetFixtureAnimationRotation: speed=%.3f -> combined=%.3f (gobo=%.3f anim=%.3f) beamMID=%p lightFnMID=%p"),
-		*FixtureId, Speed, CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed,
+		TEXT("Fixture %s SetFixtureAnimationRotation: speed=%.3f (signed[-1,1]) -> per-tick SpotLight roll (gobo=%.3f anim=%.3f combined=%.3f max=%.0fdeg/sec at speed=1) beamMID=%p lightFnMID=%p"),
+		*FixtureId, Speed,
 		CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed,
+		CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed,
+		RebusGoboMaxRotRateDegPerSec,
 		EpicBeamMID.Get(), GoboLightFnMID.Get());
 	ApplyCurrentGoboToEpicBeam();
 	if (!FMath::IsNearlyZero(CurrentAnimationWheelSpeed)) bAnimating = true;
@@ -2106,17 +2142,28 @@ void ARebusFixtureActor::ApplyCurrentGoboToEpicBeam()
 		}
 		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Num Mask"), 1.f);
 		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Index"), 0.f);
-		// v1.0.50: combined = gobo + animation. Epic's reference materials only model one rotating
-		// disc, so the animation-wheel speed (when sent independently by the portal) is added here.
-		const float CombinedRot = CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed;
-		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), CombinedRot);
+		// v1.0.52: pin DMX Gobo Disk Rotation Speed to 0. Per the HLSL inside M_Beam_Master:
+		//   GoboUV.x = GoboUV.x + (Time * GoboScrollingSpeed)
+		//   GoboUV.x = GoboUV.x / NumGobos
+		// "Disk Rotation Speed" is a U-axis SCROLL that cycles through the wheel slots (with
+		// NumMask=1 it slides the single gobo image horizontally / wraps, which the user reported
+		// as "rotates through the various gobos" in v1.0.50). Epic exposes NO image-rotation
+		// param in M_Beam_Master / MF_DMXGobo / M_Light_Master (verified v1.0.52 by enumerating
+		// the uasset string tables). To actually SPIN the selected gobo image in place, v1.0.52
+		// composes a per-tick component-axis roll on the SpotLight (rotates the cookie projection
+		// on the floor) and on the Epic beam canvas mesh (its GoboUV samples in mesh-local
+		// transverse coords, so rolling the mesh around its local +Z emission axis rotates the
+		// in-cone gobo). See Tick + RefreshMotion + DriveEpicBeamFromSpotLight. The Disk Rotation
+		// Speed param is held at 0 so no U-scroll happens regardless of gobo or animation speed.
+		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), 0.f);
 
 		UE_LOG(LogRebusVisualiser, Verbose,
-			TEXT("Fixture %s epic-beam gobo: tex=%s default=%s gobo=%.2f anim=%.2f combined=%.2f"),
+			TEXT("Fixture %s epic-beam gobo: tex=%s default=%s rotation via component-roll (gobo=%.2f anim=%.2f combined=%.2f) -- material wheel-scroll pinned to 0"),
 			*FixtureId,
 			CurrentGoboTexture ? *CurrentGoboTexture->GetName() : TEXT("<default>"),
 			EpicBeamDefaultGoboTex ? *EpicBeamDefaultGoboTex->GetName() : TEXT("(none)"),
-			CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed, CombinedRot);
+			CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed,
+			CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed);
 	}
 
 	// v1.0.49: same texture/rotation also drives the SpotLight cookie via M_Light_Master.
@@ -2169,11 +2216,14 @@ void ARebusFixtureActor::ApplyCurrentGoboToLightFn()
 		SpotLight->bAllowMegaLights = 0;
 		// Push the same single-cell atlas params as the cone. The MF_DMXGobo inside M_Light_Master
 		// reads the texture identically; "Num Mask = 1, Index = 0" sweeps the entire texture.
-		const float CombinedRot = CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed;
+		// v1.0.52: as on EpicBeamMID, pin "DMX Gobo Disk Rotation Speed" to 0 -- it's a U-scroll
+		// not an image rotation. True image rotation comes from the per-tick SpotLight roll
+		// applied in RefreshMotion (rolls the cookie projection on the lit pool around the
+		// emission axis).
 		GoboLightFnMID->SetTextureParameterValue(TEXT("DMX Gobo Disk Frosted"), CurrentGoboTexture);
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Num Mask"), 1.f);
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Index"), 0.f);
-		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), CombinedRot);
+		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), 0.f);
 		SpotLight->SetLightFunctionMaterial(GoboLightFnMID);
 		// v1.0.51: bAllowMegaLights is read by FLightSceneInfo at proxy-creation time
 		// (LightSceneInfo.cpp:55 -> Proxy->AllowMegaLights()), so the value MUST be present on a
@@ -2191,10 +2241,11 @@ void ARebusFixtureActor::ApplyCurrentGoboToLightFn()
 		}
 
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("Fixture %s gobo cookie: lightFn=MI_Light tex=%s(%dx%d) gobo=%.2f anim=%.2f combined=%.2f castShadows=%d bAllowMegaLights=%d (was %d, %s for light function)"),
+			TEXT("Fixture %s gobo cookie: lightFn=MI_Light tex=%s(%dx%d) gobo=%.2f anim=%.2f combined=%.2f (rotation via SpotLight roll, material wheel-scroll pinned to 0) castShadows=%d bAllowMegaLights=%d (was %d, %s for light function)"),
 			*FixtureId, *CurrentGoboTexture->GetName(),
 			CurrentGoboTexture->GetSizeX(), CurrentGoboTexture->GetSizeY(),
-			CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed, CombinedRot,
+			CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed,
+			CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed,
 			SpotLight->CastShadows ? 1 : 0,
 			SpotLight->bAllowMegaLights ? 1 : 0, bPrevMegaLights ? 1 : 0,
 			bPrevMegaLights ? TEXT("REREGISTERED") : TEXT("MarkRenderStateDirty"));
@@ -2416,7 +2467,27 @@ void ARebusFixtureActor::Tick(float DeltaSeconds)
 	const bool bConeAnim = ZoomDeg.Tick(DeltaSeconds) | Iris.Tick(DeltaSeconds) | Frost.Tick(DeltaSeconds);
 	Focus.Tick(DeltaSeconds);
 
-	if (bMotionAnim) { RefreshMotion(); bStillAnimating = true; }
+	// v1.0.52: integrate the gobo IMAGE rotation FIRST so any RefreshMotion called below picks up
+	// the latest GoboAngle. Per the v1.0.52 fix, Epic's M_Beam_Master has no image-rotation param
+	// (DMX Gobo Disk Rotation Speed is a U-axis scroll = wheel-cycle, which is what the user saw
+	// in v1.0.50), so the only path to actually SPIN the selected gobo is a per-tick component
+	// roll: the SpotLight rolls the cookie projection on the floor, and the Epic beam canvas
+	// mesh rolls around its local +Z emission axis to rotate the in-cone gobo via its mesh-local
+	// GoboUV sampling. Combined speed = gobo + animation, both signed normalised [-1, +1].
+	const float CombinedSpin = FMath::Clamp(CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed, -2.f, 2.f);
+	const bool bGoboSpinActive = !FMath::IsNearlyZero(CombinedSpin);
+	if (bGoboSpinActive)
+	{
+		GoboAngle = FMath::Fmod(GoboAngle + DeltaSeconds * CombinedSpin * RebusGoboMaxRotRateDegPerSec, 360.f);
+		bStillAnimating = true;
+	}
+
+	// v1.0.52: when only the spin is animating (no pan/tilt), still re-push the SpotLight + beam
+	// canvas transforms so the rolled angle takes effect. RefreshMotion now bakes GoboAngle into
+	// the SpotLight's relative rotation (around local +X emission axis) and DriveEpicBeamFromSpotLight
+	// rolls the canvas around its local +Z (also emission axis). Both are rotationally symmetric
+	// so the geometry / lit-pool footprint don't visually shift -- only the gobo image spins.
+	if (bMotionAnim || bGoboSpinActive) { RefreshMotion(); bStillAnimating = true; }
 	if (bIntensityAnim) { RefreshIntensity(); bStillAnimating = true; }
 	if (bConeAnim) { RecomputeConeAngles(); SelectIesForZoom(); bStillAnimating = true; }
 
@@ -2426,13 +2497,6 @@ void ARebusFixtureActor::Tick(float DeltaSeconds)
 		ShutterPhase += DeltaSeconds * ShutterRateHz;
 		ShutterPhase = FMath::Fmod(ShutterPhase, 1.f);
 		RefreshIntensity();
-		bStillAnimating = true;
-	}
-
-	// Gobo spin (visual only when a light-function material is present).
-	if (!FMath::IsNearlyZero(GoboRotationSpeed))
-	{
-		GoboAngle += DeltaSeconds * GoboRotationSpeed * 360.f;
 		bStillAnimating = true;
 	}
 
