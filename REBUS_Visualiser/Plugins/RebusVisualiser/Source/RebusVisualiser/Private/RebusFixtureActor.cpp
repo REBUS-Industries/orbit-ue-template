@@ -1285,22 +1285,23 @@ void ARebusFixtureActor::UpdateEpicBeamParams()
 	// live selection. ApplyCurrentGoboToEpicBeam picks the right texture + atlas indices.
 	ApplyCurrentGoboToEpicBeam();
 
-	// v1.0.57 (corrected v1.0.58): push the SpotLight cookie material (MI_Light / M_Light_Master,
-	// LightFunction domain) its OWN vocabulary -- this is NOT the M_Beam_Master vocabulary. The
-	// v1.0.57 attempt mirrored the beam params verbatim (DMX Color / DMX Max Light Intensity /
-	// DMX Zoom / DMX Max Light Distance / DMX Lens Radius / DMX Quality Level), but verified by
+	// v1.0.57 introduced, v1.0.58 corrected vocabulary, v1.0.59 stripped strobe pushes: re-push
+	// the SpotLight cookie material (MI_Light / M_Light_Master, LightFunction domain) on the same
+	// cadence as the volumetric beam. M_Light_Master exposes a different vocabulary than
+	// M_Beam_Master (DMX Color / DMX Max Light Intensity / DMX Zoom etc. don't exist on the light
+	// function material -- v1.0.57 mistakenly pushed them and they silently no-oped; verified by
 	// unpacking the on-disk M_Light_Master.uasset string table at
-	// /DMXFixtures/LightFixtures/DMX_Materials/Masters/M_Light_Master those scalars DO NOT EXIST
-	// on the light function material -- they silently no-oped. M_Light_Master only exposes DMX
-	// Dimmer / DMX Frost / DMX Strobe Open / DMX Strobe Frequency / DMX Strobe Disable Burst +
-	// the MF_DMXGobo atlas (DMX Gobo Disk Frosted / DMX Gobo Disk / DMX Gobo Num Mask / DMX
-	// Gobo Index / DMX Gobo Disk Rotation Speed) and a "Use Gobo" StaticSwitchParameter
-	// (verified ON in MI_Light because Epic ships a separate MI_LightNoGobo for the opposite
-	// case, 5441 bytes larger to carry the static permutation override). UpdateEpicLightFnParams
-	// pushes the CORRECT vocabulary -- in particular DMX Strobe Open=1 (the gate Strobe_Component
-	// drives in Epic's stock BP_MovingHead -- without it M_Light_Master multiplies the cookie by 0
-	// even when every other param is correct, the actual root cause of v1.0.49 -> v1.0.57 failing
-	// to show a footprint gobo).
+	// /DMXFixtures/LightFixtures/DMX_Materials/Masters/M_Light_Master). The exposed scalars are
+	// DMX Dimmer / DMX Frost + the MF_DMXStrobe inputs (DMX Strobe Open / DMX Strobe Frequency /
+	// DMX Strobe Disable Burst) + the MF_DMXGobo atlas (DMX Gobo Disk / DMX Gobo Disk Frosted /
+	// DMX Gobo Num Mask / DMX Gobo Index / DMX Gobo Disk Rotation Speed) + a "Use Gobo" Static
+	// SwitchParameter (verified ON in MI_Light because Epic ships a separate MI_LightNoGobo for
+	// the opposite case, 5441 bytes larger to carry the static permutation override). UpdateEpic
+	// LightFnParams now pushes ONLY DMX Dimmer (= Dim * Gate, combined dimmer+shutter envelope)
+	// and DMX Frost. The v1.0.58 Strobe Open / Frequency / Disable Burst pushes are removed --
+	// MF_DMXStrobe's internal Time-driven Sine was self-strobing the cookie even with our gate
+	// at 1, which the user reported as the footprint flashing. The beam handles its shutter
+	// purely via DMX Dimmer = Dim * Gate and never flashed; the cookie now does the same.
 	UpdateEpicLightFnParams();
 }
 
@@ -1311,14 +1312,25 @@ void ARebusFixtureActor::UpdateEpicLightFnParams()
 	// anyway, so no cookie projects regardless of params).
 	if (!GoboLightFnMID) return;
 
-	// Shutter-gate matches Epic beam / SpotLight intensity / lens disc. Epic models the strobe as
-	// TWO separate signals on M_Light_Master: DMX Dimmer is the continuous 0..1 dim level, and
-	// DMX Strobe Open is the binary 0/1 gate (toggled by Strobe_Component each strobe pulse). We
-	// drive both: DMX Dimmer = pure Dimmer.Current (so a 0.5 dim halves cookie brightness in
-	// lockstep with the SpotLight's own SetIntensity), and DMX Strobe Open = our existing Gate
-	// (0 when shutter closed, oscillating for strobe, 1 when open). Multiplying them inside the
-	// material reproduces Epic's stock behaviour: shutter-closed AND dimmed-to-zero both gate the
-	// cookie to nothing, in the SAME frame the SpotLight intensity drops via RefreshIntensity.
+	// v1.0.59: shutter gating is now applied PURELY via DMX Dimmer (Dim * Gate), matching how
+	// EpicBeamMID (the volumetric beam) is driven by UpdateEpicBeamParams. The v1.0.58 push of
+	// DMX Strobe Open / DMX Strobe Frequency / DMX Strobe Disable Burst is REMOVED -- those
+	// parameters feed MF_DMXStrobe inside M_Light_Master, which combines them with an internal
+	// Time-driven Sine to PRODUCE strobe oscillation. Pushing Gate=1 into DMX Strobe Open while
+	// leaving Frequency/Disable Burst at their MID defaults made MF_DMXStrobe modulate the cookie
+	// independently of our own shutter state machine -- the user observed this as the footprint
+	// flashing even with the shutter logically Open (ShutterMode=Open, Gate=1, but the material's
+	// internal strobe ran free). The beam works correctly WITHOUT pushing any DMX Strobe params
+	// (UpdateEpicBeamParams only writes DMX Dimmer = Dim * Gate -- see lines around 1277), so we
+	// mirror that: leave M_Light_Master's strobe inputs at the Epic shipped MID defaults (Frost_
+	// Component / Dimmer_Component / Strobe_Component are inactive when our Strobe_Component
+	// equivalent never fires), and combine our entire shutter envelope into DMX Dimmer. This
+	// makes DMX Strobe Open / Frequency / Disable Burst inert from our side, which is correct --
+	// our SetFixtureShutter descriptor IS the single source of truth, and Gate is what propagates
+	// it to (a) SpotLight->SetIntensity (RefreshIntensity), (b) EpicBeamMID DMX Dimmer
+	// (UpdateEpicBeamParams) and (c) GoboLightFnMID DMX Dimmer (here). All three gate in the
+	// same Tick from the same Gate value, so shutter is one unified control across beam + cookie
+	// + raw light as the user requested.
 	float Gate = 1.f;
 	switch (ShutterMode)
 	{
@@ -1327,8 +1339,7 @@ void ARebusFixtureActor::UpdateEpicLightFnParams()
 	default: break;
 	}
 
-	const float Dim = FMath::Clamp(Dimmer.Current, 0.f, 1.f);
-	const float StrobeOpen = Gate;
+	const float Dim = FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate;
 	const float FrostNorm = FMath::Clamp(Frost.Current, 0.f, 1.f);
 
 	// M_Light_Master vocabulary (verified on disk; unknown params silently no-op so this remains
@@ -1338,14 +1349,11 @@ void ARebusFixtureActor::UpdateEpicLightFnParams()
 	// RefreshIntensity) IS the cookie's colour; pushing DMX Color here would silently no-op
 	// anyway and add confusion to the trace.
 	GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Dimmer"), Dim);
-	GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Strobe Open"), StrobeOpen);
-	GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Strobe Frequency"), 0.f);
-	GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Strobe Disable Burst"), 0.f);
 	GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Frost"), FrostNorm);
 
 	UE_LOG(LogRebusVisualiser, Verbose,
-		TEXT("Fixture %s gobo cookie params (v1.0.58 corrected): dim=%.2f strobeOpen=%.2f frost=%.2f gate=%.2f -- M_Light_Master vocabulary (DMX Strobe Open was the missing gate that multiplied the cookie by 0 in v1.0.49->v1.0.57)."),
-		*FixtureId, Dim, StrobeOpen, FrostNorm, Gate);
+		TEXT("Fixture %s gobo cookie params (v1.0.59): dimXgate=%.2f frost=%.2f gate=%.2f -- shutter combined into DMX Dimmer (matches beam); DMX Strobe Open/Frequency/Disable Burst left at MID defaults to stop MF_DMXStrobe self-strobing the cookie."),
+		*FixtureId, Dim, FrostNorm, Gate);
 }
 
 void ARebusFixtureActor::DriveEpicBeamFromSpotLight()
@@ -2273,12 +2281,24 @@ void ARebusFixtureActor::ApplyCurrentGoboToEpicBeam()
 		if (CurrentGoboTexture)
 		{
 			EnsureGoboRT();
-			// v1.0.53: even when the RT was already allocated from a previous gobo, the source
-			// texture may have just changed (new SetFixtureGobo); kick a redraw so the RT
-			// contains the NEW gobo BEFORE we push it to the material -- otherwise the cone +
-			// cookie would project the previous gobo for one frame before the Tick spin block
-			// would refresh it.
-			if (GoboRT) GoboRT->UpdateResource();
+			// v1.0.59: only kick a redraw when the SOURCE gobo has actually changed since the
+			// previous call. The v1.0.53 unconditional UpdateResource() ran on every
+			// ApplyCurrentGoboToEpicBeam invocation, including the per-Tick path through
+			// UpdateEpicBeamParams during dimmer/motion/colour fades -- each call cleared the
+			// RT to transparent before OnGoboRTUpdate redrew, and the cookie LightFunction
+			// material sampled the "clear" frame between the clear and the draw, producing a
+			// per-fade flash on the footprint that the user reported as the cookie strobing
+			// even with shutter Open. Comparing TObjectPtr equality on the underlying UObject*
+			// gates the redraw to actual gobo-change events (ApplyGoboTextureFromBytes,
+			// SetInlineGobos re-push, ClearGoboToOpen). The Tick spin block still kicks a
+			// redraw every frame when GoboAngle is animating -- that's correct because the
+			// RT contents need to change to show the rotation; LastGoboRTUpdateTex is not
+			// reset there because the SOURCE texture hasn't changed.
+			if (GoboRT && CurrentGoboTexture != LastGoboRTUpdateTex)
+			{
+				GoboRT->UpdateResource();
+				LastGoboRTUpdateTex = CurrentGoboTexture;
+			}
 			TexToPush = GoboRT ? static_cast<UTexture*>(GoboRT.Get()) : static_cast<UTexture*>(CurrentGoboTexture.Get());
 		}
 		else
@@ -2388,14 +2408,18 @@ void ARebusFixtureActor::ApplyCurrentGoboToLightFn()
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Num Mask"), 1.f);
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Index"), 0.f);
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), 0.f);
-		// v1.0.57 (corrected v1.0.58): prime the non-gobo M_Light_Master scalars so the cookie
-		// isn't multiplied by 0. v1.0.57 mistakenly pushed M_Beam_Master vocabulary here (DMX
-		// Color / DMX Max Light Intensity / DMX Zoom etc.) which DOES NOT EXIST on M_Light_
-		// Master -- silent no-ops. v1.0.58 pushes the verified M_Light_Master vocabulary: DMX
-		// Dimmer + DMX Strobe Open + DMX Strobe Frequency + DMX Strobe Disable Burst + DMX
-		// Frost. The CRITICAL gate was DMX Strobe Open: defaults to 0 on the MID until we set
-		// it, and M_Light_Master multiplies its entire output by it -- so the cookie was being
-		// gated off regardless of the gobo texture being correctly bound.
+		// v1.0.57 introduced, v1.0.58 corrected vocabulary, v1.0.59 stripped strobe pushes:
+		// prime the non-gobo M_Light_Master scalars so the cookie isn't multiplied by 0 the very
+		// first frame after the MID is created. v1.0.57 mistakenly pushed M_Beam_Master
+		// vocabulary here (DMX Color / DMX Max Light Intensity / DMX Zoom etc.) which DOES NOT
+		// EXIST on M_Light_Master -- silent no-ops. v1.0.58 switched to the correct vocabulary
+		// (DMX Dimmer + DMX Strobe Open + DMX Strobe Frequency + DMX Strobe Disable Burst + DMX
+		// Frost). v1.0.59 dropped DMX Strobe Open / Frequency / Disable Burst because they feed
+		// MF_DMXStrobe's internal Sine and were self-modulating the cookie (footprint flashed
+		// even with our gate at 1). UpdateEpicLightFnParams now pushes only DMX Dimmer
+		// (= Dim * Gate, combined dimmer+shutter envelope) and DMX Frost. The cookie was actually
+		// fixed in v1.0.58 by the DMX Gobo Disk push above (M_Light_Master's MF_DMXGobo samples
+		// the clean disc texture, which we'd never written until then), not by Strobe Open.
 		UpdateEpicLightFnParams();
 		UE_LOG(LogRebusVisualiser, Verbose,
 			TEXT("Fixture %s gobo TEX param: beamMID=set lightFnMID=set src=%s push=%s (RT=%s)"),
@@ -2491,10 +2515,14 @@ void ARebusFixtureActor::ClearGoboToOpen(const TCHAR* Reason)
 	// flash the previous gobo. We keep the RT allocated (cheap to keep, expensive to recreate
 	// every gobo change) -- just blank it. OnGoboRTUpdate early-outs on CurrentGoboTexture==null
 	// (just-set above), so the UpdateResource here only fires the default clear-to-transparent.
+	// v1.0.59: also reset LastGoboRTUpdateTex so the next non-Open assignment (CurrentGoboTexture
+	// becomes non-null) is correctly detected as a CHANGE by ApplyCurrentGoboToEpicBeam and
+	// triggers a single deliberate redraw of the new source.
 	if (GoboRT)
 	{
 		GoboRT->UpdateResource();
 	}
+	LastGoboRTUpdateTex = nullptr;
 	// Push the cleared state into BOTH the cone (reverts EpicBeamMID to its MI default) and the
 	// cookie (nulls SpotLight->LightFunctionMaterial). Then reassert CastShadows so the now-cleared
 	// bGoboActive removes any gobo-driven shadow override on non-hero beams.

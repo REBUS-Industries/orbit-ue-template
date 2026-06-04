@@ -593,6 +593,96 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Cookie footprint flashing during fades + unified shutter (v1.0.59).** User retest of v1.0.58:
+> "it working but the gobo on the floor is flashing. I think this is to do with Shutter. Can we
+> we control shutter as a sperate parameter. The shutter applies to the beam as well as footprint
+> as one control." Two distinct bugs were producing the flash, and the shutter control the user
+> wanted **already exists** as the `SetFixtureShutter` descriptor — it was just being undermined
+> by the bugs and by the v1.0.58 strobe-param push.
+>
+> **Bug 1 — per-frame `GoboRT->UpdateResource()` clears the RT to transparent every Tick.** The
+> v1.0.53 `ApplyCurrentGoboToEpicBeam` unconditionally called `GoboRT->UpdateResource()` so the
+> RT always held the latest source-gobo + rotation. That function is called per-frame from
+> `UpdateEpicBeamParams` during any fade (dimmer, colour, motion, cone). `UCanvasRenderTarget2D
+> ::UpdateResource()` clears to `ClearColor` (transparent) **before** firing `OnCanvasRender
+> TargetUpdate` — there's a one-frame gap where the RT holds nothing. The cookie `LightFunction`
+> material samples that "blank" frame between the clear and the redraw and the footprint
+> projects nothing for one frame; the beam mesh hid the same gap inside translucent surface
+> blending (which is why the user only reported the cookie flashing, not the beam). v1.0.59
+> adds `LastGoboRTUpdateTex` on the actor and gates the redraw to the case where `CurrentGobo
+> Texture` has actually changed since the last call:
+>
+> ```cpp
+> if (GoboRT && CurrentGoboTexture != LastGoboRTUpdateTex)
+> {
+>     GoboRT->UpdateResource();
+>     LastGoboRTUpdateTex = CurrentGoboTexture;
+> }
+> ```
+>
+> Reset to `nullptr` in `ClearGoboToOpen` so the next non-Open assignment is correctly detected
+> as a change. The Tick spin block (`bGoboSpinActive`) is **unchanged** — it still kicks
+> `UpdateResource()` every frame because the RT contents need to change to show the rotation;
+> `LastGoboRTUpdateTex` is not touched there because the source texture hasn't changed.
+>
+> **Bug 2 — `DMX Strobe Open` push made `MF_DMXStrobe` self-modulate the cookie.** v1.0.58 added
+> `DMX Strobe Open` / `DMX Strobe Frequency` / `DMX Strobe Disable Burst` pushes on `GoboLightFn
+> MID`. Those scalars feed `MF_DMXStrobe` inside `M_Light_Master`, which combines them with an
+> internal `MaterialExpressionTime`-driven `MaterialExpressionSine` to **produce** strobe
+> oscillation (verified by enumerating the `MF_DMXStrobe.uasset` node graph string table: nodes
+> include `MaterialExpressionSine`, `MaterialExpressionTime`, `MaterialExpressionMultiply`,
+> `MaterialExpressionIf`, comment "Pulse,strobe,sinewave"). Pushing `Gate = 1` into `DMX Strobe
+> Open` while leaving Frequency/Disable Burst at their MID defaults made the material strobe
+> independently of our `ShutterMode` state machine. **The fix the user actually saw in v1.0.58
+> wasn't `DMX Strobe Open` at all — it was the `DMX Gobo Disk` (clean disc) texture push** in
+> `ApplyCurrentGoboToLightFn`. `M_Light_Master`'s `MF_DMXGobo` samples the CLEAN disc, not the
+> FROSTED disc; we'd been writing only Frosted from v1.0.49 → v1.0.57, so the cookie sampled
+> Epic's stock default texture and showed nothing user-specific. v1.0.58 added the missing
+> Clean push and that's what made user gobos visible. The Strobe Open push was a coincidental
+> co-change that introduced the flashing.
+>
+> **v1.0.59 collapses shutter into `DMX Dimmer`** to mirror how the beam already does it. The
+> volumetric beam (`EpicBeamMID` / `M_Beam_Master`) has always handled shutter purely via
+> `DMX Dimmer = Dim * Gate` and has never flashed — it doesn't push any `DMX Strobe *` params,
+> just inherits the MID defaults. `UpdateEpicLightFnParams` now writes only:
+>
+> ```cpp
+> const float Dim = FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate;
+> const float FrostNorm = FMath::Clamp(Frost.Current, 0.f, 1.f);
+> GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Dimmer"), Dim);
+> GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Frost"),  FrostNorm);
+> ```
+>
+> The `DMX Strobe Open`, `DMX Strobe Frequency`, `DMX Strobe Disable Burst` pushes are removed.
+> Shutter is now a single signed envelope (`Dim * Gate`) propagated identically to (a) `SpotLight
+> ->SetIntensity` in `RefreshIntensity`, (b) `EpicBeamMID DMX Dimmer` in `UpdateEpicBeamParams`,
+> and (c) `GoboLightFnMID DMX Dimmer` here. All three multiply by the same `Gate` computed in
+> the same Tick from `ShutterMode` + `ShutterPhase`, so a portal `SetFixtureShutter` command is
+> reflected simultaneously across the beam, the cookie footprint, and the SpotLight's raw output
+> as the user requested ("one control" for the whole fixture).
+>
+> **`SetFixtureShutter` descriptor (already in v1.0.56, documented here).** The portal-facing
+> shutter control was wired in `URebusFixtureControlSubsystem::SetFixtureShutter` in v1.0.56;
+> this is the formal contract:
+>
+> ```json
+> { "type": "SetFixtureShutter", "id": "<fixtureId>", "mode": 0, "rateHz": 0 }
+> ```
+>
+> | Field    | Type   | Meaning                                                                   |
+> | -------- | ------ | ------------------------------------------------------------------------- |
+> | `mode`   | int    | `0` = Open (continuous), `1` = Closed (blacked-out), `2` = Strobe         |
+> | `rateHz` | number | Strobe rate in Hz when `mode == 2`; clamped to `[0, 30]`; ignored otherwise |
+>
+> The control is unified: a single descriptor drives the entire fixture (beam + cookie + lens
+> disc + spotlight intensity). `mode=1` blacks everything out in lockstep; `mode=2` strobes
+> everything in lockstep at `rateHz`. `mode=0` (the default) leaves the fixture continuously lit.
+> The same descriptor can be sent in a batch (`SetFixturesBatch`) for synchronised multi-fixture
+> shuttering. Diagnostic line: `Fixture <id> gobo cookie params (v1.0.59): dimXgate=<d>
+> frost=<f> gate=<g> -- shutter combined into DMX Dimmer (matches beam); DMX Strobe Open/
+> Frequency/Disable Burst left at MID defaults to stop MF_DMXStrobe self-strobing the cookie.`
+> Enable with `Log LogRebusVisualiser Verbose`.
+
 > **Spotlight footprint gobo: corrected to actual M_Light_Master vocabulary (v1.0.58).** User
 > retest of v1.0.57: "we are still seeing no gobos in the footprint of the light on the floor."
 > v1.0.57's diagnosis (cookie multiplied by 0 by an unset gating scalar) was the right shape but

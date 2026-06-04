@@ -261,21 +261,22 @@ private:
 	// the gobo projects onto the lit floor pool. Lazily MIDs MI_Light on first call; sets
 	// SpotLight->LightFunctionMaterial. On clear (CurrentGoboTexture==null) nulls the light fn.
 	void ApplyCurrentGoboToLightFn();
-	// v1.0.57 introduced + v1.0.58 corrected: push the verified M_Light_Master vocabulary onto
-	// GoboLightFnMID -- DMX Dimmer / DMX Strobe Open / DMX Strobe Frequency / DMX Strobe Disable
-	// Burst / DMX Frost. The CRITICAL gate is DMX Strobe Open: M_Light_Master multiplies its
-	// entire light-function output by it, and the MID default is 0, so the cookie was being
-	// completely zeroed until we set it -- the actual root cause of v1.0.49 through v1.0.57
-	// "spotlight footprint gobo never shows". v1.0.57 wrongly pushed M_Beam_Master vocabulary
-	// (DMX Color / DMX Max Light Intensity / DMX Max Light Distance / DMX Lens Radius / DMX Zoom
-	// / DMX Zoom Normalize / DMX Quality Level) verbatim, but those scalars don't exist on
-	// M_Light_Master (verified by unpacking the on-disk .uasset string table at /DMXFixtures/
-	// LightFixtures/DMX_Materials/Masters/M_Light_Master) so they silently no-oped. v1.0.58
-	// drops them and pushes the CORRECT vocabulary that Epic's stock Strobe_Component +
-	// Dimmer_Component + Frost_Component fire at DynamicMaterialSpotLight in BP_MovingHead.
-	// No-op when GoboLightFnMID is null (no gobo active). Called from UpdateEpicBeamParams
-	// (every refresh) and from ApplyCurrentGoboToLightFn (lazy-MID-creation primer + every gobo
-	// selection).
+	// v1.0.57 introduced, v1.0.58 corrected vocabulary, v1.0.59 collapsed shutter into DMX Dimmer:
+	// push the verified M_Light_Master vocabulary onto GoboLightFnMID -- now just DMX Dimmer (set
+	// to Dim * Gate, i.e. the combined dimmer-and-shutter envelope, identical to how UpdateEpic
+	// BeamParams gates the volumetric beam) and DMX Frost (live frost fade). The v1.0.58 pushes
+	// of DMX Strobe Open / DMX Strobe Frequency / DMX Strobe Disable Burst are REMOVED because
+	// those scalars feed M_Light_Master's MF_DMXStrobe sub-function, which combines them with an
+	// internal Time-driven Sine to PRODUCE strobe oscillation -- pushing Gate=1 into DMX Strobe
+	// Open while leaving Frequency/Disable Burst at their MID defaults caused MF_DMXStrobe to
+	// modulate the cookie independently of our ShutterMode state machine, which the user observed
+	// as the footprint gobo flashing even when shutter was logically Open. The beam (M_Beam_Master
+	// also references MF_DMXStrobe) has never pushed those params and is steady, so the cookie
+	// now mirrors that approach: shutter goes through DMX Dimmer alone, which makes Set
+	// FixtureShutter the single source of truth across beam + cookie + SpotLight intensity (all
+	// three multiply by the same Gate computed in the same Tick). No-op when GoboLightFnMID is
+	// null (no gobo active). Called from UpdateEpicBeamParams (every refresh) and from
+	// ApplyCurrentGoboToLightFn (lazy-MID-creation primer + every gobo selection).
 	void UpdateEpicLightFnParams();
 	// v1.0.49: explicit clear path. Drops CurrentGoboTexture, reverts the Epic beam MID to its
 	// MI default, nulls the SpotLight light function, clears bGoboActive, and reasserts shadows.
@@ -336,6 +337,17 @@ private:
 	UPROPERTY() TObjectPtr<UCanvasRenderTarget2D> GoboRT = nullptr;
 	UFUNCTION() void OnGoboRTUpdate(UCanvas* Canvas, int32 Width, int32 Height);
 	void EnsureGoboRT();
+	// v1.0.59: last CurrentGoboTexture we kicked GoboRT->UpdateResource() for. Used to gate the
+	// redraw so it ONLY fires when the source gobo actually changes (new SetFixtureGobo
+	// selection / inline-bytes decode / ClearGoboToOpen), NOT every time ApplyCurrentGoboToEpic
+	// Beam is called for a per-frame param refresh. The unconditional v1.0.53 redraw was clearing
+	// the RT to transparent then redrawing every Tick during dimmer/colour/motion fades --
+	// EpicBeamMID and GoboLightFnMID both sample the RT, and the cookie footprint flashed because
+	// the user-visible material sampled the "clear" frame between the clear and the OnGoboRTUpdate
+	// draw. The beam mesh was less visibly affected because translucent surface materials hide the
+	// 1-frame gap better than a hard-edged LightFunction projection. Compare-pointer (not equals)
+	// is sufficient -- CurrentGoboTexture is a TObjectPtr so == checks the underlying UObject*.
+	UPROPERTY() TObjectPtr<UTexture2D> LastGoboRTUpdateTex = nullptr;
 	float CurrentGoboRotationSpeed = 0.f;
 	// v1.0.50: animation-wheel rotation, signed normalised [-1..1]. Epic's M_Beam_Master has no
 	// dedicated animation-wheel param (only DMX Gobo Disk Rotation Speed), so we add this to the
