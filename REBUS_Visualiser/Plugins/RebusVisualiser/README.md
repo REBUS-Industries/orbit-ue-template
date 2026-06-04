@@ -348,6 +348,28 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 > natural end of the column rather than a hard bright disc. Bounds are unchanged (cap centres lie on
 > the axis within the existing ring extents).
 
+> **DMX-fixtures-style beam + IES-driven light (v1.0.42).** Researched UE's native **DMX Fixtures**
+> plugin (`Engine/Plugins/VirtualProduction/DMX/DMXFixtures`, `ADMXFixtureActor`): its visible beam
+> is a **translucent cone static mesh raymarched** by `M_LightBeam` (params `DMX Quality Level` step
+> size, `DMX Max Light Distance`, `DMX Max Light Intensity`, `DMX Lens Radius`), the lens is an
+> **emissive disc**, and the cast light is a `USpotLightComponent` whose intensity is normalized by
+> the cone solid angle and shaped by a **light-function cookie** — stock DMX does *not* read `.ies`.
+> Our `ARebusFixtureActor` already matches this architecture (SpotLight + cone-mesh raymarch beam
+> `M_RebusBeam` + emissive lens `M_RebusLensFlare`) **and exceeds it**: the SpotLight is driven by a
+> true **runtime IES profile** built from the raw `.ies` text (`RegisterFixtureIes` →
+> `RebusIes::BuildLightProfile` via the engine `IESFile`/`FIESConverter` module → `UTextureLightProfile`
+> → `SpotLight->SetIESTexture`, `bUseIESBrightness=false` so the portal keeps brightness authority),
+> with cone half-angle and candela intensity from the parsed photometrics. So no architectural
+> "restart" was required; instead the beam **look** was matched to the DMX beam:
+> - **Smooth Gaussian cross-section** (`core = exp(-rN²·BeamSharpness)`) replaces the old
+>   `pow(1-rN)` hard rim — a soft glow with no crisp mesh edge.
+> - **Soft depth fade** (`DEPTH_FADE_CM` = 50 cm) dissolves the shaft where it meets opaque geometry
+>   (the DMX soft-particle look) instead of a hard scene-depth clip.
+>
+> Preserved: v1.0.34 direction, v1.0.39 camera-inside entry/exit + near fade, v1.0.41 end caps,
+> pan/tilt/colour/dimmer, Orbit-model binding, no self-shadow. **IES path chosen: true runtime
+> `UTextureLightProfile`** (already in place), not an angle approximation — the accurate option.
+
 ### `RenderQuality` scene property (runtime tiers)
 
 Push `SetSceneProperty name="RenderQuality" value="<tier>"` (case-insensitive; unknown values

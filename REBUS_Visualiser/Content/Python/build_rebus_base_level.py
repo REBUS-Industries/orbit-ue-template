@@ -218,7 +218,14 @@ _BEAM_RAYMARCH_HLSL = """
 // wide far end no longer reads brighter than the narrow near-lens region purely from path length;
 // (2) a distance-from-SOURCE softened inverse-square falloff so the shaft is BRIGHTEST at the lens
 // and dims downrange (BeamFalloff = strength). The radial core starts at the lens radius (LensRadius
-// at axial=0), so the shaft visibly begins as a disc of the lens diameter. Output: float4(rgb, a).
+// at axial=0), so the shaft visibly begins as a disc of the lens diameter.
+//
+// v1.0.42 -- match the UE DMX-fixtures beam LOOK (the shaft is a translucent cone mesh raymarched
+// front-to-back, exactly as DMXFixtures' M_LightBeam does): the radial cross-section is now a SMOOTH
+// Gaussian glow (no hard mesh rim) and a soft depth fade dissolves the beam where it meets opaque
+// geometry (DMX soft-particle look) instead of a hard scene-depth clip. The actual cast light stays
+// IES-driven on the USpotLightComponent (more accurate than stock DMX, which uses a light-function
+// cookie). Output: float4(rgb beam colour, a coverage).
 float3 ro = CamPos.xyz;
 float3 pp = PixelPos.xyz;
 float3 toPix = pp - ro;
@@ -295,6 +302,7 @@ float sharp = max(BeamSharpness, 0.01);
 float fall = max(BeamFalloff, 0.0);
 const float NEAR_FADE_CM = 10.0;      // fade only the few cm nearest the camera (no hard wall)
 const float REF_RADIUS_CM = 100.0;    // fixed length scale for the width-bias normalization
+const float DEPTH_FADE_CM = 50.0;     // DMX-style soft depth fade where the beam meets geometry
 
 float trans = 1.0;
 float t = tEntry + dt * 0.5;
@@ -314,9 +322,12 @@ for (int i = 0; i < MAXSTEPS; ++i)
         float3 perp = rel - axial * bd;
         float radial = length(perp);
         float rN = (radiusAt > 0.001) ? (radial / radiusAt) : 2.0;
-        if (rN < 1.0)
+        if (rN < 1.5)
         {
-            float core = pow(saturate(1.0 - rN), sharp);
+            // v1.0.42 DMX-style soft Gaussian cross-section: a smooth glow core that fades to the
+            // cone edge with NO hard rim (the old pow(1-rN) had a hard cutoff at rN=1 that read as a
+            // crisp mesh edge). BeamSharpness = core tightness (higher = tighter, narrower core).
+            float core = exp(-rN * rN * sharp);
             // v1.0.40 width-bias normalization: optical density per unit length ~ 1/radiusAt, so a
             // view ray crossing the WIDE far end no longer reads brighter than the NARROW near-lens
             // region purely from path length (the old bug that made the beam faint at the fixture).
@@ -328,8 +339,9 @@ for (int i = 0; i < MAXSTEPS; ++i)
             // (0 = flat, higher = faster falloff); the +1 clamp keeps it finite at the lens.
             float dn = axial * invLen;               // 0 at lens .. 1 at the far throw
             float srcAtten = 1.0 / (1.0 + fall * dn * dn);
-            float nf = saturate(t / NEAR_FADE_CM);   // soft near-camera fade only
-            float d = BeamDensity * core * widthNorm * srcAtten * nf;
+            float nf = saturate(t / NEAR_FADE_CM);              // soft near-camera fade
+            float softOcc = saturate((tOcc - t) / DEPTH_FADE_CM); // DMX-style soft fade at geometry
+            float d = BeamDensity * core * widthNorm * srcAtten * nf * softOcc;
             float a = 1.0 - exp(-d * dt);
             trans *= (1.0 - a);
         }
