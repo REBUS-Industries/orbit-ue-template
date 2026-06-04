@@ -202,6 +202,89 @@ void ARebusFixtureActor::LogVolumetricShadowBudget(int32 SpawnedTotal)
 		SpawnedTotal, WantShadow, Hero, RebusMaxShadowFogBeams, GRebusHeroShadowScatter);
 }
 
+void ARebusFixtureActor::DumpLightStateForDebug() const
+{
+	// v1.0.51 per-fixture light dump for the Rebus.DumpFixtureLights console command. Walks the
+	// fixture's primary SpotLight + every other ULightComponent attached to this actor (looking
+	// for duplicate / competing lights that would wash out the projected gobo cookie) + the bound
+	// Orbit-imported components (to confirm whether the import path silently brought aux lights
+	// via glTF KHR_lights_punctual). Every line is at Log level so the user can paste the output.
+	const FVector Loc = GetActorLocation();
+	if (!SpotLight)
+	{
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("DumpFixtureLights '%s' (loc=(%.0f,%.0f,%.0f)): NO SpotLight component -- fixture not fully constructed."),
+			*FixtureId, Loc.X, Loc.Y, Loc.Z);
+		return;
+	}
+
+	const UMaterialInterface* LightFnMat = SpotLight->LightFunctionMaterial;
+	const UTextureLightProfile* Ies = SpotLight->IESTexture;
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("DumpFixtureLights '%s' (loc=(%.0f,%.0f,%.0f)) SpotLight: visible=%d intensity=%.1f units=%d attenRadius=%.0f innerCone=%.1f outerCone=%.1f castShadows=%d castVolumetricShadow=%d bAllowMegaLights=%d LightFn=%s IES=%s mobility=%d"),
+		*FixtureId, Loc.X, Loc.Y, Loc.Z,
+		SpotLight->IsVisible() ? 1 : 0,
+		SpotLight->Intensity, (int32)SpotLight->IntensityUnits,
+		SpotLight->AttenuationRadius, SpotLight->InnerConeAngle, SpotLight->OuterConeAngle,
+		SpotLight->CastShadows ? 1 : 0, SpotLight->bCastVolumetricShadow ? 1 : 0,
+		SpotLight->bAllowMegaLights ? 1 : 0,
+		LightFnMat ? *LightFnMat->GetPathName() : TEXT("nullptr"),
+		Ies ? *Ies->GetName() : TEXT("nullptr"),
+		(int32)SpotLight->Mobility);
+
+	// Sibling light enumeration: anything else on this actor that's a ULightComponent is a
+	// potential duplicate / wash-out source. Our pipeline only spawns ONE SpotLight per fixture
+	// (BuildSpotLight, RebusFixtureActor.cpp:509), and OrbitImportSubsystem::SpawnNodeRecursive
+	// only creates UStaticMeshComponents (no KHR_lights_punctual lights -- verified v1.0.51), so
+	// any sibling light here would be a regression worth chasing.
+	TArray<ULightComponent*> SiblingLights;
+	GetComponents<ULightComponent>(SiblingLights);
+	int32 SiblingCount = 0;
+	for (ULightComponent* L : SiblingLights)
+	{
+		if (!L || L == SpotLight) continue;
+		++SiblingCount;
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("DumpFixtureLights '%s' SIBLING LIGHT #%d: class=%s name=%s visible=%d intensity=%.1f castShadows=%d -- potential cookie wash-out source."),
+			*FixtureId, SiblingCount, *L->GetClass()->GetName(), *L->GetName(),
+			L->IsVisible() ? 1 : 0, L->Intensity, L->CastShadows ? 1 : 0);
+	}
+	if (SiblingCount == 0)
+	{
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("DumpFixtureLights '%s' sibling lights: NONE (only the primary SpotLight is attached -- no duplication on the fixture actor)."),
+			*FixtureId);
+	}
+
+	// Bound Orbit components: enumerate by class so the user can see whether any are lights.
+	int32 OrbitLightCount = 0;
+	int32 OrbitTotal = 0;
+	for (const TWeakObjectPtr<USceneComponent>& W : OrbitComponents)
+	{
+		const USceneComponent* C = W.Get();
+		if (!C) continue;
+		++OrbitTotal;
+		if (C->IsA(ULightComponent::StaticClass()))
+		{
+			++OrbitLightCount;
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("DumpFixtureLights '%s' BOUND ORBIT LIGHT #%d: class=%s name=%s owner=%s -- aux light from glTF KHR_lights_punctual; gobo cookie will be washed out by this."),
+				*FixtureId, OrbitLightCount, *C->GetClass()->GetName(), *C->GetName(),
+				C->GetOwner() ? *C->GetOwner()->GetName() : TEXT("(none)"));
+		}
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("DumpFixtureLights '%s' Orbit binding: bound=%d components (lights=%d) objectId='%s'."),
+		*FixtureId, OrbitTotal, OrbitLightCount, *GetBoundOrbitObjectId());
+
+	// Total component count under the actor (sanity check for unexpected attachments).
+	TArray<USceneComponent*> AllScene;
+	GetComponents<USceneComponent>(AllScene);
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("DumpFixtureLights '%s' totalSceneComponents=%d (this includes SpotLight + FixtureRoot + BeamCone + EpicBeamCanvas + LensDisc + any mesh proxies)."),
+		*FixtureId, AllScene.Num());
+}
+
 ARebusFixtureActor::ARebusFixtureActor()
 {
 	PrimaryActorTick.bCanEverTick = true;
@@ -2092,15 +2175,54 @@ void ARebusFixtureActor::ApplyCurrentGoboToLightFn()
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Index"), 0.f);
 		GoboLightFnMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), CombinedRot);
 		SpotLight->SetLightFunctionMaterial(GoboLightFnMID);
-		SpotLight->MarkRenderStateDirty(); // bAllowMegaLights + LightFunctionMaterial proxy refresh
+		// v1.0.51: bAllowMegaLights is read by FLightSceneInfo at proxy-creation time
+		// (LightSceneInfo.cpp:55 -> Proxy->AllowMegaLights()), so the value MUST be present on a
+		// freshly-created proxy to take effect. MarkRenderStateDirty alone scheduled a deferred
+		// recreate that proved unreliable in v1.0.50 (the user reported no cookie). A full
+		// ReregisterComponent() on a TRANSITION (not every gobo update) guarantees the proxy is
+		// rebuilt with bAllowMegaLights=0. Cost: brief one-frame blackout on the toggle -- fine.
+		if (bPrevMegaLights)
+		{
+			SpotLight->ReregisterComponent();
+		}
+		else
+		{
+			SpotLight->MarkRenderStateDirty();
+		}
 
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("Fixture %s gobo cookie: lightFn=MI_Light tex=%s(%dx%d) gobo=%.2f anim=%.2f combined=%.2f castShadows=%d bAllowMegaLights=%d (was %d, toggled for light function)"),
+			TEXT("Fixture %s gobo cookie: lightFn=MI_Light tex=%s(%dx%d) gobo=%.2f anim=%.2f combined=%.2f castShadows=%d bAllowMegaLights=%d (was %d, %s for light function)"),
 			*FixtureId, *CurrentGoboTexture->GetName(),
 			CurrentGoboTexture->GetSizeX(), CurrentGoboTexture->GetSizeY(),
 			CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed, CombinedRot,
 			SpotLight->CastShadows ? 1 : 0,
-			SpotLight->bAllowMegaLights ? 1 : 0, bPrevMegaLights ? 1 : 0);
+			SpotLight->bAllowMegaLights ? 1 : 0, bPrevMegaLights ? 1 : 0,
+			bPrevMegaLights ? TEXT("REREGISTERED") : TEXT("MarkRenderStateDirty"));
+
+		// v1.0.51: next-tick verification log so we can SEE what the runtime proxy ended up with
+		// after the reregister/markdirty. The component value above is the GAME-thread value; this
+		// reads it again one tick later to confirm it survived render-thread setup.
+		TWeakObjectPtr<const ARebusFixtureActor> WeakSelf(this);
+		GetWorld()->GetTimerManager().SetTimerForNextTick(
+			[WeakSelf]()
+			{
+				const ARebusFixtureActor* Self = WeakSelf.Get();
+				if (!Self || !Self->SpotLight) return;
+				const UMaterialInterface* LightFnMat = Self->SpotLight->LightFunctionMaterial;
+				const UTextureLightProfile* Ies = Self->SpotLight->IESTexture;
+				UE_LOG(LogRebusVisualiser, Log,
+					TEXT("Fixture %s cookie NEXT-TICK verify: bAllowMegaLights=%d castShadows=%d castVolumetricShadow=%d intensity=%.1f units=%d attenRadius=%.0f outerCone=%.1f LightFn=%s IES=%s"),
+					*Self->FixtureId,
+					Self->SpotLight->bAllowMegaLights ? 1 : 0,
+					Self->SpotLight->CastShadows ? 1 : 0,
+					Self->SpotLight->bCastVolumetricShadow ? 1 : 0,
+					Self->SpotLight->Intensity,
+					(int32)Self->SpotLight->IntensityUnits,
+					Self->SpotLight->AttenuationRadius,
+					Self->SpotLight->OuterConeAngle,
+					LightFnMat ? *LightFnMat->GetPathName() : TEXT("nullptr"),
+					Ies ? *Ies->GetName() : TEXT("nullptr"));
+			});
 	}
 	else
 	{
@@ -2111,10 +2233,19 @@ void ARebusFixtureActor::ApplyCurrentGoboToLightFn()
 		const bool bPrevMegaLights = SpotLight->bAllowMegaLights != 0;
 		SpotLight->bAllowMegaLights = 1;
 		SpotLight->SetLightFunctionMaterial(nullptr);
-		SpotLight->MarkRenderStateDirty();
+		// v1.0.51: ReregisterComponent on the OFF->ON transition for the same proxy-baked reason.
+		if (!bPrevMegaLights)
+		{
+			SpotLight->ReregisterComponent();
+		}
+		else
+		{
+			SpotLight->MarkRenderStateDirty();
+		}
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("Fixture %s gobo cookie: lightFn=nullptr (Open / clear). bAllowMegaLights=%d (was %d, restored to MegaLights path)."),
-			*FixtureId, SpotLight->bAllowMegaLights ? 1 : 0, bPrevMegaLights ? 1 : 0);
+			TEXT("Fixture %s gobo cookie: lightFn=nullptr (Open / clear). bAllowMegaLights=%d (was %d, %s to MegaLights path)."),
+			*FixtureId, SpotLight->bAllowMegaLights ? 1 : 0, bPrevMegaLights ? 1 : 0,
+			bPrevMegaLights ? TEXT("MarkRenderStateDirty") : TEXT("REREGISTERED restoring"));
 	}
 }
 

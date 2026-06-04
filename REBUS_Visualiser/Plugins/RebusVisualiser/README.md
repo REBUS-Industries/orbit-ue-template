@@ -449,6 +449,71 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Footprint cookie diagnostics + MegaLights reregister + verified-no-aux-lights (v1.0.51).**
+> v1.0.50 set `bAllowMegaLights=0` + `MarkRenderStateDirty()` to route the SpotLight through the
+> standard deferred path so `LightFunctionMaterial` (the `MI_Light` cookie MID) would actually
+> render. The user reported the cookie still wasn't visible on the lit floor pool, suspecting
+> competing/duplicate light sources. This release does three things in priority order:
+>
+> 1. **Verified — no aux lights enter from the Orbit import path.** Walked
+>    `OrbitConnector/Source/OrbitConnectorRuntime/Private/OrbitImportSubsystem.cpp`
+>    (`SpawnNodeRecursive`). The recursive node walker only acts on `Node.MeshIndex != INDEX_NONE`
+>    and constructs `UStaticMeshComponent` only — it never calls
+>    `UglTFRuntimeAsset::LoadPunctualLight`. So even if an Orbit-imported glTF carries
+>    `KHR_lights_punctual` nodes (some fixture exports do), they are NOT spawned as
+>    `UPointLightComponent`/`USpotLightComponent` siblings on the import root, and therefore are
+>    not tagged with the fixture's objectId, and therefore are not bound onto the
+>    `ARebusFixtureActor` via `BindOrbitComponents`. This rules out the "aux import light washes
+>    out the cookie" hypothesis at the architectural level. We still report any sibling light
+>    found at runtime as a Warning (see (3)) — if a future code path ever attaches one, we'll see
+>    it immediately.
+>
+> 2. **Stronger MegaLights opt-out via `ReregisterComponent` on the transition.**
+>    `bAllowMegaLights` is read by `FLightSceneInfo` at PROXY-CREATION time
+>    (`Engine/Source/Runtime/Renderer/Private/LightSceneInfo.cpp:55` —
+>    `bAllowMegaLights = InLightSceneInfo->Proxy->AllowMegaLights()`), so the flag must be present
+>    on a freshly-created proxy to take effect. `MarkRenderStateDirty()` SHOULD schedule a
+>    deferred proxy recreate via `LightComponent`'s render-state lifecycle, but the user's
+>    report suggests that in practice the proxy state was stale. v1.0.51 now calls
+>    `SpotLight->ReregisterComponent()` specifically on the OFF→ON / ON→OFF transition (NOT every
+>    gobo update — that would be wasteful), which guarantees `DestroyRenderState_Concurrent` +
+>    `CreateRenderState_Concurrent` and a fresh proxy with the new `bAllowMegaLights`. Cost: a
+>    single one-frame light blackout on the toggle. Within-gobo-active updates (texture / rotation
+>    changes while the cookie is already on) still use the lightweight `MarkRenderStateDirty()`.
+>
+> 3. **`Rebus.DumpFixtureLights` console command (always-on diagnostic).** Dumps to
+>    `LogRebusVisualiser` for every fixture in every game/PIE/editor world: SpotLight properties
+>    (`visible / intensity / units / attenRadius / inner+outerCone / castShadows /
+>    bCastVolumetricShadow / bAllowMegaLights / LightFunctionMaterial path / IESTexture / mobility`),
+>    ANY sibling `ULightComponent` on the actor (Warning level — these are the duplication
+>    smoking-gun), the bound Orbit components (count, and any that are `ULightComponent` — flagged
+>    as Warning), and total `USceneComponent` count. World-level header line lists competing scene
+>    lights (sky / directional, anything not on a fixture) and reports the relevant CVars:
+>    `r.SupportLightFunctions`, `r.LightFunctionAtlas.Enabled`, `r.MegaLights.Allow`,
+>    `r.MegaLights.LightFunctions`, `r.MegaLights.Volume`. Run after setting a gobo (`SetFixtureGobo`
+>    with a real `index`) and paste the output — we can tell at a glance whether the proxy
+>    state is what we set, whether a sibling light is leaking, and which scalability CVar is in
+>    the way.
+>
+> Also added: a **next-tick verification log** (`FTimerManager::SetTimerForNextTick`) inside
+> `ApplyCurrentGoboToLightFn` that re-reads the SpotLight one frame after the
+> reregister/markdirty and emits:
+> `Fixture <id> cookie NEXT-TICK verify: bAllowMegaLights=%d castShadows=%d
+> castVolumetricShadow=%d intensity=%.1f units=%d attenRadius=%.0f outerCone=%.1f LightFn=%s
+> IES=%s`. The component-thread value above prints the GAME-thread state; this prints what the
+> NEXT tick sees (after the deferred render-state work has run on the render thread). The
+> existing apply-cookie log now ends with `REREGISTERED` (transition) or
+> `MarkRenderStateDirty` (within-gobo update) instead of the v1.0.50 unconditional `toggled for
+> light function`.
+>
+> **What to look for in the output.** If `bAllowMegaLights=0` on the NEXT-TICK line and
+> `LightFn=/Game/.../MI_Light` and `castShadows=1`, the SpotLight is correctly set up — any
+> remaining cookie-invisible symptom is either (a) a competing scene light (check the world's
+> competing-lights count and dirlight/sky values), (b) a SIBLING LIGHT Warning on the fixture
+> (regression — paste it back), (c) `r.SupportLightFunctions=0` (scalability low), or (d) the
+> floor material doesn't receive standard deferred lighting. None of those are this plugin's
+> fault and we have direct evidence pointing at the right place.
+
 > **Footprint gobo via MegaLights opt-out + gobo/animation-wheel rotation wire (v1.0.50).** Two
 > deliverables:
 >

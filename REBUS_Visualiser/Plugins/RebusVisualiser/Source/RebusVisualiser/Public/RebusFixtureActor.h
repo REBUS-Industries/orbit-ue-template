@@ -267,6 +267,9 @@ public:
 	// for "Open"/"None"/"Empty"/"Clear"/"No Gobo"/"Open Hole"/"Off" and a few common variants.
 	// Public so RebusVisualiserSubsystem's RegisterFixtureGobos finalizer can tag Open entries.
 	static bool IsOpenSlotName(const FString& Name);
+	// v1.0.51: dump THIS fixture's SpotLight + any sibling light components for cookie debugging.
+	// Called by the Rebus.DumpFixtureLights console command (registered in RebusVisualiser.cpp).
+	void DumpLightStateForDebug() const;
 private:
 	void FetchAndAssignGobo(int32 GoboIndex);            // existing profile-wheel URL path
 	void FetchAndAssignGoboFromUrl(const FString& ImageUrl);

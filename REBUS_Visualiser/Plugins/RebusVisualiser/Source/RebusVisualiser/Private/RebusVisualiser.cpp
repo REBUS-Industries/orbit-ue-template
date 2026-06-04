@@ -2,12 +2,17 @@
 #include "RebusVisualiser.h"
 #include "RebusVisualiserLog.h"
 #include "RebusFixtureControlSubsystem.h"
+#include "RebusFixtureActor.h"
 #include "RebusSceneSettingsSubsystem.h"
 
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"
 #include "HAL/IConsoleManager.h"
+#include "Components/LightComponent.h"
+#include "Engine/DirectionalLight.h"
+#include "Engine/SkyLight.h"
 
 DEFINE_LOG_CATEGORY(LogRebusVisualiser);
 
@@ -17,6 +22,73 @@ namespace
 {
 	IConsoleCommand* GDriveOrbitModelsCommand = nullptr;
 	IConsoleCommand* GMeshBeamsCommand = nullptr;
+	IConsoleCommand* GDumpFixtureLightsCommand = nullptr;
+
+	// v1.0.51: `Rebus.DumpFixtureLights` -- enumerate every fixture's SpotLight and ANY sibling
+	// light components for cookie debugging. Also reports world-level competing lights (sky /
+	// directional) and the relevant LightFunction CVars so the user can paste one block and we
+	// can tell why a projected gobo cookie isn't visible on the lit floor pool.
+	void HandleDumpFixtureLightsCommand(const TArray<FString>& /*Args*/)
+	{
+		if (!GEngine) return;
+
+		auto ReadIntCVar = [](const TCHAR* Name) -> int32
+		{
+			IConsoleVariable* C = IConsoleManager::Get().FindConsoleVariable(Name);
+			return C ? C->GetInt() : -1;
+		};
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("DumpFixtureLights CVars: r.SupportLightFunctions=%d r.LightFunctionAtlas.Enabled=%d r.MegaLights.Allow=%d r.MegaLights.LightFunctions=%d r.MegaLights.Volume=%d"),
+			ReadIntCVar(TEXT("r.SupportLightFunctions")),
+			ReadIntCVar(TEXT("r.LightFunctionAtlas.Enabled")),
+			ReadIntCVar(TEXT("r.MegaLights.Allow")),
+			ReadIntCVar(TEXT("r.MegaLights.LightFunctions")),
+			ReadIntCVar(TEXT("r.MegaLights.Volume")));
+
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE && Ctx.WorldType != EWorldType::Editor)) continue;
+
+			// World-level competing lights: any ULightComponent that is NOT owned by a fixture is
+			// a candidate cookie wash-out source. A bright skylight or directional light will dilute
+			// the projected gobo's dark cells -- not a duplication, but a contrast killer.
+			int32 OtherLights = 0;
+			int32 SkyLights = 0;
+			int32 DirLights = 0;
+			for (TActorIterator<AActor> It(World); It; ++It)
+			{
+				AActor* A = *It;
+				if (!A || A->IsA(ARebusFixtureActor::StaticClass())) continue;
+				TArray<ULightComponent*> Lights;
+				A->GetComponents<ULightComponent>(Lights);
+				for (const ULightComponent* L : Lights)
+				{
+					if (!L || !L->IsVisible() || L->Intensity <= 0.f) continue;
+					++OtherLights;
+					if (L->GetClass()->GetName().Contains(TEXT("DirectionalLight"))) ++DirLights;
+					if (L->GetClass()->GetName().Contains(TEXT("SkyLight"))) ++SkyLights;
+				}
+			}
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("DumpFixtureLights world '%s': competing scene lights (not fixtures) = %d (sky=%d directional=%d). Bright skylight/dirlight dilutes projected gobo contrast on the lit pool."),
+				*World->GetName(), OtherLights, SkyLights, DirLights);
+
+			// Per-fixture dump.
+			int32 FixtureCount = 0;
+			for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+			{
+				if (const ARebusFixtureActor* F = *It)
+				{
+					F->DumpLightStateForDebug();
+					++FixtureCount;
+				}
+			}
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("DumpFixtureLights world '%s': dumped %d fixture(s)."),
+				*World->GetName(), FixtureCount);
+		}
+	}
 
 	// v1.0.47: `Rebus.MeshBeams [0|1]` -- live toggle for the visible Epic beam canvas, so you can
 	// A/B against the SpotLight's VSM-shadowed fog beam (the source of the truss-gap shafts inside
@@ -87,6 +159,16 @@ void FRebusVisualiserModule::StartupModule()
 			 "Usage: Rebus.MeshBeams [0|1]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleMeshBeamsCommand),
 		ECVF_Default);
+
+	GDumpFixtureLightsCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.DumpFixtureLights"),
+		TEXT("Dump every fixture's SpotLight + any sibling/aux lights to LogRebusVisualiser, plus "
+			 "world-level competing lights (sky/directional) and the relevant LightFunction CVars. "
+			 "Use this when the projected gobo cookie isn't visible on the lit floor pool to see "
+			 "whether the proxy state is what we set (bAllowMegaLights, LightFunctionMaterial, "
+			 "CastShadows) and whether a competing/aux light is washing it out."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpFixtureLightsCommand),
+		ECVF_Default);
 }
 
 void FRebusVisualiserModule::ShutdownModule()
@@ -100,6 +182,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GMeshBeamsCommand);
 		GMeshBeamsCommand = nullptr;
+	}
+	if (GDumpFixtureLightsCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GDumpFixtureLightsCommand);
+		GDumpFixtureLightsCommand = nullptr;
 	}
 
 	UE_LOG(LogRebusVisualiser, Log, TEXT("RebusVisualiser module shut down."));
