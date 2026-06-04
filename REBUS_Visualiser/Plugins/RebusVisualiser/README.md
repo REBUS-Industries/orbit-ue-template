@@ -593,6 +593,49 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Focus now pulls the beam / gobo in and out of focus (v1.0.64).** User report after the
+> v1.0.63 iris+frost fix: *"Focus doesnt do anything. can it pull a beam or gobo in and out of
+> focus."* Before v1.0.64 `ApplyFocus` only stored the value in `Focus.Current` for the visual
+> pipeline to consume -- nothing read it. The fix wires Focus into BOTH the GoboRT multi-tap
+> blur (v1.0.63's gobo softening) AND the SpotLight inner-cone / source-radius softening, so
+> the effect is visible whether or not a gobo is loaded.
+>
+> **Convention: BIPOLAR around 0.5.** `Focus = 0.5` is sharp (matches the
+> `ResetAnimatedToDefaults` snap value, so a freshly-spawned fixture is always in focus). Either
+> direction from 0.5 progressively defocuses; `Focus = 0` or `Focus = 1` is maximum defocus.
+> This mirrors how a real stage moving light's focus knob behaves -- sweeping through the focal
+> plane goes from soft → sharp → soft. The portal contract is unchanged
+> (`{"type":"SetFixtureFocus", "focus": 0..1, "fadeMs"?}`); only the visual interpretation gains
+> teeth.
+>
+> **What v1.0.64 changes.**
+>
+> 1. **`OnGoboRTUpdate` blur fold.** `DefocusNorm = clamp(|Focus.Current - 0.5| * 2, 0, 1)`
+>    additively combines with `FrostNorm` into a single `BlurNorm` (clamped to 1) that drives
+>    the existing v1.0.63 multi-tap pass. Either alone reaches max softening; both together
+>    still cap at `BlurNorm = 1` so the tap offset never escapes the gobo's circular boundary.
+>    Re-using the same path avoids a second 8-tap draw call.
+> 2. **`RecomputeConeAngles` soften fold.** Same `DefocusNorm` adds into the inner-cone /
+>    source-radius `SoftenAmount`. Without a gobo, this is what makes "defocus the beam" visible
+>    -- the penumbra widens, the inner cone contracts toward the outer, the source disc grows
+>    (4× at max combined Frost+defocus). With a gobo, the cookie blur AND the cone softening
+>    both apply.
+> 3. **`ApplyFocus` redraw kick.** Mirrors `ApplyIris` / `ApplyFrost` from v1.0.63: instant
+>    single-shot changes call `RecomputeConeAngles()` AND `GoboRT->UpdateResource()` so the cone
+>    and cookie reflect the new focus immediately; fades fall through the `Tick` `bConeAnim`
+>    path, which now includes `Focus.Tick()` (previously ticked separately with no down-stream
+>    effect).
+>
+> **Why bipolar instead of monotonic.** A unipolar focus (0 = soft, 1 = sharp) is more natural
+> on a generic slider, but stage moving lights physically have a focus position that sweeps
+> THROUGH the focal plane -- 0 is "near focus", 1 is "far focus", and the gobo is sharpest
+> somewhere in between (where the lens converges the image at the reference throw distance).
+> Defaulting to 0.5 = sharp is the conservative interpretation that matches GDTF "Focus 1"
+> conventions and gives the user predictable behaviour: sweep focus 0→1 and the gobo goes from
+> very soft → sharp at midpoint → very soft. If the portal needs monotonic semantics, the simple
+> change is `DefocusNorm = 1.f - Focus.Current` in `OnGoboRTUpdate` + `RecomputeConeAngles` (and
+> drop the abs/×2).
+>
 > **Iris circular crop + Frost gobo blur (v1.0.63).** User report after the v1.0.62 shutter
 > fix: *"When we have a gobo in. Iris is zooming instead of circular cropping like an iris
 > would. Frost is not working when a gobo is in."* Both effects had the same root cause — the

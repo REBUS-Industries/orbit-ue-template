@@ -1739,18 +1739,26 @@ void ARebusFixtureActor::RecomputeConeAngles()
 		InnerRatio = (float)(Profile.Photometrics.BeamAngle.GetValue() / Profile.Photometrics.FieldAngle.GetValue());
 		InnerRatio = FMath::Clamp(InnerRatio, 0.05f, 0.98f);
 	}
-	const float FrostSoften = FMath::Lerp(1.f, 0.2f, FMath::Clamp(Frost.Current, 0.f, 1.f));
+	// v1.0.64: Focus (bipolar around 0.5) contributes a defocus amount that ADDITIVELY combines
+	// with Frost to soften the inner cone and enlarge the apparent source. This is what makes
+	// "pull the beam in/out of focus" visible WITHOUT a gobo -- defocused -> wider penumbra,
+	// soft edge; sharp -> crisp edge. Combined amount is clamped to 1 so either alone (or both
+	// together) reaches the same maximum softening (matches the GoboRT blur cap in OnGoboRTUpdate).
+	const float DefocusAmount = FMath::Clamp(FMath::Abs(Focus.Current - 0.5f) * 2.f, 0.f, 1.f);
+	const float SoftenAmount = FMath::Clamp(FMath::Clamp(Frost.Current, 0.f, 1.f) + DefocusAmount, 0.f, 1.f);
+	const float FrostSoften = FMath::Lerp(1.f, 0.2f, SoftenAmount);
 	const float InnerHalf = OuterHalf * InnerRatio * FrostSoften;
 
 	SpotLight->SetOuterConeAngle(OuterHalf);
 	SpotLight->SetInnerConeAngle(FMath::Min(InnerHalf, OuterHalf));
 
-	// Frost also enlarges the apparent source for softer penumbra. Scale the resolved base source
-	// radius (the lens-opening disc set in BuildSpotLight) so the beam-origin diameter stays
-	// consistent with the lens-flare disc; left untouched when no source size was known.
+	// Frost+defocus also enlarge the apparent source for softer penumbra. Scale the resolved
+	// base source radius (the lens-opening disc set in BuildSpotLight) so the beam-origin
+	// diameter stays consistent with the lens-flare disc; left untouched when no source size
+	// was known.
 	if (BaseSourceRadiusUnreal >= 0.f)
 	{
-		SpotLight->SetSourceRadius(BaseSourceRadiusUnreal * FMath::Lerp(1.f, 4.f, FMath::Clamp(Frost.Current, 0.f, 1.f)));
+		SpotLight->SetSourceRadius(BaseSourceRadiusUnreal * FMath::Lerp(1.f, 4.f, SoftenAmount));
 	}
 
 	// Keep the cone-mesh beam sized to the same field half-angle (regenerates the frustum far
@@ -1837,9 +1845,20 @@ void ARebusFixtureActor::ApplyIris(float Iris01, float FadeSeconds)
 
 void ARebusFixtureActor::ApplyFocus(float Focus01, float FadeSeconds)
 {
-	// Stored + interpolated; visual focus deferred on the reference plugin (§5.2).
+	// v1.0.64: Focus is BIPOLAR around 0.5 (sharp at midpoint, max defocus at 0 or 1). The
+	// default reset value is 0.5 (ResetAnimatedToDefaults), so a fresh fixture starts perfectly
+	// focused. Defocus = abs(Focus - 0.5) * 2 folds into both the GoboRT multi-tap blur
+	// (OnGoboRTUpdate) and the inner-cone / source-radius soften (RecomputeConeAngles), so the
+	// effect is visible on the gobo AND on the no-gobo beam edge. Same redraw-kick contract as
+	// ApplyIris / ApplyFrost: instant single-shot changes need to refresh both the cone and the
+	// cookie immediately; fades fall through the Tick bConeAnim path.
 	Focus.SetTarget(FMath::Clamp(Focus01, 0.f, 1.f), FadeSeconds);
 	bAnimating = true;
+	if (FadeSeconds <= 0.f) RecomputeConeAngles();
+	if (bGoboActive && GoboRT && FadeSeconds <= 0.f)
+	{
+		GoboRT->UpdateResource();
+	}
 }
 
 void ARebusFixtureActor::ApplyFrost(float Frost01, float FadeSeconds)
@@ -2344,14 +2363,21 @@ void ARebusFixtureActor::OnGoboRTUpdate(UCanvas* Canvas, int32 Width, int32 Heig
 	const FVector2D CoordSize(1.f, 1.f);
 	const FVector2D Pivot(0.5f, 0.5f);
 
-	// ---- Pass 1: gobo draw (centre tap + frost-scaled ring taps) ----------------------------
+	// ---- Pass 1: gobo draw (centre tap + (frost+defocus)-scaled ring taps) ------------------
+	// v1.0.64: Focus is bipolar around 0.5 (sharp at midpoint, max defocus at 0 or 1). Defocus
+	// is folded ADDITIVELY into the same multi-tap blur Frost already drives -- both produce a
+	// soft gobo halo, so re-using the path avoids a second 8-tap pass. The combined amount is
+	// clamped to 1 so the maximum tap offset stays inside the gobo's circular boundary regardless
+	// of whether the softness came from frost, defocus, or both.
 	const float FrostNorm = FMath::Clamp(Frost.Current, 0.f, 1.f);
-	const int32 RingTaps = (FrostNorm > KINDA_SMALL_NUMBER) ? 8 : 0;
+	const float DefocusNorm = FMath::Clamp(FMath::Abs(Focus.Current - 0.5f) * 2.f, 0.f, 1.f);
+	const float BlurNorm = FMath::Clamp(FrostNorm + DefocusNorm, 0.f, 1.f);
+	const int32 RingTaps = (BlurNorm > KINDA_SMALL_NUMBER) ? 8 : 0;
 	const int32 TotalTaps = 1 + RingTaps;
-	// Offset is a fraction of the RT side -- small at low frost, ~2.5% of RT (~13 px on a 512 RT,
-	// which projects to a noticeable halo at typical throws) at max frost. Keep small enough not
+	// Offset is a fraction of the RT side -- small at low blur, ~2.5% of RT (~13 px on a 512 RT,
+	// which projects to a noticeable halo at typical throws) at max blur. Keep small enough not
 	// to bleed off the gobo's circular boundary.
-	const float TapOffsetPx = FrostNorm * (Side * 0.025f);
+	const float TapOffsetPx = BlurNorm * (Side * 0.025f);
 	const float TapAlpha = 1.f / (float)TotalTaps;
 	const FLinearColor TapTint(1.f, 1.f, 1.f, TapAlpha);
 
@@ -2885,8 +2911,12 @@ void ARebusFixtureActor::Tick(float DeltaSeconds)
 
 	const bool bMotionAnim = PanDeg.Tick(DeltaSeconds) | TiltDeg.Tick(DeltaSeconds);
 	const bool bIntensityAnim = Dimmer.Tick(DeltaSeconds) | ColorR.Tick(DeltaSeconds) | ColorG.Tick(DeltaSeconds) | ColorB.Tick(DeltaSeconds);
-	const bool bConeAnim = ZoomDeg.Tick(DeltaSeconds) | Iris.Tick(DeltaSeconds) | Frost.Tick(DeltaSeconds);
-	Focus.Tick(DeltaSeconds);
+	// v1.0.64: Focus is now bipolar around 0.5 (sharp at midpoint, max defocus at 0 or 1) and
+	// folds into BOTH the multi-tap GoboRT blur (OnGoboRTUpdate) and the inner-cone / source-
+	// radius softening (RecomputeConeAngles) so the user gets a visible "pull in/out of focus"
+	// on both the gobo stencil AND the no-gobo beam edge. Hoisting Focus.Tick into bConeAnim
+	// drives the redraw + cone-recompute on every fade frame, matching how Frost is wired.
+	const bool bConeAnim = ZoomDeg.Tick(DeltaSeconds) | Iris.Tick(DeltaSeconds) | Frost.Tick(DeltaSeconds) | Focus.Tick(DeltaSeconds);
 
 	// v1.0.53: integrate the gobo image rotation into a per-tick angle that is consumed by the
 	// gobo RT redraw (OnGoboRTUpdate draws CurrentGoboTexture into GoboRT rotated by GoboAngle).
