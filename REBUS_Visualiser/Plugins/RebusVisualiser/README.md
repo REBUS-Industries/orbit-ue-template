@@ -370,6 +370,48 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 > pan/tilt/colour/dimmer, Orbit-model binding, no self-shadow. **IES path chosen: true runtime
 > `UTextureLightProfile`** (already in place), not an angle approximation — the accurate option.
 
+> **Epic's REAL DMX beam assets, byte-for-byte (v1.0.43).** Instead of *reproducing* the DMX look,
+> the visible beam now uses Epic's **actual** DMX Fixtures content when it's installed: the official
+> beam canvas mesh **`SM_Beam_RM`** + the official **`MI_Beam`** instance of **`M_Beam_Master`**
+> (the world-space, object-transform-driven raymarch that uses `MF_WSIntersection`/`MF_BeamStepSize`/
+> `MF_JitterOffset`). Verified on-disk object paths (UE 5.7, mount `/DMXFixtures`):
+> - `/DMXFixtures/LightFixtures/DMX_Materials/MI_Beam.MI_Beam` (master `…/Masters/M_Beam_Master`)
+> - `/DMXFixtures/LightFixtures/Meshes/SM_Beam_RM.SM_Beam_RM`
+> - (lens content is also present: `…/DMX_Materials/MI_Lens`, lens meshes `…/Meshes/SM_*_Lens`)
+>
+> **How it's wired (`ARebusFixtureActor`).** `BuildBeamCone` still builds the procedural cone +
+> `M_RebusBeam` as the **fallback canvas**, then `TryBuildEpicBeam()` attempts to load Epic's assets
+> (cook-safe CDO `FObjectFinder`, else a config-overridable runtime `LoadObject`). On success it
+> spawns an `EpicBeamCanvas` `UStaticMeshComponent` (`SM_Beam_RM` + a `MID` of `MI_Beam`), **hides**
+> the procedural cone, and logs `using Epic M_LightBeam (MI_Beam + SM_Beam_RM)`; on failure it logs
+> `Epic DMX content NOT found … using fallback beam (M_RebusBeam)`. **The active path is Epic's beam.**
+>
+> **Param mapping (our drives → `M_Beam_Master`, mirrors `ADMXFixtureActor::FeedFixtureData`):**
+> - colour × dimmer × shutter-gate → **`DMX Color`** (vector) + **`DMX Max Light Intensity`** (scalar)
+> - SpotLight throw (`AttenuationRadius`) → **`DMX Max Light Distance`**
+> - lens radius (`ResolveLensDiameterMeters`, floored) → **`DMX Lens Radius`**
+> - raymarch quality → **`DMX Quality Level`** = 1.0 (Epic "High")
+> - pan/tilt/head (v1.0.34 ground truth) → the canvas **world transform**: `DriveEpicBeamFromSpotLight`
+>   rides the live `USpotLightComponent` (origin = lens, mesh-local length axis → emission forward via
+>   `FQuat::FindBetweenNormals`), and **scales `SM_Beam_RM` up** to enclose the cone (length × far
+>   radius from the IES field angle). Because `M_Beam_Master` defines the cone in world space from its
+>   params + the component transform, an over-sized canvas only adds coverage — it never distorts the
+>   beam, so the shaft is robust at every camera angle including close/inside.
+>
+> **IES preserved:** the `USpotLightComponent` still uses our true runtime `UTextureLightProfile` —
+> we're ahead of stock DMX (which uses light-function cookies). v1.0.36 no-self-shadow is applied to
+> the Epic canvas too; v1.0.38 bounds/occluder flags match the procedural cone.
+>
+> **Install / cook.** The beam needs Epic's **DMX Fixtures** plugin content (the `DMXFixtures` plugin
+> is enabled in `REBUS_Visualiser.uproject`). The content folder
+> `Engine/Plugins/VirtualProduction/DMX/DMXFixtures/Content/LightFixtures` ships with the plugin; if a
+> build is missing it, install/repair the **DMX Fixtures** plugin via the Epic Games Launcher (Unreal
+> Engine → Installed → *Options* → enable the DMX/Virtual-Production components) or the **DMX** project
+> template. `/DMXFixtures/LightFixtures` is added to `+DirectoriesToAlwaysCook` (`DefaultGame.ini`) so
+> packaged builds include Epic's beam (it's only referenced at runtime). Optional path overrides:
+> `[RebusVisualiser] EpicDmxBeamMaterial=…` / `EpicDmxBeamMesh=…`. If the content is ever absent the
+> actor falls back cleanly to `M_RebusBeam` — no fabricated assets, fully reversible.
+
 ### `RenderQuality` scene property (runtime tiers)
 
 Push `SetSceneProperty name="RenderQuality" value="<tier>"` (case-insensitive; unknown values

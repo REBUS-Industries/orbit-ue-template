@@ -16,6 +16,7 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "ImageUtils.h"
 #include "UObject/ConstructorHelpers.h"
+#include "Misc/ConfigCacheIni.h"
 
 namespace
 {
@@ -58,6 +59,18 @@ namespace
 	// raymarch entry/exit rework in M_RebusBeam -- bounds were NOT the cause -- so this is kept small
 	// (just a little frustum-cull headroom for the elongated shaft), reduced from the v1.0.38 3x.
 	constexpr float RebusBeamBoundsScale = 1.5f;
+
+	// v1.0.43: Epic DMX beam (M_Beam_Master) "DMX Quality Level" feed = the raymarch step-size factor
+	// (lower is better). 1.0 == Epic's High quality (see ADMXFixtureActor::FeedFixtureData). The Epic
+	// beam canvas (SM_Beam_RM) is scaled UP by this margin so it always encloses our cone -- the
+	// world-space raymarch shape is param-driven, so over-coverage is free of visual distortion.
+	constexpr float RebusEpicBeamQuality = 1.0f;
+	constexpr float RebusEpicBeamCoverMargin = 1.15f;
+	// Verified-on-disk object paths for Epic's UE 5.7 DMX Fixtures content (mount /DMXFixtures). A
+	// config override ([RebusVisualiser] EpicDmxBeamMaterial/EpicDmxBeamMesh in DefaultGame.ini) lets
+	// a differing install relocate them without a recompile.
+	const TCHAR* RebusEpicBeamMaterialPath = TEXT("/DMXFixtures/LightFixtures/DMX_Materials/MI_Beam.MI_Beam");
+	const TCHAR* RebusEpicBeamMeshPath = TEXT("/DMXFixtures/LightFixtures/Meshes/SM_Beam_RM.SM_Beam_RM");
 
 	// Phase 2 (v1.0.33) raymarch tuning: view-ray march steps + per-step density seeded on the MID
 	// (StepCount/BeamDensity in M_RebusBeam's Custom HLSL). 32 steps is a good live/final balance.
@@ -130,6 +143,16 @@ ARebusFixtureActor::ARebusFixtureActor()
 	// LoadObject fallback). /Game/REBUS is also in DirectoriesToAlwaysCook (v1.0.30).
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> BeamMatFinder(TEXT("/Game/REBUS/Materials/M_RebusBeam.M_RebusBeam"));
 	if (BeamMatFinder.Succeeded()) BeamMaterial = BeamMatFinder.Object;
+
+	// v1.0.43 cook-safe hard refs to Epic's REAL DMX beam assets (installed under /DMXFixtures). When
+	// present, BuildBeamCone -> TryBuildEpicBeam uses Epic's SM_Beam_RM canvas + MI_Beam material as
+	// the visible beam; absent, these stay null and we fall back to the procedural cone + M_RebusBeam.
+	// FObjectFinder resolves in-editor/at-cook only; a missing path just leaves the ref null (a benign
+	// "failed to find" note) and the runtime path also tries a config-overridable LoadObject.
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> EpicBeamMatFinder(TEXT("/DMXFixtures/LightFixtures/DMX_Materials/MI_Beam.MI_Beam"));
+	if (EpicBeamMatFinder.Succeeded()) EpicBeamMaterial = EpicBeamMatFinder.Object;
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> EpicBeamMeshFinder(TEXT("/DMXFixtures/LightFixtures/Meshes/SM_Beam_RM.SM_Beam_RM"));
+	if (EpicBeamMeshFinder.Succeeded()) EpicBeamMesh = EpicBeamMeshFinder.Object;
 }
 
 void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
@@ -762,6 +785,16 @@ void ARebusFixtureActor::BuildBeamCone()
 		*FixtureId, BeamBaseRadiusUnreal, BeamConeLastFarRadius, BeamLengthUnreal, OuterHalf,
 		CurIntensity, bMeshBeamEnabled ? 1 : 0, DiamSrc,
 		ConeFwd.X, ConeFwd.Y, ConeFwd.Z, SpotFwd.X, SpotFwd.Y, SpotFwd.Z);
+
+	// v1.0.43: prefer Epic's REAL DMX beam (SM_Beam_RM + MI_Beam) when the DMX Fixtures content is
+	// installed. On success the procedural cone above becomes the hidden fallback (it stays built so
+	// the integration is fully reversible / robust to the content being removed). On failure we keep
+	// the M_RebusBeam cone as the visible beam.
+	bUsingEpicBeam = TryBuildEpicBeam();
+	if (bUsingEpicBeam && BeamCone)
+	{
+		BeamCone->SetVisibility(false);
+	}
 }
 
 void ARebusFixtureActor::UpdateBeamConeGeometry()
@@ -862,6 +895,13 @@ void ARebusFixtureActor::UpdateBeamConeGeometry()
 		BeamMID->SetScalarParameterValue(TEXT("LensRadius"), RB);
 		BeamMID->SetScalarParameterValue(TEXT("FarRadius"), RF);
 	}
+
+	// v1.0.43: zoom/iris changed the far radius -> re-scale Epic's canvas + re-push its distance/lens
+	// params so the Epic beam tracks the same cone the procedural mesh would have.
+	if (bUsingEpicBeam)
+	{
+		DriveEpicBeamFromSpotLight();
+	}
 }
 
 void ARebusFixtureActor::RefreshBeamEmissive()
@@ -884,6 +924,12 @@ void ARebusFixtureActor::RefreshBeamEmissive()
 	BeamMID->SetVectorParameterValue(TEXT("BeamColor"), Linear);
 	BeamMID->SetScalarParameterValue(TEXT("BeamIntensity"),
 		RebusMeshBeamMaxIntensity * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate * MeshBeamUserScale);
+
+	// v1.0.43: when Epic's DMX beam is the live path, push the same colour/dimmer/gate onto it too.
+	if (bUsingEpicBeam)
+	{
+		UpdateEpicBeamParams();
+	}
 }
 
 void ARebusFixtureActor::RefreshBeamSpatialParams()
@@ -932,6 +978,134 @@ void ARebusFixtureActor::DriveBeamConeFromSpotLight()
 	const FVector SpotLoc = SpotLight->GetComponentLocation();
 	BeamCone->SetWorldLocationAndRotation(SpotLoc, FRotationMatrix::MakeFromX(SpotFwd).ToQuat());
 	RefreshBeamSpatialParams(); // push the (now spotlight-aligned) world origin/dir to the raymarch MID
+
+	// v1.0.43: ride the Epic DMX beam canvas off the same ground-truth spotlight transform.
+	if (bUsingEpicBeam)
+	{
+		DriveEpicBeamFromSpotLight();
+	}
+}
+
+bool ARebusFixtureActor::TryBuildEpicBeam()
+{
+	// Resolve Epic's official DMX beam assets: prefer the cook-safe CDO hard refs (constructor
+	// FObjectFinder), else a runtime LoadObject by the verified /DMXFixtures path (config-overridable
+	// for non-standard installs). If either the material or the canvas mesh is missing, the DMX
+	// content isn't installed -> keep the M_RebusBeam fallback.
+	FString MatPath = RebusEpicBeamMaterialPath;
+	FString MeshPath = RebusEpicBeamMeshPath;
+	GConfig->GetString(TEXT("RebusVisualiser"), TEXT("EpicDmxBeamMaterial"), MatPath, GGameIni);
+	GConfig->GetString(TEXT("RebusVisualiser"), TEXT("EpicDmxBeamMesh"), MeshPath, GGameIni);
+
+	UMaterialInterface* EpicMat = EpicBeamMaterial ? EpicBeamMaterial.Get()
+		: LoadObject<UMaterialInterface>(nullptr, *MatPath);
+	UStaticMesh* EpicMesh = EpicBeamMesh ? EpicBeamMesh.Get()
+		: LoadObject<UStaticMesh>(nullptr, *MeshPath);
+	if (!EpicMat || !EpicMesh)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s beam: Epic DMX content NOT found (MI_Beam=%s SM_Beam_RM=%s) -- using fallback beam (M_RebusBeam). Install the DMX Fixtures plugin content to enable Epic's M_LightBeam."),
+			*FixtureId, EpicMat ? TEXT("ok") : *MatPath, EpicMesh ? TEXT("ok") : *MeshPath);
+		return false;
+	}
+
+	EpicBeamComp = NewObject<UStaticMeshComponent>(this, TEXT("EpicBeamCanvas"));
+	EpicBeamComp->SetupAttachment(FixtureRoot);
+	EpicBeamComp->RegisterComponent();
+	EpicBeamComp->SetStaticMesh(EpicMesh);
+	EpicBeamComp->SetMobility(EComponentMobility::Movable);
+	EpicBeamComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	EpicBeamComp->SetCastShadow(false);
+	EpicBeamComp->bCastDynamicShadow = false;
+	// Parity with the procedural cone (v1.0.36/v1.0.38): never occlude, use own bounds, no
+	// self-volumetric-shadow into its own beam, and a modest bounds margin against frustum culling.
+	EpicBeamComp->bUseAttachParentBound = false;
+	EpicBeamComp->bUseAsOccluder = false;
+	EpicBeamComp->SetBoundsScale(RebusBeamBoundsScale);
+	EpicBeamComp->SetVisibility(bMeshBeamEnabled);
+	DisableSelfBeamVolumetricShadow(EpicBeamComp);
+
+	EpicBeamMID = UMaterialInstanceDynamic::Create(EpicMat, this);
+	EpicBeamComp->SetMaterial(0, EpicBeamMID);
+
+	// Pick the mesh-local axis that represents the beam length (largest local extent) so we can align
+	// SM_Beam_RM to the live emission regardless of how Epic authored its local orientation.
+	const FVector Ext = EpicMesh->GetBounds().BoxExtent;
+	EpicBeamLocalFwd = (Ext.X >= Ext.Y && Ext.X >= Ext.Z) ? FVector::ForwardVector
+		: (Ext.Y >= Ext.Z) ? FVector::RightVector : FVector::UpVector;
+
+	UpdateEpicBeamParams();
+	DriveEpicBeamFromSpotLight();
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s beam: using Epic M_LightBeam (MI_Beam + SM_Beam_RM) localExt=(%.1f,%.1f,%.1f) localFwd=(%.0f,%.0f,%.0f) src=%s."),
+		*FixtureId, Ext.X, Ext.Y, Ext.Z, EpicBeamLocalFwd.X, EpicBeamLocalFwd.Y, EpicBeamLocalFwd.Z,
+		EpicBeamMaterial ? TEXT("CDO") : TEXT("LoadObject"));
+	return true;
+}
+
+void ARebusFixtureActor::UpdateEpicBeamParams()
+{
+	if (!EpicBeamMID) return;
+
+	// Same shutter-gate the SpotLight/lens/cone use so the Epic beam strobes/blacks-out in lockstep.
+	float Gate = 1.f;
+	switch (ShutterMode)
+	{
+	case ERebusShutterMode::Closed: Gate = 0.f; break;
+	case ERebusShutterMode::Strobe: Gate = (ShutterPhase < 0.5f) ? 1.f : 0.f; break;
+	default: break;
+	}
+
+	const FLinearColor Col(
+		FMath::Clamp(ColorR.Current, 0.f, 1.f),
+		FMath::Clamp(ColorG.Current, 0.f, 1.f),
+		FMath::Clamp(ColorB.Current, 0.f, 1.f), 1.f);
+	const float Intensity = RebusMeshBeamMaxIntensity * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate * MeshBeamUserScale;
+
+	// Epic M_Beam_Master param vocabulary (mirrors ADMXFixtureActor::FeedFixtureData). Unknown params
+	// silently no-op, so this is safe across DMX content revisions.
+	EpicBeamMID->SetVectorParameterValue(TEXT("DMX Color"), Col);
+	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Max Light Intensity"), Intensity);
+	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Max Light Distance"), BeamLengthUnreal);
+	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Lens Radius"), BeamBaseRadiusUnreal);
+	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Quality Level"), RebusEpicBeamQuality);
+}
+
+void ARebusFixtureActor::DriveEpicBeamFromSpotLight()
+{
+	if (!SpotLight || !EpicBeamComp) return;
+
+	// Origin = lens (SpotLight world location); orient the mesh-local length axis onto the live
+	// emission forward (ground truth, exactly like DriveBeamConeFromSpotLight does for the cone).
+	const FVector SpotFwd = SpotLight->GetForwardVector().GetSafeNormal();
+	const FVector SpotLoc = SpotLight->GetComponentLocation();
+	const FQuat Rot = FQuat::FindBetweenNormals(EpicBeamLocalFwd, SpotFwd);
+	EpicBeamComp->SetWorldLocationAndRotation(SpotLoc, Rot);
+
+	// Scale Epic's canvas so it ENCLOSES our cone (length L along the local fwd axis, far radius RF
+	// laterally). M_Beam_Master raymarches the cone in world space from its params + the component's
+	// transform, so an over-sized canvas only adds coverage headroom -- it never distorts the beam.
+	if (UStaticMesh* SM = EpicBeamComp->GetStaticMesh())
+	{
+		const FVector Ext = SM->GetBounds().BoxExtent; // local half-extents
+		const float OuterHalf = ResolveOuterHalfDeg();
+		const float RF = FMath::Max(BeamLengthUnreal * FMath::Tan(FMath::DegreesToRadians(OuterHalf)),
+			BeamBaseRadiusUnreal + 0.1f);
+
+		const bool bFwdX = (EpicBeamLocalFwd.X != 0.f);
+		const bool bFwdY = (EpicBeamLocalFwd.Y != 0.f);
+		const float FwdExt = FMath::Max(bFwdX ? Ext.X : (bFwdY ? Ext.Y : Ext.Z), 1.f);
+		const float LatExt = FMath::Max(FMath::Min3(Ext.X, Ext.Y, Ext.Z), 1.f);
+		const float SFwd = (BeamLengthUnreal * RebusEpicBeamCoverMargin) / (2.f * FwdExt);
+		const float SLat = (RF * RebusEpicBeamCoverMargin) / (2.f * LatExt);
+
+		FVector S(SLat, SLat, SLat); // relative (mesh-local) scale; the fwd axis gets the length scale
+		if (bFwdX) S.X = SFwd; else if (bFwdY) S.Y = SFwd; else S.Z = SFwd;
+		EpicBeamComp->SetRelativeScale3D(S);
+	}
+
+	UpdateEpicBeamParams();
 }
 
 void ARebusFixtureActor::RefreshBeamShadowMode()
@@ -964,7 +1138,13 @@ void ARebusFixtureActor::SetMeshBeamEnabled(bool bEnabled)
 	bMeshBeamEnabled = bEnabled;
 	if (BeamCone)
 	{
-		BeamCone->SetVisibility(bEnabled);
+		// When Epic's beam is live the procedural cone stays hidden (it's the fallback canvas);
+		// otherwise it is the visible beam and follows the toggle.
+		BeamCone->SetVisibility(bEnabled && !bUsingEpicBeam);
+	}
+	if (EpicBeamComp)
+	{
+		EpicBeamComp->SetVisibility(bEnabled);
 	}
 	// Re-resolve the SpotLight volumetric state (mesh-only vs hero VSM fog shadow vs restored fog).
 	RefreshBeamShadowMode();

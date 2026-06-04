@@ -1,4 +1,4 @@
-﻿{
+{
 	"FileVersion": 3,
 	"EngineAssociation": "5.7",
 	"Category": "",
@@ -20,7 +20,8 @@
 		},
 		{
 			"Name": "glTFRuntime",
-			"Enabled": true
+			"Enabled": true,
+			"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/product/d2ed3709933d4608a3a8dd746cbc045d"
 		},
 		{
 			"Name": "OrbitConnector",
@@ -47,6 +48,10 @@
 			"TargetAllowList": [
 				"Editor"
 			]
+		},
+		{
+			"Name": "DMXFixtures",
+			"Enabled": true
 		}
 	]
 }

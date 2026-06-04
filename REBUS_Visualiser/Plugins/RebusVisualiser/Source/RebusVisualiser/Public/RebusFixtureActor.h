@@ -181,6 +181,18 @@ private:
 	// Re-orient + co-locate the cone mesh from the live SpotLight world transform (ground truth)
 	// so its +X (frustum opening) is the real emission forward, then re-push the raymarch feeds.
 	void DriveBeamConeFromSpotLight();
+	// v1.0.43: when Epic's official DMX Fixtures content is installed, build the visible beam from
+	// Epic's REAL SM_Beam_RM canvas mesh + MI_Beam (M_Beam_Master) world-space raymarch material,
+	// driven by our data. Returns true if the Epic assets loaded + the beam was wired (the live
+	// path), false to fall back to the procedural cone + M_RebusBeam.
+	bool TryBuildEpicBeam();
+	// Push our drives onto Epic's M_Beam_Master param vocabulary (DMX Color / DMX Max Light
+	// Intensity / DMX Max Light Distance / DMX Lens Radius / DMX Quality Level).
+	void UpdateEpicBeamParams();
+	// Ride the live SpotLight emission (origin=lens, length axis -> emission) and scale Epic's
+	// canvas mesh to ENCLOSE the cone (length x far radius). The M_Beam_Master raymarch is
+	// world-space/param-driven, so an over-sized canvas only affects coverage, not the beam shape.
+	void DriveEpicBeamFromSpotLight();
 	// Resolve the SpotLight's volumetric state for Phase-2 light-blocking shadows: hero shadow
 	// beams (bWantsVolumetricShadow + budget) get a modest fog VolumetricScatteringIntensity + Cast
 	// Volumetric Shadow (native VSM carves truss gaps on runtime meshes); everyone else is mesh-only
@@ -276,6 +288,19 @@ private:
 	UPROPERTY() TObjectPtr<UProceduralMeshComponent> BeamCone = nullptr;
 	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> BeamMID = nullptr;
 	UPROPERTY() TObjectPtr<UMaterialInterface> BeamMaterial = nullptr;
+
+	// Epic DMX official beam (v1.0.43). Hard CDO refs (so the cooker packages them) to Epic's REAL
+	// beam canvas mesh (SM_Beam_RM) + beam material (MI_Beam / M_Beam_Master) from the installed DMX
+	// Fixtures plugin content (/DMXFixtures/LightFixtures/...). Null when the DMX content isn't
+	// installed, in which case BuildBeamCone keeps the procedural cone + M_RebusBeam fallback.
+	// bUsingEpicBeam latches which path is live; EpicBeamComp/EpicBeamMID are the per-fixture canvas
+	// component + MID; EpicBeamLocalFwd is the mesh-local length axis aligned to the emission dir.
+	UPROPERTY() TObjectPtr<UStaticMesh> EpicBeamMesh = nullptr;
+	UPROPERTY() TObjectPtr<UMaterialInterface> EpicBeamMaterial = nullptr;
+	UPROPERTY() TObjectPtr<class UStaticMeshComponent> EpicBeamComp = nullptr;
+	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> EpicBeamMID = nullptr;
+	bool bUsingEpicBeam = false;
+	FVector EpicBeamLocalFwd = FVector::ForwardVector;
 
 	// Cone-beam geometry/state. BeamConeRest is the rest transform (mesh +Z -> beam forward, at the
 	// beam origin) composed with the head motion each RefreshMotion. LastFarRadius lets zoom ticks
