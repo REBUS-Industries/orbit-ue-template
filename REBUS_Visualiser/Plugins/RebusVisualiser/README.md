@@ -449,6 +449,39 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Gobos through Epic's beam + full pipeline diagnostics (v1.0.48).** Two co-existing breaks made
+> gobos invisible since the v1.0.43 Epic beam swap. (1) `GoboMID` (the legacy SpotLight light-function
+> MID) was declared but **never instantiated** — `M_RebusGobo` doesn't exist in content, so
+> `ApplyGoboTextureFromBytes`'s `if (Tex && GoboMID)` always fell through and the projection path
+> silently no-oped from day one. (2) Since v1.0.43 the **visible cone is Epic's `M_Beam_Master`**,
+> which exposes first-class gobo params (`DMX Gobo Disk Frosted` texture + `DMX Gobo Num Mask`,
+> `DMX Gobo Index`, `DMX Gobo Disk Rotation Speed`) — but we wrote NONE of them. Net effect: the gobo
+> rendered in zero places.
+>
+> **Fix.** `ApplyGoboTextureFromBytes` decodes the slot image (`FImageUtils::ImportBufferAsTexture2D`,
+> auto-detects PNG/JPEG/etc) into `CurrentGoboTexture` (`UTexture2D` cached on the actor) and calls
+> `ApplyCurrentGoboToEpicBeam`, which pushes onto `EpicBeamMID`:
+> ```
+> DMX Gobo Disk Frosted     = CurrentGoboTexture  (or EpicBeamDefaultGoboTex on clear)
+> DMX Gobo Num Mask         = 1                    (single-cell atlas == our whole texture)
+> DMX Gobo Index            = 0                    (cell 0 of 1)
+> DMX Gobo Disk Rotation Speed = CurrentGoboRotationSpeed
+> ```
+> `TryBuildEpicBeam` snapshots the MI parent's default `DMX Gobo Disk Frosted` into
+> `EpicBeamDefaultGoboTex` once, so a `SetFixtureGobo(clear)` reverts to Epic's open disc instead of
+> leaving the last-picked image stuck. `UpdateEpicBeamParams` calls `ApplyCurrentGoboToEpicBeam` on
+> every refresh so beam (re)builds, zoom changes, and re-aims don't drop the live gobo.
+> `ApplyGoboRotation(speed)` writes the rotation directly to the MID *and* caches it in
+> `CurrentGoboRotationSpeed`. The legacy light-function write is preserved (guarded) so a future
+> `M_RebusGobo` content asset would light up automatically — today it stays a no-op.
+>
+> **Diagnostics.** Always-on `LogRebusVisualiser` lines at every link of the pipeline
+> (`RegisterFixtureGobos chunk N/M`, per-slot `finalized: …`, `complete: …`, per-fixture
+> `SetFixtureGobo:`, `AssignGobo: source=…`, `gobo decode OK: → texture(W×H)`). The README's
+> §"Gobo pipeline diagnostics" bullet lists each line and the failure mode each missing line implies,
+> so the user can run once with the editor's Output Log filtered to `LogRebusVisualiser` and identify
+> the broken link top-to-bottom.
+
 > **Visible beam shadow gaps (v1.0.47).** Epic's `M_Beam_Master` is a pure unshadowed additive
 > raymarch (no `DistanceField`/VSM/`SceneTexture` sampling — verified by inspection), so the truss
 > "gap" shafts inside the cone come **exclusively** from the SpotLight's VSM-shadowed fog
@@ -659,10 +692,33 @@ The migration reference: <https://github.com/EpicGamesExt/PixelStreamingInfrastr
   data it uses the `Source` path; cooked builds fill platform data directly. If a shipping
   build can't load IES at runtime, pre-bake the profiles or fall back to the synthesized cone
   (already the default when no IES exists).
-- **Gobo projection** (`RebusFixtureActor::FetchAndAssignGobo`) decodes the wheel image to a
-  `UTexture2D` and feeds a light-function MID; the actual light-function material
-  (`M_RebusGobo` with a `GoboTexture` param + *Volumetric Fog Uses Light Function Atlas*) is a
-  content asset to author. Without it, gobo fetch is a no-op (lights still work).
+- **Gobo projection** (v1.0.48: visible in the Epic beam cone, no light-function asset needed).
+  `RebusFixtureActor::ApplyGoboTextureFromBytes` decodes the inline (or fetched) wheel image to a
+  `UTexture2D`, caches it as `CurrentGoboTexture`, and `ApplyCurrentGoboToEpicBeam` pushes it into
+  the **Epic `M_Beam_Master` MID** (`MI_Beam`) as a **single-cell atlas**:
+  `DMX Gobo Disk Frosted = <our texture>`, `DMX Gobo Num Mask = 1`, `DMX Gobo Index = 0`, and
+  `DMX Gobo Disk Rotation Speed = ApplyGoboRotation(speed)`. The gobo therefore appears **in the
+  visible beam cone** (Epic's raymarch sees it directly). On a beam (re)build/refresh,
+  `UpdateEpicBeamParams` re-pushes the cached gobo so motion/zoom changes don't drop it. On
+  `SetFixtureGobo` clear, the MI parent's default `DMX Gobo Disk Frosted` (snapshotted at
+  `TryBuildEpicBeam` into `EpicBeamDefaultGoboTex`) is restored — Epic's open disc, beam unmasked.
+  The LEGACY SpotLight light-function path (`GoboMID` + `M_RebusGobo`) is still declared but the
+  MID is never instantiated (no content asset), so it remains a no-op; the cpp writes are guarded
+  so a future `M_RebusGobo` asset would light up automatically.
+- **Gobo pipeline diagnostics** (v1.0.48). Always-on `LogRebusVisualiser` lines, in order of arrival:
+  1. `RegisterFixtureGobos '<libraryId>' chunk N/M (E entr(ies) in msg, A accumulated).`
+  2. `RegisterFixtureGobos '<libraryId>' finalized: wheelIndex=W wheel='WN'(kind=K) slot=S slotName='SN' bytes=B urlFallback=0|1` — one line per slot the worker assembled.
+  3. `RegisterFixtureGobos '<libraryId>' complete: N gobo image(s) across W wheel(s), B total bytes.`
+  4. `Fixture <id> SetFixtureGobo: bHasIndex=… goboIndex=… wheelIndex=… wheelName=… inlineGobos=N epicBeamMID=set|absent legacyGoboMID=absent (never instantiated)` — every wire-side `SetFixtureGobo` arrival.
+  5. `Fixture <id> AssignGobo: source=inline|inline-url|fallback …` — which path resolved.
+  6. `Fixture <id> gobo decode OK: B bytes -> texture(W×H) -> epicBeamMID=set|absent legacyGoboMID=…` — decode + Epic MID push receipt.
+  7. (On URL fallback) `Fixture <id> gobo URL fetched: B bytes, applied=0|1`.
+  Recipe: open the editor's Output Log, filter `LogRebusVisualiser`, change a gobo on a fixture in
+  Orbit, and read top-to-bottom. The first missing line identifies the broken link (no chunk = wire
+  not arriving; chunk but no finalize = base64/parse failure; finalize but no `SetFixtureGobo` =
+  control-channel `setFixtureGobo` not being sent; `SetFixtureGobo` but `inlineGobos=0` = the
+  fixture's `libraryFixtureId` doesn't match any cached library; `AssignGobo source=fallback` and
+  no decode = no inline match for `(wheelIndex, slot)` so it falls to the REST URL fetch).
 - **Spotlight source size (§8.3)** (`RebusFixtureActor::BuildSpotLight`) sizes the
   `USpotLightComponent` emitter so the **beam starts at the lens diameter** (a finite disc, not a
   point) — the beam and its volumetric scattering emanate from the lens and gain soft-shadow

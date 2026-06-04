@@ -243,6 +243,10 @@ private:
 	// Build + assign a gobo UTexture2D from decoded image bytes via the existing light-function
 	// MID path; returns true when a texture was applied.
 	bool ApplyGoboTextureFromBytes(const TArray<uint8>& Bytes);
+	// v1.0.48: push the cached gobo state (texture + Num Mask + Index + rotation) onto Epic's
+	// M_Beam_Master MID -- the actual visible cone -- so the user sees the gobo inside the beam.
+	// When CurrentGoboTexture is null, reverts to the MI parent's default (EpicBeamDefaultGoboTex).
+	void ApplyCurrentGoboToEpicBeam();
 	void FetchAndAssignGobo(int32 GoboIndex);            // existing profile-wheel URL path
 	void FetchAndAssignGoboFromUrl(const FString& ImageUrl);
 
@@ -267,7 +271,20 @@ private:
 	TArray<int32> MeshAxisBucket;
 
 	UPROPERTY() TObjectPtr<UTextureLightProfile> ActiveIesProfile = nullptr;
+	// LEGACY: a light-function MID that was meant to project the gobo on the lit floor pool. It was
+	// declared but never instantiated (no /Game/REBUS M_RebusGobo asset exists), so the SpotLight
+	// projection path silently no-oped from day one. v1.0.48 leaves the property in place and skips
+	// it cleanly when null; the user-visible gobo now goes through the Epic beam MID below.
 	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> GoboMID = nullptr;
+
+	// v1.0.48 GOBO state: cache the decoded slot image so we can re-push it every time the Epic
+	// beam MID is rebuilt or refreshed (UpdateEpicBeamParams) without re-decoding. EpicBeamDefault
+	// GoboTex snapshots the MI parent's "DMX Gobo Disk Frosted" at canvas-build time so a "clear
+	// gobo" can revert to Epic's default instead of leaving the last-selected image stuck. Rotation
+	// speed mirrors ApplyGoboRotation's input and feeds the MI's "DMX Gobo Disk Rotation Speed".
+	UPROPERTY() TObjectPtr<UTexture2D> CurrentGoboTexture = nullptr;
+	UPROPERTY() TObjectPtr<UTexture> EpicBeamDefaultGoboTex = nullptr;
+	float CurrentGoboRotationSpeed = 0.f;
 
 	// Emissive "glowing lens" flare disc: a thin plane at the beam origin, normal along the beam
 	// forward, parented under FixtureRoot and driven by BeamRest/head motion like the SpotLight so

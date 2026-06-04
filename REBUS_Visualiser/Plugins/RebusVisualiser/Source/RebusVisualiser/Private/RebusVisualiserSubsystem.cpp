@@ -918,6 +918,12 @@ void URebusVisualiserSubsystem::HandleSceneDefinition(const FString& Type, const
 			{
 				continue;
 			}
+			// v1.0.48: per-slot finalize log so the user can see EXACTLY which (wheel, slot)
+			// entries actually assembled, with their byte counts and url fallback presence.
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("RegisterFixtureGobos '%s' finalized: wheelIndex=%d wheel='%s'(kind=%s) slot=%d slotName='%s' bytes=%d urlFallback=%d"),
+				*LibraryId, Out.WheelIndex, *Out.Wheel, *Out.WheelKind, Out.Slot, *Out.SlotName,
+				Out.Bytes.Num(), Out.ImageUrl.IsEmpty() ? 0 : 1);
 			TotalBytes += Out.Bytes.Num();
 			WheelSet.Add(Out.Wheel);
 			Finalized.Gobos.Add(MoveTemp(Out));

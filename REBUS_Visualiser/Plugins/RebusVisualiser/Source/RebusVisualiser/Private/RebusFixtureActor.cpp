@@ -1120,6 +1120,15 @@ bool ARebusFixtureActor::TryBuildEpicBeam()
 	EpicBeamMID = UMaterialInstanceDynamic::Create(EpicMat, this);
 	EpicBeamComp->SetMaterial(0, EpicBeamMID);
 
+	// v1.0.48: snapshot the MI parent's default "DMX Gobo Disk Frosted" so a "clear gobo"
+	// (ApplyGobo with !bHasIndex) can restore Epic's default (T_GoboDisk_01_Frosted, the open
+	// disc that lets the beam through unmasked) instead of leaving the last-selected gobo stuck.
+	{
+		UTexture* DefTex = nullptr;
+		EpicMat->GetTextureParameterValue(FMaterialParameterInfo(TEXT("DMX Gobo Disk Frosted")), DefTex);
+		EpicBeamDefaultGoboTex = DefTex;
+	}
+
 	// Fixed local transform relative to the SpotLight: apex/lens at the spotlight origin (relLoc 0),
 	// canvas local emission (+Z, see comment block at top) mapped onto the spotlight's local +X
 	// emission, scale 1 (the WPO cone is built in unit space; any component scale breaks it). When
@@ -1179,6 +1188,10 @@ void ARebusFixtureActor::UpdateEpicBeamParams()
 	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Zoom"), ZoomFullDeg);
 	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Zoom Normalize"), 0.f); // DMX Zoom is in degrees
 	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Quality Level"), RebusEpicBeamQuality);
+
+	// v1.0.48: also re-push the gobo state here so a beam (re)build or refresh doesn't drop the
+	// live selection. ApplyCurrentGoboToEpicBeam picks the right texture + atlas indices.
+	ApplyCurrentGoboToEpicBeam();
 }
 
 void ARebusFixtureActor::DriveEpicBeamFromSpotLight()
@@ -1651,6 +1664,12 @@ void ARebusFixtureActor::ApplyShutter(ERebusShutterMode Mode, float RateHz)
 void ARebusFixtureActor::ApplyGoboRotation(float Speed)
 {
 	GoboRotationSpeed = FMath::Clamp(Speed, -1.f, 1.f);
+	// v1.0.48: route the rotation into Epic's M_Beam_Master MID so the in-cone gobo actually spins.
+	CurrentGoboRotationSpeed = GoboRotationSpeed;
+	if (EpicBeamMID)
+	{
+		EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), CurrentGoboRotationSpeed);
+	}
 	if (!FMath::IsNearlyZero(GoboRotationSpeed)) bAnimating = true;
 }
 
@@ -1698,12 +1717,24 @@ void ARebusFixtureActor::ApplyBeamVolumetrics(float Intensity, bool bCastVolumet
 
 void ARebusFixtureActor::ApplyGobo(int32 GoboIndex, bool bHasIndex, int32 WheelIndex, const FString& Wheel, float /*FadeSeconds*/)
 {
+	// v1.0.48: always-on log so the user can see SetFixtureGobo arrivals + which path they took.
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s SetFixtureGobo: bHasIndex=%d goboIndex=%d wheelIndex=%d wheelName='%s' inlineGobos=%d epicBeamMID=%s legacyGoboMID=%s"),
+		*FixtureId, bHasIndex ? 1 : 0, GoboIndex, WheelIndex, *Wheel,
+		InlineGobos.Gobos.Num(),
+		EpicBeamMID ? TEXT("set") : TEXT("absent"),
+		GoboMID ? TEXT("set") : TEXT("absent (never instantiated)"));
+
 	// Discrete: switch the slot immediately (a wheel slot can't be half-selected, §11).
 	if (!bHasIndex)
 	{
 		CurrentGoboIndex = INDEX_NONE;
 		CurrentGoboWheelIndex = WheelIndex;
 		CurrentGoboWheel = Wheel;
+		// v1.0.48: clear the Epic-beam gobo back to Epic's default (open frosted disc), AND clear
+		// the legacy light-function (no-op when GoboMID is null, which it always is today).
+		CurrentGoboTexture = nullptr;
+		ApplyCurrentGoboToEpicBeam();
 		if (SpotLight) SpotLight->SetLightFunctionMaterial(nullptr);
 		return;
 	}
@@ -1913,20 +1944,68 @@ const FRebusInlineGobo* ARebusFixtureActor::SelectInlineGobo(int32 Slot, int32 W
 
 bool ARebusFixtureActor::ApplyGoboTextureFromBytes(const TArray<uint8>& Bytes)
 {
-	if (!SpotLight || Bytes.Num() == 0) return false;
+	if (Bytes.Num() == 0)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s gobo decode: 0 bytes supplied; nothing to apply."), *FixtureId);
+		return false;
+	}
 
-	// Decode the bytes to a transient UTexture2D (auto-detects PNG/JPEG/etc) and feed it into
-	// the light-function MID -- the SAME assignment path the URL fetch uses. Projecting it as a
-	// true light-function needs a light-function material in content (M_RebusGobo with a
-	// Texture2D param); see README "Gobo decode" for the wiring.
+	// Decode the bytes to a transient UTexture2D (auto-detects PNG/JPEG/etc). v1.0.48: the result
+	// is the user-facing gobo image -- we route it INTO Epic's M_Beam_Master MID's "DMX Gobo Disk
+	// Frosted" (visible in the cone) rather than the legacy SpotLight light-function path
+	// (GoboMID was declared but never instantiated, so that path silently no-oped from day one).
 	UTexture2D* Tex = FImageUtils::ImportBufferAsTexture2D(Bytes);
-	if (Tex && GoboMID)
+	if (!Tex)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s gobo decode FAILED: %d bytes did not parse as a known image (PNG/JPEG/etc)."),
+			*FixtureId, Bytes.Num());
+		return false;
+	}
+
+	CurrentGoboTexture = Tex;
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s gobo decode OK: %d bytes -> texture(%dx%d) -> epicBeamMID=%s legacyGoboMID=%s"),
+		*FixtureId, Bytes.Num(), Tex->GetSizeX(), Tex->GetSizeY(),
+		EpicBeamMID ? TEXT("set") : TEXT("absent"),
+		GoboMID ? TEXT("set") : TEXT("absent (never instantiated)"));
+
+	ApplyCurrentGoboToEpicBeam();
+
+	// LEGACY: write the same texture to the light-function MID if (one day) it gets wired. Today
+	// GoboMID is always null, so this is a no-op; left here so a future M_RebusGobo can light up.
+	if (GoboMID && SpotLight)
 	{
 		GoboMID->SetTextureParameterValue(TEXT("GoboTexture"), Tex);
 		SpotLight->SetLightFunctionMaterial(GoboMID);
-		return true;
 	}
-	return false;
+	return true;
+}
+
+void ARebusFixtureActor::ApplyCurrentGoboToEpicBeam()
+{
+	if (!EpicBeamMID) return;
+
+	// Single-cell atlas mapping: each of our per-slot images becomes the WHOLE "atlas" with one
+	// cell ("DMX Gobo Num Mask=1, DMX Gobo Index=0"), so MF_DMXGobo samples the entire texture.
+	// On "clear" (CurrentGoboTexture==null) revert to Epic's MI default (T_GoboDisk_01_Frosted,
+	// the open disc that lets the beam through unmasked) cached at TryBuildEpicBeam time.
+	UTexture* TexToPush = CurrentGoboTexture ? static_cast<UTexture*>(CurrentGoboTexture.Get()) : EpicBeamDefaultGoboTex.Get();
+	if (TexToPush)
+	{
+		EpicBeamMID->SetTextureParameterValue(TEXT("DMX Gobo Disk Frosted"), TexToPush);
+	}
+	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Num Mask"), 1.f);
+	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Index"), 0.f);
+	EpicBeamMID->SetScalarParameterValue(TEXT("DMX Gobo Disk Rotation Speed"), CurrentGoboRotationSpeed);
+
+	UE_LOG(LogRebusVisualiser, Verbose,
+		TEXT("Fixture %s epic-beam gobo: tex=%s default=%s rot=%.2f"),
+		*FixtureId,
+		CurrentGoboTexture ? *CurrentGoboTexture->GetName() : TEXT("<default>"),
+		EpicBeamDefaultGoboTex ? *EpicBeamDefaultGoboTex->GetName() : TEXT("(none)"),
+		CurrentGoboRotationSpeed);
 }
 
 void ARebusFixtureActor::AssignGobo(int32 GoboIndex, int32 WheelIndex, const FString& WheelName)
@@ -1939,21 +2018,25 @@ void ARebusFixtureActor::AssignGobo(int32 GoboIndex, int32 WheelIndex, const FSt
 	{
 		if (Inline->Bytes.Num() > 0 && ApplyGoboTextureFromBytes(Inline->Bytes))
 		{
-			UE_LOG(LogRebusVisualiser, Verbose,
-				TEXT("Fixture %s gobo assigned (source=inline, reqWheelIdx=%d -> wheelIndex=%d wheel='%s', slot=%d, %d bytes)."),
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Fixture %s AssignGobo: source=inline reqWheelIdx=%d -> wheelIndex=%d wheel='%s' slot=%d bytes=%d"),
 				*FixtureId, WheelIndex, Inline->WheelIndex, *Inline->Wheel, Inline->Slot, Inline->Bytes.Num());
 			return;
 		}
 		// 2) Inline entry carries only a signed url fallback (or its bytes failed to decode).
 		if (!Inline->ImageUrl.IsEmpty())
 		{
-			UE_LOG(LogRebusVisualiser, Verbose,
-				TEXT("Fixture %s gobo assigned (source=inline-url, reqWheelIdx=%d -> wheelIndex=%d wheel='%s', slot=%d)."),
-				*FixtureId, WheelIndex, Inline->WheelIndex, *Inline->Wheel, Inline->Slot);
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Fixture %s AssignGobo: source=inline-url (bytes empty or decode failed) reqWheelIdx=%d -> wheelIndex=%d wheel='%s' slot=%d url=%s"),
+				*FixtureId, WheelIndex, Inline->WheelIndex, *Inline->Wheel, Inline->Slot, *Inline->ImageUrl);
 			FetchAndAssignGoboFromUrl(Inline->ImageUrl);
 			return;
 		}
 	}
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s AssignGobo: no inline match (reqWheelIdx=%d wheel='%s' slot=%d, inlineCount=%d) -> falling back to profile URL."),
+		*FixtureId, WheelIndex, *WheelName, GoboIndex, InlineGobos.Gobos.Num());
 
 	// 3) Fall back to the profile wheel's signed imageUrl (existing REST path; legacy single
 	//    gobo wheel -- the multi-wheel selectors apply to the inline cache above).
@@ -1990,7 +2073,8 @@ void ARebusFixtureActor::FetchAndAssignGoboFromUrl(const FString& ImageUrl)
 			ARebusFixtureActor* Self = WeakThis.Get();
 			if (!Self || !bOk || !Self->SpotLight) return;
 			const bool bApplied = Self->ApplyGoboTextureFromBytes(Bytes);
-			UE_LOG(LogRebusVisualiser, Verbose, TEXT("Fixture %s gobo image fetched (%d bytes, applied=%d)."),
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Fixture %s gobo URL fetched: %d bytes, applied=%d"),
 				*Self->FixtureId, Bytes.Num(), bApplied);
 		}));
 }
