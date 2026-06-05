@@ -346,6 +346,14 @@ public:
 	// Called from `BuildBeamCone` for the initial seed and from the `Rebus.BeamShadow*` CVar
 	// refresh sinks (which walk every fixture). Silently no-ops when BeamMID is null.
 	void RefreshBeamShadowParams();
+	// v1.0.108 -- push the three radial-attenuation scalars (BeamSharpness / BeamDensity /
+	// BeamFalloff) onto this fixture's BeamMID. Mirrors `RefreshBeamShadowParams` shape: called
+	// from `BuildBeamCone` after the initial constant-seeded push (so the live CVar wins over
+	// the constant) and from the `Rebus.BeamSharpness` / `Rebus.BeamDensity` /
+	// `Rebus.BeamFalloff` CVar refresh sinks (which walk every fixture). Silently no-ops when
+	// BeamMID is null. Cone-mesh geometry is NOT touched -- these knobs only reshape the
+	// radial Gaussian / axial falloff inside the existing cone volume.
+	void RefreshBeamRadialParams();
 private:
 	// v1.0.101 -- single-source-of-truth canonical zoom half-angle (degrees) for both the
 	// SpotLight outer-cone AND the procedural cone-mesh far-radius (and the Epic-beam DMX
@@ -361,6 +369,26 @@ private:
 	// cone or the lit footprint would shrink with it, defeating the entire fix).
 	float ResolveZoomHalfDeg(float ZoomFullDeg) const;
 	float ResolveOuterHalfDeg() const; // thin wrapper -- ResolveZoomHalfDeg(ZoomDeg.Current * 2.f). Kept for call-site readability.
+	// v1.0.108 -- inner-cone-vs-outer-cone ratio used by `RecomputeConeAngles` to derive
+	// `SpotLight->InnerConeAngle = OuterHalf * InnerRatio * FrostSoften`. Factored out so
+	// `UpdateBeamConeGeometry` (and `UpdateEpicBeamParams`) can size the visible cone-mesh
+	// FarRadius to the HALF-INTENSITY edge `(InnerHalf + OuterHalf)/2 = OuterHalf * (1 +
+	// InnerRatio) / 2` instead of the geometric outer cone (where the SpotLight's linear
+	// taper has already faded to zero). Returns the per-fixture ratio: photometrics
+	// `BeamAngle / FieldAngle` clamped to [0.05, 0.98] when both are present, else the
+	// `0.8` fallback that matches `RecomputeConeAngles`. Frost is INTENTIONALLY excluded
+	// here -- it softens the inner cone toward the outer (penumbra widening) but does NOT
+	// move the half-intensity edge that the visible cone-mesh should match. Iris is also
+	// excluded -- iris pinches the OUTER cone (handled by `ResolveZoomHalfDeg`) so its
+	// effect propagates through the OuterHalf the half-intensity formula scales.
+	float ResolveFootprintInnerRatio() const;
+	// v1.0.108 -- the half-intensity match angle (degrees) the visible cone-mesh should be
+	// sized to so its edge coincides with the bright floor disc the SpotLight's linear
+	// inner..outer taper produces. Equals `OuterHalf * (1 + ResolveFootprintInnerRatio()) /
+	// 2`. Both `UpdateBeamConeGeometry` and `UpdateEpicBeamParams` use this as the FarRadius
+	// base; the per-fixture `BeamConeRadiusScale` (default 1.0 since v1.0.108) is multiplied
+	// at the end so it stays a pure polish knob on top of the corrected geometry.
+	float ResolveBeamFootprintMatchHalfDeg() const;
 	void RefreshMotion();         // re-solve pan/tilt and push transforms to groups + light
 	// v1.0.68: per-component-axis drive. Each bound Orbit component carries its own bucketed
 	// motion axis (OrbitAxisBucket[i]) -- INDEX_NONE for base components (no motion), pan axis for

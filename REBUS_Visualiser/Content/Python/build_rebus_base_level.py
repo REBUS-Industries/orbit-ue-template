@@ -875,7 +875,18 @@ def _build_beam_master(mat):
         return s
 
     intensity = _scalar("BeamIntensity", 0.0, -140)
-    sharp = _scalar("BeamSharpness", 2.5, -60)
+    # v1.0.108 -- raised authored default 2.5 -> 6.0 so a freshly-regenerated
+    # `M_RebusBeam` master inherits the sharper Gaussian core that pinches the visible
+    # shaft to the bright floor disc edge (the v1.0.108 "cone size doesn't match the
+    # spotlight footprint" fix). The per-fixture MID seeds this scalar from the
+    # `Rebus.BeamSharpness` CVar via `RefreshBeamRadialParams` (RebusFixtureActor.cpp)
+    # at every spawn AND every CVar refresh -- so this authored default only matters
+    # for fixtures that bypass `BuildBeamCone`'s seed (none in the current pipeline)
+    # OR for the master's editor preview before any MID is created. Kept in sync with
+    # the constexpr `RebusBeamSharpness = 6.0f` in RebusFixtureActor.cpp so master-level
+    # tools (live shader tweaks in the editor) read the same default the runtime fixture
+    # would seed at spawn.
+    sharp = _scalar("BeamSharpness", 6.0, -60)
     falloff = _scalar("BeamFalloff", 1.6, 20)
     stepcount = _scalar("StepCount", 32.0, 100)
     density = _scalar("BeamDensity", 0.015, 180)

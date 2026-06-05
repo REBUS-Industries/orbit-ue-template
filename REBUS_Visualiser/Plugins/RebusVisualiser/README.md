@@ -594,6 +594,131 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Cone-mesh radius + raymarch sharpness match the lit footprint edge (half-intensity geometry) (v1.0.108).**
+>
+> User report (verbatim):
+>
+> > "The cone size and spotlight size are not the same, they should match."
+>
+> Reference image (saved): two procedural cone shafts on a marble floor; the
+> visible cone diameter at the floor plane reads ~2-3x larger than the bright floor
+> disc each beam produces. Now that v1.0.106 made `Rebus.PreferProceduralBeam 1`
+> the default, this mismatch is no longer hidden behind Epic's `MI_Beam` shaft and
+> is the user's headline visual complaint.
+>
+> **The math diagnosis -- why v1.0.101's `BeamConeRadiusScale` only got us
+> partway.** v1.0.101 already documented (correctly) that UE's
+> `USpotLightComponent` ramps brightness LINEARLY from `InnerConeAngle` (peak)
+> to `OuterConeAngle` (zero), so the visible bright disc on the floor sits at
+> roughly the half-intensity edge ~ `(InnerHalf + OuterHalf) / 2`. With the
+> default `InnerRatio = 0.8` (BeamAngle/FieldAngle when the GDTF profile carries
+> both, else fallback) the perceived disc edge sits at ~`0.9 * outer`, while the
+> v1.0.101..v1.0.107 procedural cone-mesh's far-radius was sized to `BeamLength
+> * tan(OuterHalf) * BeamConeRadiusScale` -- exactly `outer`. The cone-mesh
+> therefore reads ~10 % wider than the lit footprint by GEOMETRY alone (a
+> misalignment v1.0.101 surfaced as the operator-tunable
+> `Rebus.BeamConeRadiusScale 0.85..0.95` knob).
+>
+> But the v1.0.108 user image showed a 2-3x mismatch -- WAY beyond the 10 %
+> geometric gap. The dominant cause: the M_RebusBeam Custom HLSL raymarch's
+> radial cross-section was an extremely SOFT Gaussian (`core = exp(-rN^2 *
+> BeamSharpness)` with `BeamSharpness = 2.5` since v1.0.42). At `rN = 1` (the
+> geometric cone-mesh edge) the soft glow density is `exp(-2.5) = 8.2 %` of axis
+> density -- visible. At `rN = 0.7` it's 29 %, at `rN = 0.5` it's 54 %. So the
+> visible bright shaft was effectively painting the FULL cone-mesh interior --
+> reading as a fat soft cylinder filling the entire `OuterConeAngle` cone --
+> while the bright floor disc was being driven by the IES profile + the
+> SpotLight's linear inner..outer taper, which crashes to zero much faster.
+> The OuterConeAngle-sized cone-mesh + the soft Gaussian was the v1.0.101
+> 10 % gap MULTIPLIED by ~2-3x of soft-Gaussian filling.
+>
+> **What lands in v1.0.108.**
+>
+> | Surface | Behaviour |
+> | --- | --- |
+> | `UpdateBeamConeGeometry` FarRadius math (the heavy lift) | The cone-mesh's far-radius BASE is now `BeamLength * tan(MatchHalf)` where `MatchHalf = OuterHalf * (1 + InnerRatio) / 2` (the half-intensity ring -- new helper `ResolveBeamFootprintMatchHalfDeg()` factors `InnerRatio` out via the new `ResolveFootprintInnerRatio()`, mirroring the InnerRatio derivation in `RecomputeConeAngles` so the two paths share one source of truth by construction). With `InnerRatio = 0.8` the geometric base shrinks to `0.9 * OuterHalf`. `BeamConeRadiusScale` is multiplied at the end EXACTLY as before, so the per-fixture polish knob still works on top of the corrected base. The SpotLight's own `OuterConeAngle` is INTENTIONALLY UNTOUCHED -- the lit footprint, IES sampling, and 1/r^2 falloff continue to track the GDTF zoom-range specification verbatim. |
+> | `UpdateEpicBeamParams` `DMX Zoom` math | Same MatchHalf substitution -- the Epic-beam canvas (active when `Rebus.PreferProceduralBeam 0`) inherits the v1.0.108 visible-shaft-vs-lit-disc parity for free. Pre-v1.0.108 was `RebusEpicBeamZoomScale * BeamConeRadiusScale * SpotOuterHalfDeg`; v1.0.108 is `RebusEpicBeamZoomScale * BeamConeRadiusScale * MatchHalfDeg`. |
+> | `Rebus.BeamSharpness <float>` CVar (NEW, default `6.0`) | The dominant fix on top of the geometry. Drives the M_RebusBeam Custom HLSL `BeamSharpness` scalar -- the `core = exp(-rN^2 * BeamSharpness)` exponent. Default raised from 2.5 to 6.0 so the visible shaft pinches to ~60 % of the cone-mesh radius (where `core(rN=0.6) = exp(-2.16) = 11 %`, just past human-visible threshold for the additive accumulator). Recommended operator range: `[4..12]` -- 4 = soft / frosted look (the pre-v1.0.108 fat-cylinder shape), 12 = ultra-tight bright core (theatrical-mover hero look). Live -- the refresh sink (`RefreshBeamRadialParamsOnEveryFixture`) walks every Rebus fixture and re-pushes the BeamMID scalar; cone-mesh geometry is unchanged. |
+> | `Rebus.BeamDensity <float>` CVar (NEW, default `0.015`) | Per-step density gain on the same Custom HLSL `BeamDensity` scalar. Default unchanged from v1.0.40; exposed in v1.0.108 as a companion to `Rebus.BeamSharpness` for total-opacity tuning that doesn't touch the radial profile. Recommended `[0.005..0.06]`. |
+> | `Rebus.BeamFalloff <float>` CVar (NEW, default `1.6`) | Length-fade strength on the same Custom HLSL `BeamFalloff` scalar (`srcAtten = 1 / (1 + BeamFalloff * dn^2)`). Default unchanged from v1.0.40; exposed for the full radial+axial gradient knob set. Recommended `[0..4]`. |
+> | `RefreshBeamRadialParams()` per-fixture method (NEW, public) | One chokepoint that pushes the three radial-attenuation scalars onto `BeamMID`. Mirrors `RefreshBeamShadowParams` shape verbatim (per-fixture seed point in `BuildBeamCone` after the constexpr-defaulted seed, plus the three CVar refresh sinks). Idempotent / silent when BeamMID is null. |
+> | `Rebus.DumpFixtureZoom` per-fixture line | Now also reports `matchHalf=<deg>` (the v1.0.108 cone-mesh target half-angle), `footprintInnerRatio=<r>` (the InnerRatio fed into MatchHalf), and `BeamMID.Sharpness=<s> BeamMID.Density=<d> BeamMID.Falloff=<f>` (read back from the live MID -- proves the v1.0.108 push won the race against any portal/scene-property override; mirrors the `BeamMID.FarRadius` read-back v1.0.101 added). |
+> | Verbose `ApplyZoom` log | Now also reports `matchHalf=<deg>` so the operator can confirm at every zoom change that `coneFarRadius = BeamLength * tan(matchHalf) * BeamConeRadiusScale`. |
+>
+> **Operator migration -- BeamConeRadiusScale stays at 1.0.** The per-fixture
+> `BeamConeRadiusScale` knob STAYS at default `1.0`. Operators who tuned
+> `Rebus.BeamConeRadiusScale 0.85..0.95` per-show in v1.0.101..v1.0.107 to
+> compensate for the geometric outer-cone over-sizing will find their cones
+> TOO NARROW after v1.0.108 (the geometric base is already 10 % tighter from
+> the MatchHalf math, plus the visible Gaussian is ~60 % of the cone-mesh
+> radius rather than ~100 %, so a 0.9 user-applied scale stacks ~0.5x of the
+> v1.0.107 visible width). **Reset `Rebus.BeamConeRadiusScale 1.0`** when
+> upgrading to v1.0.108. The knob is now a polish lever, not the workaround
+> for a systemic gap.
+>
+> **What stays unchanged (deliberately).**
+>
+> * `SpotLight->OuterConeAngle` continues to track the GDTF zoom-range half-
+>   angle verbatim. The lit footprint, the IES sampling, and the 1/r^2 falloff
+>   are all anchored to the photometric truth -- v1.0.108 only narrows the
+>   VISIBLE shaft.
+> * `RecomputeConeAngles` continues to derive `InnerConeAngle = OuterHalf *
+>   InnerRatio * FrostSoften`. Frost is intentionally NOT applied in
+>   `ResolveFootprintInnerRatio()`: frost softens the inner cone toward the
+>   outer (penumbra widening) but does NOT move the half-intensity ring that
+>   the visible cone-mesh should match. The visible-shaft target stays at
+>   the photometric (Beam/Field) half-intensity edge regardless of frost
+>   level -- which is the intuitively correct behaviour (frost makes the
+>   shaft READ softer/wider via the Gaussian, not via the geometric base).
+> * `Rebus.BeamShadowSteps` / `BeamShadowStrength` / `BeamShadowBias` /
+>   `BeamShadowDebug` (v1.0.96 / v1.0.99 / v1.0.103 / v1.0.106 self-shadow
+>   trace) -- v1.0.108 does not touch the screen-space shadow trace; the
+>   trace continues to render on the now-pinched visible shaft.
+> * `Rebus.PreferProceduralBeam` (v1.0.106 default `1`) -- v1.0.108
+>   benefits BOTH paths. The procedural cone gets the heavy lift (Sharpness +
+>   MatchHalf both apply); the Epic beam gets MatchHalf via `DMX Zoom`. So an
+>   operator who flips `Rebus.PreferProceduralBeam 0` for an Epic-beam-
+>   specific show context still sees the v1.0.108 visible-shaft-vs-lit-disc
+>   parity.
+>
+> **Operator verification (mirrors the v1.0.101 checklist).**
+>
+> 1. Spawn a single moving-head fixture, point it straight down at the floor
+>    (or on a marble plane like the canonical user image).
+> 2. Push a narrow zoom (e.g. mid of the GDTF zoom range, ~10° full = 5° half).
+> 3. Look at the visible shaft disc on the floor vs the bright-disc lit edge.
+>    They should COINCIDE within ~5 % on the canonical test scene -- the
+>    visible cone-mesh edge sits at the bright-floor-disc edge, with the soft
+>    Gaussian fading further out as a halo (not a fat cylinder).
+> 4. Run `Rebus.DumpFixtureZoom` -- confirm `matchHalf < resolvedHalf`
+>    (typically `0.9 * resolvedHalf` for the default 0.8 InnerRatio),
+>    `coneFarRadiusBuilt == coneFarRadiusExpected` (within 0.5 cm), and
+>    `BeamMID.Sharpness == 6.000`.
+> 5. Push `Rebus.BeamSharpness 12` -- the visible bright shaft pinches further
+>    to a hairline core; the cone-mesh edge is still where the bright-disc
+>    edge was. Push `Rebus.BeamSharpness 2.5` -- restores the v1.0.107
+>    fat-cylinder Gaussian for direct A/B against the v1.0.108 default.
+> 6. Push `Rebus.BeamConeRadiusScale 1.0` (the v1.0.108 default; ALSO push
+>    `1.0` if you were running 0.85..0.95 in v1.0.107 -- per the migration
+>    note above).
+>
+> **Files touched (v1.0.108).**
+>
+> | File | What changed |
+> | --- | --- |
+> | `Source/RebusVisualiser/Public/RebusFixtureActor.h` | Added `RefreshBeamRadialParams()` public method declaration (next to `RefreshBeamShadowParams`). Added private helpers `ResolveFootprintInnerRatio() const` + `ResolveBeamFootprintMatchHalfDeg() const`. |
+> | `Source/RebusVisualiser/Private/RebusFixtureActor.cpp` | Raised `RebusBeamSharpness` constexpr 2.5 -> 6.0. Added `GRebusBeamSharpness` / `GRebusBeamDensity` / `GRebusBeamFalloff` globals + `RefreshBeamRadialParamsOnEveryFixture` sink + the three new `Rebus.BeamSharpness` / `Rebus.BeamDensity` / `Rebus.BeamFalloff` `FAutoConsoleVariableRef` blocks. Implemented `ResolveFootprintInnerRatio()` + `ResolveBeamFootprintMatchHalfDeg()` + `RefreshBeamRadialParams()`. Replaced `OuterHalf -> tan -> FarRadius` with `MatchHalf -> tan -> FarRadius` in `UpdateBeamConeGeometry`. Replaced `SpotOuterHalfDeg` with `MatchHalfDeg` in `UpdateEpicBeamParams`'s `DMX Zoom` formula. Extended `DumpFixtureZoomStateForDebug` + the verbose `ApplyZoom` log to surface `matchHalf` + the BeamMID radial scalar read-backs. Added `RefreshBeamRadialParams()` to the `BuildBeamCone` initial-seed sequence (next to `RefreshBeamShadowParams`). |
+> | `Content/Python/build_rebus_base_level.py` | Raised the `M_RebusBeam` master's authored `BeamSharpness` default 2.5 -> 6.0 to match the v1.0.108 constexpr (so a master regen and a runtime fixture seed agree). |
+> | `RebusVisualiser.uplugin` | `VersionName` 1.0.107 -> 1.0.108. |
+> | `README.md` | This release block. |
+>
+> No engine / OrbitConnector / Epic-DMX-Fixtures asset is touched. The
+> v1.0.106 / v1.0.107 work (PreferProceduralBeam toggle + version watermark)
+> is orthogonal -- v1.0.108 only touches the cone-mesh radial geometry +
+> raymarch radial-attenuation scalars; the v1.0.96..v1.0.107 lineage of
+> shadow-trace + watermark + Nanite/double-sided/Orbit-binding behaviour
+> is preserved verbatim.
+
 > **Top-centre version watermark on every rendered frame (operator-toggleable, default ON) (v1.0.107).**
 >
 > User request (verbatim):

@@ -83,7 +83,23 @@ namespace
 	constexpr int32 RebusBeamConeSegments = 24;
 	// v1.0.40: brightened the shaft (was 3.0) so it reads as a clearly visible volumetric beam.
 	constexpr float RebusMeshBeamMaxIntensity = 4.f;
-	constexpr float RebusBeamSharpness = 2.5f;
+	// v1.0.108 -- raised from 2.5 to 6.0. The raymarch's radial cross-section is
+	// `core = exp(-rN^2 * BeamSharpness)` where `rN = radial / radiusAt` (axial=1 at the
+	// cone-mesh edge). At the v1.0.42..v1.0.107 default `BeamSharpness = 2.5` the visible
+	// glow at `rN = 1` is `exp(-2.5) = 8.2 %` of axis density -- the soft Gaussian visibly
+	// extends ALL THE WAY to the geometric cone edge, so the visible shaft reads as a fat
+	// soft cylinder filling the entire `OuterConeAngle` cone, while the lit floor disc
+	// (driven by the IES profile + the SpotLight's linear inner..outer taper) sits at maybe
+	// half that width on the floor -- the user's "cone is much wider than the spotlight
+	// footprint" v1.0.108 report. At `BeamSharpness = 6.0` the cross-section is
+	// `core(rN=0.5) = 22 %`, `core(rN=0.7) = 5 %`, `core(rN=1.0) = 0.25 %` -- the visible
+	// bright shaft pinches to roughly `rN < 0.6` (about 60 % of the geometric cone-mesh
+	// radius), which combined with the v1.0.108 half-intensity FarRadius geometry math
+	// (UpdateBeamConeGeometry) brings the visible shaft edge into ~5 % alignment with the
+	// bright floor disc on the canonical test scene. Live-tunable via
+	// `Rebus.BeamSharpness <float>` (default 6.0; recommended 4..12); operators tune
+	// upward for tight-aperture profile fixtures, downward for soft / frosted looks.
+	constexpr float RebusBeamSharpness = 6.0f;
 	// v1.0.40: BeamFalloff is now the distance-from-SOURCE inverse-square STRENGTH in M_RebusBeam
 	// (0 = flat along length, higher = dims faster downrange), NOT the old length-fade pow exponent.
 	constexpr float RebusBeamFalloff = 1.6f;
@@ -367,6 +383,121 @@ FAutoConsoleVariableRef CVarRebusBeamConeRadiusScale(
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("Rebus.BeamConeRadiusScale -> %.3f, refreshed %d fixture(s) (procedural cone-mesh + Epic-beam DMX Zoom both re-pushed; SpotLight outer cone untouched)."),
 			NewVal, Refreshed);
+	}),
+	ECVF_Default);
+
+// v1.0.108 -- M_RebusBeam radial-attenuation tuning CVars. The raymarch composes density
+// per shaft sample as `d = BeamDensity * core * widthNorm * srcAtten * nf * softOcc *
+// shadowAtten` where `core = exp(-rN^2 * BeamSharpness)` (radial Gaussian; rN=0 on axis,
+// rN=1 at the geometric cone-mesh edge), `srcAtten = 1 / (1 + BeamFalloff * dn^2)`
+// (length-fade from lens to throw, dn=axial/length 0..1), and `BeamDensity` is the
+// per-step density gain. Together these knobs control how WIDE / how BRIGHT the visible
+// shaft reads INSIDE the geometric cone-mesh (which is sized by the v1.0.108
+// half-intensity-FarRadius math in `UpdateBeamConeGeometry`).
+//
+// `Rebus.BeamSharpness <float>` (default 6.0; recommended [4..12]) -- the heavy hitter
+// for the v1.0.108 "cone size doesn't match spotlight size" fix. Higher = the soft
+// Gaussian glow narrows to the bright core (visible disc on the floor matches the lit
+// disc edge); lower = soft / frosted look that fills the geometric cone-mesh. The
+// pre-v1.0.108 default of 2.5 visibly bled the shaft across the entire geometric
+// outer-cone (the user's image showed a cylindrical shaft 2-3x wider than the lit
+// floor disc); v1.0.108 lifts the default to 6.0 so the visible bright shaft pinches
+// to ~60% of the geometric cone-mesh radius, which combined with the half-intensity
+// FarRadius math lands the visible shaft edge within ~5% of the bright floor disc
+// edge on the canonical test scene. Operators who liked the soft v1.0.107 look can
+// flip `Rebus.BeamSharpness 2.5`; show-context fixtures with tight apertures can push
+// to 8-12 for an even tighter core.
+//
+// `Rebus.BeamDensity <float>` (default 0.015; recommended [0.005..0.06]) -- per-step
+// density gain. Higher = denser / brighter shaft (harder to see through, may saturate
+// the additive accumulator); lower = wispy / faint shaft. Default unchanged from
+// v1.0.40; exposed in v1.0.108 so an operator can tune total opacity without touching
+// the Sharpness/Falloff radial profile.
+//
+// `Rebus.BeamFalloff <float>` (default 1.6; recommended [0..4]) -- length-fade strength
+// (`srcAtten = 1 / (1 + BeamFalloff * dn^2)`). 0 = flat along the shaft (visible same
+// brightness from lens to throw); higher = dims faster downrange (lens reads brightest,
+// throw reads dim). Default unchanged from v1.0.40; exposed in v1.0.108 as a
+// companion to BeamSharpness/Density so the full radial+axial gradient can be tuned
+// live.
+//
+// All three CVars share `RefreshBeamRadialParamsOnEveryFixture` which walks every
+// Rebus fixture and re-pushes onto the BeamMID (which routes into the Custom HLSL
+// Custom node's BeamSharpness / BeamDensity / BeamFalloff scalar inputs). Cheap; no
+// proxy rebuild required (these are radial scalars only -- the cone mesh's geometry
+// is unchanged by these knobs).
+float GRebusBeamSharpness = 6.0f;
+float GRebusBeamDensity   = 0.015f;
+float GRebusBeamFalloff   = 1.6f;
+
+static void RefreshBeamRadialParamsOnEveryFixture(const TCHAR* CVarLabel, float NewVal)
+{
+	if (!GEngine) return;
+	int32 Refreshed = 0;
+	for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+	{
+		UWorld* W = Ctx.World();
+		if (!W) continue;
+		for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+		{
+			if (ARebusFixtureActor* F = *It)
+			{
+				F->RefreshBeamRadialParams();
+				++Refreshed;
+			}
+		}
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("%s -> %.4f, refreshed %d fixture(s) (M_RebusBeam radial-attenuation scalar re-pushed; cone-mesh geometry unchanged)."),
+		CVarLabel, NewVal, Refreshed);
+}
+
+FAutoConsoleVariableRef CVarRebusBeamSharpness(
+	TEXT("Rebus.BeamSharpness"),
+	GRebusBeamSharpness,
+	TEXT("v1.0.108 -- M_RebusBeam radial-Gaussian sharpness (default 6.0; recommended [4..12]). "
+		 "Per-shaft-sample density `core = exp(-rN^2 * BeamSharpness)` where rN=radial/coneRadius. "
+		 "Higher = visible shaft pinches to a tight bright core (matches the bright floor disc "
+		 "edge); lower = soft / frosted shaft fills the geometric cone-mesh. Pre-v1.0.108 "
+		 "default 2.5 visibly bled the shaft across the entire OuterConeAngle cone, reading "
+		 "as a fat soft cylinder ~2-3x wider than the lit footprint (the v1.0.108 user "
+		 "report). Live -- changing this walks every Rebus fixture and re-pushes the scalar "
+		 "onto the BeamMID; cone-mesh geometry is unchanged."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamRadialParamsOnEveryFixture(TEXT("Rebus.BeamSharpness"), CVar->GetFloat());
+	}),
+	ECVF_Default);
+
+FAutoConsoleVariableRef CVarRebusBeamDensity(
+	TEXT("Rebus.BeamDensity"),
+	GRebusBeamDensity,
+	TEXT("v1.0.108 -- M_RebusBeam per-step density gain (default 0.015; recommended "
+		 "[0.005..0.06]). Higher = denser / brighter shaft (may saturate the additive "
+		 "accumulator); lower = wispy / faint shaft. Companion to Rebus.BeamSharpness; the "
+		 "Sharpness knob shapes the radial profile (where the shaft fades to black laterally), "
+		 "this knob scales the overall opacity (how dense the visible shaft reads regardless "
+		 "of profile). Live -- the refresh sink walks every fixture and re-pushes the BeamMID "
+		 "scalar."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamRadialParamsOnEveryFixture(TEXT("Rebus.BeamDensity"), CVar->GetFloat());
+	}),
+	ECVF_Default);
+
+FAutoConsoleVariableRef CVarRebusBeamFalloff(
+	TEXT("Rebus.BeamFalloff"),
+	GRebusBeamFalloff,
+	TEXT("v1.0.108 -- M_RebusBeam length-fade strength (default 1.6; recommended [0..4]). "
+		 "Per-shaft-sample axial attenuation `srcAtten = 1 / (1 + BeamFalloff * dn^2)` "
+		 "where dn = axial/BeamLength (0 at lens, 1 at throw). 0 = flat along the shaft "
+		 "(visible same brightness from lens to throw); higher = dims faster downrange "
+		 "(lens reads brightest, throw reads dim). Companion to Rebus.BeamSharpness and "
+		 "Rebus.BeamDensity for full radial+axial control. Live -- the refresh sink walks "
+		 "every fixture and re-pushes the BeamMID scalar."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamRadialParamsOnEveryFixture(TEXT("Rebus.BeamFalloff"), CVar->GetFloat());
 	}),
 	ECVF_Default);
 
@@ -1115,37 +1246,57 @@ void ARebusFixtureActor::DumpFixtureZoomStateForDebug() const
 	}
 
 	const float ResolvedHalf = ResolveOuterHalfDeg();
-	const float TanHalf      = FMath::Tan(FMath::DegreesToRadians(ResolvedHalf));
+	const float MatchHalf    = ResolveBeamFootprintMatchHalfDeg();
+	const float FootprintInnerRatio = ResolveFootprintInnerRatio();
+	const float TanMatch     = FMath::Tan(FMath::DegreesToRadians(MatchHalf));
 	const float ConeScale    = FMath::Max(0.05f, BeamConeRadiusScale);
-	const float ExpectedFar  = FMath::Max(BeamLengthUnreal * TanHalf * ConeScale,
+	const float ExpectedFar  = FMath::Max(BeamLengthUnreal * TanMatch * ConeScale,
 	                                      BeamBaseRadiusUnreal + 0.1f);
 
 	float MidFarRadius = -999.f;
+	float MidSharpness = -999.f;
+	float MidDensity   = -999.f;
+	float MidFalloff   = -999.f;
 	if (BeamMID)
 	{
 		BeamMID->GetScalarParameterValue(FMaterialParameterInfo(TEXT("FarRadius")), MidFarRadius);
+		BeamMID->GetScalarParameterValue(FMaterialParameterInfo(TEXT("BeamSharpness")), MidSharpness);
+		BeamMID->GetScalarParameterValue(FMaterialParameterInfo(TEXT("BeamDensity")), MidDensity);
+		BeamMID->GetScalarParameterValue(FMaterialParameterInfo(TEXT("BeamFalloff")), MidFalloff);
 	}
 
 	const FString ZoomRange = Profile.Zoom.bValid
 		? FString::Printf(TEXT("[%.2f..%.2fdeg full]"), (float)Profile.Zoom.MinDeg, (float)Profile.Zoom.MaxDeg)
 		: FString(TEXT("<no profile zoom range>"));
 
+	// v1.0.108 -- the dump now reports BOTH the geometric outer half AND the half-
+	// intensity match half (MatchHalf = OuterHalf * (1+InnerRatio)/2 -- the angle the
+	// visible cone-mesh is now sized to so its edge coincides with the bright floor
+	// disc), the SpotLight's actual InnerCone/OuterCone (which the half-intensity
+	// edge derives from), the per-fixture cone-mesh FarRadius BUILT vs EXPECTED at
+	// MatchHalf, AND the live radial-attenuation MID scalars (BeamSharpness /
+	// BeamDensity / BeamFalloff) so an operator can confirm the v1.0.108 push won the
+	// race against any portal/scene-property override AND tune-correlate the
+	// `Rebus.BeamSharpness` / `Rebus.BeamDensity` / `Rebus.BeamFalloff` CVar values
+	// against what the BeamMID is actually rendering with.
 	UE_LOG(LogRebusVisualiser, Log,
 		TEXT("DumpFixtureZoom '%s' zoomTarget=%.2fdeg(half) profileZoomRange=%s "
-			 "resolvedHalf=%.2fdeg | spotOuterCone=%.2fdeg spotInnerCone=%.2fdeg "
-			 "(InnerRatio=%.3f -- bright-disc edge ~mid of inner..outer) | "
+			 "resolvedHalf=%.2fdeg matchHalf=%.2fdeg(footprintInnerRatio=%.3f -> visible-shaft edge target) | "
+			 "spotOuterCone=%.2fdeg spotInnerCone=%.2fdeg (InnerRatio=%.3f) | "
 			 "beamLength=%.1fcm coneFarRadiusBuilt=%.1fcm coneFarRadiusExpected=%.1fcm "
-			 "BeamMID.FarRadius=%.1f | BeamConeRadiusScale=%.3f bUsingEpicBeam=%d "
-			 "bMeshBeamEnabled=%d bGoboActive=%d iris=%.3f"),
+			 "BeamMID.FarRadius=%.1f | BeamConeRadiusScale=%.3f | "
+			 "BeamMID.Sharpness=%.3f BeamMID.Density=%.4f BeamMID.Falloff=%.3f | "
+			 "bUsingEpicBeam=%d bMeshBeamEnabled=%d bGoboActive=%d iris=%.3f"),
 		*FixtureId,
 		ZoomDeg.Current, *ZoomRange,
-		ResolvedHalf,
+		ResolvedHalf, MatchHalf, FootprintInnerRatio,
 		SpotLight->OuterConeAngle, SpotLight->InnerConeAngle,
 		(SpotLight->OuterConeAngle > KINDA_SMALL_NUMBER)
 			? (SpotLight->InnerConeAngle / SpotLight->OuterConeAngle) : 0.f,
 		BeamLengthUnreal, BeamConeLastFarRadius, ExpectedFar,
 		MidFarRadius,
 		ConeScale,
+		MidSharpness, MidDensity, MidFalloff,
 		bUsingEpicBeam ? 1 : 0,
 		bMeshBeamEnabled ? 1 : 0,
 		bGoboActive ? 1 : 0,
@@ -2649,6 +2800,48 @@ float ARebusFixtureActor::ResolveOuterHalfDeg() const
 	return ResolveZoomHalfDeg(ZoomDeg.Current * 2.f);
 }
 
+float ARebusFixtureActor::ResolveFootprintInnerRatio() const
+{
+	// v1.0.108 -- mirror `RecomputeConeAngles`'s `InnerRatio` derivation so the visible
+	// cone-mesh FarRadius math (UpdateBeamConeGeometry / UpdateEpicBeamParams) and the
+	// SpotLight's actual linear-taper taper-floor angle stay in lockstep by construction.
+	// When the GDTF profile carries both BeamAngle (peak-intensity full angle) and
+	// FieldAngle (zero-intensity full angle), the ratio of the two IS the inner/outer
+	// ratio that drives the SpotLight's `InnerConeAngle / OuterConeAngle`; the 0.8
+	// fallback matches the v1.0.101 design point for fixtures that arrive without
+	// per-shape photometrics (most theatrical movers do, but architectural / library
+	// fixtures may not -- the fallback errs on the wider-inner-cone side which produces
+	// a slightly LARGER visible-shaft target than 0.5 x outer would).
+	float InnerRatio = 0.8f;
+	if (Profile.Photometrics.BeamAngle.IsSet() && Profile.Photometrics.FieldAngle.IsSet()
+		&& Profile.Photometrics.FieldAngle.GetValue() > KINDA_SMALL_NUMBER)
+	{
+		InnerRatio = (float)(Profile.Photometrics.BeamAngle.GetValue() / Profile.Photometrics.FieldAngle.GetValue());
+		InnerRatio = FMath::Clamp(InnerRatio, 0.05f, 0.98f);
+	}
+	return InnerRatio;
+}
+
+float ARebusFixtureActor::ResolveBeamFootprintMatchHalfDeg() const
+{
+	// v1.0.108 -- the visible cone-mesh should be sized to the HALF-INTENSITY edge of the
+	// SpotLight's linear inner..outer taper, NOT the geometric outer cone (where the
+	// SpotLight's contribution has already faded to zero). For a SpotLight that ramps
+	// brightness linearly from `InnerConeAngle` (peak) to `OuterConeAngle` (zero), the
+	// half-brightness ring sits at `(InnerHalf + OuterHalf) / 2 = OuterHalf * (1 +
+	// InnerRatio) / 2`. With the v1.0.101 default `InnerRatio = 0.8` the match angle is
+	// `0.9 * OuterHalf` (the 10 % gap the v1.0.101 release block already documented; the
+	// v1.0.108 user image showed a much bigger visual gap which the v1.0.108
+	// `Rebus.BeamSharpness 6.0` Gaussian-tightening fix addresses on top of this). For
+	// a profile with `InnerRatio = 0.5` the match angle is `0.75 * OuterHalf`; for a
+	// near-uniform profile `InnerRatio -> 1.0` the match angle approaches the geometric
+	// outer cone (i.e. the SpotLight reads as an even disc with a hard edge, which is
+	// what flat-field fixtures want).
+	const float OuterHalf  = ResolveOuterHalfDeg();
+	const float InnerRatio = ResolveFootprintInnerRatio();
+	return OuterHalf * (1.0f + InnerRatio) * 0.5f;
+}
+
 void ARebusFixtureActor::BuildBeamCone()
 {
 	// v1.0.101 -- seed the per-fixture cone-mesh radius scale from the CURRENT live CVar
@@ -2703,6 +2896,11 @@ void ARebusFixtureActor::BuildBeamCone()
 	BeamCone->bUseAsOccluder = false;
 
 	BeamMID = UMaterialInstanceDynamic::Create(Mat, this);
+	// Constant-default seed for the radial-attenuation scalars. `RefreshBeamRadialParams`
+	// below overwrites these with the live `Rebus.BeamSharpness` / `Rebus.BeamDensity` /
+	// `Rebus.BeamFalloff` CVar values so a fresh-spawn fixture inherits the operator's
+	// current tuning (the v1.0.108 fix shape: same per-fixture seed pattern as
+	// `RefreshBeamShadowParams` for the v1.0.96 trace scalars).
 	BeamMID->SetScalarParameterValue(TEXT("BeamSharpness"), RebusBeamSharpness);
 	BeamMID->SetScalarParameterValue(TEXT("BeamFalloff"), RebusBeamFalloff);
 	// Raymarch tuning (Phase 2): march step count + per-step density for the Custom HLSL body.
@@ -2713,6 +2911,12 @@ void ARebusFixtureActor::BuildBeamCone()
 	// `Rebus.BeamShadowStrength`, not the master's authored defaults. Live CVar changes after
 	// this point re-push through `RefreshBeamShadowParams` via the CVar refresh sinks above.
 	RefreshBeamShadowParams();
+	// v1.0.108 -- same shape, but for the radial-attenuation scalars. Pushes
+	// `Rebus.BeamSharpness` / `Rebus.BeamDensity` / `Rebus.BeamFalloff` onto the BeamMID so
+	// the fresh-spawn cone reads with the operator's CURRENT Gaussian-tightening tune
+	// (default sharpness raised to 6.0 in v1.0.108 to match the bright floor disc edge --
+	// see the constexpr `RebusBeamSharpness` doc-comment).
+	RefreshBeamRadialParams();
 
 	// Rest transform: the cone mesh is generated along its local +X (the SAME axis a
 	// USpotLightComponent emits along), so it must use the SAME rotation basis as the SpotLight
@@ -2805,12 +3009,35 @@ void ARebusFixtureActor::UpdateBeamConeGeometry()
 	// `BeamConeRadiusScale` is applied ONLY to the visible cone-mesh radius below, NOT
 	// to the half-angle the SpotLight uses, so the lit footprint and IES sampling stay
 	// anchored to the GDTF zoom range while the operator can pinch the visible shaft to
-	// match the perceived bright disc edge (typically ~0.9 with default InnerRatio=0.8;
-	// see the BeamConeRadiusScale UPROPERTY comment in the header).
-	const float OuterHalf = ResolveOuterHalfDeg();
-	const float TanHalf = FMath::Tan(FMath::DegreesToRadians(OuterHalf));
+	// match the perceived bright disc edge.
+	//
+	// v1.0.108 -- the FarRadius BASE is now the HALF-INTENSITY match angle
+	// (`ResolveBeamFootprintMatchHalfDeg() = OuterHalf * (1 + InnerRatio) / 2`) instead
+	// of the geometric `OuterHalf`. The SpotLight's `USpotLightComponent` linear taper
+	// drops brightness from `InnerConeAngle` (peak) to `OuterConeAngle` (zero) so the
+	// VISIBLE bright disc on the floor sits at exactly the half-intensity ring; sizing
+	// the cone-mesh to `OuterHalf * tan(...)` (the v1.0.101..v1.0.107 behaviour) over-
+	// sizes the visible shaft to the geometric cone where the SpotLight has already
+	// faded to zero. With default `InnerRatio = 0.8` the match angle is `0.9 *
+	// OuterHalf` -- a 10 % geometric pinch -- but the v1.0.108 user image showed the
+	// visible shaft reading 2-3x wider than the lit floor disc, which the geometric
+	// 10 % alone could not explain: the dominant cause was the soft Gaussian raymarch
+	// (`BeamSharpness = 2.5`) bleeding the visible glow all the way to the geometric
+	// edge -- v1.0.108 raises the default sharpness to 6.0 (constexpr `RebusBeamSharpness`)
+	// so the visible bright shaft pinches to ~60 % of the cone-mesh radius, and the
+	// half-intensity FarRadius math here makes that 60 % radius coincide with the
+	// SpotLight's actual half-bright ring on the floor.
+	//
+	// `BeamConeRadiusScale` (default 1.0 since v1.0.101, kept at 1.0 in v1.0.108) is
+	// multiplied AT THE END so it stays a pure polish knob on top of the corrected
+	// geometric base. Operators who tuned `BeamConeRadiusScale` to 0.85..0.95 in
+	// v1.0.101..v1.0.107 to compensate for this gap will find their cones too narrow
+	// after v1.0.108 and should reset to 1.0 (documented in the v1.0.108 README
+	// release block under "Operator migration").
+	const float MatchHalf = ResolveBeamFootprintMatchHalfDeg();
+	const float TanMatch  = FMath::Tan(FMath::DegreesToRadians(MatchHalf));
 	const float ConeScale = FMath::Max(0.05f, BeamConeRadiusScale);
-	const float FarRadius = FMath::Max(BeamLengthUnreal * TanHalf * ConeScale, BeamBaseRadiusUnreal + 0.1f);
+	const float FarRadius = FMath::Max(BeamLengthUnreal * TanMatch * ConeScale, BeamBaseRadiusUnreal + 0.1f);
 
 	// Skip the rebuild when the far radius is essentially unchanged (zoom fades tick every frame).
 	if (BeamConeLastFarRadius >= 0.f && FMath::Abs(FarRadius - BeamConeLastFarRadius) < 0.5f)
@@ -2938,6 +3165,42 @@ void ARebusFixtureActor::RefreshBeamShadowParams()
 	// branches on `> 0.5` and `> 1.5` thresholds, so pushing the int verbatim is fine.
 	BeamMID->SetScalarParameterValue(TEXT("BeamShadowDebug"),
 		(float)FMath::Clamp(GRebusBeamShadowDebug, 0, 2));
+}
+
+void ARebusFixtureActor::RefreshBeamRadialParams()
+{
+	// v1.0.108 -- push the three radial-attenuation scalars (BeamSharpness / BeamDensity /
+	// BeamFalloff) onto the BeamMID. Mirrors the `RefreshBeamShadowParams` shape verbatim
+	// so the per-fixture seed point (BuildBeamCone) and the global CVar refresh sinks
+	// (`Rebus.BeamSharpness` / `Rebus.BeamDensity` / `Rebus.BeamFalloff`) share one
+	// chokepoint -- a future `bRadialOverridden` per-fixture flag could opt a hero
+	// fixture out of the global push without changing the call sites.
+	//
+	// Clamps:
+	//   * BeamSharpness clamped to [0.05, 32]. Lower bound = the shader's own
+	//     `max(BeamSharpness, 0.01)` floor (so `core` stays a finite Gaussian at the
+	//     minimum); upper bound is well past the operator-recommended [4..12] range
+	//     (32 makes the shaft a hairline core only -- already past useful) but stays
+	//     finite so a portal mis-push can't blow up the shader.
+	//   * BeamDensity clamped to [0, 1]. 0 = invisible shaft (the trace runs but no
+	//     density accumulates); upper 1 is well past the recommended [0.005..0.06]
+	//     band (1 saturates the additive accumulator instantly).
+	//   * BeamFalloff clamped to [0, 32]. 0 = flat along the shaft (no length-fade);
+	//     32 effectively kills the shaft a few cm downrange. Operator-recommended
+	//     [0..4].
+	//
+	// Safe to call when BeamMID is null (the M_RebusBeam load failed in BuildBeamCone, or
+	// this fixture pre-dates the v1.0.108 self-heal regen): the early return matches the
+	// rest of the MID-push helpers and the CVar refresh sink walks every fixture, including
+	// those without a BeamMID, without crashing.
+	if (!BeamMID) return;
+
+	BeamMID->SetScalarParameterValue(TEXT("BeamSharpness"),
+		FMath::Clamp(GRebusBeamSharpness, 0.05f, 32.f));
+	BeamMID->SetScalarParameterValue(TEXT("BeamDensity"),
+		FMath::Clamp(GRebusBeamDensity, 0.f, 1.f));
+	BeamMID->SetScalarParameterValue(TEXT("BeamFalloff"),
+		FMath::Clamp(GRebusBeamFalloff, 0.f, 32.f));
 }
 
 void ARebusFixtureActor::RefreshBeamEmissive()
@@ -3136,9 +3399,17 @@ void ARebusFixtureActor::UpdateEpicBeamParams()
 	// footprint is unchanged), so the Epic-beam canvas + the procedural cone mesh tighten
 	// in sync while the lit footprint, IES sampling, and 1/r^2 falloff continue to track
 	// the GDTF zoom-range specification verbatim.
-	const float SpotOuterHalfDeg = SpotLight ? SpotLight->OuterConeAngle : ResolveOuterHalfDeg();
+	//
+	// v1.0.108 -- DMX Zoom is now driven from the HALF-INTENSITY match angle
+	// (`ResolveBeamFootprintMatchHalfDeg() = OuterHalf * (1 + InnerRatio) / 2`) instead
+	// of the live `SpotLight->OuterConeAngle`. The Epic-beam canvas is sized by the same
+	// geometric truth as the procedural cone (UpdateBeamConeGeometry), so the
+	// `Rebus.PreferProceduralBeam 0` (Epic-beam) path inherits the v1.0.108 visible-
+	// shaft-vs-lit-disc parity for free. The SpotLight's own OuterConeAngle is still
+	// untouched (the lit footprint is unchanged); only the visible shaft tightens.
+	const float MatchHalfDeg = ResolveBeamFootprintMatchHalfDeg();
 	const float ConeScale = FMath::Max(0.05f, BeamConeRadiusScale);
-	const float ZoomFullDeg = FMath::Clamp(RebusEpicBeamZoomScale * ConeScale * SpotOuterHalfDeg, 1.f, 179.f);
+	const float ZoomFullDeg = FMath::Clamp(RebusEpicBeamZoomScale * ConeScale * MatchHalfDeg, 1.f, 179.f);
 	const float DistCm = FMath::Clamp(BeamLengthUnreal, 1.f, RebusEpicBeamMaxDistanceCm);
 
 	// Epic M_Beam_Master param vocabulary (mirrors ADMXFixtureActor::FeedFixtureData + the BP zoom
@@ -4091,18 +4362,29 @@ void ARebusFixtureActor::ApplyZoom(float ZoomHalfAngleDeg, float FadeSeconds)
 	// per-fixture BeamConeRadiusScale knob that pulls the visible shaft tighter than
 	// the lit footprint. Verbose-level so a busy show isn't spammed; flip
 	// `Log LogRebusVisualiser Verbose` (or use `Rebus.DumpFixtureZoom`) to surface.
+	// v1.0.108 -- the verbose ApplyZoom log now also reports the half-intensity match
+	// half (`ResolveBeamFootprintMatchHalfDeg` = OuterHalf * (1 + InnerRatio) / 2) which
+	// is the angle the visible cone-mesh is actually sized to (so its edge coincides
+	// with the bright floor disc the SpotLight's linear taper produces). The
+	// `coneFarRadius` value below derives from MatchHalf, NOT from the geometric outer
+	// half -- that's the v1.0.108 fix for the "cone is much wider than the spotlight
+	// footprint" report. SpotLight outer cone stays at the un-pinched ResolvedHalf
+	// (its lit footprint is unchanged).
 	const float ResolvedHalf = ResolveOuterHalfDeg();
+	const float MatchHalf    = ResolveBeamFootprintMatchHalfDeg();
 	const float SpotOuterDeg = SpotLight ? SpotLight->OuterConeAngle : -1.f;
 	const float SpotInnerDeg = SpotLight ? SpotLight->InnerConeAngle : -1.f;
-	const float TanHalf = FMath::Tan(FMath::DegreesToRadians(ResolvedHalf));
+	const float TanMatch = FMath::Tan(FMath::DegreesToRadians(MatchHalf));
 	const float ConeScale = FMath::Max(0.05f, BeamConeRadiusScale);
-	const float ConeFarRadius = FMath::Max(BeamLengthUnreal * TanHalf * ConeScale, BeamBaseRadiusUnreal + 0.1f);
+	const float ConeFarRadius = FMath::Max(BeamLengthUnreal * TanMatch * ConeScale, BeamBaseRadiusUnreal + 0.1f);
 	UE_LOG(LogRebusVisualiser, Verbose,
-		TEXT("Fixture %s ApplyZoom: zoomTarget=%.2fdeg(half) resolvedHalf=%.2fdeg "
+		TEXT("Fixture %s ApplyZoom: zoomTarget=%.2fdeg(half) resolvedHalf=%.2fdeg matchHalf=%.2fdeg "
 			 "spotOuterCone=%.2fdeg spotInnerCone=%.2fdeg coneFarRadius=%.1fcm "
-			 "beamLength=%.1fcm beamConeRadiusScale=%.3f fade=%.2fs (single-source-of-truth: "
-			 "spotOuter and coneFar both derive from resolvedHalf via ResolveZoomHalfDeg)"),
-		*FixtureId, ZoomHalfAngleDeg, ResolvedHalf, SpotOuterDeg, SpotInnerDeg,
+			 "beamLength=%.1fcm beamConeRadiusScale=%.3f fade=%.2fs (v1.0.108: cone-mesh "
+			 "FarRadius is sized to matchHalf -- the SpotLight's half-intensity ring -- so "
+			 "the visible shaft edge coincides with the bright floor disc; spotOuter is "
+			 "unchanged at resolvedHalf so the lit footprint is unchanged)"),
+		*FixtureId, ZoomHalfAngleDeg, ResolvedHalf, MatchHalf, SpotOuterDeg, SpotInnerDeg,
 		ConeFarRadius, BeamLengthUnreal, ConeScale, FadeSeconds);
 }
 
