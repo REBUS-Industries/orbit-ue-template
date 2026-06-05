@@ -32,6 +32,8 @@ class FJsonObject;
 class UMaterialInterface;
 class UMaterialInstanceDynamic;
 class UPrimitiveComponent;
+class UCanvas;
+class APlayerController;
 
 UCLASS()
 class REBUSVISUALISER_API URebusVisualiserSubsystem : public UGameInstanceSubsystem
@@ -323,6 +325,45 @@ public:
 	void SetNaniteOrbitImportsEnabled(bool bEnabled);
 	bool IsNaniteOrbitImportsEnabled() const { return bNaniteOrbitImportsEnabled; }
 
+	// v1.0.107 -- always-on-top version watermark overlay. User request (verbatim):
+	// "can we print the version on the top centre of the ouput with a command to be able
+	// to turn off. So we see top centre of the stream v1.0.106 for example."
+	//
+	// Renders the cached `v<VersionName>` string (e.g. `v1.0.107`) at the top-centre of
+	// every rendered viewport via `UDebugDrawService::Register("Foreground", ...)` -- the
+	// "Foreground" debug-draw extension fires after the 3D world is rendered but before
+	// UMG/HUD, so the watermark sits on top of the scene + below any operator-facing UMG
+	// (correct stacking for a non-intrusive overlay). Pixel Streaming 2 captures the
+	// FCanvas overlay verbatim into the H.264 stream frames, so the watermark appears in
+	// the live stream without any PS2-side integration.
+	//
+	// Version source-of-truth: `IPluginManager::FindPlugin("RebusVisualiser")
+	// ->GetDescriptor().VersionName` -- the engine-blessed accessor that always reports
+	// the currently-running binary's plugin descriptor. Cached once at Initialize() so
+	// the per-frame draw is zero JSON re-parse + zero string allocation.
+	//
+	// Operator overrides:
+	//   * `Rebus.ShowVersion [0|1|status]` flips bShowVersionWatermark. Default ON
+	//     (seeded true at Initialize()). Status prints the live flag + the cached
+	//     version display string + the live Y-margin so an operator can verify in one
+	//     log line that the watermark is wired and what it'll print.
+	//   * `Rebus.VersionWatermarkY <px>` sets the top-edge margin in pixels (default 12).
+	//     Lets operators drop the watermark below an overlapping HUD element if needed.
+	//   * `bShowVersionWatermark` scene property mirrors the same flag through the
+	//     portal / SetSceneProperty wire path -- routes via SetVersionWatermarkEnabled
+	//     below so the console + portal paths can never diverge.
+	void SetVersionWatermarkEnabled(bool bEnabled);
+	bool IsVersionWatermarkEnabled() const;
+	const FString& GetCachedVersionDisplay() const { return CachedVersionDisplay; }
+
+	// Static accessors for the watermark Y-margin. Static (rather than instance) so the
+	// `Rebus.VersionWatermarkY <px>` console command in RebusVisualiser.cpp can write
+	// the live state without iterating GameInstance subsystems for the simple case
+	// where there's only one number to push -- the Y-margin is a global pixel offset
+	// with no per-world identity, so a single file-scope value is the right shape.
+	static void  SetVersionWatermarkTopMarginPx(float Px);
+	static float GetVersionWatermarkTopMarginPx();
+
 	// Per-mesh dump entry surfaced by `Rebus.DumpOrbitNanite`. Grouped by UStaticMesh so
 	// each unique imported asset reports ONCE with a count of components referencing it
 	// (the OrbitConnector import shares trusses / set-piece geometry between many
@@ -513,4 +554,16 @@ private:
 	// conversion unavailable" so we don't spam every tick. Reset to false on a Set* call
 	// so the operator gets a fresh log line if they fire the toggle in a packaged build.
 	bool bNanitePackagedWarningLogged = false;
+
+	// v1.0.107 -- top-centre version watermark state. See the doc-comment on
+	// `SetVersionWatermarkEnabled` above for the rationale + algorithm. The display
+	// string is cached at Initialize() (`v` + IPluginManager VersionName) so the per-
+	// frame draw allocates nothing. UDebugDrawService("Foreground") is the single
+	// integration point -- the registered delegate fires after every rendered viewport
+	// and is captured by PixelStreaming2 verbatim. The toggle + Y-margin are runtime-
+	// settable via `Rebus.ShowVersion` / `Rebus.VersionWatermarkY` (registered in
+	// RebusVisualiser.cpp) and via the `bShowVersionWatermark` scene property.
+	FString CachedVersionDisplay; // "v1.0.107" -- composed once at Initialize()
+	FDelegateHandle VersionWatermarkDrawHandle; // UDebugDrawService::Register handle
+	void DrawVersionWatermark(UCanvas* Canvas, APlayerController* PC);
 };

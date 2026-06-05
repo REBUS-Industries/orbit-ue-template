@@ -54,6 +54,13 @@ namespace
 	IConsoleCommand* GDumpOrbitNaniteCommand = nullptr;    // v1.0.105 -- per-mesh Nanite diagnostic dump
 	// v1.0.101 -- per-fixture zoom / cone-mesh / SpotLight outer-cone runtime dump.
 	IConsoleCommand* GDumpFixtureZoomCommand = nullptr;
+	// v1.0.107 -- top-centre version watermark overlay (UDebugDrawService("Foreground")
+	// canvas draw). Two commands: the visibility toggle (with a `status` arg that
+	// prints the live state + cached version string + Y-margin) and the top-edge
+	// margin tunable. See the doc-comment on URebusVisualiserSubsystem::
+	// SetVersionWatermarkEnabled for the rationale.
+	IConsoleCommand* GShowVersionCommand = nullptr;
+	IConsoleCommand* GVersionWatermarkYCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -1138,6 +1145,100 @@ namespace
 			bShow ? 1 : 0, TotalFixtures, TotalAffected, bShow ? TEXT("shown") : TEXT("hidden"));
 	}
 
+	// v1.0.107: `Rebus.ShowVersion [0|1|status]` -- toggle the always-on-top version
+	// watermark (drawn at the top centre of every rendered viewport via
+	// UDebugDrawService("Foreground"), captured into PixelStreaming2 stream frames).
+	// Default ON (the watermark is the operator's at-a-glance confirmation that the
+	// running binary matches the expected release on every rendered frame). The
+	// `status` arg prints the LIVE flag + the cached `v<VersionName>` display string
+	// + the live Y-margin so an operator can verify in one log line that the
+	// watermark is wired and what it'll print -- mirrors the Rebus.AAMode "status"
+	// surface introduced in v1.0.83. Routes through every Game/PIE world's
+	// URebusVisualiserSubsystem::SetVersionWatermarkEnabled (single chokepoint
+	// shared with the bShowVersionWatermark scene property).
+	void HandleShowVersionCommand(const TArray<FString>& Args)
+	{
+		if (!GEngine) return;
+		const bool bWantStatus = (Args.Num() > 0)
+			&& Args[0].Equals(TEXT("status"), ESearchCase::IgnoreCase);
+
+		if (!bWantStatus)
+		{
+			const bool bEnable = ParseBoolArg(Args, true);
+			int32 Subsystems = 0;
+			for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+			{
+				UWorld* World = Ctx.World();
+				if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+				UGameInstance* GI = World->GetGameInstance();
+				if (!GI) continue;
+				if (URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>())
+				{
+					Viz->SetVersionWatermarkEnabled(bEnable);
+					++Subsystems;
+				}
+			}
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.ShowVersion %d: subsystems=%d -- watermark %s on every "
+					 "rendered viewport (and every PixelStreaming2 stream frame that "
+					 "captures the FCanvas overlay)."),
+				bEnable ? 1 : 0, Subsystems,
+				bEnable ? TEXT("ENABLED") : TEXT("DISABLED"));
+		}
+
+		// Status path always logs the live state + cached version + Y-margin (lifted
+		// from any subsystem -- they all share file-scope flags + each owns the same
+		// CachedVersionDisplay derived from the SAME plugin descriptor).
+		FString DisplayStr;
+		bool bLiveEnabled = false;
+		bool bFoundSubsystem = false;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+			UGameInstance* GI = World->GetGameInstance();
+			if (!GI) continue;
+			if (URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>())
+			{
+				DisplayStr = Viz->GetCachedVersionDisplay();
+				bLiveEnabled = Viz->IsVersionWatermarkEnabled();
+				bFoundSubsystem = true;
+				break;
+			}
+		}
+		const float YPx = URebusVisualiserSubsystem::GetVersionWatermarkTopMarginPx();
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.ShowVersion status: enabled=%s, display='%s', y-margin=%.1fpx, "
+				 "subsystem-found=%s. Source-of-truth: IPluginManager::FindPlugin("
+				 "\"RebusVisualiser\")->GetDescriptor().VersionName, cached at "
+				 "subsystem Initialize()."),
+			bLiveEnabled ? TEXT("true") : TEXT("false"),
+			DisplayStr.IsEmpty() ? TEXT("<unset>") : *DisplayStr,
+			YPx,
+			bFoundSubsystem ? TEXT("yes") : TEXT("no -- launch a PIE/Game world first"));
+	}
+
+	// v1.0.107: `Rebus.VersionWatermarkY <px>` -- set the top-edge margin in pixels
+	// for the version watermark (default 12px). Operators with a HUD element near
+	// the top centre can drop the watermark below it without disabling it. Negative
+	// values are clamped to 0 in the setter. With no arg, logs the current margin.
+	void HandleVersionWatermarkYCommand(const TArray<FString>& Args)
+	{
+		if (Args.Num() == 0)
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.VersionWatermarkY (status): y-margin=%.1fpx (default 12)."),
+				URebusVisualiserSubsystem::GetVersionWatermarkTopMarginPx());
+			return;
+		}
+		const float Px = FCString::Atof(*Args[0]);
+		URebusVisualiserSubsystem::SetVersionWatermarkTopMarginPx(Px);
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.VersionWatermarkY %.1fpx (clamped from %s)."),
+			URebusVisualiserSubsystem::GetVersionWatermarkTopMarginPx(),
+			*Args[0]);
+	}
+
 	// v1.0.70: `Rebus.ShowOrbit [0|1]` -- broad sledgehammer that hides EVERY actor of class
 	// OrbitImportRoot in every Game/PIE world via SetActorHiddenInGame. This kills the whole
 	// Orbit import (fixtures AND trusses / set pieces / layout meshes); use ShowOrbitFixtures
@@ -1653,6 +1754,35 @@ void FRebusVisualiserModule::StartupModule()
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleShowOrbitCommand),
 		ECVF_Default);
 
+	// v1.0.107 top-centre version watermark overlay (UDebugDrawService("Foreground")
+	// canvas draw, captured into PixelStreaming2 stream frames). Default ON; routes
+	// through URebusVisualiserSubsystem::SetVersionWatermarkEnabled (the same
+	// chokepoint the bShowVersionWatermark scene property uses) so the console +
+	// scene-property paths can never diverge.
+	GShowVersionCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.ShowVersion"),
+		TEXT("v1.0.107 -- toggle the always-on-top version watermark drawn at the top "
+			 "centre of every rendered viewport (and every PixelStreaming2 stream "
+			 "frame that captures the FCanvas overlay). The displayed string is "
+			 "`v<RebusVisualiser plugin VersionName>` (e.g. `v1.0.107`), sourced once "
+			 "at subsystem Initialize() via IPluginManager::FindPlugin->GetDescriptor"
+			 "().VersionName so it always reflects the running binary's plugin "
+			 "descriptor (you can trust what you see). Default ON. The `status` arg "
+			 "logs the live flag + cached display string + Y-margin in one line. "
+			 "Pair with `Rebus.VersionWatermarkY <px>` to tune the top-edge margin. "
+			 "Usage: Rebus.ShowVersion [0|1|status]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleShowVersionCommand),
+		ECVF_Default);
+
+	GVersionWatermarkYCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.VersionWatermarkY"),
+		TEXT("v1.0.107 -- set the version watermark's top-edge margin in pixels "
+			 "(default 12). Increase to drop the watermark below an overlapping HUD "
+			 "element; decrease to push it closer to the top edge. With no arg, "
+			 "logs the current margin. Usage: Rebus.VersionWatermarkY <px>"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleVersionWatermarkYCommand),
+		ECVF_Default);
+
 	// v1.0.71 fixture material override toggle.
 	GOverrideFixtureMaterialsCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Rebus.OverrideFixtureMaterials"),
@@ -1991,6 +2121,16 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GDumpFixtureZoomCommand);
 		GDumpFixtureZoomCommand = nullptr;
+	}
+	if (GShowVersionCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GShowVersionCommand);
+		GShowVersionCommand = nullptr;
+	}
+	if (GVersionWatermarkYCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GVersionWatermarkYCommand);
+		GVersionWatermarkYCommand = nullptr;
 	}
 	// v1.0.73 / v1.0.78: restore both CVar packs to their snapshotted values so a hot-reload
 	// of the module doesn't leak a permanent override into the engine session. Both packs

@@ -594,6 +594,84 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Top-centre version watermark on every rendered frame (operator-toggleable, default ON) (v1.0.107).**
+>
+> User request (verbatim):
+>
+> > "can we print the version on the top centre of the ouput with a command to be able to turn off. So we see top centre of the stream v1.0.106 for example."
+>
+> Operator context: with v1.0.99 / v1.0.103 / v1.0.106 each iterating on the same
+> visible failure mode (beam shadow trace), every QA cycle has had to start with
+> an explicit "what version is actually running?" log grep. The watermark
+> short-circuits that round-trip: the running binary's plugin VersionName paints
+> itself top-centre on every rendered viewport (and every PixelStreaming2 stream
+> frame that captures the FCanvas overlay), so the operator can read the version
+> off the live stream / a screen-cap before they even open the log.
+>
+> **What lands in v1.0.107.**
+>
+> | Surface | Behaviour |
+> | --- | --- |
+> | `URebusVisualiserSubsystem::DrawVersionWatermark(UCanvas*, APlayerController*)` (NEW) | The per-frame foreground-canvas draw, registered with `UDebugDrawService::Register("Foreground", ...)` from `URebusVisualiserSubsystem::Initialize()`. Composes a centred `v<VersionName>` glyph (e.g. `v1.0.107`) against the engine's medium font (`GEngine->GetMediumFont()`), measures via `Canvas->TextSize`, centres horizontally on `Canvas->SizeX`, and offsets vertically by `RebusVersionWatermark::GTopMarginPx` (default 12px). Drop-shadow draw via `FCanvasTextItem::EnableShadow(black, 70%)` underneath the white-90% foreground keeps the text legible against bright skies + dark stages without an opaque background plate. Wrapped in a single `if (RebusVersionWatermark::GShowEnabled)` early-out so the per-frame cost is one branch when the toggle is off. |
+> | `IPluginManager::FindPlugin("RebusVisualiser")->GetDescriptor().VersionName` cache | Composed once at `Initialize()` into `CachedVersionDisplay = "v" + VersionName`. The engine-blessed accessor always reports the running binary's plugin descriptor (no JSON re-parse, no risk of the watermark drifting from `RebusVisualiser.uplugin`'s on-disk content for the wrong reason -- the descriptor is what the engine actually loaded). Cached so the per-frame draw allocates nothing. The watermark is the source-of-truth: **what you see on screen is what's running**. |
+> | `Rebus.ShowVersion [0\|1\|status]` console command (NEW) | Default ON. Routes through every Game/PIE world's `URebusVisualiserSubsystem::SetVersionWatermarkEnabled` -- the SAME chokepoint the `bShowVersionWatermark` scene property uses, so the console + portal paths can never diverge (mirrors v1.0.99 / v1.0.104 / v1.0.105 single-chokepoint pattern). The `status` arg logs the live flag + cached display string + Y-margin in one line for quick verification. |
+> | `Rebus.VersionWatermarkY <px>` console command (NEW) | Sets the top-edge margin in pixels (default 12, clamped to ≥0). With no arg, logs the current margin. Lets operators with a HUD element near the top centre drop the watermark below it without disabling it. |
+> | `bShowVersionWatermark` scene property (NEW) | Seeded `true` in `URebusSceneSettingsSubsystem::Initialize()`. Mirrors the v1.0.99 / v1.0.104 / v1.0.105 routing: `ApplySceneProperty("bShowVersionWatermark", ...)` resolves the GameInstance's `URebusVisualiserSubsystem` and calls `SetVersionWatermarkEnabled(Value.bBool)` -- one source of truth for the live state across the console command, the portal `SetSceneProperty`, and the SceneState round-trip read-back. |
+>
+> **Why `UDebugDrawService("Foreground")` rather than a UMG widget or `AHUD::PostRender`?**
+>
+> | Path | Pros | Cons | Verdict |
+> | --- | --- | --- | --- |
+> | `UDebugDrawService::Register("Foreground", ...)` (CHOSEN) | Engine-blessed FCanvas overlay; fires after the 3D world is rendered + before UMG/HUD; captured by PixelStreaming2 verbatim into the H.264 stream (the PS2 capture pipeline records the same FCanvas pass); zero-config (one delegate registration in `Initialize()`); no actor / pawn / level dependency. | None for this use case. | Ship. |
+> | UMG widget on a level-blueprint-spawned `UUserWidget` | Rich layout / animation. | Requires a project-side widget asset, a level-script entry point, lifecycle plumbing across PIE / Game / packaged; UMG isn't always captured in screenshot-export paths the way FCanvas is. Overkill for "draw one string top-centre". | Reject (overweight). |
+> | `AHUD::PostRender` via a custom `AHUD` subclass set as the project default HUD | Same FCanvas pass as `UDebugDrawService("Foreground")`, captured by PS2 the same way. | Requires subclassing `AHUD` AND wiring it as the project default HUD AND keeping that wiring across map travel; existing project doesn't use a custom HUD class. Adds a configuration surface for zero behavioural gain. | Reject (architectural cost > behavioural value). |
+> | Direct `FCanvas` draw from a viewport callback | Lowest-level. | Reinvents what `UDebugDrawService` already exposes; no per-extension visibility filtering. | Reject (reinvents). |
+>
+> Operator-side verification of the PS2 capture path: `UDebugDrawService` runs on
+> the FCanvas pass that the PixelStreaming2 scene-capture pipeline records into
+> the H.264 frames -- no special integration required. The watermark appears in
+> the live stream automatically; an operator can confirm by opening the portal,
+> launching a stream, and reading the version off the live frame.
+>
+> **Operator action path (v1.0.107+).**
+>
+> 1. **Default ON does the right thing.** Launch the editor / packaged build; the
+>    watermark `v1.0.107` appears in the top centre of the viewport AND in any
+>    PixelStreaming2 stream the build serves. No operator action required.
+> 2. **Verify with `Rebus.ShowVersion status`.** The status path logs:
+>    `enabled=true, display='v1.0.107', y-margin=12.0px` (subsystem-found=yes
+>    once a PIE/Game world has spun up). If `display=<unset>` the IPluginManager
+>    look-up failed at startup (cooked-package edge case); a one-shot Warning is
+>    logged at `Initialize()` naming the failure.
+> 3. **Toggle off for clean reference captures.** `Rebus.ShowVersion 0` removes
+>    the watermark on the next frame. `Rebus.ShowVersion 1` restores it. The
+>    portal can drive the same flip via `SetSceneProperty bShowVersionWatermark
+>    {true|false}` (mirrored chokepoint, never diverges).
+> 4. **Tune the vertical position.** `Rebus.VersionWatermarkY 40` drops the
+>    watermark 40 px from the top edge -- useful when an operator's HUD overlay
+>    sits at the top centre. With no arg, the command logs the current margin.
+> 5. **Trust the displayed string.** The string is sourced via `IPluginManager::
+>    FindPlugin("RebusVisualiser")->GetDescriptor().VersionName` at subsystem
+>    `Initialize()` -- the engine-blessed accessor that reads what the engine
+>    actually loaded. The watermark therefore always reflects the running
+>    binary's plugin descriptor; what you see on screen is what's running.
+>
+> **Files touched (v1.0.107).**
+>
+> | File | Change |
+> | --- | --- |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Public/RebusVisualiserSubsystem.h` | Forward decls for `UCanvas` + `APlayerController`. New public `SetVersionWatermarkEnabled` / `IsVersionWatermarkEnabled` / `GetCachedVersionDisplay` API + static `Set/GetVersionWatermarkTopMarginPx` accessors. Private `CachedVersionDisplay` `FString` + `VersionWatermarkDrawHandle` `FDelegateHandle` + private `DrawVersionWatermark` member. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp` | New includes (`Debug/DebugDrawService.h`, `Engine/Canvas.h`, `CanvasItem.h`, `CanvasTypes.h`, `Engine/Font.h`, `Interfaces/IPluginManager.h`). New file-scope `RebusVersionWatermark::GShowEnabled` + `GTopMarginPx` (live state shared with the console commands). `Initialize()` caches `CachedVersionDisplay` from `IPluginManager` + registers the `UDebugDrawService::Register("Foreground", ...)` delegate. `Deinitialize()` unregisters. New `Set/IsVersionWatermarkEnabled` instance methods + static `Set/GetVersionWatermarkTopMarginPx` + `DrawVersionWatermark` impl (FCanvasTextItem with EnableShadow). |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusVisualiser.cpp` | New `Rebus.ShowVersion` command (with `status` arg printing live flag + cached display + Y-margin) + `Rebus.VersionWatermarkY <px>` command. Both registered + unregistered alongside the existing `Rebus.*` commands. Both route through the v1.0.107 single chokepoint on `URebusVisualiserSubsystem`. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusSceneSettingsSubsystem.cpp` | Seed `bShowVersionWatermark = true` in `Initialize()`. New `ApplySceneProperty` branch routing through `URebusVisualiserSubsystem::SetVersionWatermarkEnabled` (mirrors v1.0.99 / v1.0.104 / v1.0.105 routing byte-for-byte). |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/RebusVisualiser.uplugin` | `VersionName` bumped `1.0.106` -> `1.0.107`. The watermark reads this descriptor field at runtime. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/README.md` | This release block. |
+>
+> No engine / `OrbitConnector` / `glTFRuntime` / PixelStreaming2 asset is touched
+> -- v1.0.107 stays inside `RebusVisualiser`. The v1.0.106 procedural-beam
+> default flip is preserved verbatim. The v1.0.97 / v1.0.99 / v1.0.103 /
+> v1.0.104 / v1.0.105 walkers are untouched.
+
 > **Prefer the procedural `M_RebusBeam` cone over Epic's `MI_Beam` so the v1.0.96 / v1.0.99 screen-space self-shadow trace actually renders -- Epic-beam parity queued for v1.0.107 (v1.0.106).**
 >
 > User report (verbatim):

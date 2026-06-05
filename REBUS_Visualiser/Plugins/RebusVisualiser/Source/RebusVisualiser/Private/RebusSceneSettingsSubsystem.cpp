@@ -131,6 +131,19 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// packaged builds, and the rebuild-storm caveat on the OFF path.
 	Values.Add(TEXT("bNaniteOrbitImports"), FRebusPropertyValue::MakeBool(true));
 
+	// v1.0.107 -- top-centre version watermark overlay. Default ON: every rendered
+	// viewport (and every PixelStreaming2 stream frame that captures the FCanvas
+	// overlay) shows `v<RebusVisualiser plugin VersionName>` in the top centre via
+	// URebusVisualiserSubsystem's UDebugDrawService("Foreground") draw delegate.
+	// Routed here so the portal can flip it via SetSceneProperty
+	// bShowVersionWatermark=false (mirrors the `Rebus.ShowVersion 0` console
+	// command). Source-of-truth: IPluginManager::FindPlugin("RebusVisualiser")
+	// ->GetDescriptor().VersionName, cached at subsystem Initialize() so the per-
+	// frame draw allocates nothing. See the v1.0.107 README release block for the
+	// full algorithm + why UDebugDrawService("Foreground") is the correct
+	// integration point (sits over 3D scene + under UMG, captured by PS2).
+	Values.Add(TEXT("bShowVersionWatermark"), FRebusPropertyValue::MakeBool(true));
+
 	// v1.0.90: post-process Bloom / Lens Flare / Vignette exposed as portal scene properties.
 	// Seeded so SceneState round-trips them before the portal pushes its first value, and the
 	// v1.0.89 ReapplyAll re-asserts the operator's live values on every (re)spawn of the
@@ -654,6 +667,26 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 				if (URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>())
 				{
 					Viz->SetNaniteOrbitImportsEnabled(Value.bBool);
+				}
+			}
+		}
+	}
+	// v1.0.107 top-centre version watermark visibility. Routes through the same
+	// GameInstance subsystem chokepoint as v1.0.99 / v1.0.104 / v1.0.105 so the
+	// portal scene-property push and the `Rebus.ShowVersion` console command share
+	// one source of truth -- a portal recycle would otherwise quietly drop the
+	// operator's choice. The watermark string itself is sourced once at subsystem
+	// Initialize() via IPluginManager so this branch only affects visibility, never
+	// content. Mirrors the v1.0.105 bNaniteOrbitImports branch byte-for-byte.
+	else if (Name == TEXT("bShowVersionWatermark"))
+	{
+		if (UWorld* World = GetWorld())
+		{
+			if (UGameInstance* GI = World->GetGameInstance())
+			{
+				if (URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>())
+				{
+					Viz->SetVersionWatermarkEnabled(Value.bBool);
 				}
 			}
 		}

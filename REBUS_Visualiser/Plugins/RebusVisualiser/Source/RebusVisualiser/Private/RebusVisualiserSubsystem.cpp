@@ -35,7 +35,41 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Components/PrimitiveComponent.h"
 
+// v1.0.107 -- watermark overlay support. UDebugDrawService is the engine's
+// FCanvas-overlay registry; the "Foreground" extension fires after the world is
+// rendered but before UMG/HUD, so the watermark sits over the 3D scene + under any
+// operator UMG -- correct stacking for a non-intrusive overlay. Pixel Streaming 2
+// captures the same FCanvas pass into the H.264 stream so the watermark appears
+// in the live stream without PS2-side glue.
+#include "Debug/DebugDrawService.h"
+#include "Engine/Canvas.h"
+#include "CanvasItem.h"
+#include "CanvasTypes.h"
+#include "Engine/Font.h"
+#include "Interfaces/IPluginManager.h"
+
 static const TCHAR* RebusProjectVersion = TEXT("rebus-visualiser-1.0.0");
+
+// v1.0.107 -- version-watermark live state. File-scope (rather than member fields)
+// so the per-frame foreground-canvas draw delegate + the `Rebus.ShowVersion` /
+// `Rebus.VersionWatermarkY` console commands (registered in RebusVisualiser.cpp) +
+// the SetSceneProperty handler all read the SAME bool/float without an extra
+// subsystem lookup per frame. The flag default is ON: the watermark is the
+// operator's at-a-glance confirmation that the running binary matches the
+// expected release on every rendered frame (and every PixelStreaming2 stream
+// frame that captures the FCanvas overlay), so it must be visible by default.
+//
+// Mirrors the existing Rebus.* IConsoleCommand pattern (Rebus.ShowOrbitFixtures /
+// Rebus.OverrideTrussMaterial / Rebus.OrbitDoubleSided / Rebus.NaniteOrbitImports)
+// rather than TAutoConsoleVariable: those existing commands all support multi-arg
+// invocations (`status`, descriptive log lines, scene-property routing) that a
+// raw CVar can't provide, and pairing the namespace with a CVar would conflict
+// with the IConsoleCommand registration anyway.
+namespace RebusVersionWatermark
+{
+	bool   GShowEnabled  = true;
+	float  GTopMarginPx  = 12.f;
+}
 
 // v1.0.100 -- default streamed-view spawn pose now lives in RebusCineCameraDefaults
 // (RebusCineCameraPawn.h) so URebusVisualiserSubsystem::TryPositionPlayerView (spawn) and
@@ -93,6 +127,42 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	// in-place via the same Python entry point so the operator never has to restart the
 	// editor in the v1.0.103+ flow.
 	ProbeBeamMasterAtStartup();
+
+	// v1.0.107 -- compose the watermark display string ONCE from the plugin
+	// descriptor's VersionName (the engine-blessed source-of-truth that always
+	// reflects the running binary). Caching here makes the per-frame draw zero-
+	// allocation. We fall back to the project-version literal if the plugin
+	// somehow can't be located (cooked-package edge case); the watermark still
+	// renders something useful instead of an empty string.
+	{
+		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("RebusVisualiser"));
+		if (Plugin.IsValid())
+		{
+			CachedVersionDisplay = FString::Printf(TEXT("v%s"), *Plugin->GetDescriptor().VersionName);
+		}
+		else
+		{
+			CachedVersionDisplay = TEXT("v?.?.?");
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("v1.0.107 watermark: IPluginManager could not find 'RebusVisualiser' "
+					 "-- falling back to placeholder version string. The watermark will "
+					 "still render but it won't reflect the descriptor's VersionName."));
+		}
+	}
+
+	// Register the foreground debug-draw delegate. UDebugDrawService dispatches the
+	// "Foreground" extension after the 3D world is rendered + before UMG/HUD, so the
+	// watermark sits on top of the scene + below any operator UMG (correct stacking
+	// for a non-intrusive overlay). PixelStreaming2 captures the FCanvas overlay
+	// pass verbatim into the H.264 stream frames -- no PS2-side integration needed.
+	VersionWatermarkDrawHandle = UDebugDrawService::Register(
+		TEXT("Foreground"),
+		FDebugDrawDelegate::CreateUObject(this, &URebusVisualiserSubsystem::DrawVersionWatermark));
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("v1.0.107 watermark registered: display='%s', toggle='Rebus.ShowVersion' (default ON), "
+			 "y-margin='Rebus.VersionWatermarkY' (default 12px)."),
+		*CachedVersionDisplay);
 
 	UE_LOG(LogRebusVisualiser, Log, TEXT("Visualiser subsystem initialised (streamer='%s', project='%s', model='%s')."),
 		*StreamerId, *ProjectId, *ModelId);
@@ -167,9 +237,93 @@ void URebusVisualiserSubsystem::Deinitialize()
 		FTSTicker::GetCoreTicker().RemoveTicker(TickHandle);
 		TickHandle.Reset();
 	}
+	// v1.0.107 -- always unregister the watermark draw delegate so a hot-reload of
+	// the module / GameInstance respawn doesn't leak a dangling delegate into the
+	// debug-draw service (would crash on the next "Foreground" dispatch when the
+	// captured `this` is destructed).
+	if (VersionWatermarkDrawHandle.IsValid())
+	{
+		UDebugDrawService::Unregister(VersionWatermarkDrawHandle);
+		VersionWatermarkDrawHandle.Reset();
+	}
 	Channel.Reset();
 	Rest.Reset();
 	Super::Deinitialize();
+}
+
+// v1.0.107 -- single chokepoint for the version-watermark visibility toggle.
+// Routes through the file-scope `RebusVersionWatermark::GShowEnabled` so the
+// per-frame draw + the `Rebus.ShowVersion` console command + the
+// `bShowVersionWatermark` scene property + a programmatic API call all share one
+// source of truth for the live state. Mirrors the v1.0.99 / v1.0.104 / v1.0.105
+// single-chokepoint pattern (SetOrbitCastShadowsEnabled,
+// SetOrbitDoubleSidedEnabled, SetNaniteOrbitImportsEnabled).
+void URebusVisualiserSubsystem::SetVersionWatermarkEnabled(bool bEnabled)
+{
+	RebusVersionWatermark::GShowEnabled = bEnabled;
+}
+
+bool URebusVisualiserSubsystem::IsVersionWatermarkEnabled() const
+{
+	return RebusVersionWatermark::GShowEnabled;
+}
+
+void URebusVisualiserSubsystem::SetVersionWatermarkTopMarginPx(float Px)
+{
+	RebusVersionWatermark::GTopMarginPx = FMath::Max(0.f, Px);
+}
+
+float URebusVisualiserSubsystem::GetVersionWatermarkTopMarginPx()
+{
+	return RebusVersionWatermark::GTopMarginPx;
+}
+
+// v1.0.107 -- the per-frame foreground-canvas draw that paints the watermark.
+// Wrapped in a single early-out so the per-frame cost is zero when the toggle is
+// off (the most common state in QA runs that don't want the overlay polluting
+// reference captures). UDebugDrawService::Register passes us a per-viewport
+// UCanvas + the local PlayerController; we measure the cached `v<VersionName>`
+// string against the engine's medium font, centre it horizontally on the canvas
+// width, and offset it down from the top edge by the configured margin.
+//
+// Drop-shadow: a black-70%-alpha shadow beneath the white-90% foreground glyph
+// keeps the text readable against bright skies (set in PIE) AND dark stages
+// (typical operator scene) without needing an opaque background plate. UE
+// `FCanvasTextItem::EnableShadow` does both layers in one DrawItem call.
+void URebusVisualiserSubsystem::DrawVersionWatermark(UCanvas* Canvas, APlayerController* /*PC*/)
+{
+	if (!Canvas || CachedVersionDisplay.IsEmpty())
+	{
+		return;
+	}
+	if (!RebusVersionWatermark::GShowEnabled)
+	{
+		return; // toggle is off -- per-frame cost collapses to one branch
+	}
+
+	UFont* Font = (GEngine != nullptr) ? GEngine->GetMediumFont() : nullptr;
+	if (!Font)
+	{
+		return; // engine still bootstrapping; try again next frame
+	}
+
+	float TextW = 0.f, TextH = 0.f;
+	Canvas->TextSize(Font, CachedVersionDisplay, TextW, TextH);
+
+	const float CanvasW = static_cast<float>(Canvas->SizeX);
+	const float MarginY = FMath::Max(0.f, RebusVersionWatermark::GTopMarginPx);
+	const float DrawX = FMath::Max(0.f, (CanvasW - TextW) * 0.5f);
+	const float DrawY = MarginY;
+
+	// FCanvasTextItem with EnableShadow is the canonical UE way to draw a shadow
+	// stroke + foreground glyph in one item. The foreground is white-90% and the
+	// shadow is black-70%; works against bright + dark backgrounds without
+	// needing an opaque background plate.
+	FCanvasTextItem TextItem(FVector2D(DrawX, DrawY), FText::FromString(CachedVersionDisplay), Font, FLinearColor(1.f, 1.f, 1.f, 0.9f));
+	TextItem.EnableShadow(FLinearColor(0.f, 0.f, 0.f, 0.7f));
+	TextItem.bCentreX = false; // we computed the centred X explicitly above
+	TextItem.bCentreY = false;
+	Canvas->DrawItem(TextItem);
 }
 
 void URebusVisualiserSubsystem::ReadConfig()
