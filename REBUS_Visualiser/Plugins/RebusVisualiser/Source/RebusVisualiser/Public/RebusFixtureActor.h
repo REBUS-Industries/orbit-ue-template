@@ -354,6 +354,14 @@ private:
 	// v1.0.49: explicit clear path. Drops CurrentGoboTexture, reverts the Epic beam MID to its
 	// MI default, nulls the SpotLight light function, clears bGoboActive, and reasserts shadows.
 	void ClearGoboToOpen(const TCHAR* Reason);
+	// v1.0.83: per-light Lumen isolation while a gobo is active. Sets
+	// SpotLight->SetAffectGlobalIllumination(!bGoboActive) so Lumen doesn't sample the lit
+	// floor for indirect bounce while the cookie pattern is animating -- removes the
+	// Lumen-side ghost trail surgically, without the v1.0.78 global Lumen.Temporal=0 nuke
+	// (which added noise everywhere). The direct beam still casts and lights surfaces; only
+	// the indirect (bounce) contribution is suppressed. Called from both ApplyGobo paths and
+	// from ClearGoboToOpen so the SpotLight always agrees with bGoboActive.
+	void RefreshGoboLumenIsolation();
 public:
 	// v1.0.49: case-insensitive match against known "no-gobo" slot names. Trimmed; returns true
 	// for "Open"/"None"/"Empty"/"Clear"/"No Gobo"/"Open Hole"/"Off" and a few common variants.

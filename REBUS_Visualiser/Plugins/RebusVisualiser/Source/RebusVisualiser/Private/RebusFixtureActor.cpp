@@ -2806,6 +2806,9 @@ bool ARebusFixtureActor::ApplyGoboTextureFromBytes(const TArray<uint8>& Bytes)
 
 	ApplyCurrentGoboToEpicBeam(); // tail-calls ApplyCurrentGoboToLightFn (cone + cookie).
 	RefreshBeamShadowMode();      // enables CastShadows now that bGoboActive is true.
+	RefreshGoboLumenIsolation();  // v1.0.83: removes the spotlight from Lumen GI while the
+	                              //          cookie is animating -- kills the GI ghost layer
+	                              //          without touching global Lumen CVars.
 	return true;
 }
 
@@ -3371,6 +3374,37 @@ void ARebusFixtureActor::ClearGoboToOpen(const TCHAR* Reason)
 	// bGoboActive removes any gobo-driven shadow override on non-hero beams.
 	ApplyCurrentGoboToEpicBeam();
 	RefreshBeamShadowMode();
+	RefreshGoboLumenIsolation(); // v1.0.83: re-enable Lumen GI contribution now that the cookie
+	                             //          is no longer animating.
+}
+
+void ARebusFixtureActor::RefreshGoboLumenIsolation()
+{
+	if (!SpotLight) return;
+
+	// While a gobo is active, the spotlight is projecting a per-frame-changing cookie pattern
+	// onto whatever the cone hits. Lumen samples that lit surface sparsely for indirect bounce
+	// and accumulates the result temporally -- which is exactly what produces the residual
+	// "ghost in the GI" trail behind a rotating cookie that survived TSR-side mitigations. By
+	// removing this single light from Lumen's indirect-lighting set while bGoboActive is true,
+	// the bounce contribution from a cookie-projecting fixture no longer feeds Lumen's
+	// temporal history, so there's nothing for Lumen to ghost.
+	//
+	// Direct lighting (the lit floor itself) is unaffected; only the bounce off that floor onto
+	// surrounding geometry is suppressed for the cookie's duration. For a stage lighting
+	// visualiser this is invisible 95%+ of the time -- spotlights with cookies are aimed at the
+	// floor / set pieces, and the missing-bounce hit is just a slightly less-glowy room.
+	// Cleared the second the cookie is removed (ClearGoboToOpen -> RefreshGoboLumenIsolation
+	// reasserts !bGoboActive which is now false -> GI back on).
+	const bool bDesired = !bGoboActive;
+	if (SpotLight->bAffectGlobalIllumination == bDesired)
+	{
+		return; // no-op fast path
+	}
+	SpotLight->SetAffectGlobalIllumination(bDesired);
+	UE_LOG(LogRebusVisualiser, Verbose,
+		TEXT("Fixture %s gobo Lumen-isolation: SetAffectGlobalIllumination(%d) (bGoboActive=%d)"),
+		*FixtureId, bDesired ? 1 : 0, bGoboActive ? 1 : 0);
 }
 
 bool ARebusFixtureActor::IsOpenSlotName(const FString& Name)

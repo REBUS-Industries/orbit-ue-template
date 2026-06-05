@@ -594,6 +594,100 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Fresh approach to rotating-gobo ghosting -- per-light Lumen isolation + operator-picked AA mode (v1.0.83).**
+> User: *"Since we made the render setting changes to improve the gobo rotate ghosting, we are getting noise/flickering.
+> The ghosting isnt fixed though. can we reset these render settings and come up with a fresh approach to solve the ghosting.
+> If we move the camera, it temporarily stops ghosting."*
+>
+> **Why the v1.0.73/74/78 approach failed.** Those releases shipped two CVar packs auto-applied at
+> `PostEngineInit`:
+>
+> * **GoboAntiGhost** (v1.0.73/74): `r.TSR.ShadingRejection.Flickering=1`, `r.TSR.History.UpdateRate=0.6`,
+>   `r.LightFunctionAtlas.Enabled=0`, + a few related knobs. The theory: make TSR more aggressive at
+>   rejecting "flickering" pixels so the rotating cookie wouldn't smear. The reality: TSR's shading
+>   rejection cannot distinguish "rotating gobo" from "noisy pixel" without lowering thresholds globally,
+>   so the cure introduced low-grade noise/shimmer across the whole frame -- on geometry that has nothing
+>   to do with gobos.
+> * **LumenFastResponse** (v1.0.78): `r.Lumen.ScreenProbeGather.Temporal=0`, `r.Lumen.Reflections.Temporal=0`,
+>   `r.Lumen.Radiosity.Temporal=0`. The theory: kill Lumen's temporal accumulator so the cookie's bounce
+>   contribution doesn't ghost in GI. The reality: disabling Lumen's temporal filters globally means
+>   *every* indirect-lighting sample is now sparse and noisy. Stage scenes look grainy even when no
+>   gobo is animating.
+>
+> The user's diagnostic gold: *"if we move the camera, it temporarily stops ghosting"*. This is the
+> proof that TSR is the layer doing it. When the camera moves, the floor's motion vector is non-zero,
+> TSR reprojects history to a different pixel (which had a different lit colour), the colour-match
+> check fails, history is rejected, ghost vanishes. When the camera is still, motion vector is zero
+> and TSR keeps blending stale lit pixels at the same screen position. **TSR is fundamentally not
+> designed for stationary geometry with animated light functions**, and no amount of CVar tuning
+> changes that without trading one artifact for another.
+>
+> **Fresh approach: attack the two ghost layers surgically, not globally.**
+>
+> 1. **Lumen ghost layer -- per-light isolation.** `ARebusFixtureActor::RefreshGoboLumenIsolation()`
+>    flips `SpotLight->SetAffectGlobalIllumination(!bGoboActive)` on the *specific* spotlight projecting
+>    a cookie. Called from `ApplyGobo()` (gobo bound -> Lumen off for THIS light) and from
+>    `ClearGoboToOpen()` (cookie removed -> Lumen back on). The bounce contribution from a
+>    cookie-projecting fixture no longer enters Lumen's temporal history, so there's nothing for Lumen
+>    to ghost -- and every other light in the scene keeps full GI fidelity. No global CVar nuke. The
+>    cost is invisible 95%+ of the time: spotlights with cookies are aimed at floor/set pieces, the
+>    "missing bounce" is a slightly less-glowy surrounding room, and the direct light is unaffected.
+> 2. **TSR ghost layer -- operator-picked AA mode.** `Rebus.AAMode tsr|taa|fxaa|msaa|off|status` flips
+>    `r.AntiAliasingMethod`. The recommendation for shows featuring rotating gobos is **TAA** (mode 2):
+>    older temporal AA, simpler history, more aggressive rejection -- trails MUCH less behind animated
+>    lights at the cost of slightly softer static AA. Shows without animated cookies stay on TSR (the
+>    default). FXAA / no-AA are also available for extreme cases. Portal can drive this from the UI
+>    by sending `{"type":"ConsoleCommand","command":"Rebus.AAMode taa"}` over the existing
+>    `ConsoleCommand` descriptor pipe (no new portal-side wiring required).
+>
+> **Reverted.** The `PostEngineInit` auto-apply of `ApplyGoboAntiGhost(true)` and
+> `ApplyLumenFastResponse(true)` is removed. The packs and their console commands still exist
+> (`Rebus.GoboAntiGhost [0|1]` / `Rebus.LumenFastResponse [0|1]`) for A/B testing, but they're OFF by
+> default. Anyone who relaunches into v1.0.83 immediately gets engine-default TSR + full Lumen back.
+> The CVars are snapshotted on first ON and restored byte-exact on OFF, so flipping the toggles
+> mid-session is safe (the snapshot is empty until the first ON, so the new default has zero
+> historical interference).
+>
+> **What changed in code.**
+>
+> * `RebusVisualiser.cpp` -- `OnPostEngineInit` no longer auto-applies the two CVar packs. Replaced
+>   with a long comment explaining the v1.0.83 diagnosis. Added `Rebus.AAMode` console command
+>   (registration + handler + unregister). Updated `Rebus.GoboAntiGhost` help text to reflect the
+>   new default-OFF status.
+> * `RebusFixtureActor.h` -- declared `RefreshGoboLumenIsolation()`.
+> * `RebusFixtureActor.cpp` -- implemented `RefreshGoboLumenIsolation()` (single-line flip via
+>   `SetAffectGlobalIllumination` with a no-op fast path). Called from `ApplyGobo` (after
+>   `RefreshBeamShadowMode`) and from `ClearGoboToOpen` (after `RefreshBeamShadowMode`).
+>
+> **Operator checklist for ghost-free rotating gobos.**
+>
+> ```
+> # 1. Confirm the v1.0.83 reset is live.
+> Rebus.GoboAntiGhost 0         # should report "OFF" (it already is, this re-asserts)
+> Rebus.LumenFastResponse 0     # ditto
+>
+> # 2. Pick the AA mode that fits the show.
+> Rebus.AAMode status           # current setting (likely "tsr" -- UE default)
+> Rebus.AAMode taa              # recommended for rotating-gobo shows
+>
+> # 3. Verify per-light Lumen isolation is firing.
+> #    (Set a gobo on a fixture from the portal, then dump.)
+> Rebus.DumpGoboState           # confirms bGoboActive=1 on the chosen fixture
+> #    The hidden Verbose-level log line "gobo Lumen-isolation: SetAffectGlobalIllumination(0)"
+> #    fires the moment a gobo is bound; clear the gobo -> the same line with (1) fires.
+>
+> # 4. (Optional) The legacy v1.0.73/74/78 packs still exist if you want them.
+> Rebus.GoboAntiGhost 1         # re-enable the v1.0.73 pack (NOT recommended -- adds noise)
+> Rebus.LumenFastResponse 1     # re-enable v1.0.78 pack (NOT recommended -- adds noise)
+> ```
+>
+> **Why this is the right shape long-term.** Neither layer is solved with "one CVar fixes
+> everything". The Lumen layer is solved per-light (the surgical change ships with every binary --
+> no operator action). The TSR layer is solved per-show (operator picks AA mode based on whether
+> rotating gobos are featured -- single command, persists for the session). The default-OFF reset
+> means new operators get a clean engine baseline and can opt into the legacy packs only if they
+> want to A/B-test the trade-offs themselves.
+
 > **CameraState delivery diagnostics + first-spawn force-push (v1.0.82).**
 > User: *"we are not seeing the camera data in our portal, we have used the notes you gave us"*.
 >

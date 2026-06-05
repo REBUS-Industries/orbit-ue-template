@@ -40,6 +40,7 @@ namespace
 	IConsoleCommand* GCameraResetCommand = nullptr;
 	IConsoleCommand* GCameraStreamStatusCommand = nullptr;
 	IConsoleCommand* GSendCameraStateCommand = nullptr;
+	IConsoleCommand* GAAModeCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -507,9 +508,10 @@ namespace
 	}
 
 	// v1.0.73: `Rebus.GoboAntiGhost [0|1]` -- toggle the rotating-gobo ghosting mitigation
-	// (TSR flicker-aware shading rejection + full-res light functions). Default ON since
-	// v1.0.73 (auto-applied on PostEngineInit). Disable for A/B comparison or if a specific
-	// scene needs raw TSR back.
+	// (TSR flicker-aware shading rejection + full-res light functions). Default OFF since
+	// v1.0.83 (the auto-apply on PostEngineInit was removed -- this pack added more flicker
+	// than it removed and didn't actually fix the underlying TSR pathology). Keep the
+	// command for A/B testing.
 	void HandleGoboAntiGhostCommand(const TArray<FString>& Args)
 	{
 		const bool bEnable = ParseBoolArg(Args, true);
@@ -517,6 +519,95 @@ namespace
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("Rebus.GoboAntiGhost %d -> live state %s."),
 			bEnable ? 1 : 0, GGoboAntiGhostEnabled ? TEXT("ON") : TEXT("OFF"));
+	}
+
+	// v1.0.83: `Rebus.AAMode [tsr|taa|fxaa|msaa|off]` -- pick the screen-space anti-aliasing
+	// method. The fresh approach to the rotating-gobo ghost problem.
+	//
+	// Background: TSR (the default since UE 5.2) is a temporal upscaler that REPROJECTS the
+	// previous frame's image via per-pixel motion vectors and blends it with the current
+	// frame. Geometry that doesn't move has motion-vector = 0, so TSR fetches "the same pixel
+	// from the last frame" as history. When an ANIMATED LIGHT FUNCTION (our rotating gobo
+	// cookie) projects onto that stationary geometry, the lit colour changes per frame but the
+	// geometry doesn't, so TSR keeps blending in stale lit colour from the trailing rotation
+	// angle -> ghost trail. The user's diagnostic observation "if we move the camera, it
+	// temporarily stops ghosting" is the proof: camera motion makes the floor's motion vector
+	// non-zero, TSR reprojects to a DIFFERENT pixel in history (which had different lit
+	// content), the colour-match check fails, history is rejected, ghost gone.
+	//
+	// TSR's shading-rejection heuristic (r.TSR.ShadingRejection.*) tries to detect this case
+	// but can't distinguish "rotating gobo" from "noisy pixel" without lowering thresholds
+	// globally -- which is exactly what the v1.0.73/74 GoboAntiGhost pack did, and exactly
+	// what produced the noise/flickering side effect the user reported. TSR fundamentally
+	// can't fix this case in software without surface-classification metadata it doesn't have.
+	//
+	// Workarounds, in order of preference for a stage visualiser:
+	//   * TAA  (r.AntiAliasingMethod=2): older temporal AA, simpler history, more aggressive
+	//          rejection. Trails MUCH less behind animated lights at the cost of slightly
+	//          softer static AA. RECOMMENDED for shows where rotating gobos are featured.
+	//   * TSR  (r.AntiAliasingMethod=4): UE5 default. Sharpest, best static AA, ghosts on
+	//          rotating gobos. Use for shows without animated cookies.
+	//   * FXAA (r.AntiAliasingMethod=1): per-frame edge filter, no history at all -> zero
+	//          ghosting. Costs cookie sharpness across frames (no temporal accumulation
+	//          benefit) and is jaggier on geometry edges. Acceptable on high-res output.
+	//   * MSAA (r.AntiAliasingMethod=3): forward shading only -- DOES NOT WORK in this
+	//          project's deferred renderer; we accept the argument and log that it falls
+	//          back to no-AA. Listed for completeness.
+	//   * off  (r.AntiAliasingMethod=0): no AA. Maximum ghost-freedom; visible aliasing.
+	//
+	// Values are pushed with ECVF_SetByGameOverride so per-scene scalability still wins.
+	// Snapshot/restore: not needed; flipping AA mode is a single CVar write the engine
+	// already handles via runtime scalability.
+	void HandleAAModeCommand(const TArray<FString>& Args)
+	{
+		const FString Mode = (Args.Num() > 0) ? Args[0].ToLower() : FString(TEXT("status"));
+		IConsoleVariable* AA = IConsoleManager::Get().FindConsoleVariable(TEXT("r.AntiAliasingMethod"));
+		if (!AA)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.AAMode: r.AntiAliasingMethod CVar not registered (renderer module not loaded?)."));
+			return;
+		}
+
+		if (Mode == TEXT("status") || Mode == TEXT(""))
+		{
+			static const TCHAR* Names[] = { TEXT("off"), TEXT("fxaa"), TEXT("taa"), TEXT("msaa"), TEXT("tsr") };
+			const int32 V = AA->GetInt();
+			const TCHAR* Name = (V >= 0 && V < UE_ARRAY_COUNT(Names)) ? Names[V] : TEXT("?");
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.AAMode status: r.AntiAliasingMethod=%d (%s). Set with: Rebus.AAMode tsr|taa|fxaa|msaa|off"),
+				V, Name);
+			return;
+		}
+
+		int32 Target = -1;
+		if      (Mode == TEXT("off") || Mode == TEXT("none") || Mode == TEXT("0"))            Target = 0;
+		else if (Mode == TEXT("fxaa") || Mode == TEXT("1"))                                    Target = 1;
+		else if (Mode == TEXT("taa") || Mode == TEXT("temporal") || Mode == TEXT("2"))         Target = 2;
+		else if (Mode == TEXT("msaa") || Mode == TEXT("3"))                                    Target = 3;
+		else if (Mode == TEXT("tsr") || Mode == TEXT("4"))                                     Target = 4;
+		else
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.AAMode: unknown mode '%s'. Valid: tsr|taa|fxaa|msaa|off|status."), *Mode);
+			return;
+		}
+
+		const FString Before = AA->GetString();
+		AA->Set(Target, ECVF_SetByGameOverride);
+		const FString After = AA->GetString();
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.AAMode '%s' -> r.AntiAliasingMethod %s -> %s. %s"),
+			*Mode, *Before, *After,
+			(Target == 2)
+				? TEXT("(TAA selected -- recommended for rotating gobos; slightly softer static AA than TSR but no ghost trail.)")
+				: (Target == 4)
+					? TEXT("(TSR selected -- best static AA; rotating gobos on stationary geometry will trail because of TSR's temporal reprojection.)")
+					: (Target == 1)
+						? TEXT("(FXAA -- per-frame edge filter, no temporal history, zero ghosting, jaggier geometry.)")
+						: (Target == 0)
+							? TEXT("(AA off -- maximum ghost-freedom, visible aliasing.)")
+							: TEXT("(MSAA selected; this project uses deferred shading so MSAA effectively maps to no-AA.)"));
 	}
 
 	// v1.0.55: Pixel Streaming console-command gate. v1.0.54 set only the PS1 CVar
@@ -819,15 +910,25 @@ void FRebusVisualiserModule::StartupModule()
 		TryForcePixelStreamingGate(TEXT("PostEngineInit"));
 		LogPixelStreamingGateStatus();
 
-		// v1.0.73: rotating-gobo ghosting mitigation, auto-applied at PostEngineInit so the
-		// renderer module's TSR CVars are guaranteed registered. Default ON; disable per
-		// session with `Rebus.GoboAntiGhost 0` for A/B against the prior look.
-		ApplyGoboAntiGhost(true, TEXT("PostEngineInit"));
-
-		// v1.0.78: Lumen GI fast-response pack, same auto-apply pattern. Default ON; disable
-		// for cinematic scenes via `Rebus.LumenFastResponse 0`. See the pack definition above
-		// for the full diagnosis (lights on/off GI fade, gobo bounce ghost).
-		ApplyLumenFastResponse(true, TEXT("PostEngineInit"));
+		// v1.0.83: REVERTED the v1.0.73/74/78 auto-apply. The GoboAntiGhost + LumenFastResponse
+		// packs traded ghosting for global noise/flickering AND didn't actually fix the
+		// underlying TSR pathology. Root cause (proved by the user's "moving the camera
+		// temporarily stops ghosting" observation): TSR + animated light functions on
+		// stationary geometry. Motion vectors are zero on the floor, so TSR reprojects from
+		// the SAME pixel last frame -- which had the cookie pattern at a slightly different
+		// rotation. TSR's shading-rejection heuristic can't tell "rotating gobo" apart from
+		// "noise" without lowering thresholds globally, which is what created the noise side
+		// effect. The packs remain available behind their console commands for A/B; the
+		// fresh approach (v1.0.83) tackles the actual layers:
+		//   1. Lumen ghost layer  -> per-spotlight bAffectDynamicIndirectLighting=false while
+		//                            a gobo is active (in ARebusFixtureActor::ApplyGobo). Kills
+		//                            the GI trail cleanly WITHOUT the global Lumen.Temporal=0
+		//                            nuke that added noise everywhere.
+		//   2. TSR ghost layer    -> Rebus.AAMode console + SetAAMode portal descriptor.
+		//                            Operator picks TAA (handles animated lights without
+		//                            ghost trails because its history rejection is simpler/
+		//                            more aggressive) when a show features rotating gobos.
+		//                            TSR stays default for shows without animated cookies.
 	});
 
 	GDriveOrbitModelsCommand = IConsoleManager::Get().RegisterConsoleCommand(
@@ -1000,6 +1101,20 @@ void FRebusVisualiserModule::StartupModule()
 			 "event listener (event name mismatch, frontend not subscribed), not in UE."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleSendCameraStateCommand),
 		ECVF_Default);
+
+	// v1.0.83 fresh approach to rotating-gobo ghosting -- operator-picked AA method. See the
+	// HandleAAModeCommand comment header for the full diagnosis of why TSR ghosts on animated
+	// light functions.
+	GAAModeCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.AAMode"),
+		TEXT("Pick the screen-space AA method: tsr (UE default, ghosts on rotating gobos), "
+			 "taa (older temporal AA, recommended for shows featuring rotating gobos -- "
+			 "slightly softer static AA but no ghost trail), fxaa (no temporal history, zero "
+			 "ghosting, jaggier geometry), msaa (deferred renderer falls back to no-AA), "
+			 "off (no AA). No argument or 'status' logs the current setting. "
+			 "Usage: Rebus.AAMode [tsr|taa|fxaa|msaa|off|status]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleAAModeCommand),
+		ECVF_Default);
 }
 
 void FRebusVisualiserModule::ShutdownModule()
@@ -1079,8 +1194,15 @@ void FRebusVisualiserModule::ShutdownModule()
 		IConsoleManager::Get().UnregisterConsoleObject(GSendCameraStateCommand);
 		GSendCameraStateCommand = nullptr;
 	}
+	if (GAAModeCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GAAModeCommand);
+		GAAModeCommand = nullptr;
+	}
 	// v1.0.73 / v1.0.78: restore both CVar packs to their snapshotted values so a hot-reload
-	// of the module doesn't leak a permanent override into the engine session.
+	// of the module doesn't leak a permanent override into the engine session. Both packs
+	// no-op if never enabled (v1.0.83 removed the auto-apply), so this is safe in the default
+	// case where the operator never touched the toggles.
 	ApplyGoboAntiGhost(false, TEXT("ShutdownModule"));
 	ApplyLumenFastResponse(false, TEXT("ShutdownModule"));
 
