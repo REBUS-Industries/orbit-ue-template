@@ -42,6 +42,7 @@ namespace
 	IConsoleCommand* GSendCameraStateCommand = nullptr;
 	IConsoleCommand* GAAModeCommand = nullptr;
 	IConsoleCommand* GOverrideTrussMaterialCommand = nullptr;
+	IConsoleCommand* GSetGroundTilingCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -833,6 +834,35 @@ namespace
 			bShow ? 1 : 0, RootsAffected, bShow ? TEXT("shown") : TEXT("hidden"));
 	}
 
+	// v1.0.86: `Rebus.SetGroundTiling <metres>` -- set the floor texture's physical tile size.
+	// With the v1.0.86 ground master, 1.0 (default) = one texture repeat per 1 m of world
+	// space regardless of the floor mesh's actor scale (the BaseLevel floor is a 100 cm engine
+	// plane scaled 2000x = 2 km square, so without world-driven UVs every texture was being
+	// stretched 2000x). Lower => finer tiling (0.5 = 2 repeats/m). Routes through every
+	// running Game/PIE world's URebusSceneSettingsSubsystem::SetGroundTilingMeters (and
+	// updates the SceneState 'GroundTilingMeters' value so the portal sees the new tiling on
+	// its next read-back).
+	void HandleSetGroundTilingCommand(const TArray<FString>& Args)
+	{
+		if (!GEngine) return;
+		const float Metres = (Args.Num() > 0) ? FCString::Atof(*Args[0]) : 1.0f;
+		int32 Subsystems = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+			URebusSceneSettingsSubsystem* Sce = World->GetSubsystem<URebusSceneSettingsSubsystem>();
+			if (!Sce) continue;
+			++Subsystems;
+			// Route via the catalogue path so SceneState gets the new value (instead of just
+			// pushing to the MID directly -- that would render correctly but a SceneState
+			// read-back would still report the old tiling).
+			Sce->ApplySceneProperty(TEXT("GroundTilingMeters"), FRebusPropertyValue::MakeNumber(Metres));
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.SetGroundTiling %.3f: pushed to %d scene-settings subsystem(s)."), Metres, Subsystems);
+	}
+
 	// v1.0.85: `Rebus.OverrideTrussMaterial [0|1]` -- enable / disable the powdercoat material
 	// override on every Orbit-imported primitive NOT bound to a fixture. ON applies the truss
 	// material (loaded from /Game/REBUS/Materials/M_RebusTruss.M_RebusTruss if present, else a
@@ -1141,6 +1171,17 @@ void FRebusVisualiserModule::StartupModule()
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleSendCameraStateCommand),
 		ECVF_Default);
 
+	// v1.0.86 floor texture tiling at world scale.
+	GSetGroundTilingCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.SetGroundTiling"),
+		TEXT("Set the floor texture's physical tile size in metres (1 texture repeat per N metres "
+			 "of world space). Default 1.0 (matches the SceneState default). Pre-v1.0.86 ground "
+			 "masters lack the TilingMeters parameter -- the push is a silent no-op there until "
+			 "the master is regenerated via build_rebus_base_level.build() in the editor. "
+			 "Usage: Rebus.SetGroundTiling <metres>"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleSetGroundTilingCommand),
+		ECVF_Default);
+
 	// v1.0.85 truss / set-piece powdercoat material override -- ON by default. See the
 	// HandleOverrideTrussMaterialCommand comment header for the full rationale.
 	GOverrideTrussMaterialCommand = IConsoleManager::Get().RegisterConsoleCommand(
@@ -1257,6 +1298,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GOverrideTrussMaterialCommand);
 		GOverrideTrussMaterialCommand = nullptr;
+	}
+	if (GSetGroundTilingCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GSetGroundTilingCommand);
+		GSetGroundTilingCommand = nullptr;
 	}
 	// v1.0.73 / v1.0.78: restore both CVar packs to their snapshotted values so a hot-reload
 	// of the module doesn't leak a permanent override into the engine session. Both packs

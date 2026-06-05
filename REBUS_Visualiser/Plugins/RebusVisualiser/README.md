@@ -594,6 +594,107 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Floor textures tile at 1 m physical scale (v1.0.86).**
+> User: *"can we make sure that the floor textures scale correctly on the infinite plane. They
+> are currently being stretched but they need to be scaled to a 1m x 1m size and then spread
+> across the plane."*
+>
+> **Why textures were stretched.** The BaseLevel floor is `/Engine/BasicShapes/Plane.Plane`
+> (a 100 cm engine plane) at `actor_scale3d = (2000, 2000, 1)` -- a 2 km square. The plane's
+> default UV span 0..1 is therefore stretched across 2000 m, so anything that sampled a
+> texture with the default `TexCoord[0]` node read as a SINGLE texture repeat covering 2 km.
+> The pre-v1.0.86 `M_RebusGround` master sidestepped this because its only colour input was
+> a `MaterialExpressionNoise` node which already runs on `AbsoluteWorldPosition` -- but the
+> moment you wired an actual bitmap sampler into an MI based on the master, the TexCoord
+> default kicked in and the bitmap got stretched 2000x in both directions.
+>
+> **The fix.** Drive UVs from world position, not from the mesh's TexCoord. The v1.0.86
+> ground master computes:
+>
+> ```
+> WorldUVs = AbsoluteWorldPosition.xy / (TilingMeters * 100 cm)
+> ```
+>
+> With `TilingMeters = 1.0` (the new default), one texture repeat covers 1 m of world space
+> regardless of the floor mesh's actor scale. The 2 km floor now shows 2000 repeats per side.
+> `TilingMeters = 0.5` doubles the repeat density; `10.0` coarsens by 10x. The C++ runtime
+> can override this on a per-session basis without rebaking the .uasset.
+>
+> **Master graph changes (`_build_ground_master` in `build_rebus_base_level.py`).**
+>
+> ```
+> BaseColor = lerp(ColorA, ColorB, Noise) * BaseColorTexture.Sample(WorldUVs)
+> Roughness = Roughness scalar
+> TilingMeters (default 1.0) divides world position to produce WorldUVs
+> ```
+>
+> * New `TilingMeters` scalar parameter (default 1.0).
+> * New `BaseColorTexture` texture parameter -- defaults to
+>   `/Engine/EngineResources/WhiteSquareTexture` so untextured MIs multiply by white (1,1,1)
+>   and behave identically to the pre-v1.0.86 procedural-only output. The four shipped
+>   presets (Concrete / Tarmac / Sand / Grass) are untextured, so they look pixel-identical
+>   to before on regen. MIs that BIND a real tileable bitmap to `BaseColorTexture` get the
+>   new 1 m tiling behaviour for free.
+> * `Noise` stays world-driven (always was; it's correct as-is).
+>
+> **Python self-heal.** `ensure_ground_materials()` (the startup-hook entry point) now
+> inspects the on-disk master and detects the pre-v1.0.86 form (no `TilingMeters` scalar
+> parameter). When found, it promotes itself to `force=True` and regenerates the master +
+> all four preset instances. Anyone who hand-customised the master in the editor will lose
+> those edits on first v1.0.86 startup -- this regen logs a `Warning` so the change isn't
+> silent. Acceptable for an additive parameter upgrade; preserves the long-term invariant
+> that the Python script is the source of truth for the procedural master.
+>
+> **C++ runtime additions (`URebusSceneSettingsSubsystem`).**
+>
+> * New `GroundTilingMeters` scene property, default `1.0` -- shipped on every `SceneState`
+>   read-back so the portal sees the current tiling without polling.
+> * `SetGroundSurface(Preset)` now wraps the loaded MI in a `UMaterialInstanceDynamic` after
+>   `SetMaterial(0, ...)` and pushes the current `TilingMeters` to it. Discards any prior
+>   MID so a surface swap can't leak param state from the previous surface.
+> * `SetGroundTilingMeters(metres)` pushes the scalar to the cached MID (lazy-wrapped via
+>   `EnsureFloorMID`). Clamps to `>= 0.01 m` so a zero from the portal can't divide-by-zero
+>   the UV calc inside the material and render as a single texel stretched across the plane.
+> * `ApplySceneProperty` routes the new `GroundTilingMeters` name to `SetGroundTilingMeters`.
+> * Safe with pre-v1.0.86 materials: `SetScalarParameterValue` is a silent no-op when the
+>   underlying material has no `TilingMeters` parameter. Operators on an old master see no
+>   error; they just see no visible change until they regen via `build_rebus_base_level.
+>   build()` in the editor (or restart so the self-heal regen kicks in).
+>
+> **Console.** `Rebus.SetGroundTiling <metres>`. Routes through `ApplySceneProperty` so the
+> SceneState reflects the new value (instead of pushing the MID directly, which would render
+> correctly but leave `SceneState` out of date).
+>
+> **Operator checklist.**
+>
+> ```text
+> # 1. Confirm the master has been regenerated.
+> #    Editor -> /Game/REBUS/Materials/M_RebusGround -> Parameters panel should list
+> #    `TilingMeters` (default 1.0) and `BaseColorTexture` (default WhiteSquareTexture).
+> #    If missing, restart the editor -- ensure_ground_materials() will self-heal on init.
+>
+> # 2. Author a textured surface preset.
+> #    Editor -> /Game/REBUS/Materials/ -> duplicate any MI_RebusGround_<preset> ->
+> #    open in the MI editor -> set `BaseColorTexture` to your tileable PBR colour map.
+> #    The texture will immediately tile at 1 m physical scale on the floor.
+>
+> # 3. Runtime tile size adjustment without re-cooking.
+> Rebus.SetGroundTiling 1.0         # 1 texture repeat per 1 m (default)
+> Rebus.SetGroundTiling 0.5         # 2 repeats per 1 m (finer)
+> Rebus.SetGroundTiling 10          # 1 repeat per 10 m (coarser)
+>
+> # 4. Portal can drive the same control as a scene property -- the SceneState read-back
+> #    publishes GroundTilingMeters alongside GroundSurface / bGroundVisible.
+> ```
+>
+> **Why we didn't switch the noise to also use TilingMeters.** The noise scale is already
+> set such that the procedural variation reads correctly at typical floor sizes (scale=0.005
+> -> ~2 m feature size on the world-driven position input). Re-binding it to TilingMeters
+> would make the noise pattern stretch with the tile size, which is the opposite of what the
+> noise is there for (large-scale colour variation that's INDEPENDENT of tile size). Kept
+> world-driven so the noise's character is consistent whether you set `TilingMeters = 0.5`
+> or `10` for the texture layer.
+
 > **Truss / set-piece powdercoat material override (v1.0.85).**
 > User: *"if we have truss geometry can that be assigned a default material which is a black
 > powdercoating style texture."*

@@ -18,6 +18,7 @@ class AExponentialHeightFog;
 class APostProcessVolume;
 class AStaticMeshActor;
 class FJsonObject;
+class UMaterialInstanceDynamic;
 
 UCLASS()
 class REBUSVISUALISER_API URebusSceneSettingsSubsystem : public UWorldSubsystem
@@ -54,7 +55,23 @@ private:
 	AStaticMeshActor* GetFloor();
 
 	// Swap the floor plane's material to the generated MI_RebusGround_<Preset> instance.
+	// v1.0.86: the loaded MI is now wrapped in a UMaterialInstanceDynamic so per-session
+	// scalar parameters (specifically `TilingMeters`) can be pushed without persisting to the
+	// .uasset; the cached MID is reused by SetGroundTilingMeters.
 	void SetGroundSurface(const FString& Preset);
+
+	// v1.0.86: set the floor texture's physical tile size. With the v1.0.86 ground master,
+	// `TilingMeters = 1.0` means one texture repeat per 1 m of world space (so a 2 km floor
+	// plane shows 2000 repeats per side instead of one stretched repeat). Lower => finer
+	// tiling (0.5 m = 2 repeats/m); higher => coarser. Pushes the scalar to the cached floor
+	// MID; safely no-ops if the underlying material has no `TilingMeters` parameter (e.g. a
+	// pre-v1.0.86 master that hasn't been regenerated yet via the Python build script).
+	void SetGroundTilingMeters(float Metres);
+
+	// Lazily create-or-fetch the MID wrapping the floor's current slot-0 material so per-
+	// session scalar parameters can be set without modifying the .uasset. Returns nullptr if
+	// the floor or its material is missing.
+	UMaterialInstanceDynamic* EnsureFloorMID();
 
 	// Draw (or clear) a persistent world-origin XYZ axis gizmo for orientation checks.
 	// X=red, Y=green, Z=blue (Unreal convention). Toggled by the bShowOrigin scene property.
@@ -90,4 +107,8 @@ private:
 	TWeakObjectPtr<AExponentialHeightFog> CachedFog;
 	TWeakObjectPtr<APostProcessVolume> CachedPostProcess;
 	TWeakObjectPtr<AStaticMeshActor> CachedFloor;
+	// v1.0.86 MID wrapping the floor's slot-0 material so SetGroundTilingMeters can push
+	// `TilingMeters` without persisting to disk. Lazily created in EnsureFloorMID, reset
+	// when SetGroundSurface swaps the underlying material so the next push wraps the new MI.
+	TWeakObjectPtr<UMaterialInstanceDynamic> CachedFloorMID;
 };

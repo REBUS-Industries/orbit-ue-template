@@ -101,28 +101,101 @@ def _instance_path(preset):
 
 
 def _build_ground_master(mat):
-    """Author the procedural ground master graph: lerp(ColorA, ColorB, Noise) -> BaseColor."""
+    """Author the procedural ground master graph.
+
+    v1.0.86 layout (1 m physical tiling):
+
+        BaseColor = lerp(ColorA, ColorB, Noise) * BaseColorTexture.Sample(WorldUVs)
+        Roughness = Roughness
+        TilingMeters (scalar, default 1.0) drives WorldUVs = AbsoluteWorldPosition.xy
+                                                            / (TilingMeters * 100 cm)
+
+    Why world-position UVs and not TexCoord. The BaseLevel floor is a 100 cm engine plane
+    scaled 2000x = 2 km square (see _add_floor()), so the mesh's default UV span 0..1 is
+    stretched across 2000 m. Sampling a real bitmap with TexCoord makes every texture read
+    as a single 2 km repeat -- the user's "stretched" symptom. Driving the UV from the
+    pixel's WORLD POSITION makes the tile size depend on physical metres, not on mesh
+    geometry, so the same texture sample tiles 2000 times across the same plane at
+    `TilingMeters = 1`.
+
+    BaseColorTexture defaults to /Engine/EngineResources/WhiteSquareTexture so an MI that
+    doesn't wire a real texture multiplies by white (1,1,1) -- the procedural lerp output
+    is preserved byte-exact. The four shipped MI presets (Concrete / Tarmac / Sand / Grass)
+    therefore look identical to their pre-v1.0.86 form on a regen; only MIs that BIND a
+    real bitmap to `BaseColorTexture` will see the new tiling kick in.
+
+    The C++ runtime (URebusSceneSettingsSubsystem::SetGroundTilingMeters) pushes the
+    TilingMeters scalar to a per-floor MID on the live actor, so the operator can change
+    the tile size at runtime via `Rebus.SetGroundTiling <metres>` or the scene property
+    of the same name -- without re-cooking the material.
+    """
     mel = unreal.MaterialEditingLibrary
 
-    color_a = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -600, -150)
+    # --- Procedural colour layer (back-compat with the pre-v1.0.86 master) ---
+    color_a = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1400, -240)
     color_a.set_editor_property("parameter_name", "ColorA")
     color_a.set_editor_property("default_value", unreal.LinearColor(0.40, 0.40, 0.40, 1.0))
 
-    color_b = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -600, 120)
+    color_b = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1400, 30)
     color_b.set_editor_property("parameter_name", "ColorB")
     color_b.set_editor_property("default_value", unreal.LinearColor(0.52, 0.52, 0.50, 1.0))
 
-    noise = mel.create_material_expression(mat, unreal.MaterialExpressionNoise, -600, 340)
-    # Small scale => broad features that read at ground scale (world-position driven).
+    noise = mel.create_material_expression(mat, unreal.MaterialExpressionNoise, -1400, 260)
+    # Small scale => broad features at ground scale (world-position driven by default).
     _set(noise, "scale", 0.005)
 
-    lerp = mel.create_material_expression(mat, unreal.MaterialExpressionLinearInterpolate, -260, -20)
-    mel.connect_material_expressions(color_a, "", lerp, "A")
-    mel.connect_material_expressions(color_b, "", lerp, "B")
-    mel.connect_material_expressions(noise, "", lerp, "Alpha")
-    mel.connect_material_property(lerp, "", unreal.MaterialProperty.MP_BASE_COLOR)
+    proc_lerp = mel.create_material_expression(mat, unreal.MaterialExpressionLinearInterpolate, -1080, -100)
+    mel.connect_material_expressions(color_a, "", proc_lerp, "A")
+    mel.connect_material_expressions(color_b, "", proc_lerp, "B")
+    mel.connect_material_expressions(noise, "", proc_lerp, "Alpha")
 
-    rough = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -260, 260)
+    # --- World-position-derived UVs for 1 m physical tiling (v1.0.86) ---
+    # WorldUV = AbsoluteWorldPosition.xy / (TilingMeters * 100)
+    #   * /100 converts UE world units (cm) to metres,
+    #   * /TilingMeters scales the metre count so TilingMeters=1 -> 1 tex/m, 0.5 -> 2 tex/m,
+    #     10 -> 1 tex/10 m. Clamp on the C++ side prevents 0 from producing a div-by-zero
+    #     single-texel stretch.
+    tiling = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -1400, 500)
+    tiling.set_editor_property("parameter_name", "TilingMeters")
+    tiling.set_editor_property("default_value", 1.0)
+
+    world_pos = mel.create_material_expression(mat, unreal.MaterialExpressionWorldPosition, -1400, 700)
+
+    # Mask down to the XY components (the ground plane lies on Z=0; .XY is the in-plane UV).
+    xy_mask = mel.create_material_expression(mat, unreal.MaterialExpressionComponentMask, -1180, 700)
+    _set(xy_mask, "r", True)
+    _set(xy_mask, "g", True)
+    _set(xy_mask, "b", False)
+    _set(xy_mask, "a", False)
+    mel.connect_material_expressions(world_pos, "", xy_mask, "")
+
+    # tiling_cm = TilingMeters * 100 cm/m.
+    tiling_cm = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -1180, 540)
+    _set(tiling_cm, "const_b", 100.0)
+    mel.connect_material_expressions(tiling, "", tiling_cm, "A")
+
+    world_uvs = mel.create_material_expression(mat, unreal.MaterialExpressionDivide, -960, 640)
+    mel.connect_material_expressions(xy_mask, "", world_uvs, "A")
+    mel.connect_material_expressions(tiling_cm, "", world_uvs, "B")
+
+    # --- Optional BaseColor texture sampler (defaults to white so untextured MIs no-op) ---
+    base_tex = mel.create_material_expression(mat, unreal.MaterialExpressionTextureSampleParameter2D, -700, 700)
+    base_tex.set_editor_property("parameter_name", "BaseColorTexture")
+    _white = unreal.EditorAssetLibrary.load_asset("/Engine/EngineResources/WhiteSquareTexture")
+    if _white is not None:
+        # set_editor_property on "texture" assigns the default sampler asset.
+        _set(base_tex, "texture", _white)
+    # Route world-derived UVs into the sampler's UV input so the texture tiles by metres.
+    mel.connect_material_expressions(world_uvs, "", base_tex, "Coordinates")
+
+    # --- Compose BaseColor = procedural * texture ---
+    base_color = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -380, 0)
+    mel.connect_material_expressions(proc_lerp, "", base_color, "A")
+    mel.connect_material_expressions(base_tex, "", base_color, "B")  # default "" pin is RGB
+    mel.connect_material_property(base_color, "", unreal.MaterialProperty.MP_BASE_COLOR)
+
+    # --- Roughness scalar (unchanged) ---
+    rough = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -380, 240)
     rough.set_editor_property("parameter_name", "Roughness")
     rough.set_editor_property("default_value", 0.85)
     mel.connect_material_property(rough, "", unreal.MaterialProperty.MP_ROUGHNESS)
@@ -480,6 +553,20 @@ def ensure_beam_material(force=False):
     unreal.log("RebusBaseLevel: beam material ensured.")
 
 
+def _master_has_tiling_meters(master):
+    """v1.0.86: detect whether the on-disk master is the new (1 m world-driven tiling) version.
+
+    Returns True if the master exposes the `TilingMeters` scalar parameter; False otherwise
+    (pre-v1.0.86 master). We probe via MaterialEditingLibrary's scalar-parameter API which
+    enumerates the static parameter set without touching the graph.
+    """
+    try:
+        info = unreal.MaterialEditingLibrary.get_scalar_parameter_names(master)
+    except Exception:  # noqa: BLE001
+        return False
+    return any(str(n) == "TilingMeters" for n in info)
+
+
 def ensure_ground_materials(force=False):
     """Generate the procedural ground master + one instance per surface preset.
 
@@ -488,9 +575,26 @@ def ensure_ground_materials(force=False):
     them -- an unattended "always overwrite" so a full (re)bake never raises the editor's
     overwrite-confirmation dialog. Only call force=True when the level is about to be rebuilt
     (build()), so no live level actor is left referencing a deleted instance.
+
+    v1.0.86 self-heal: the non-force path detects a pre-v1.0.86 master (missing the
+    `TilingMeters` parameter) and force-regenerates the master + instances so the next
+    editor launch picks up the new world-driven UV pipeline automatically. Anyone who
+    customised the master in the editor will lose those edits on first v1.0.86 startup --
+    they should re-apply them after the regen (acceptable for an additive parameter
+    upgrade; the regen logs a Warning so the change isn't silent).
     """
     tools = unreal.AssetToolsHelpers.get_asset_tools()
     mel = unreal.MaterialEditingLibrary
+
+    # Non-force self-heal: if the existing master is the pre-v1.0.86 version (no TilingMeters
+    # parameter), promote the call to a force-regen so the new master ships on the next
+    # launch without the user manually running build().
+    if not force and unreal.EditorAssetLibrary.does_asset_exist(GROUND_MASTER_PATH):
+        existing = unreal.EditorAssetLibrary.load_asset(GROUND_MASTER_PATH)
+        if existing is not None and not _master_has_tiling_meters(existing):
+            unreal.log_warning("RebusBaseLevel: pre-v1.0.86 ground master detected (no TilingMeters); "
+                               "regenerating master + instances for 1 m world tiling.")
+            force = True
 
     if force:
         # Delete instances before the master so removing the master can't dangle their parent.
@@ -521,9 +625,13 @@ def ensure_ground_materials(force=False):
         mel.set_material_instance_vector_parameter_value(mic, "ColorA", color_a)
         mel.set_material_instance_vector_parameter_value(mic, "ColorB", color_b)
         mel.set_material_instance_scalar_parameter_value(mic, "Roughness", rough)
+        # v1.0.86 TilingMeters defaults to 1.0 on the master; preset overrides could be
+        # added here later if e.g. Sand should naturally tile coarser than Concrete. For now
+        # all four shipped presets inherit the 1 m default so the C++ runtime push is
+        # authoritative.
         unreal.EditorAssetLibrary.save_loaded_asset(mic)
 
-    unreal.log("RebusBaseLevel: ground materials ensured ({} presets).".format(len(GROUND_PRESETS)))
+    unreal.log("RebusBaseLevel: ground materials ensured ({} presets, v1.0.86 world tiling).".format(len(GROUND_PRESETS)))
 
 
 def _add_floor():

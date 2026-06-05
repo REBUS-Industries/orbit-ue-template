@@ -22,6 +22,7 @@
 #include "Components/ExponentialHeightFogComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Materials/MaterialInterface.h"
+#include "Materials/MaterialInstanceDynamic.h"
 
 void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -31,6 +32,14 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// round-trips the ground controls before the portal pushes its first value.
 	Values.Add(TEXT("GroundSurface"), FRebusPropertyValue::MakeString(TEXT("Concrete")));
 	Values.Add(TEXT("bGroundVisible"), FRebusPropertyValue::MakeBool(true));
+	// v1.0.86: floor textures tile at 1 m per repeat by default. The C++ runtime pushes this
+	// scalar to the floor MID after the ground material is (re)applied; the v1.0.86 ground
+	// master uses it to drive WorldPosition-derived UVs (UV = WorldPosition.xy / (TilingMeters
+	// * 100)), so 1.0 -> 1 m/tex repeat regardless of the floor mesh's actor scale (currently
+	// 2000x a 100 cm engine plane = 2 km square). Pre-v1.0.86 ground masters lack the
+	// `TilingMeters` parameter -- the push is a silent no-op there until the master is
+	// regenerated via build_rebus_base_level.build().
+	Values.Add(TEXT("GroundTilingMeters"), FRebusPropertyValue::MakeNumber(1.0));
 	Values.Add(TEXT("bShowOrigin"), FRebusPropertyValue::MakeBool(false));
 	// Hybrid cone-mesh volumetric beam is the default beam mode (v1.0.31); seed it so SceneState
 	// round-trips the control and a respawn re-asserts it via ReapplyAll.
@@ -125,15 +134,68 @@ void URebusSceneSettingsSubsystem::SetGroundSurface(const FString& Preset)
 
 	const FString AssetPath = FString::Printf(
 		TEXT("/Game/REBUS/Materials/MI_RebusGround_%s.MI_RebusGround_%s"), *Clean, *Clean);
-	if (UMaterialInterface* Mat = LoadObject<UMaterialInterface>(nullptr, *AssetPath))
-	{
-		Comp->SetMaterial(0, Mat);
-		UE_LOG(LogRebusVisualiser, Log, TEXT("Ground surface set to '%s'."), *Clean);
-	}
-	else
+	UMaterialInterface* Mat = LoadObject<UMaterialInterface>(nullptr, *AssetPath);
+	if (!Mat)
 	{
 		UE_LOG(LogRebusVisualiser, Warning, TEXT("Ground material not found: %s"), *AssetPath);
+		return;
 	}
+
+	// Apply the MI then immediately wrap in a fresh MID so per-session params (TilingMeters)
+	// can be pushed without persisting to the .uasset. Discard any prior MID -- it wrapped the
+	// previous MI and parameters on it would be ignored after this surface swap.
+	Comp->SetMaterial(0, Mat);
+	CachedFloorMID.Reset();
+	if (UMaterialInstanceDynamic* MID = EnsureFloorMID())
+	{
+		// Re-assert the current scene's tiling so the swap doesn't reset it to the MI's default.
+		if (const FRebusPropertyValue* TileVal = Values.Find(TEXT("GroundTilingMeters")))
+		{
+			MID->SetScalarParameterValue(TEXT("TilingMeters"), FMath::Max(TileVal->AsFloat(), 0.01f));
+		}
+	}
+	UE_LOG(LogRebusVisualiser, Log, TEXT("Ground surface set to '%s' (TilingMeters reasserted on MID)."), *Clean);
+}
+
+UMaterialInstanceDynamic* URebusSceneSettingsSubsystem::EnsureFloorMID()
+{
+	if (UMaterialInstanceDynamic* MID = CachedFloorMID.Get())
+	{
+		return MID;
+	}
+	AStaticMeshActor* Floor = GetFloor();
+	if (!Floor) return nullptr;
+	UStaticMeshComponent* Comp = Floor->GetStaticMeshComponent();
+	if (!Comp) return nullptr;
+	// If the slot-0 material is already a MID (e.g. from a prior SetGroundSurface in the same
+	// session) reuse it -- creating a second MID would orphan the parameters already pushed on
+	// the first. Otherwise wrap the static MI in a fresh MID via the standard component helper
+	// (sets it back on the component as slot 0 + returns the wrapper).
+	if (UMaterialInstanceDynamic* Existing = Cast<UMaterialInstanceDynamic>(Comp->GetMaterial(0)))
+	{
+		CachedFloorMID = Existing;
+		return Existing;
+	}
+	UMaterialInstanceDynamic* New = Comp->CreateAndSetMaterialInstanceDynamic(0);
+	CachedFloorMID = New;
+	return New;
+}
+
+void URebusSceneSettingsSubsystem::SetGroundTilingMeters(float Metres)
+{
+	// Clamp away from zero -- zero would divide-by-zero in the WorldPosition / (TilingMeters*100)
+	// UV calc inside the material and render as a single texel stretched across the whole plane.
+	// 1 cm minimum still produces sensible (if heavily-tiled) output.
+	const float Clamped = FMath::Max(Metres, 0.01f);
+	UMaterialInstanceDynamic* MID = EnsureFloorMID();
+	if (!MID)
+	{
+		UE_LOG(LogRebusVisualiser, Warning, TEXT("SetGroundTilingMeters %.3f: no floor MID (no RebusFloor in level?)."), Clamped);
+		return;
+	}
+	MID->SetScalarParameterValue(TEXT("TilingMeters"), Clamped);
+	UE_LOG(LogRebusVisualiser, Log, TEXT("Floor TilingMeters set to %.3f m (1 texture repeat per %.3f m world)."),
+		Clamped, Clamped);
 }
 
 void URebusSceneSettingsSubsystem::SetOriginGizmo(bool bShow)
@@ -378,6 +440,13 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 #endif
 		}
 	}
+	// v1.0.86 floor texture tiling at world scale -- 1 texture repeat per N metres regardless
+	// of the floor mesh's actor scale. The push is a silent no-op for materials without the
+	// `TilingMeters` parameter (e.g. a pre-v1.0.86 ground master that hasn't been regenerated).
+	else if (Name == TEXT("GroundTilingMeters"))
+	{
+		SetGroundTilingMeters(Value.AsFloat());
+	}
 	// --- Debug: world-origin XYZ gizmo (orientation check) ---
 	else if (Name == TEXT("bShowOrigin"))
 	{
@@ -470,6 +539,7 @@ void URebusSceneSettingsSubsystem::ReapplyAll()
 	CachedFog.Reset();
 	CachedPostProcess.Reset();
 	CachedFloor.Reset();
+	CachedFloorMID.Reset(); // v1.0.86: invalidate so the next push re-wraps the (possibly re-spawned) floor's slot 0
 
 	for (const TPair<FString, FRebusPropertyValue>& Pair : Snapshot)
 	{
