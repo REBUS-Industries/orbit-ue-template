@@ -45,6 +45,8 @@ namespace
 	IConsoleCommand* GSetGroundTilingCommand = nullptr;
 	IConsoleCommand* GDumpFixtureIesCommand = nullptr;
 	IConsoleCommand* GBeamShadowCommand = nullptr;
+	IConsoleCommand* GDumpBeamShadowCommand = nullptr;
+	IConsoleCommand* GOrbitCastShadowsCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -859,6 +861,45 @@ namespace
 		}
 	}
 
+	// v1.0.99 -- `Rebus.DumpBeamShadow` console command. Walks every Rebus fixture in every
+	// Game/PIE/Editor world and dumps the live MID + CVar values for the screen-space shadow
+	// trace, plus a one-line per-fixture "shadowing enabled, debug mode N" diagnostic. Use
+	// this when the operator reports "I'm not seeing the shadow trace work" -- the dump
+	// proves whether the values landed on the BeamMID, whether the MID scalar contract is
+	// the v1.0.99 shape (Bias + Debug present), and whether the master toggle is in force.
+	void HandleDumpBeamShadowCommand(const TArray<FString>& /*Args*/)
+	{
+		if (!GEngine) return;
+		IConsoleVariable* StepsCVar    = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowSteps"));
+		IConsoleVariable* StrengthCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowStrength"));
+		IConsoleVariable* BiasCVar     = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowBias"));
+		IConsoleVariable* DebugCVar    = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowDebug"));
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("DumpBeamShadow CVars: Rebus.BeamShadowSteps=%s Rebus.BeamShadowStrength=%s Rebus.BeamShadowBias=%s Rebus.BeamShadowDebug=%s"),
+			StepsCVar    ? *StepsCVar->GetString()    : TEXT("<unregistered>"),
+			StrengthCVar ? *StrengthCVar->GetString() : TEXT("<unregistered>"),
+			BiasCVar     ? *BiasCVar->GetString()     : TEXT("<unregistered>"),
+			DebugCVar    ? *DebugCVar->GetString()    : TEXT("<unregistered>"));
+
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE && Ctx.WorldType != EWorldType::Editor)) continue;
+			int32 FixtureCount = 0;
+			for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+			{
+				if (const ARebusFixtureActor* F = *It)
+				{
+					F->DumpBeamShadowStateForDebug();
+					++FixtureCount;
+				}
+			}
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("DumpBeamShadow world '%s': dumped %d fixture(s)."),
+				*World->GetName(), FixtureCount);
+		}
+	}
+
 	// v1.0.47: `Rebus.MeshBeams [0|1]` -- live toggle for the visible Epic beam canvas, so you can
 	// A/B against the SpotLight's VSM-shadowed fog beam (the source of the truss-gap shafts inside
 	// the cone). Routes through URebusSceneSettingsSubsystem::SetMeshBeamsEnabled, which mirrors
@@ -1150,6 +1191,57 @@ void FRebusVisualiserModule::StartupModule()
 			 "for tuning. See the README v1.0.96 release block for the algorithm + limitations. "
 			 "Usage: Rebus.BeamShadow [0|1|status]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleBeamShadowCommand),
+		ECVF_Default);
+
+	// v1.0.99 imported-primitive shadow-cast normalisation toggle.
+	GOrbitCastShadowsCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.OrbitCastShadows"),
+		TEXT("v1.0.99 -- toggle the imported-Orbit-primitive shadow-cast normalisation "
+			 "(default ON). When ON the visualiser subsystem walks every OrbitImportRoot's "
+			 "primitive components on the same 1 Hz cadence as RebindOrbitModels and forces "
+			 "CastShadow=true / bCastDynamicShadow=true / bCastHiddenShadow=false / "
+			 "bCastFarShadow=true on each, so the SpotLight's own shadow casting catches "
+			 "every imported truss / set-piece / fixture body. OFF walks the same tracked "
+			 "set and forces CastShadow=false (so the operator can A/B against the "
+			 "no-shadow baseline). Mirrors the `bOrbitCastShadows` scene property -- both "
+			 "drive the same SetOrbitCastShadowsEnabled chokepoint. See the v1.0.99 README "
+			 "release block for the full diagnosis (the user report \"Can we check that all "
+			 "imported objects cast shadows as default\" was Part B of the v1.0.99 work)."),
+		FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
+		{
+			const bool bEnable = ParseBoolArg(Args, true);
+			if (!GEngine) return;
+			int32 Subsystems = 0;
+			for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+			{
+				UWorld* World = Ctx.World();
+				if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+				UGameInstance* GI = World->GetGameInstance();
+				if (!GI) continue;
+				if (URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>())
+				{
+					Viz->SetOrbitCastShadowsEnabled(bEnable);
+					++Subsystems;
+				}
+			}
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.OrbitCastShadows %d: applied to %d subsystem(s)."),
+				bEnable ? 1 : 0, Subsystems);
+		}),
+		ECVF_Default);
+
+	// v1.0.99 per-fixture screen-space-shadow-trace runtime dump.
+	GDumpBeamShadowCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.DumpBeamShadow"),
+		TEXT("v1.0.99 -- dump every Rebus fixture's M_RebusBeam screen-space shadow trace "
+			 "state in one line each: live MID values (Steps/Strength/Bias/Debug as actually "
+			 "read by the per-pixel shader) + global CVar values + a 'shadowing enabled, "
+			 "debug mode N' diagnostic. Use when the operator reports the v1.0.96 shadow "
+			 "trace doesn't appear to work -- the dump proves whether RefreshBeamShadowParams "
+			 "is winning the push race, whether the master is the v1.0.99 shape (Bias+Debug "
+			 "present), and whether the master `Rebus.BeamShadow` toggle is OFF. Usage: "
+			 "Rebus.DumpBeamShadow"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpBeamShadowCommand),
 		ECVF_Default);
 
 	GDumpFixtureLightsCommand = IConsoleManager::Get().RegisterConsoleCommand(
@@ -1467,6 +1559,16 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GBeamShadowCommand);
 		GBeamShadowCommand = nullptr;
+	}
+	if (GDumpBeamShadowCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GDumpBeamShadowCommand);
+		GDumpBeamShadowCommand = nullptr;
+	}
+	if (GOrbitCastShadowsCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GOrbitCastShadowsCommand);
+		GOrbitCastShadowsCommand = nullptr;
 	}
 	// v1.0.73 / v1.0.78: restore both CVar packs to their snapshotted values so a hot-reload
 	// of the module doesn't leak a permanent override into the engine session. Both packs

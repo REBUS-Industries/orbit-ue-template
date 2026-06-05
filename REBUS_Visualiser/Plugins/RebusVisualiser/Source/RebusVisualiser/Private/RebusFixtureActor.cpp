@@ -192,8 +192,8 @@ float GRebusSpotLightScatter = 0.5f;
 
 // v1.0.96 screen-space shadow trace on the M_RebusBeam raymarch shaft. See the
 // `_BEAM_RAYMARCH_HLSL` doc-comment in build_rebus_base_level.py for the full algorithm. The
-// two CVars below push directly onto every fixture's BeamMID via `RefreshBeamShadowParams`,
-// driving the matching scalar params on the v1.0.96 master. The `Rebus.BeamShadow [0|1]`
+// CVars below push directly onto every fixture's BeamMID via `RefreshBeamShadowParams`,
+// driving the matching scalar params on the master. The `Rebus.BeamShadow [0|1]`
 // MASTER TOGGLE lives in RebusVisualiser.cpp (`HandleBeamShadowCommand`) and routes through
 // the `Rebus.BeamShadowStrength` CVar's refresh sink so flicking the master off/on never
 // loses the operator's tuned strength (the prior is stored file-static in RebusVisualiser.cpp).
@@ -202,12 +202,19 @@ float GRebusSpotLightScatter = 0.5f;
 // at full strength with no portal push needed:
 //   * BeamShadowSteps  = 8  (the design point; shader clamps to [1, 16])
 //   * BeamShadowStrength = 1  (full shadow on any sample whose ray hits an occluder)
+//   * BeamShadowBias = 5.0 cm (v1.0.99 raised from 0.5 -- FIRST-STEP MINIMUM cm so the
+//     trace can't read the shaft sample's own pixel as its own occluder; see the v1.0.99
+//     PROJECTION + SELF-OCCLUSION FIX block in _BEAM_RAYMARCH_HLSL).
+//   * BeamShadowDebug = 0 (off; 1 = shadow-factor heatmap; 2 = first-UV sanity view).
 //
-// Bias is NOT a CVar in v1.0.96 -- it's a per-fixture material default (0.5 cm) and only the
-// build_rebus_base_level Python author touches it; if banding ever shows up in the field we'll
-// promote it to a CVar in a follow-up.
+// v1.0.99: bias + debug are CVar-tunable now (v1.0.96 only exposed steps + strength, on the
+// theory the per-fixture material default would be enough). The user reported "Im not seeing
+// this work at all" so the live debug + bias knobs are needed to diagnose the trace in the
+// field. See the v1.0.99 README release block for the operator checklist.
 float GRebusBeamShadowSteps = 8.f;
 float GRebusBeamShadowStrength = 1.f;
+float GRebusBeamShadowBias = 5.f;
+int32 GRebusBeamShadowDebug = 0;
 
 // Refresh sink shared by both shadow CVars: walk every Rebus fixture and re-push the new
 // values to the BeamMID. Cheap (a handful of float param sets per fixture); no proxy rebuild
@@ -259,6 +266,54 @@ FAutoConsoleVariableRef CVarRebusBeamShadowStrength(
 	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
 	{
 		RefreshBeamShadowParamsOnEveryFixture(TEXT("Rebus.BeamShadowStrength"), CVar->GetFloat());
+	}),
+	ECVF_Default);
+
+// v1.0.99 -- M_RebusBeam screen-space shadow trace FIRST-STEP MINIMUM cm. The very first
+// SceneDepth tap is at least `BeamShadowBias` cm out from the shaft sample toward the light
+// (any closer step is skipped) so the trace can't read the shaft's own pixel as its own
+// occluder against nearby fixture / prop geometry. v1.0.96 default (0.5 cm) was too small in
+// practice -- the v1.0.99 default of 5 cm escapes self-occlusion on the cone-mesh's near
+// neighbours; raise to 50+ cm only if the user reports the beam still passes through
+// nearby props after the v1.0.99 LWC projection fix lands. See the v1.0.99 PROJECTION +
+// SELF-OCCLUSION FIX block in _BEAM_RAYMARCH_HLSL.
+FAutoConsoleVariableRef CVarRebusBeamShadowBias(
+	TEXT("Rebus.BeamShadowBias"),
+	GRebusBeamShadowBias,
+	TEXT("v1.0.99 -- M_RebusBeam screen-space shadow trace FIRST-STEP MINIMUM cm (default 5.0). "
+		 "Any candidate shadow step within this many cm of the shaft sample is skipped, so the "
+		 "first SceneDepth tap is at least Bias cm out from the sample toward the light -- "
+		 "prevents self-occlusion against nearby fixture / scene geometry. Raise to 50+ if "
+		 "the operator reports the beam still passes through nearby props in BeamShadowDebug=1 "
+		 "view. Live -- changing this walks every Rebus fixture and re-pushes the scalar onto "
+		 "the BeamMID."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamShadowParamsOnEveryFixture(TEXT("Rebus.BeamShadowBias"), CVar->GetFloat());
+	}),
+	ECVF_Default);
+
+// v1.0.99 -- M_RebusBeam screen-space shadow trace DEBUG-VIEW knob.
+//   0 = off (default; ship the regular composed beam).
+//   1 = shadow-factor heatmap (green where unshadowed, red where shadowed). The cube/prop
+//       between the fixture and the floor should appear RED in this view; if the cube is
+//       still green, the trace found NO occluders (the v1.0.96 LWC projection bug, or
+//       BeamShadowStrength=0 via `Rebus.BeamShadow 0` master toggle).
+//   2 = first shadow-step UV sanity. Beam tints orange/yellow across the screen as the UV
+//       walks [0..1]^2. Constant near-zero black means the LWC projection is broken.
+FAutoConsoleVariableRef CVarRebusBeamShadowDebug(
+	TEXT("Rebus.BeamShadowDebug"),
+	GRebusBeamShadowDebug,
+	TEXT("v1.0.99 -- M_RebusBeam screen-space shadow trace debug-view (default 0 = off). "
+		 "1 = shadow-factor heatmap (green=unshadowed, red=shadowed -- a cube placed between "
+		 "fixture + floor should appear red in this view; if the cube is still green, the "
+		 "trace found no occluders). 2 = first shadow-step UV sanity (beam tints by the "
+		 "projected UV; constant near-black means the LWC projection is broken). Live -- "
+		 "changing this walks every Rebus fixture and re-pushes the scalar onto the BeamMID. "
+		 "See the v1.0.99 README release block for the operator checklist."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamShadowParamsOnEveryFixture(TEXT("Rebus.BeamShadowDebug"), (float)CVar->GetInt());
 	}),
 	ECVF_Default);
 
@@ -582,6 +637,61 @@ void ARebusFixtureActor::DumpGoboStateForDebug() const
 		(SpotLight && SpotLight->LightFunctionMaterial) ? *SpotLight->LightFunctionMaterial->GetName() : TEXT("<null>"),
 		GoboLightFnMID.Get(),
 		EpicBeamMID.Get());
+}
+
+void ARebusFixtureActor::DumpBeamShadowStateForDebug() const
+{
+	// v1.0.99 per-fixture screen-space-shadow-trace dump for `Rebus.DumpBeamShadow`. One line per
+	// fixture so an operator can paste the whole block in a bug report.
+	//
+	// Two columns: the LIVE values on this fixture's BeamMID (the values the per-pixel shader
+	// is actually reading right now) and the CURRENT global CVar values. They MUST agree --
+	// `RefreshBeamShadowParams` runs the push at every CVar change and on each fixture build,
+	// so a divergence means a portal/scene push has overridden the CVar (or the master is
+	// pre-v1.0.99 and silently ignored the parameter set).
+	if (!BeamMID)
+	{
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("DumpBeamShadow '%s': BeamMID=<null> (M_RebusBeam load failed in BuildBeamCone, "
+				 "or the cone build never ran -- pre-v1.0.99 master self-heal will rebuild on "
+				 "next editor launch). CVars: Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d."),
+			*FixtureId,
+			GRebusBeamShadowSteps, GRebusBeamShadowStrength, GRebusBeamShadowBias,
+			GRebusBeamShadowDebug);
+		return;
+	}
+
+	// Read back what's actually on the MID right now. SetScalarParameterValue / GetScalar
+	// agree on the missing-param contract: if the master never declared the scalar (pre-v1.0.96)
+	// the get returns false and the value stays at the uninitialised default of -999, which we
+	// surface so the dump makes the silent-skip obvious instead of reporting "0.0" as if it
+	// landed.
+	auto ReadMidScalar = [this](const TCHAR* Name) -> float
+	{
+		float V = -999.f;
+		BeamMID->GetScalarParameterValue(FMaterialParameterInfo(Name), V);
+		return V;
+	};
+	const float MidSteps    = ReadMidScalar(TEXT("BeamShadowSteps"));
+	const float MidStrength = ReadMidScalar(TEXT("BeamShadowStrength"));
+	const float MidBias     = ReadMidScalar(TEXT("BeamShadowBias"));
+	const float MidDebug    = ReadMidScalar(TEXT("BeamShadowDebug"));
+
+	// One-line diagnostic: "shadowing enabled, debug mode N" derived from the LIVE MID values.
+	const bool  bShadowEnabled = (MidStrength > 0.001f);
+	const int32 DebugMode      = (MidDebug > 1.5f) ? 2 : ((MidDebug > 0.5f) ? 1 : 0);
+	const TCHAR* MasterStaleNote = (MidSteps < -100.f || MidStrength < -100.f
+			|| MidBias < -100.f || MidDebug < -100.f)
+		? TEXT(" -- pre-v1.0.99 master detected (some MID scalars missing; will self-heal next launch)")
+		: TEXT("");
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("DumpBeamShadow '%s': MID(Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d) CVars(Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d) -- shadowing %s, debug mode %d%s."),
+		*FixtureId,
+		MidSteps, MidStrength, MidBias, (int32)MidDebug,
+		GRebusBeamShadowSteps, GRebusBeamShadowStrength, GRebusBeamShadowBias, GRebusBeamShadowDebug,
+		bShadowEnabled ? TEXT("ENABLED") : TEXT("DISABLED"),
+		DebugMode, MasterStaleNote);
 }
 
 void ARebusFixtureActor::DumpIesStateForDebug() const
@@ -2049,28 +2159,31 @@ void ARebusFixtureActor::UpdateBeamConeGeometry()
 
 void ARebusFixtureActor::RefreshBeamShadowParams()
 {
-	// v1.0.96 -- push the three screen-space-shadow-trace scalars onto this fixture's BeamMID.
+	// v1.0.96/99 -- push the screen-space-shadow-trace scalars onto this fixture's BeamMID.
 	// Safe to call when BeamMID is null (the M_RebusBeam load failed in BuildBeamCone, or this
 	// fixture pre-dates the v1.0.96 self-heal regen): the early return matches the rest of the
 	// MID-push helpers and the CVar refresh sink walks every fixture, including those without
 	// a BeamMID, without crashing.
 	//
-	// Pre-v1.0.96 M_RebusBeam masters lack the `BeamShadowSteps`/`BeamShadowStrength`/
-	// `BeamShadowBias` scalars; SetScalarParameterValue on a missing parameter is a silent
-	// no-op (the MID just ignores it), so this is safe to call even when the editor hasn't yet
-	// regenerated the master. The first launch on v1.0.96 will trigger the self-heal in
-	// `ensure_beam_material` (build_rebus_base_level.py) and the next refresh will land.
+	// v1.0.99: pushes ALL FOUR scalars now -- BeamShadowSteps + BeamShadowStrength were the
+	// v1.0.96 set, BeamShadowBias is now CVar-driven (was hard-coded to 0.5 in v1.0.96),
+	// BeamShadowDebug is the new v1.0.99 debug-view selector. SetScalarParameterValue on a
+	// missing parameter is a silent no-op so the call is safe even when the editor hasn't
+	// yet regenerated the master to v1.0.99 -- the first launch will trigger
+	// `_beam_master_has_shadow_debug` self-heal in `ensure_beam_material`
+	// (build_rebus_base_level.py) and the next refresh will land all four cleanly.
 	if (!BeamMID) return;
 
 	BeamMID->SetScalarParameterValue(TEXT("BeamShadowSteps"),
 		FMath::Clamp(GRebusBeamShadowSteps, 1.f, 16.f));
 	BeamMID->SetScalarParameterValue(TEXT("BeamShadowStrength"),
 		FMath::Clamp(GRebusBeamShadowStrength, 0.f, 1.f));
-	// BeamShadowBias is set to the master's authored default (0.5 cm) and not exposed via
-	// CVar in v1.0.96 -- see the GRebusBeamShadow* doc-comment. Pushing the value anyway
-	// guarantees the MID has it set even if a future master changes the default, and the
-	// silent-no-op behaviour on a missing param keeps it backwards-compatible.
-	BeamMID->SetScalarParameterValue(TEXT("BeamShadowBias"), 0.5f);
+	BeamMID->SetScalarParameterValue(TEXT("BeamShadowBias"),
+		FMath::Max(GRebusBeamShadowBias, 0.f));
+	// Debug is an int (0/1/2) on the CVar side; the master scalar is a float that the shader
+	// branches on `> 0.5` and `> 1.5` thresholds, so pushing the int verbatim is fine.
+	BeamMID->SetScalarParameterValue(TEXT("BeamShadowDebug"),
+		(float)FMath::Clamp(GRebusBeamShadowDebug, 0, 2));
 }
 
 void ARebusFixtureActor::RefreshBeamEmissive()

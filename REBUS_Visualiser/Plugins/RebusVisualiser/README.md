@@ -594,6 +594,163 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Beam shadows actually carve the cone-mesh shaft + force-cast-shadows on every imported primitive (v1.0.99).**
+> User report (verbatim, against v1.0.96/98):
+>
+> > "Im not seeing this work at all.
+> >
+> > Part A -- Self-shadowed cone-mesh raymarch. [v1.0.96 description quoted]
+> >
+> > Can we check that all imported objects cast shadows as default.
+> >
+> > The light beam currently goes straight through any object"
+>
+> Two coupled bugs were the smoking gun -- one in the v1.0.96 shader, one in the import
+> pipeline -- and v1.0.99 fixes both. After v1.0.99 a cube placed between a fixture and
+> the floor visibly carves the M_RebusBeam shaft AND casts a hard shadow in the SpotLight
+> footprint on the floor.
+>
+> **Part A -- v1.0.96 screen-space shadow trace was projecting every shadow step
+> off-screen (Cause 1, the LWC projection bug).**
+>
+> The v1.0.96 `_BEAM_RAYMARCH_HLSL` Custom node computed `spRel = sp - ro` to convert
+> absolute-world to translated-world before the `mul(..., ResolvedView.TranslatedWorldToClip)`
+> projection. UE 5.4+'s clip-space matrix expects
+> `TranslatedWorld = AbsoluteWorld + ResolvedView.PreViewTranslation` -- those are equal
+> ONLY when the view origin is exactly the camera origin AND PreViewTranslation has no
+> jitter / shadow-pass / LWC tile term. On a stage scene the projected NDC was offset by
+> the view-origin delta, landed outside the [-1, 1] range, and the
+> `if (any(abs(ndc) > 1.0)) { continue; }` off-screen guard then dropped EVERY shadow tap
+> -- so the per-pixel `sOccluded` flag stayed false on every sample and the trace
+> concluded "always unoccluded" regardless of what was actually in the scene. Operator
+> symptom: "the light beam currently goes straight through any object" (the user report,
+> verbatim).
+>
+> v1.0.99 fix in `build_rebus_base_level.py::_BEAM_RAYMARCH_HLSL`:
+>
+> ```hlsl
+> // v1.0.96 (BROKEN -- assumed view origin == camera origin):
+> float3 spRel = sp - ro;
+> float4 clipP = mul(float4(spRel, 1.0), ResolvedView.TranslatedWorldToClip);
+>
+> // v1.0.99 (LWC-safe -- the documented engine pattern):
+> float3 PreViewT = LWCHackToFloat(ResolvedView.PreViewTranslation); // cached once / pixel
+> float3 TranslatedWorldPos = sp + PreViewT;
+> float4 clipP = mul(float4(TranslatedWorldPos, 1.0), ResolvedView.TranslatedWorldToClip);
+> ```
+>
+> Causes 2--5 from the bug brief were investigated and ruled out:
+>
+> * **Cause 2 (depth-comparison direction)**: the v1.0.96 `if (sd + stepBias < clipP.w)`
+>   check is correct -- both `CalcSceneDepth` and `clip.w` (UE perspective projection)
+>   are linear camera-Z in cm, and "scene closer than step" is the right "step occluded
+>   from the camera" condition. Symptom would be uniform dimming if wrong; the user
+>   reported NO change at all -- consistent with Cause 1, not Cause 2.
+> * **Cause 3 (self-occlusion against the cone's own depth)**: the cone mesh is
+>   `BLEND_ADDITIVE` and doesn't write to SceneDepth, so the cone itself can't be its
+>   own occluder. But the shaft sample's projected pixel CAN sit ON nearby fixture body
+>   / prop geometry that DOES write to SceneDepth -- v1.0.99 raises `BeamShadowBias`
+>   from 0.5 -> 5.0 cm and re-purposes it as the FIRST-STEP MINIMUM cm so the very
+>   first SceneDepth tap is at least 5 cm out from `wp` toward the light (with `Rebus.
+>   BeamShadowBias 50` available as the operator-side knob if 5 cm is still too small
+>   for the rig).
+> * **Cause 4 (push wiring stale)**: the v1.0.96 `RefreshBeamShadowParams` correctly
+>   pushed Steps + Strength + Bias on every CVar change. v1.0.99 extends it to push the
+>   new `BeamShadowDebug` scalar too AND adds the `Rebus.DumpBeamShadow` console
+>   command so a future "doesn't work" report can prove or disprove this in one
+>   pasted log block.
+> * **Cause 5 (Custom-node `inputs` array out of sync)**: the v1.0.96 `_build_beam_master`
+>   wired Steps/Strength/Bias correctly through `input_names + custom_inputs + src_for`.
+>   v1.0.99 follows the same pattern for the new `BeamShadowDebug` scalar so this can't
+>   regress.
+>
+> **Smoking gun: Cause 1 (LWC projection).** The shader was running every frame, the
+> CVar push was landing every value, the master was the v1.0.96 shape -- and every
+> single shadow step landed off-screen because the projection was wrong by the view
+> origin. Fixing the projection is what made the trace start finding occluders.
+>
+> **New `BeamShadowDebug` visualisation modes (`Rebus.BeamShadowDebug [0|1|2]`).**
+> The user-facing knob to verify the v1.0.99 fix landed:
+>
+> | Mode | What renders | Interpretation |
+> | --- | --- | --- |
+> | 0 | Off (default; the regular composed beam). | Operator's normal view. |
+> | 1 | Per-pixel shadow-factor heatmap. Cone shape preserved; colour is `lerp(green, red, shadowedFraction)` x 4.0 (bright). | A cube placed between fixture + floor should appear RED against a green beam. If the cube is GREEN, the trace found NO occluders -- check `Rebus.DumpBeamShadow` for `Strength=0.0` (master toggle off) or a pre-v1.0.99 master ("missing MID scalars" note). |
+> | 2 | First shadow step's projected screen UV as `(uv.x, uv.y, 0)` x 4.0 (bright). | A correctly-projected step lands at uv in [0, 1]^2 so the beam tints orange/yellow across the floor. Constant near-black means the LWC projection is broken (the v1.0.99 fix didn't land -- pre-v1.0.99 master, run `build_rebus_base_level.build()` to regenerate). |
+>
+> **Bias + Debug are now CVar-tunable** (v1.0.96 only exposed Steps + Strength). New
+> CVars: `Rebus.BeamShadowBias <cm>` (default 5.0) and `Rebus.BeamShadowDebug [0|1|2]`
+> (default 0). Both push through `RefreshBeamShadowParams` on the same refresh-sink
+> path the v1.0.96 CVars used, so a portal push and a console set agree on every
+> fixture's MID.
+>
+> **`_beam_master_has_shadow_debug` self-heal probe.** Mirrors the v1.0.96
+> `_beam_master_has_shadow_steps` pattern: `ensure_beam_material()` checks for the new
+> `BeamShadowDebug` scalar on the existing on-disk master and force-regenerates with a
+> Warning when it's missing. So the first launch on v1.0.99 picks up the corrected
+> Custom HLSL on the next editor restart with no manual re-bake.
+>
+> **Part B -- force-cast-shadows on every Orbit-imported primitive.**
+>
+> User-facing question: "Can we check that all imported objects cast shadows as
+> default." UE primitives default to `CastShadow = true`, but the glTFRuntime +
+> OrbitConnector import path lands them with `CastShadow = false` for perf. Result:
+> the SpotLight's own shadow casting catches NOTHING in the floor footprint either,
+> and the user's "the light beam currently goes straight through any object" report
+> applies to the SpotLight footprint as well as the cone-mesh shaft.
+>
+> v1.0.99 normalises every imported primitive's shadow flags on the same 1 Hz cadence
+> as `RebindOrbitModels` + `ApplyTrussMaterialPass` (the existing v1.0.85 truss
+> pipeline). New code in `URebusVisualiserSubsystem`:
+>
+> | Surface | Behaviour |
+> | --- | --- |
+> | `EnsureImportedShadowsCast()` | Walks every `OrbitImportRoot` actor (matched by class-name string -- zero compile dep on the OrbitConnector plugin) and asserts `CastShadow = true / bCastDynamicShadow = true / bCastHiddenShadow = false / bCastFarShadow = true` on every `UPrimitiveComponent`. Idempotent (per-comp early-out when flags match). Tracked comps go into `OrbitShadowTouched` so the OFF path can find them again. |
+> | `SetOrbitCastShadowsEnabled(bool)` | Single chokepoint shared by the console command and the scene-property handler. Walks `OrbitShadowTouched` to flip every prior comp + runs `EnsureImportedShadowsCast` to pick up any newly-imported geometry, so a single toggle transition is consistent across the whole import on the same call. |
+> | `Rebus.OrbitCastShadows [0|1]` console | New (default ON). Routes through `SetOrbitCastShadowsEnabled` per Game/PIE world. |
+> | `bOrbitCastShadows` scene property | New (default `true`, seeded in `URebusSceneSettingsSubsystem::Initialize`). Routes through the same chokepoint via `ApplySceneProperty`. SceneState round-trips it; `ReapplyAll` re-asserts on (re)spawn. |
+> | Tick hook | The visualiser subsystem's 1 Hz orbit-rebind tick now also calls `EnsureImportedShadowsCast()` so newly-imported Orbit geometry inherits the shadow-cast normalisation on the next 1 s without an operator console call. |
+>
+> Why `bCastHiddenShadow = false` REGARDLESS of the toggle: a hidden shadow caster
+> projects a black silhouette in the lit pool with NO surface visible, which reads as
+> a phantom dark blob the operator never wants. The toggle covers the other three
+> flags only.
+>
+> **Files touched.**
+>
+> | File | Change |
+> | --- | --- |
+> | `REBUS_Visualiser/Content/Python/build_rebus_base_level.py` | `_BEAM_RAYMARCH_HLSL` -- LWC-safe `PreViewTranslation` projection; `BeamShadowBias` repurposed as FIRST-STEP MINIMUM cm; new `BeamShadowDebug` branch (modes 0/1/2). `_build_beam_master` -- new `BeamShadowDebug` scalar wired through `input_names + custom_inputs + src_for`; `BeamShadowBias` default raised 0.5 -> 5.0. New `_beam_master_has_shadow_debug` self-heal probe + `ensure_beam_material` force-regen branch. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusFixtureActor.cpp` + `Public/RebusFixtureActor.h` | Two new CVars (`Rebus.BeamShadowBias`, `Rebus.BeamShadowDebug`) routed through the existing `RefreshBeamShadowParamsOnEveryFixture` sink. `RefreshBeamShadowParams` now pushes ALL FOUR scalars. New `DumpBeamShadowStateForDebug()` per-fixture method. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusVisualiser.cpp` | New `Rebus.DumpBeamShadow` + `Rebus.OrbitCastShadows` console commands; matching `ShutdownModule` cleanup. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp` + `Public/RebusVisualiserSubsystem.h` | `EnsureImportedShadowsCast()` + `SetOrbitCastShadowsEnabled(bool)` + `OrbitShadowTouched` tracking set. Tick hooks the new helper on the 1 Hz rebind cadence. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusSceneSettingsSubsystem.cpp` | `bOrbitCastShadows` seed (default `true`) + `ApplySceneProperty` dispatcher routing through `URebusVisualiserSubsystem::SetOrbitCastShadowsEnabled`. |
+>
+> **Operator verification checklist.** Run after rebuild + relaunch on a scene that has
+> at least one fixture aimed at the floor:
+>
+> 1. Drop a unit cube in the level between the fixture and the floor (so its silhouette
+>    should be in the beam path).
+> 2. From the portal console (or in-editor console) run `Rebus.DumpBeamShadow`. Confirm
+>    every fixture line shows `MID(Steps=8.0 Strength=1.000 Bias=5.00 Debug=0)
+>    CVars(Steps=8.0 Strength=1.000 Bias=5.00 Debug=0) -- shadowing ENABLED, debug
+>    mode 0` (or whatever the operator's current values are -- the MID column and CVars
+>    column MUST agree).
+> 3. Run `Rebus.BeamShadowDebug 1`. The whole beam tints `lerp(green, red, shadowed)`.
+>    The cube should appear RED inside the beam (the shadow factor is non-zero where
+>    the cube blocks the line to the light). Green elsewhere.
+> 4. Run `Rebus.BeamShadowDebug 2`. The beam tints by the projected screen UV; the
+>    floor footprint paints a smooth orange/yellow gradient (uv -> RG). A
+>    constant-near-black tint here means the v1.0.99 LWC projection didn't land --
+>    the master is pre-v1.0.99; run `build_rebus_base_level.build()` to regenerate.
+> 5. Run `Rebus.BeamShadowDebug 0`. The beam returns to its normal composed look.
+>    Confirm visually that the shaft is now CARVED at the cube (the cube's silhouette
+>    cuts the volumetric shaft). This is the user-reported regression resolved.
+> 6. Confirm the SpotLight's floor-footprint shadow shows the cube too (Part B). With
+>    `Rebus.OrbitCastShadows 1` (default) the cube + every Orbit-imported truss / set
+>    piece projects a hard shadow in the lit pool. Toggle `Rebus.OrbitCastShadows 0`
+>    to A/B against the no-shadow baseline.
+>
 > **Operator-friendly defaults: hide Orbit fixtures + 16:9 DSLR camera sensor (v1.0.98).**
 > User request (verbatim):
 >

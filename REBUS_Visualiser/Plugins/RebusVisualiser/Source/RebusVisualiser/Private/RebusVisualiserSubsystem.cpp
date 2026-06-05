@@ -231,6 +231,13 @@ bool URebusVisualiserSubsystem::Tick(float DeltaSeconds)
 				{
 					ApplyTrussMaterialPass();
 				}
+				// v1.0.99: piggyback the imported-shadow-cast pass on the same cadence so
+				// freshly-imported Orbit geometry inherits CastShadow=true (or =false, when
+				// the operator flipped `Rebus.OrbitCastShadows 0` / SetSceneProperty
+				// bOrbitCastShadows=false) on the next 1 Hz tick after import. Cheap when
+				// stable (per-comp early-out -- Touched=0 when nothing changed). See the
+				// EnsureImportedShadowsCast doc-comment in the header for the user report.
+				EnsureImportedShadowsCast();
 			}
 		}
 	}
@@ -1762,4 +1769,90 @@ URebusVisualiserSubsystem::FTrussMaterialApplyCount URebusVisualiserSubsystem::S
 	}
 	TrussMaterialCache.Reset();
 	return Count;
+}
+
+// v1.0.99 imported-primitive shadow-cast normalisation. See the header doc-comment on
+// `EnsureImportedShadowsCast` for the user report + design rationale. Walks every
+// OrbitImportRoot actor (matched by class-name string for zero compile dependency on the
+// separately-owned OrbitConnector plugin, mirroring the v1.0.85 truss-material pass) and
+// asserts the four shadow-related flags on every UPrimitiveComponent so the SpotLight's own
+// shadow casting catches them all. Tracked components are added to OrbitShadowTouched so the
+// OFF path of the toggle can find them again.
+URebusVisualiserSubsystem::FOrbitShadowApplyCount URebusVisualiserSubsystem::EnsureImportedShadowsCast()
+{
+	FOrbitShadowApplyCount Count;
+	UWorld* World = GetActiveWorld();
+	if (!World) return Count;
+
+	const bool bWantOn = bOrbitCastShadowsEnabled;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor || Actor->GetClass()->GetName() != TEXT("OrbitImportRoot")) continue;
+
+		TArray<UPrimitiveComponent*> Prims;
+		Actor->GetComponents<UPrimitiveComponent>(Prims);
+		for (UPrimitiveComponent* Prim : Prims)
+		{
+			if (!Prim) continue;
+			++Count.Components;
+
+			// Per-comp early-out: if every flag already matches the desired state we don't
+			// touch the component (avoids MarkRenderStateDirty per tick on every comp). The
+			// per-tick walk is therefore O(comps) cheap once the rig has stabilised.
+			//   * CastShadow / bCastDynamicShadow / bCastFarShadow follow bWantOn.
+			//   * bCastHiddenShadow is forced FALSE regardless: a hidden shadow caster
+			//     produces a silhouette in the lit pool with NO surface, which reads as
+			//     a phantom black blob -- never what the operator wants.
+			const bool bMatches =
+				(Prim->CastShadow == bWantOn)
+				&& (Prim->bCastDynamicShadow == bWantOn)
+				&& (Prim->bCastHiddenShadow == false)
+				&& (Prim->bCastFarShadow == bWantOn);
+			OrbitShadowTouched.Add(Prim);
+
+			if (bMatches) continue;
+
+			// SetCastShadow is the public setter that handles the render-state-dirty +
+			// scene-proxy notify; the other three are USceneComponent / UPrimitiveComponent
+			// public bools that need a manual MarkRenderStateDirty (handled below).
+			Prim->SetCastShadow(bWantOn);
+			Prim->bCastDynamicShadow = bWantOn;
+			Prim->bCastHiddenShadow = false;
+			Prim->bCastFarShadow = bWantOn;
+			Prim->MarkRenderStateDirty();
+			++Count.Touched;
+		}
+	}
+	return Count;
+}
+
+void URebusVisualiserSubsystem::SetOrbitCastShadowsEnabled(bool bEnabled)
+{
+	bOrbitCastShadowsEnabled = bEnabled;
+
+	// First walk the previously-touched set so an OFF flips ALL prior comps off (and an ON
+	// flip after that gets them back on). Then run the standard pass to pick up any newly-
+	// imported geometry that hasn't been visited yet on this cadence -- so a single toggle
+	// transition is fully consistent across the whole import on the same call.
+	int32 Restored = 0;
+	for (auto It = OrbitShadowTouched.CreateIterator(); It; ++It)
+	{
+		UPrimitiveComponent* Prim = It->Get();
+		if (!Prim)
+		{
+			It.RemoveCurrent();
+			continue;
+		}
+		Prim->SetCastShadow(bEnabled);
+		Prim->bCastDynamicShadow = bEnabled;
+		Prim->bCastHiddenShadow = false;
+		Prim->bCastFarShadow = bEnabled;
+		Prim->MarkRenderStateDirty();
+		++Restored;
+	}
+	const FOrbitShadowApplyCount Count = EnsureImportedShadowsCast();
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Rebus.OrbitCastShadows %d: prior-touched=%d freshly-touched=%d (of %d Orbit primitive(s) walked)."),
+		bEnabled ? 1 : 0, Restored, Count.Touched, Count.Components);
 }

@@ -139,6 +139,38 @@ public:
 	FTrussMaterialApplyCount SetTrussMaterialOverrideEnabled(bool bEnabled);
 	bool IsTrussMaterialOverrideEnabled() const { return bTrussMaterialOverrideEnabled; }
 
+	// v1.0.99 -- force every Orbit-imported primitive component to cast shadows by default.
+	// User reported (against v1.0.96/98): "Can we check that all imported objects cast shadows
+	// as default. The light beam currently goes straight through any object." UE primitives
+	// default to CastShadow=true, but glTFRuntime + the OrbitConnector import pipeline can
+	// land them with CastShadow=false (perf-driven import preset) -- so the SpotLight's own
+	// shadow casting catches nothing and the floor footprint stays unshadowed.
+	//
+	// EnsureImportedShadowsCast walks every OrbitImportRoot actor in the active world (matched
+	// by class-name string for zero compile dependency on the OrbitConnector plugin, mirroring
+	// ApplyTrussMaterialPass) and asserts CastShadow / bCastDynamicShadow / bCastHiddenShadow=
+	// false / bCastFarShadow on every UPrimitiveComponent. Idempotent (per-comp early-out when
+	// flags already match). Driven from Tick on the same 1Hz cadence as RebindOrbitModels +
+	// ApplyTrussMaterialPass, so newly-imported geometry inherits the override on the next
+	// second after import without an operator-side console call.
+	//
+	// Operator overrides:
+	//   * `Rebus.OrbitCastShadows [0|1]` flips bOrbitCastShadowsEnabled. ON (default) forces
+	//     CastShadow=true on every tracked + newly-encountered comp. OFF walks the tracked
+	//     set and forces CastShadow=false (so the operator can A/B against the no-shadow
+	//     baseline). The tick walk continues to enforce the chosen state on newly-arrived
+	//     geometry either way.
+	//   * `bOrbitCastShadows` scene property mirrors the same flag through the portal /
+	//     SetSceneProperty wire path -- routes via SetOrbitCastShadowsEnabled below.
+	struct FOrbitShadowApplyCount
+	{
+		int32 Components = 0; // total Orbit primitive components considered this pass
+		int32 Touched    = 0; // had a flag flipped this call
+	};
+	FOrbitShadowApplyCount EnsureImportedShadowsCast();
+	void SetOrbitCastShadowsEnabled(bool bEnabled);
+	bool IsOrbitCastShadowsEnabled() const { return bOrbitCastShadowsEnabled; }
+
 private:
 	// Config / launch tokens.
 	FString PortalUrl;
@@ -277,4 +309,13 @@ private:
 	// Build the set of every Orbit component currently bound to a fixture (those keep the
 	// fixture-material override and must be skipped). Called from ApplyTrussMaterialPass.
 	void BuildBoundOrbitComponentSet(TSet<UPrimitiveComponent*>& Out) const;
+
+	// v1.0.99 -- imported-primitive shadow-cast normalisation state. See the doc-comment on
+	// `EnsureImportedShadowsCast` above for the rationale + algorithm.
+	bool bOrbitCastShadowsEnabled = true;
+	// Set of every primitive we've ever asserted shadow-cast state on, so the OFF path can
+	// walk the same comps and force CastShadow=false (and a re-toggle ON walks them to
+	// CastShadow=true). Weak so a destroyed comp on re-import is silently dropped on next
+	// pass instead of crashing.
+	TSet<TWeakObjectPtr<UPrimitiveComponent>> OrbitShadowTouched;
 };

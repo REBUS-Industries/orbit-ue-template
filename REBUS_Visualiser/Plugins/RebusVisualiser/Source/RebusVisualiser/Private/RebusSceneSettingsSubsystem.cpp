@@ -4,6 +4,7 @@
 #include "RebusVisualiserLog.h"
 #include "RebusFixtureActor.h"
 #include "RebusFixtureControlSubsystem.h"
+#include "RebusVisualiserSubsystem.h" // v1.0.99 SetOrbitCastShadowsEnabled chokepoint
 #include "Engine/GameInstance.h"
 
 #include "EngineUtils.h"
@@ -72,6 +73,17 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// this seed reaches the freshly-bound Orbit components on the very first bind without any
 	// operator action. See the v1.0.98 README release block for the full timing analysis.
 	Values.Add(TEXT("bShowOrbitFixtures"), FRebusPropertyValue::MakeBool(false));
+
+	// v1.0.99 imported-primitive shadow-cast normalisation. Default ON: every OrbitImportRoot
+	// primitive component is forced to CastShadow=true on the periodic 1Hz tick (
+	// URebusVisualiserSubsystem::EnsureImportedShadowsCast) so the SpotLight's own shadow
+	// casting catches every imported truss / set-piece / fixture body. The user reported
+	// against v1.0.96/98 that the beam was passing through every imported object -- root
+	// cause: glTFRuntime + the OrbitConnector import path imports primitives with
+	// CastShadow=false. The portal can override per-scene via SetSceneProperty
+	// bOrbitCastShadows=false, mirrored by the `Rebus.OrbitCastShadows 0` console command.
+	// See the v1.0.99 README release block for the full diagnosis.
+	Values.Add(TEXT("bOrbitCastShadows"), FRebusPropertyValue::MakeBool(true));
 
 	// v1.0.90: post-process Bloom / Lens Flare / Vignette exposed as portal scene properties.
 	// Seeded so SceneState round-trips them before the portal pushes its first value, and the
@@ -535,6 +547,26 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 				TEXT("bShowOrbitFixtures=%d applied to %d fixture(s), %d Orbit component(s) %s."),
 				Value.bBool ? 1 : 0, Fixtures, Affected,
 				Value.bBool ? TEXT("shown") : TEXT("hidden"));
+		}
+	}
+	// v1.0.99 imported-primitive shadow-cast normalisation. Routes the portal scene-property
+	// push through the GameInstance subsystem's chokepoint so the toggle path AND the
+	// periodic tick agree on the desired state -- without this, a portal recycle would
+	// quietly leave bOrbitCastShadowsEnabled at its construction default and any operator
+	// override would be lost. The `Rebus.OrbitCastShadows` console command lives in
+	// RebusVisualiser.cpp and routes through the SAME SetOrbitCastShadowsEnabled, so the
+	// console + scene-property paths can never diverge.
+	else if (Name == TEXT("bOrbitCastShadows"))
+	{
+		if (UWorld* World = GetWorld())
+		{
+			if (UGameInstance* GI = World->GetGameInstance())
+			{
+				if (URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>())
+				{
+					Viz->SetOrbitCastShadowsEnabled(Value.bBool);
+				}
+			}
 		}
 	}
 	// --- Stream Quality (Pixel Streaming encoder params) ---

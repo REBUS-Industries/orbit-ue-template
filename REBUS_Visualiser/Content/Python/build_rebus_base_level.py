@@ -341,28 +341,70 @@ _BEAM_RAYMARCH_HLSL = """
 // so an off-screen occluder never casts shadow into the shaft (its depth isn't in the depth
 // buffer). MDF fallback is documented as future work (see README v1.0.96).
 //
+// v1.0.99 PROJECTION + SELF-OCCLUSION FIX (the v1.0.96 shadow trace did not visibly carve the
+// beam at any occluder -- the user reported "the light beam currently goes straight through
+// any object"). Two coupled bugs were the smoking gun:
+//
+//   (1) LWC PROJECTION. v1.0.96 computed `spRel = sp - ro` and fed that to
+//       `ResolvedView.TranslatedWorldToClip`. UE 5.7's clip-space matrix expects
+//       `TranslatedWorld = AbsoluteWorld + ResolvedView.PreViewTranslation`, NOT
+//       `AbsoluteWorld - CamPos`: those are only equal when the view origin is exactly the
+//       camera origin (and PreViewTranslation has no jitter / shadow-pass offset / LWC tile
+//       term). On a stage scene the projected NDC was off by the view-origin delta, lands
+//       outside [-1, 1], and the `if (any(abs(ndc) > 1.0)) { continue; }` skip then dropped
+//       EVERY shadow step -- so no step ever taps SceneDepth and the trace looks "always
+//       unoccluded" (the user-visible "goes straight through any object" symptom). v1.0.99
+//       uses the LWC-safe formula `TranslatedWorld = sp + LWCHackToFloat(ResolvedView.
+//       PreViewTranslation)`, which is the documented engine pattern for absolute-world ->
+//       clip in a Custom HLSL node.
+//
+//   (2) FIRST-STEP SELF-OCCLUSION. The translucent cone-mesh ITSELF doesn't write to
+//       SceneDepth (it's BLEND_ADDITIVE), but the shaft sample `wp` lives ON the cone's
+//       projected screen pixel where the SOLID fixture body / nearby props can read AHEAD of
+//       a small shadow step. v1.0.99 promotes `BeamShadowBias` (default raised 0.5 -> 5.0 cm)
+//       to act as a FIRST-STEP MINIMUM DISTANCE: any candidate step with `sj < BeamShadowBias`
+//       is skipped, so the trace starts at least 5 cm out from `wp` toward the light before
+//       its first SceneDepth tap. If the user still sees the beam pass through occluders
+//       after this, raising `BeamShadowBias` to 50 cm is the operator-side knob (set via the
+//       MID directly or via a future `Rebus.BeamShadowBias` CVar).
+//
 // Algorithm (per shaft sample inside the existing march loop, after the density `d` is computed
 // but before composing it into the transmittance):
 //   1. toLight = (bo - wp); dToLight = |toLight|; sdir = toLight / dToLight.
 //   2. March BeamShadowSteps steps from `wp` toward `bo` (the SpotLight position), at step
 //      distance sdt = dToLight / BeamShadowSteps. The shadow march MUST NOT exceed dToLight --
 //      we clamp `sj < dToLight` so a far occluder behind the light can't falsely shadow us.
-//   3. At each step, world-position -> NDC -> ScreenUV via ResolvedView.TranslatedWorldToClip
-//      (subtract the camera ray-origin ro first to go absolute-world -> camera-relative; the
-//      matrix expects translated/camera-relative input in UE 5.7).
+//   3. At each step, world-position -> NDC -> ScreenUV via ResolvedView.TranslatedWorldToClip,
+//      using `TranslatedWorld = sp + LWCHackToFloat(ResolvedView.PreViewTranslation)` (the
+//      v1.0.99 LWC-safe absolute-world -> translated-world formula -- see the v1.0.99 fix
+//      block above for the v1.0.96 bug it replaces).
 //   4. Tap CalcSceneDepth(uv) at the projected UV. If sd + perStepBias < step.cameraZ (= clip.w
 //      in UE perspective projection), the step is OCCLUDED from the camera's view -> something
 //      opaque is between the camera and the step -> the step is shadowed from the light too
 //      (under the screen-space assumption: the occluder is on the screen and obstructs the
-//      light-ray we're tracing). BeamShadowBias is the additive per-step camera-Z tolerance
-//      (cm) to prevent the shaft sample being read as its own occluder when the very first
-//      step lands on its own pixel; further bias `0.01 * sdt` scales with the step distance
-//      to remain robust at long shadow rays.
+//      light-ray we're tracing). v1.0.99: `BeamShadowBias` is the FIRST-STEP MINIMUM cm
+//      (default 5.0) -- any candidate step within `BeamShadowBias` cm of the shaft sample is
+//      skipped to avoid self-occlusion against nearby fixture / scene geometry. A tiny
+//      `0.01 * sdt` per-step camera-Z tolerance is still added to the depth comparison so
+//      banding doesn't appear when sd and clip.w are within float precision.
 //   5. If ANY step hits an occluder we mark the sample as shadowed and attenuate the density
 //      contribution by (1 - BeamShadowStrength). Strength=1 -> the shadowed sample contributes
 //      nothing (full shadow). Strength=0 -> the trace runs but does nothing (master OFF).
 //
-// Limitations (documented in README v1.0.96):
+// v1.0.99 DEBUG VIEW (`BeamShadowDebug` scalar param, driven by `Rebus.BeamShadowDebug
+// [0|1|2]`):
+//   * 0 = off (default; ship the regular composed beam).
+//   * 1 = render the shadow factor as a heatmap. The beam coverage stays the same so the cone
+//         shape is visible, but the colour is `lerp(green, red, shadowedFraction)` x 4.0
+//         (bright). A cube placed between fixture + floor should appear as red against a
+//         green beam -- if the cube is green, the trace is finding NO occluders (Cause 1
+//         regression) or BeamShadowStrength is 0 (`Rebus.BeamShadow 0` master toggle).
+//   * 2 = render the FIRST shadow step's projected screen UV as `(uv.x, uv.y, 0)` x 4.0
+//         (bright). A correctly-projected step lands at uv in [0, 1]^2 so the beam tints
+//         orange/yellow across the floor; if the screen UV is constant black/red the LWC
+//         projection is broken (Cause 1 regression -- the v1.0.99 fix did not land).
+//
+// Limitations (documented in README v1.0.96/99):
 //   * Screen-space only -- off-screen occluders don't cast.
 //   * Cost ~ StepCount * BeamShadowSteps SceneDepth taps per pixel. Keep BeamShadowSteps low
 //     (default 8, clamped to 16) -- 32 march * 8 shadow = 256 taps/pixel is the design point.
@@ -446,6 +488,21 @@ const float NEAR_FADE_CM = 10.0;      // fade only the few cm nearest the camera
 const float REF_RADIUS_CM = 100.0;    // fixed length scale for the width-bias normalization
 const float DEPTH_FADE_CM = 50.0;     // DMX-style soft depth fade where the beam meets geometry
 
+// v1.0.99 LWC translation helper. `ResolvedView.PreViewTranslation` is a `WSVector` in LWC
+// builds (UE 5.4+); `LWCHackToFloat` is the engine-blessed accessor inside Custom HLSL that
+// converts an LWC vector to a float3 representing translated-world. Cached once per pixel
+// because every shadow step needs it.
+float3 PreViewT = LWCHackToFloat(ResolvedView.PreViewTranslation);
+
+// v1.0.99 debug-view accumulators. Track whether we found ANY occluder during the per-pixel
+// march, what fraction of samples were shadowed, and the FIRST shadow step's projected UV
+// so the operator can verify the LWC projection math + that the trace is actually finding
+// occluders. Cheap (a few scalar ops at the end of the per-pixel work); only consulted
+// when `BeamShadowDebug > 0.5` so the regular path stays unchanged.
+int   shadowedSampleCount = 0;
+int   totalSampleCount = 0;
+float2 firstShadowUV = float2(-1.0, -1.0); // sentinel "no shadow step ever taken"
+
 float trans = 1.0;
 float t = tEntry + dt * 0.5;
 const int MAXSTEPS = 64;
@@ -488,9 +545,14 @@ for (int i = 0; i < MAXSTEPS; ++i)
             // step finds an opaque feature in front of it. See the file-header doc-comment for
             // the full algorithm. The trace is gated on BeamShadowStrength > 0 so the master
             // toggle (Rebus.BeamShadow 0) takes the branch out of the per-pixel cost.
+            // v1.0.99: also gated on BeamShadowDebug > 0 so the heatmap visualisation runs
+            // even when strength is near zero (operator can confirm the trace finds
+            // occluders independently of the strength dial).
             float shadowAtten = 1.0;
+            bool  sOccluded   = false;
+            ++totalSampleCount;
             [branch]
-            if (BeamShadowStrength > 0.001)
+            if (BeamShadowStrength > 0.001 || BeamShadowDebug > 0.5)
             {
                 float3 toLight = bo - wp;
                 float dToLight = length(toLight);
@@ -499,31 +561,50 @@ for (int i = 0; i < MAXSTEPS; ++i)
                     float3 sdir = toLight / dToLight;
                     int sSteps = (int)clamp(BeamShadowSteps, 1.0, 16.0);
                     float sdt = dToLight / (float)sSteps;
+                    // v1.0.99: BeamShadowBias is the FIRST-STEP MINIMUM cm (default 5.0).
+                    // Any candidate step within `biasBase` cm of the shaft sample is
+                    // skipped, so the very first SceneDepth tap is at least biasBase cm
+                    // out from `wp` toward the light. This avoids the trace reading a
+                    // nearby opaque pixel (fixture body / prop edge near the cone) as
+                    // its own occluder. See the file-header v1.0.99 fix doc-comment.
                     float biasBase = max(BeamShadowBias, 0.0);
-                    bool sOccluded = false;
                     [loop]
                     for (int j = 0; j < 16; ++j)
                     {
                         if (j >= sSteps) { break; }
-                        // Per-step offset: (j+1) * sdt is the linear step distance from wp
-                        // toward bo; subtract the bias to avoid self-occlusion on the very
-                        // first step landing on the shaft sample's own screen pixel.
-                        float sj = sdt * ((float)j + 1.0) - biasBase;
-                        if (sj <= 0.0) { continue; }
+                        // Linear step distance from wp toward bo. The first viable step
+                        // is the smallest j with `sj >= biasBase` (skip everything
+                        // closer to wp than the first-step minimum).
+                        float sj = sdt * ((float)j + 1.0);
+                        if (sj < biasBase) { continue; }
                         // Clamp the march distance so a far-away occluder BEHIND the light
                         // can't falsely shadow the shaft (per the v1.0.96 spec).
                         if (sj >= dToLight) { break; }
                         float3 sp = wp + sdir * sj;
-                        // sp - ro: absolute world -> camera-relative (translated world). UE
-                        // 5.7's ResolvedView.TranslatedWorldToClip expects translated input.
-                        float3 spRel = sp - ro;
-                        float4 clipP = mul(float4(spRel, 1.0), ResolvedView.TranslatedWorldToClip);
+                        // v1.0.99: LWC-safe absolute-world -> translated-world. The
+                        // v1.0.96 `sp - ro` shortcut was wrong (TranslatedWorldToClip
+                        // expects `AbsoluteWorld + PreViewTranslation`, not
+                        // `AbsoluteWorld - CamPos`) and projected every step OUTSIDE
+                        // the [-1,1] NDC range -- the off-screen guard then dropped
+                        // every tap so the trace concluded "always unoccluded" and the
+                        // beam visibly carved nothing. See the file-header v1.0.99
+                        // fix doc-comment for the full diagnosis.
+                        float3 TranslatedWorldPos = sp + PreViewT;
+                        float4 clipP = mul(float4(TranslatedWorldPos, 1.0), ResolvedView.TranslatedWorldToClip);
                         if (clipP.w <= 0.001) { continue; }
                         float2 ndc = clipP.xy / clipP.w;
                         // Off-screen step -> can't sample the depth buffer, skip.
                         if (any(abs(ndc) > 1.0)) { continue; }
                         // NDC -> UV (UE Y is flipped relative to NDC).
                         float2 uv = ndc * float2(0.5, -0.5) + 0.5;
+                        // v1.0.99 debug capture: remember the very first projected UV
+                        // we actually evaluate (any sample, any step). The mode-2
+                        // visualisation paints this on the beam so the operator can
+                        // see at a glance whether the LWC projection lands sane UVs.
+                        if (firstShadowUV.x < 0.0)
+                        {
+                            firstShadowUV = uv;
+                        }
                         // SceneDepth at uv is linear camera-Z in cm; clip.w in UE perspective
                         // projection is also camera-Z, so the comparison is consistent.
                         float sd = CalcSceneDepth(uv);
@@ -533,6 +614,7 @@ for (int i = 0; i < MAXSTEPS; ++i)
                     if (sOccluded)
                     {
                         shadowAtten = max(1.0 - BeamShadowStrength, 0.0);
+                        ++shadowedSampleCount;
                     }
                 }
             }
@@ -546,6 +628,37 @@ for (int i = 0; i < MAXSTEPS; ++i)
 
 float coverage = saturate(1.0 - trans);
 float3 col = BeamColor.rgb * BeamIntensity * coverage;
+
+// v1.0.99 debug visualisation. Mode 1: per-pixel heatmap of `shadowedSampleCount /
+// totalSampleCount` (green = no shadow steps found an occluder, red = every visible
+// sample was shadowed). Mode 2: render the FIRST shadow step's projected UV as
+// (uv.x, uv.y, 0). The 4.0 multiplier keeps the debug output bright even at low
+// coverage so dim cone edges stay visible.
+[branch]
+if (BeamShadowDebug > 0.5)
+{
+    float shadowedFrac = (totalSampleCount > 0)
+        ? saturate((float)shadowedSampleCount / (float)totalSampleCount) : 0.0;
+    float3 dbgGreen = float3(0.0, 1.0, 0.0);
+    float3 dbgRed   = float3(1.0, 0.0, 0.0);
+    float3 dbgCol;
+    if (BeamShadowDebug > 1.5)
+    {
+        // Mode 2 -- UV sanity. Black means "no shadow step ever took a tap" (LWC
+        // projection broken, dToLight=0, or the trace's strength+debug gate never
+        // fired). uv ~ (0.5, 0.5) with the beam in the centre of the screen means
+        // the projection is healthy.
+        float2 uv = (firstShadowUV.x >= 0.0) ? firstShadowUV : float2(0.0, 0.0);
+        dbgCol = float3(uv.x, uv.y, 0.0);
+    }
+    else
+    {
+        // Mode 1 -- shadow-factor heatmap.
+        dbgCol = lerp(dbgGreen, dbgRed, shadowedFrac);
+    }
+    col = dbgCol * 4.0 * coverage;
+}
+
 return float4(col, coverage);
 """
 
@@ -609,25 +722,35 @@ def _build_beam_master(mat):
     # CVar can't blow the per-pixel cost; default 8 is the design point paired with StepCount=32
     # (32 * 8 = 256 SceneDepth taps per beam pixel). BeamShadowStrength = 1 means "fully shadow
     # any sample whose shadow ray hits an occluder" -- 0 disables the trace via the
-    # `if (BeamShadowStrength > 0.001) [branch]` gate in the shader. BeamShadowBias is the
-    # additive cm tolerance used to skip the shaft sample's own pixel as its own occluder.
+    # `if (BeamShadowStrength > 0.001) [branch]` gate in the shader.
+    #
+    # v1.0.99: BeamShadowBias now means "FIRST-STEP MINIMUM cm" (default raised 0.5 -> 5.0)
+    # to prevent self-occlusion against nearby fixture / prop geometry on the first SceneDepth
+    # tap. See the v1.0.99 PROJECTION + SELF-OCCLUSION FIX block in the _BEAM_RAYMARCH_HLSL
+    # doc-comment for the rationale.
+    #
+    # v1.0.99 BeamShadowDebug visualisation mode (default 0 = off). Set to 1 to render the
+    # per-pixel shadow-factor heatmap (green = unshadowed, red = shadowed); set to 2 to render
+    # the first shadow step's projected screen UV as (uv.x, uv.y, 0). Driven by the
+    # `Rebus.BeamShadowDebug [0|1|2]` console CVar (RebusFixtureActor.cpp).
     shadowsteps = _scalar("BeamShadowSteps", 8.0, 500)
     shadowstrength = _scalar("BeamShadowStrength", 1.0, 580)
-    shadowbias = _scalar("BeamShadowBias", 0.5, 660)
+    shadowbias = _scalar("BeamShadowBias", 5.0, 660)
+    shadowdebug = _scalar("BeamShadowDebug", 0.0, 740)
 
-    beamorigin = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 740)
+    beamorigin = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 820)
     beamorigin.set_editor_property("parameter_name", "BeamOrigin")
     beamorigin.set_editor_property("default_value", unreal.LinearColor(0.0, 0.0, 0.0, 0.0))
 
-    beamdir = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 820)
+    beamdir = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 900)
     beamdir.set_editor_property("parameter_name", "BeamDir")
     beamdir.set_editor_property("default_value", unreal.LinearColor(1.0, 0.0, 0.0, 0.0))
 
     # ---- Scene/view inputs (engine nodes) ----
-    campos = mel.create_material_expression(mat, unreal.MaterialExpressionCameraPositionWS, -1100, 900)
-    pixelpos = mel.create_material_expression(mat, unreal.MaterialExpressionWorldPosition, -1100, 980)
-    scenedepth = mel.create_material_expression(mat, unreal.MaterialExpressionSceneDepth, -1100, 1060)
-    pixeldepth = mel.create_material_expression(mat, unreal.MaterialExpressionPixelDepth, -1100, 1140)
+    campos = mel.create_material_expression(mat, unreal.MaterialExpressionCameraPositionWS, -1100, 980)
+    pixelpos = mel.create_material_expression(mat, unreal.MaterialExpressionWorldPosition, -1100, 1060)
+    scenedepth = mel.create_material_expression(mat, unreal.MaterialExpressionSceneDepth, -1100, 1140)
+    pixeldepth = mel.create_material_expression(mat, unreal.MaterialExpressionPixelDepth, -1100, 1220)
 
     # ---- Custom raymarch node ----
     custom = mel.create_material_expression(mat, unreal.MaterialExpressionCustom, -500, 100)
@@ -640,8 +763,8 @@ def _build_beam_master(mat):
         "BeamColor", "BeamIntensity", "BeamSharpness", "BeamFalloff",
         "StepCount", "BeamDensity", "BeamOrigin", "BeamDir",
         "BeamLength", "LensRadius", "FarRadius",
-        # v1.0.96 screen-space shadow trace inputs.
-        "BeamShadowSteps", "BeamShadowStrength", "BeamShadowBias",
+        # v1.0.96 screen-space shadow trace inputs (v1.0.99 added BeamShadowDebug).
+        "BeamShadowSteps", "BeamShadowStrength", "BeamShadowBias", "BeamShadowDebug",
     ]
     custom_inputs = []
     for n in input_names:
@@ -655,7 +778,8 @@ def _build_beam_master(mat):
         "BeamColor": color, "BeamIntensity": intensity, "BeamSharpness": sharp, "BeamFalloff": falloff,
         "StepCount": stepcount, "BeamDensity": density, "BeamOrigin": beamorigin, "BeamDir": beamdir,
         "BeamLength": beamlen, "LensRadius": lensrad, "FarRadius": farrad,
-        "BeamShadowSteps": shadowsteps, "BeamShadowStrength": shadowstrength, "BeamShadowBias": shadowbias,
+        "BeamShadowSteps": shadowsteps, "BeamShadowStrength": shadowstrength,
+        "BeamShadowBias": shadowbias, "BeamShadowDebug": shadowdebug,
     }
     for n in input_names:
         mel.connect_material_expressions(src_for[n], "", custom, n)
@@ -697,6 +821,23 @@ def _beam_master_has_shadow_steps(master):
             and "BeamShadowBias" in names)
 
 
+def _beam_master_has_shadow_debug(master):
+    """v1.0.99 self-heal probe -- True when the on-disk master is the v1.0.99 version that
+    exposes the new `BeamShadowDebug` scalar (the per-pixel shadow-factor / first-UV
+    visualisation knob driven by `Rebus.BeamShadowDebug`). Pre-v1.0.99 masters carry the
+    v1.0.96 shadow-trace contract but the projection-bug-and-self-occlusion fix in the
+    Custom HLSL is bundled with this scalar; flagging the master as STALE on missing
+    BeamShadowDebug forces a regen with the corrected HLSL on the next editor launch.
+    Mirrors `_beam_master_has_shadow_steps` exactly.
+    """
+    try:
+        info = unreal.MaterialEditingLibrary.get_scalar_parameter_names(master)
+    except Exception:  # noqa: BLE001
+        return False
+    names = [str(n) for n in info]
+    return "BeamShadowDebug" in names
+
+
 def ensure_beam_material(force=False):
     """Generate the faux-volumetric beam master material. Idempotent (only creates when missing)
     unless force=True (delete + regenerate, e.g. during a full build()).
@@ -715,6 +856,17 @@ def ensure_beam_material(force=False):
             unreal.log_warning("RebusBaseLevel: pre-v1.0.96 M_RebusBeam detected "
                                "(missing BeamShadowSteps/BeamShadowStrength/BeamShadowBias); "
                                "regenerating with screen-space shadow trace.")
+            force = True
+        elif existing is not None and not _beam_master_has_shadow_debug(existing):
+            # v1.0.99 self-heal -- existing v1.0.96/97 master is missing BeamShadowDebug
+            # AND (more importantly) the v1.0.99 LWC-projection / first-step-bias fix in
+            # the _BEAM_RAYMARCH_HLSL Custom node. Force-regen so the per-fixture MID picks
+            # up the corrected shader (operator-visible bug: shadow trace runs but every
+            # step lands off-screen, so the beam looks unshadowed at any occluder -- the
+            # exact symptom the v1.0.99 release block calls out).
+            unreal.log_warning("RebusBaseLevel: pre-v1.0.99 M_RebusBeam detected "
+                               "(missing BeamShadowDebug + carries the v1.0.96 LWC "
+                               "projection bug); regenerating with the v1.0.99 fix.")
             force = True
 
     if force and unreal.EditorAssetLibrary.does_asset_exist(BEAM_PATH):

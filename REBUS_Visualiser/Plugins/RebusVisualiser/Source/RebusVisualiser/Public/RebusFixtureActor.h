@@ -444,6 +444,15 @@ public:
 	// Called by the Rebus.DumpFixtureLights console command (registered in RebusVisualiser.cpp).
 	void DumpLightStateForDebug() const;
 
+	// v1.0.99: dump THIS fixture's M_RebusBeam screen-space-shadow-trace state in one line --
+	// whether BeamMID is bound, the live values of BeamShadowSteps / BeamShadowStrength /
+	// BeamShadowBias / BeamShadowDebug as they exist on the MID right now (so the operator
+	// can confirm `RefreshBeamShadowParams` is winning the push race against any portal /
+	// scene-property override), plus the CURRENT global CVar values for diff against. Called
+	// by `Rebus.DumpBeamShadow` (registered in RebusVisualiser.cpp). Public + const so the
+	// console handler can iterate fixtures via `TActorIterator<ARebusFixtureActor>`.
+	void DumpBeamShadowStateForDebug() const;
+
 	// v1.0.74: dump THIS fixture's gobo runtime state -- whether a gobo is bound, RT size +
 	// pointer, current rotation angle, combined spin rate, MegaLights opt-out flag, light-
 	// function material pointer, and last frame the RT was redrawn. Called by the new
