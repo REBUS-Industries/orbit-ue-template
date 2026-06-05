@@ -151,6 +151,14 @@ public:
 	void SetDriveOrbitModel(bool bEnabled);
 	bool IsDrivingOrbitModel() const { return bDriveOrbitModel; }
 	const FString& GetBoundOrbitObjectId() const { return BoundOrbitObjectId; }
+	// v1.0.70: show / hide the Orbit-imported components bound to this fixture (e.g. to A/B
+	// against the control-channel mesh proxies, or to "remove" duplicate fixture geometry without
+	// touching the rest of the Orbit import like trusses and set pieces). Walks OrbitComponents
+	// and calls SetVisibility(bVisible, /*bPropagateToChildren*/ true) on each. Returns the
+	// number of components affected. The drive loop is unchanged -- hidden components still
+	// receive transform updates, so toggling visibility back on lands them in the current pose
+	// instead of a stale one.
+	int32 SetOrbitVisibility(bool bVisible);
 
 	// REST client used to lazily fetch gobo wheel images / IES bytes.
 	void SetRestClient(TSharedPtr<FRebusRestClient> InClient) { RestClient = InClient; }

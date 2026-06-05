@@ -25,6 +25,8 @@ namespace
 	IConsoleCommand* GDriveOrbitModelsCommand = nullptr;
 	IConsoleCommand* GMeshBeamsCommand = nullptr;
 	IConsoleCommand* GDumpFixtureLightsCommand = nullptr;
+	IConsoleCommand* GShowOrbitFixturesCommand = nullptr;
+	IConsoleCommand* GShowOrbitCommand = nullptr;
 
 	// v1.0.55: Pixel Streaming console-command gate. v1.0.54 set only the PS1 CVar
 	// ("PixelStreaming.AllowPixelStreamingCommands") and had no effect because this project enables
@@ -178,6 +180,76 @@ namespace
 		}
 	}
 
+	// v1.0.70 shared helper -- parse a single bool-ish arg ("1"/"on"/"true" -> true, anything
+	// else -> false; no arg -> true) for the show/hide console commands. Matches the existing
+	// MeshBeams / DriveOrbitModels parser to keep the wire shape uniform.
+	bool ParseBoolArg(const TArray<FString>& Args, bool bDefault = true)
+	{
+		if (Args.Num() == 0) return bDefault;
+		const FString& A = Args[0];
+		if (A == TEXT("1") || A.Equals(TEXT("on"), ESearchCase::IgnoreCase) || A.Equals(TEXT("true"), ESearchCase::IgnoreCase)) return true;
+		if (A == TEXT("0") || A.Equals(TEXT("off"), ESearchCase::IgnoreCase) || A.Equals(TEXT("false"), ESearchCase::IgnoreCase)) return false;
+		return bDefault;
+	}
+
+	// v1.0.70: `Rebus.ShowOrbitFixtures [0|1]` -- show/hide the Orbit-imported fixture geometry
+	// bound to each ARebusFixtureActor (the components matched + bound by RebindOrbitModels).
+	// Anything else in the OrbitImportRoot (trusses, set pieces, layout meshes that aren't
+	// fixtures) stays visible. Use this when you want to A/B between the control-channel mesh
+	// proxies and the orbit-imported fixture bodies, or to "delete" duplicate fixture geometry
+	// without losing the rest of the Orbit scene. Routes via ARebusFixtureActor::SetOrbitVisibility
+	// per fixture in every Game/PIE world.
+	void HandleShowOrbitFixturesCommand(const TArray<FString>& Args)
+	{
+		const bool bShow = ParseBoolArg(Args, true);
+		if (!GEngine) return;
+		int32 TotalFixtures = 0, TotalAffected = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+			for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					TotalAffected += F->SetOrbitVisibility(bShow);
+					++TotalFixtures;
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.ShowOrbitFixtures %d: %d fixture(s), %d Orbit component(s) %s."),
+			bShow ? 1 : 0, TotalFixtures, TotalAffected, bShow ? TEXT("shown") : TEXT("hidden"));
+	}
+
+	// v1.0.70: `Rebus.ShowOrbit [0|1]` -- broad sledgehammer that hides EVERY actor of class
+	// OrbitImportRoot in every Game/PIE world via SetActorHiddenInGame. This kills the whole
+	// Orbit import (fixtures AND trusses / set pieces / layout meshes); use ShowOrbitFixtures
+	// when you only want to hide the fixture bodies. The class match is by name string (no
+	// compile dependency on the separately-owned OrbitConnector plugin, matching how
+	// RebindOrbitModels finds the root).
+	void HandleShowOrbitCommand(const TArray<FString>& Args)
+	{
+		const bool bShow = ParseBoolArg(Args, true);
+		if (!GEngine) return;
+		int32 RootsAffected = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+			for (TActorIterator<AActor> It(World); It; ++It)
+			{
+				AActor* A = *It;
+				if (!A || A->GetClass()->GetName() != TEXT("OrbitImportRoot")) continue;
+				A->SetActorHiddenInGame(!bShow);
+				++RootsAffected;
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.ShowOrbit %d: %d OrbitImportRoot actor(s) %s."),
+			bShow ? 1 : 0, RootsAffected, bShow ? TEXT("shown") : TEXT("hidden"));
+	}
+
 	// `Rebus.DriveOrbitModels [0|1]` -- live toggle for the Phase-1 Orbit-model sync test (mirrors
 	// the bDriveOrbitModels scene property). No arg / "1"/"on"/"true" enables; "0"/"off"/"false"
 	// disables. Routes to the fixture control subsystem of each running Game/PIE world.
@@ -245,6 +317,28 @@ void FRebusVisualiserModule::StartupModule()
 			 "CastShadows) and whether a competing/aux light is washing it out."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpFixtureLightsCommand),
 		ECVF_Default);
+
+	// v1.0.70 visibility toggles for the Orbit import. ShowOrbitFixtures is the targeted one
+	// (hides JUST the fixture bodies bound to ARebusFixtureActors -- trusses / set / non-fixture
+	// orbit imports stay visible). ShowOrbit is the broad sledgehammer (hides every
+	// OrbitImportRoot actor). Both default to showing when invoked with no arg, matching the
+	// other Rebus.* toggles.
+	GShowOrbitFixturesCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.ShowOrbitFixtures"),
+		TEXT("Show/hide the Orbit-imported fixture geometry bound to each control-channel fixture "
+			 "(leaves non-fixture orbit imports like trusses and set pieces visible). "
+			 "Usage: Rebus.ShowOrbitFixtures [0|1]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleShowOrbitFixturesCommand),
+		ECVF_Default);
+
+	GShowOrbitCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.ShowOrbit"),
+		TEXT("Show/hide EVERY actor of class OrbitImportRoot in every Game/PIE world (kills the "
+			 "whole Orbit import -- fixtures AND trusses / set / layout). Use Rebus.ShowOrbitFixtures "
+			 "instead if you only want to hide the fixture bodies. "
+			 "Usage: Rebus.ShowOrbit [0|1]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleShowOrbitCommand),
+		ECVF_Default);
 }
 
 void FRebusVisualiserModule::ShutdownModule()
@@ -263,6 +357,16 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GDumpFixtureLightsCommand);
 		GDumpFixtureLightsCommand = nullptr;
+	}
+	if (GShowOrbitFixturesCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GShowOrbitFixturesCommand);
+		GShowOrbitFixturesCommand = nullptr;
+	}
+	if (GShowOrbitCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GShowOrbitCommand);
+		GShowOrbitCommand = nullptr;
 	}
 
 	UE_LOG(LogRebusVisualiser, Log, TEXT("RebusVisualiser module shut down."));

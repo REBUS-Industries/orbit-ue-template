@@ -593,6 +593,38 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Hide-Orbit console commands (v1.0.70).** User asked *"how do I hide the orbit lights on
+> cmd"* -- there was no console toggle for this. v1.0.65's `Rebus.DriveOrbitModels 0` only stops
+> driving (the orbit fixtures freeze at their imported pose but stay visible). Added two
+> commands, scoped narrow -> broad:
+>
+> - `Rebus.ShowOrbitFixtures [0|1]` -- show / hide ONLY the Orbit-imported geometry bound to
+>   each `ARebusFixtureActor` (the components matched + bound by `RebindOrbitModels`).
+>   Anything else in the OrbitImportRoot -- trusses, set pieces, layout meshes -- stays
+>   visible. Use this when you want to A/B between the control-channel mesh proxies and the
+>   orbit-imported fixture bodies, or to silently "remove" duplicate fixture geometry when
+>   the two are stacked on top of each other.
+> - `Rebus.ShowOrbit [0|1]` -- sledgehammer: hide every actor of class `OrbitImportRoot` in
+>   every Game/PIE world via `SetActorHiddenInGame`. Kills the entire Orbit scene -- fixtures
+>   AND trusses / set / layout -- in one shot.
+>
+> Both default to *show* when invoked with no arg, matching the other `Rebus.*` toggles
+> (`Rebus.MeshBeams`, `Rebus.DriveOrbitModels`). The fixtures command logs a per-invocation
+> summary: `Rebus.ShowOrbitFixtures 0: 4 fixture(s), 20 Orbit component(s) hidden.` The root
+> command logs the count of OrbitImportRoot actors touched.
+>
+> Implementation notes:
+>
+> - `ARebusFixtureActor::SetOrbitVisibility(bool)` walks `OrbitComponents` and calls
+>   `Comp->SetVisibility(bVisible, /*bPropagateToChildren*/ true)`. Returns the count
+>   toggled so the console summary is meaningful. Dead weak handles (post-reimport) are
+>   silently skipped.
+> - The drive loop is unchanged -- hidden components still receive transform updates, so
+>   toggling visibility back on lands them in the current pose, not a stale one.
+> - The root command matches `GetClass()->GetName() == TEXT("OrbitImportRoot")` to avoid a
+>   compile/link dependency on the separately-owned OrbitConnector plugin (same pattern
+>   `RebindOrbitModels` uses to find the root).
+
 > **ID-only axis classification, no bounding box (v1.0.69).** v1.0.68 added per-component
 > motion-axis bucketing but its position-fallback strategy misbehaved on the user's GLBs:
 >

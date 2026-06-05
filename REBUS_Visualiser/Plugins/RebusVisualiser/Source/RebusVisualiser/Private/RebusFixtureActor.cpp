@@ -1840,6 +1840,24 @@ void ARebusFixtureActor::ClearOrbitBinding()
 	BoundOrbitObjectId.Reset();
 }
 
+int32 ARebusFixtureActor::SetOrbitVisibility(bool bVisible)
+{
+	// v1.0.70 helper for `Rebus.ShowOrbitFixtures`. Walks the bound components and toggles
+	// their rendered visibility (propagating to children so a parent mesh comp with sub-meshes
+	// hides as one unit). Returns the count actually toggled so the console command can log
+	// a meaningful summary -- weak handles that have died (re-import / late teardown) are
+	// silently skipped.
+	int32 Affected = 0;
+	for (const TWeakObjectPtr<USceneComponent>& Weak : OrbitComponents)
+	{
+		USceneComponent* C = Weak.Get();
+		if (!C) continue;
+		C->SetVisibility(bVisible, /*bPropagateToChildren*/ true);
+		++Affected;
+	}
+	return Affected;
+}
+
 bool ARebusFixtureActor::HasOrbitBinding() const
 {
 	for (const TWeakObjectPtr<USceneComponent>& C : OrbitComponents)
