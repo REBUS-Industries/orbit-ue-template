@@ -2137,6 +2137,35 @@ int32 ARebusFixtureActor::SetOrbitVisibility(bool bVisible)
 	return Affected;
 }
 
+void ARebusFixtureActor::GetBoundOrbitPrimitives(TSet<UPrimitiveComponent*>& OutSet) const
+{
+	// v1.0.85: emit every live primitive currently in the fixture's Orbit binding so the
+	// subsystem's truss-material pass can skip them. We also walk children of each bound
+	// scene component because BindOrbitComponents stores the top of each axis bucket and
+	// (depending on the import shape) the actual renderable meshes can sit one level deeper
+	// (a parent SceneComponent with StaticMeshComponent children). Recursively unrolling
+	// keeps the skip behaviour correct on imports that nest geometry under transform-only
+	// nodes (Speckle / glTFRuntime both do this for grouped objects).
+	for (const TWeakObjectPtr<USceneComponent>& Weak : OrbitComponents)
+	{
+		USceneComponent* Top = Weak.Get();
+		if (!Top) continue;
+		if (UPrimitiveComponent* P = Cast<UPrimitiveComponent>(Top))
+		{
+			OutSet.Add(P);
+		}
+		TArray<USceneComponent*> Children;
+		Top->GetChildrenComponents(/*bIncludeAllDescendants*/ true, Children);
+		for (USceneComponent* Child : Children)
+		{
+			if (UPrimitiveComponent* PC = Cast<UPrimitiveComponent>(Child))
+			{
+				OutSet.Add(PC);
+			}
+		}
+	}
+}
+
 bool ARebusFixtureActor::HasOrbitBinding() const
 {
 	for (const TWeakObjectPtr<USceneComponent>& C : OrbitComponents)

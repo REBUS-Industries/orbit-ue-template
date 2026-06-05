@@ -32,6 +32,8 @@
 #include "Components/ExponentialHeightFogComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Materials/MaterialInterface.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "Components/PrimitiveComponent.h"
 
 static const TCHAR* RebusProjectVersion = TEXT("rebus-visualiser-1.0.0");
 
@@ -220,6 +222,15 @@ bool URebusVisualiserSubsystem::Tick(float DeltaSeconds)
 			{
 				OrbitRebindTimer = 0.f;
 				Ctl->RebindOrbitModels();
+				// v1.0.85: piggyback the truss-material override on the rebind cadence so
+				// newly-bound fixture components are correctly EXCLUDED (handled by the body/
+				// lens override) and newly-imported orphan geometry inherits the powdercoat
+				// pass without the operator having to re-run the console command. Cheap when
+				// the cache is already up to date -- the per-pass diff returns Touched=0.
+				if (bTrussMaterialOverrideEnabled)
+				{
+					ApplyTrussMaterialPass();
+				}
 			}
 		}
 	}
@@ -1545,4 +1556,210 @@ void URebusVisualiserSubsystem::BroadcastCameraStateIfChanged(bool bForce)
 	LastSentCameraState.FocusCm      = S.FocusDistanceCm;
 	LastSentCameraState.ExposureEv   = S.ExposureBiasEv;
 	LastSentCameraState.bManualFocus = S.bManualFocus;
+}
+
+// =========================================================================================
+// v1.0.85 truss / set-piece material override
+// =========================================================================================
+
+void URebusVisualiserSubsystem::EnsureTrussMaterial()
+{
+	// Preferred path: a user-authored M_RebusTruss .uasset at /Game/REBUS/Materials/. If
+	// present we use it verbatim (no parameter mangling). Mirrors the same convention as
+	// ARebusFixtureActor::FixtureBodyMaterialOverride so an operator with one project setup
+	// gets matching materials for fixture bodies, lenses, and truss.
+	if (!TrussMaterialOverride)
+	{
+		TrussMaterialOverride = LoadObject<UMaterialInterface>(nullptr,
+			TEXT("/Game/REBUS/Materials/M_RebusTruss.M_RebusTruss"));
+	}
+	if (TrussMaterialOverride) return; // user .uasset wins, no MID needed
+
+	// Fallback: parametric MID built off BasicShapeMaterial. Same pattern the fixture-body
+	// override uses, with PBR knobs tuned for a real powdercoat finish:
+	//   * BaseColor #040404 -- slightly above pure black so the surface catches highlights
+	//                          and reads as "matte black material" instead of "void". Pure
+	//                          black crushes contrast and trusses end up looking 2D.
+	//   * Roughness 0.55    -- powdercoat is microscopically textured but not as rough as raw
+	//                          steel; ~0.55 lands between satin (0.4) and matte (0.7) and is
+	//                          what real Prolyte / Eurotruss profiles meter at in a Macbeth
+	//                          chart shoot.
+	//   * Metallic 0.0      -- powdercoat is a polymer coating over aluminium; the lit surface
+	//                          is dielectric, not metallic. Setting Metallic>0 would give the
+	//                          truss an aluminium-mirror sheen that breaks the illusion.
+	//   * Specular 0.5      -- BasicShapeMaterial respects this; default is 0.5 (water/plastic
+	//                          F0) which is correct for polymer powdercoat.
+	if (!TrussMatParent)
+	{
+		TrussMatParent = LoadObject<UMaterialInterface>(nullptr,
+			TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
+	}
+	if (TrussMatParent && !TrussMaterialMID)
+	{
+		TrussMaterialMID = UMaterialInstanceDynamic::Create(TrussMatParent, this);
+		if (TrussMaterialMID)
+		{
+			TrussMaterialMID->SetVectorParameterValue(TEXT("Color"),     FLinearColor(0.015f, 0.015f, 0.015f, 1.f));
+			TrussMaterialMID->SetScalarParameterValue(TEXT("Roughness"), 0.55f);
+			TrussMaterialMID->SetScalarParameterValue(TEXT("Metallic"),  0.0f);
+			TrussMaterialMID->SetScalarParameterValue(TEXT("Specular"),  0.5f);
+		}
+	}
+}
+
+UMaterialInterface* URebusVisualiserSubsystem::ResolveTrussMaterial()
+{
+	EnsureTrussMaterial();
+	if (TrussMaterialOverride) return TrussMaterialOverride;
+	if (TrussMaterialMID)      return TrussMaterialMID;
+	return nullptr;
+}
+
+void URebusVisualiserSubsystem::BuildBoundOrbitComponentSet(TSet<UPrimitiveComponent*>& Out) const
+{
+	// Every ARebusFixtureActor in the active world publishes a list of Orbit components it
+	// has bound (the body / yoke / head meshes under OrbitImportRoot that RebindOrbitModels
+	// matched). Those keep the v1.0.71 fixture body+lens override and must NOT be touched by
+	// the truss pass, otherwise the user would see the body material flip to truss material
+	// the second the orbit rebind cycle runs. GetBoundOrbitPrimitives also walks descendants
+	// so nested mesh trees under a transform-only Orbit node are correctly excluded.
+	UWorld* World = GetActiveWorld();
+	if (!World) return;
+	for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+	{
+		if (ARebusFixtureActor* F = *It)
+		{
+			F->GetBoundOrbitPrimitives(Out);
+		}
+	}
+}
+
+URebusVisualiserSubsystem::FTrussMaterialApplyCount URebusVisualiserSubsystem::ApplyTrussMaterialPass()
+{
+	FTrussMaterialApplyCount Count;
+	if (!bTrussMaterialOverrideEnabled) return Count;
+
+	UWorld* World = GetActiveWorld();
+	if (!World) return Count;
+
+	UMaterialInterface* Mat = ResolveTrussMaterial();
+	if (!Mat) return Count; // material missing entirely (BasicShapeMaterial failed to load) -- bail
+
+	TSet<UPrimitiveComponent*> Bound;
+	BuildBoundOrbitComponentSet(Bound);
+
+	// Drop dead entries from the cache (component or material got GC'd while we weren't
+	// looking). Walk back-to-front so RemoveAtSwap doesn't shuffle the index we're iterating.
+	for (int32 i = TrussMaterialCache.Num() - 1; i >= 0; --i)
+	{
+		if (!TrussMaterialCache[i].Comp.IsValid())
+		{
+			TrussMaterialCache.RemoveAtSwap(i, EAllowShrinking::No);
+		}
+	}
+
+	// Build a quick lookup for "is this component already in the cache" so we know whether
+	// the first-time snapshot capture path needs to run.
+	TMap<UPrimitiveComponent*, int32> CacheIndex;
+	CacheIndex.Reserve(TrussMaterialCache.Num());
+	for (int32 i = 0; i < TrussMaterialCache.Num(); ++i)
+	{
+		if (UPrimitiveComponent* C = TrussMaterialCache[i].Comp.Get())
+		{
+			CacheIndex.Add(C, i);
+		}
+	}
+
+	// Match RebindOrbitModels: find OrbitImportRoot actors by class-name so we keep zero
+	// compile dependency on the separately-owned OrbitConnector plugin.
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor || Actor->GetClass()->GetName() != TEXT("OrbitImportRoot")) continue;
+
+		TArray<UPrimitiveComponent*> Prims;
+		Actor->GetComponents<UPrimitiveComponent>(Prims);
+		for (UPrimitiveComponent* Prim : Prims)
+		{
+			if (!Prim) continue;
+			++Count.Components;
+
+			if (Bound.Contains(Prim))
+			{
+				++Count.SkippedBound;
+				continue;
+			}
+
+			const int32 NumSlots = Prim->GetNumMaterials();
+			if (NumSlots <= 0) continue;
+
+			// First time we see this component, snapshot every original material slot so the
+			// OFF path restores byte-exact. Existing-cache fast-path skips re-snapshotting
+			// (otherwise a re-apply pass would overwrite the genuine original with the truss
+			// material we just set last cycle).
+			int32 EntryIdx = INDEX_NONE;
+			if (int32* Existing = CacheIndex.Find(Prim))
+			{
+				EntryIdx = *Existing;
+			}
+			else
+			{
+				FTrussMaterialEntry E;
+				E.Comp = Prim;
+				E.OriginalMaterials.Reserve(NumSlots);
+				for (int32 s = 0; s < NumSlots; ++s)
+				{
+					E.OriginalMaterials.Add(Prim->GetMaterial(s));
+				}
+				EntryIdx = TrussMaterialCache.Add(MoveTemp(E));
+				CacheIndex.Add(Prim, EntryIdx);
+			}
+			(void)EntryIdx;
+
+			// Apply to every slot. SetMaterial is a render-state-dirty no-op when the slot
+			// already has Mat (UE's MaterialOverrides setter compares first), so this stays
+			// cheap on the steady-state re-apply pass.
+			bool bAnyApplied = false;
+			for (int32 s = 0; s < NumSlots; ++s)
+			{
+				if (Prim->GetMaterial(s) != Mat)
+				{
+					Prim->SetMaterial(s, Mat);
+					bAnyApplied = true;
+				}
+			}
+			if (bAnyApplied) ++Count.Touched;
+		}
+	}
+	return Count;
+}
+
+URebusVisualiserSubsystem::FTrussMaterialApplyCount URebusVisualiserSubsystem::SetTrussMaterialOverrideEnabled(bool bEnabled)
+{
+	FTrussMaterialApplyCount Count;
+	bTrussMaterialOverrideEnabled = bEnabled;
+
+	if (bEnabled)
+	{
+		return ApplyTrussMaterialPass();
+	}
+
+	// Disable path: restore every cached original (slot-aligned) and clear the cache so a
+	// later re-enable starts from a fresh snapshot of whatever the import currently has.
+	for (FTrussMaterialEntry& E : TrussMaterialCache)
+	{
+		UPrimitiveComponent* P = E.Comp.Get();
+		if (!P) continue;
+		const int32 NumSlots = FMath::Min(P->GetNumMaterials(), E.OriginalMaterials.Num());
+		bool bAnyRestored = false;
+		for (int32 s = 0; s < NumSlots; ++s)
+		{
+			UMaterialInterface* Orig = E.OriginalMaterials[s].Get();
+			P->SetMaterial(s, Orig); // null is fine -- restores to "no material" if the original was null
+			bAnyRestored = true;
+		}
+		if (bAnyRestored) ++Count.Restored;
+	}
+	TrussMaterialCache.Reset();
+	return Count;
 }

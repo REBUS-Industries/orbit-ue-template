@@ -41,6 +41,7 @@ namespace
 	IConsoleCommand* GCameraStreamStatusCommand = nullptr;
 	IConsoleCommand* GSendCameraStateCommand = nullptr;
 	IConsoleCommand* GAAModeCommand = nullptr;
+	IConsoleCommand* GOverrideTrussMaterialCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -832,6 +833,44 @@ namespace
 			bShow ? 1 : 0, RootsAffected, bShow ? TEXT("shown") : TEXT("hidden"));
 	}
 
+	// v1.0.85: `Rebus.OverrideTrussMaterial [0|1]` -- enable / disable the powdercoat material
+	// override on every Orbit-imported primitive NOT bound to a fixture. ON applies the truss
+	// material (loaded from /Game/REBUS/Materials/M_RebusTruss.M_RebusTruss if present, else a
+	// runtime MID built off BasicShapeMaterial with PBR params tuned for matte black powder-
+	// coat) to every material slot of every unbound primitive on every OrbitImportRoot in
+	// every Game/PIE world. OFF restores each component's original slot materials from the
+	// per-subsystem cache captured the first time the override was applied. Default ON since
+	// v1.0.85 (the override fires automatically on the same 1Hz cadence as RebindOrbitModels).
+	void HandleOverrideTrussMaterialCommand(const TArray<FString>& Args)
+	{
+		const bool bEnable = ParseBoolArg(Args, true);
+		if (!GEngine) return;
+		int32 Subsystems = 0;
+		int32 TotalComponents = 0, TotalTouched = 0, TotalSkippedBound = 0, TotalRestored = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+			UGameInstance* GI = World->GetGameInstance();
+			if (!GI) continue;
+			URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>();
+			if (!Viz) continue;
+			++Subsystems;
+			const URebusVisualiserSubsystem::FTrussMaterialApplyCount C = Viz->SetTrussMaterialOverrideEnabled(bEnable);
+			TotalComponents   += C.Components;
+			TotalTouched      += C.Touched;
+			TotalSkippedBound += C.SkippedBound;
+			TotalRestored     += C.Restored;
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.OverrideTrussMaterial %d: subsystems=%d -- %s."),
+			bEnable ? 1 : 0, Subsystems,
+			bEnable
+				? *FString::Printf(TEXT("scanned=%d touched=%d skippedFixtureBound=%d (unbound Orbit comps repainted; bound fixture geometry untouched)"),
+					TotalComponents, TotalTouched, TotalSkippedBound)
+				: *FString::Printf(TEXT("restored=%d original Orbit material(s)"), TotalRestored));
+	}
+
 	// v1.0.71: `Rebus.OverrideFixtureMaterials [0|1]` -- enable / disable the body+lens material
 	// override on every ARebusFixtureActor in every Game/PIE world. ON applies the black satin
 	// plastic body material to every non-lens mesh (control-channel procedural meshes +
@@ -1102,6 +1141,21 @@ void FRebusVisualiserModule::StartupModule()
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleSendCameraStateCommand),
 		ECVF_Default);
 
+	// v1.0.85 truss / set-piece powdercoat material override -- ON by default. See the
+	// HandleOverrideTrussMaterialCommand comment header for the full rationale.
+	GOverrideTrussMaterialCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.OverrideTrussMaterial"),
+		TEXT("Toggle the powdercoat material override on every Orbit-imported primitive NOT "
+			 "bound to a fixture (trusses, set pieces, layout meshes). ON loads "
+			 "/Game/REBUS/Materials/M_RebusTruss.M_RebusTruss if present, else builds a runtime "
+			 "MID from BasicShapeMaterial (color #040404, roughness 0.55, metallic 0). Default "
+			 "ON since v1.0.85; the override re-applies on the same 1Hz cadence as the Orbit "
+			 "rebind so newly-imported geometry inherits it without re-running the command. OFF "
+			 "restores each Orbit primitive's original slot materials byte-exact from the per-"
+			 "subsystem cache. Usage: Rebus.OverrideTrussMaterial [0|1]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleOverrideTrussMaterialCommand),
+		ECVF_Default);
+
 	// v1.0.83 fresh approach to rotating-gobo ghosting -- operator-picked AA method. See the
 	// HandleAAModeCommand comment header for the full diagnosis of why TSR ghosts on animated
 	// light functions.
@@ -1198,6 +1252,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GAAModeCommand);
 		GAAModeCommand = nullptr;
+	}
+	if (GOverrideTrussMaterialCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GOverrideTrussMaterialCommand);
+		GOverrideTrussMaterialCommand = nullptr;
 	}
 	// v1.0.73 / v1.0.78: restore both CVar packs to their snapshotted values so a hot-reload
 	// of the module doesn't leak a permanent override into the engine session. Both packs

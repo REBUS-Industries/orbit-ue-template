@@ -594,6 +594,93 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Truss / set-piece powdercoat material override (v1.0.85).**
+> User: *"if we have truss geometry can that be assigned a default material which is a black
+> powdercoating style texture."*
+>
+> Yes. v1.0.85 extends the v1.0.71 fixture-body / lens override system to a third category:
+> every Orbit-imported primitive that ISN'T claimed by a fixture's bind set (the trusses, set
+> pieces, ground rows, layout meshes -- everything that's not a moving head). They all get a
+> matte black powdercoat material applied automatically.
+>
+> **How it picks "is this truss vs is this a fixture body".** `URebusVisualiserSubsystem`
+> already iterates every `OrbitImportRoot` actor on a 1Hz cadence (the `RebindOrbitModels`
+> timer); the truss pass piggybacks on that. Each `ARebusFixtureActor` publishes its bound-
+> Orbit-component set via `GetBoundOrbitPrimitives(TSet<UPrimitiveComponent*>&)` -- which
+> recursively walks descendants so nested mesh trees under a transform-only Orbit node are
+> correctly classified as "fixture geometry". Anything in the OrbitImportRoot tree NOT in
+> that bound set is treated as truss / set-piece and gets the powdercoat material. Result:
+> the v1.0.71 fixture body+lens override and the v1.0.85 truss override are mutually
+> exclusive per component; no double-application, no visible flicker on the 1Hz re-apply.
+>
+> **Material source, in order of preference.**
+>
+> 1. **`/Game/REBUS/Materials/M_RebusTruss.M_RebusTruss`** (user-authored .uasset). If
+>    present, used verbatim -- no parameter mangling. The operator owns the look entirely.
+>    Same convention as `M_RebusFixtureBody` / `M_RebusFixtureLens` from v1.0.71. To author:
+>    in the editor, right-click `/Game/REBUS/Materials/`, New -> Material, save as
+>    `M_RebusTruss`. Any PBR shading you want; no parameter naming requirement.
+> 2. **Runtime fallback MID** built off `/Engine/BasicShapes/BasicShapeMaterial`. Same
+>    pattern v1.0.71 uses for the fixture body fallback. PBR knobs tuned for a real
+>    powdercoat finish:
+>    * `Color` = `#040404` -- slightly above pure black so the surface catches highlights
+>      and reads as "matte black material". Pure black crushes contrast and makes trusses
+>      look 2D under stage light.
+>    * `Roughness` = `0.55` -- powdercoat is microscopically textured; lands between satin
+>      (0.4) and matte (0.7), matching what real Prolyte / Eurotruss profiles meter at.
+>    * `Metallic` = `0.0` -- powdercoat is a polymer over aluminium; the visible surface is
+>      dielectric. Setting Metallic > 0 would give a chrome sheen that breaks the illusion.
+>    * `Specular` = `0.5` -- the polymer F0 (default water/plastic specular).
+>
+> **Console command.** `Rebus.OverrideTrussMaterial [0|1]`. Default ON. OFF restores every
+> originally-imported slot material from the per-subsystem cache (captured slot-aligned the
+> first time each component was overridden), so the toggle round-trips byte-exact.
+>
+> ```text
+> # ON (default) -- repaints unbound Orbit geometry in powdercoat.
+> Rebus.OverrideTrussMaterial 1
+>
+> # OFF -- restores original glTF / Orbit materials.
+> Rebus.OverrideTrussMaterial 0
+> ```
+>
+> **Lifecycle / what fires when.**
+>
+> * On `URebusVisualiserSubsystem::Tick` -> every 1 second (alongside `RebindOrbitModels`):
+>   the truss pass runs. Cheap when nothing changed (the per-slot diff returns Touched=0,
+>   `UPrimitiveComponent::SetMaterial` short-circuits when the slot already has the target
+>   material). Re-uses the same cadence so a freshly-imported truss / set piece is in
+>   powdercoat within one second of arriving.
+> * On `SetTrussMaterialOverrideEnabled(true)`: immediate one-shot apply (returns the count
+>   counters so the console command logs `scanned=N touched=M skippedFixtureBound=K`).
+> * On `SetTrussMaterialOverrideEnabled(false)`: walk the per-subsystem cache, restore each
+>   primitive's original slot materials, clear the cache. Components that have been GC'd
+>   since the snapshot was taken are silently skipped (TWeakObjectPtr->IsValid check).
+>
+> **Why this lives in the subsystem instead of on the actor.** Truss components belong to the
+> separately-owned `OrbitImportRoot` actor (we have zero compile / link dependency on the
+> OrbitConnector plugin -- both this pass and v1.0.70's `Rebus.ShowOrbit` find the root by
+> class-name string match). There's no per-actor owner to attach the material state to, so
+> `URebusVisualiserSubsystem` owns a global per-component cache keyed by `TWeakObjectPtr<
+> UPrimitiveComponent>`. Dead weak handles are pruned at the start of each pass.
+>
+> **Operator checklist for first show with a powdercoat look.**
+>
+> ```text
+> # 1. Verify the override is live.
+> Rebus.OverrideTrussMaterial 1     # logs "scanned=N touched=M skippedFixtureBound=K".
+>                                    # M > 0 the first run, ~0 thereafter; K matches the
+>                                    # count of fixture-bound Orbit components (sanity check).
+>
+> # 2. (Optional) Author a custom M_RebusTruss.uasset to override the parametric fallback.
+> #    Editor -> /Game/REBUS/Materials/ -> right-click -> New -> Material -> save as
+> #    M_RebusTruss. Restart the visualiser. The user .uasset is picked up at first use.
+>
+> # 3. A/B against the original glTF materials any time.
+> Rebus.OverrideTrussMaterial 0     # logs "restored=K original Orbit material(s)".
+> Rebus.OverrideTrussMaterial 1     # back to powdercoat.
+> ```
+
 > **Zoom wire convention fix -- `zoomDeg` is now FULL beam angle (v1.0.84).**
 > User: *"the zoom range from 23ish to 45 makes no change to the beam."*
 >

@@ -189,6 +189,13 @@ public:
 	// instead of a stale one.
 	int32 SetOrbitVisibility(bool bVisible);
 
+	// v1.0.85: fill OutSet with every live primitive component in this fixture's Orbit
+	// binding. Used by URebusVisualiserSubsystem::ApplyTrussMaterialPass to EXCLUDE
+	// fixture-bound geometry from the truss/powdercoat override (fixture-bound comps keep
+	// the body+lens override path above). Skips dead weak handles and non-primitive
+	// scene components. Cheap; bounded by the binding size (typically 2-8 per fixture).
+	void GetBoundOrbitPrimitives(TSet<UPrimitiveComponent*>& OutSet) const;
+
 	// v1.0.71: enable/disable the body+lens material override on every mesh owned by this
 	// fixture (control-channel UProceduralMeshComponent body meshes AND the Orbit-imported
 	// components that were bound by RebindOrbitModels). When enabled, every non-lens mesh gets

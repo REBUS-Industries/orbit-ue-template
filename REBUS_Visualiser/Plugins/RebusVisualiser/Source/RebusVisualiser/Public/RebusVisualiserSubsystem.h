@@ -29,6 +29,9 @@ class URebusSceneSettingsSubsystem;
 class ARebusFixtureActor;
 class ARebusCineCameraPawn;
 class FJsonObject;
+class UMaterialInterface;
+class UMaterialInstanceDynamic;
+class UPrimitiveComponent;
 
 UCLASS()
 class REBUSVISUALISER_API URebusVisualiserSubsystem : public UGameInstanceSubsystem
@@ -117,6 +120,24 @@ public:
 	void NotifyFixtureControlMutated();
 	void NotifySelectionChanged();
 	void NotifySceneSettingsChanged();
+
+	// v1.0.85: truss / set-piece material override. Walks every OrbitImportRoot's primitive
+	// components in the active world, skips anything bound to a fixture (those keep the v1.0.71
+	// fixture-body override behaviour), and replaces every remaining material slot with a
+	// black-powdercoat material. Tries `/Game/REBUS/Materials/M_RebusTruss.M_RebusTruss` first;
+	// if that .uasset isn't present in the project the subsystem builds a fallback MID from
+	// BasicShapeMaterial with PBR params tuned for a matte powdercoat finish (#040404 base,
+	// roughness ~0.55, fully dielectric). Per-component slot-aligned cache restores byte-exact
+	// on disable. ON by default; the operator can flip with `Rebus.OverrideTrussMaterial 0`.
+	struct FTrussMaterialApplyCount
+	{
+		int32 Components   = 0; // total Orbit primitive components considered this pass
+		int32 Touched      = 0; // had at least one slot overridden this call
+		int32 SkippedBound = 0; // skipped because the component is bound to a fixture
+		int32 Restored     = 0; // had original materials restored this call
+	};
+	FTrussMaterialApplyCount SetTrussMaterialOverrideEnabled(bool bEnabled);
+	bool IsTrussMaterialOverrideEnabled() const { return bTrussMaterialOverrideEnabled; }
 
 private:
 	// Config / launch tokens.
@@ -224,4 +245,36 @@ private:
 	// registrations trigger their own immediate rebind in URebusFixtureControlSubsystem::Register
 	// Fixture, so this timer mostly catches the import-arrived-after-fixtures-spawned case.)
 	float OrbitRebindTimer = 0.f;
+
+	// v1.0.85 truss-material override state. Lazy-loaded /Game/REBUS/Materials/M_RebusTruss.M_
+	// RebusTruss with fallback to a runtime MID. Per-component slot-aligned snapshot so disable
+	// restores the original Orbit-import materials byte-exact. ApplyTrussMaterialPass runs once
+	// per OrbitRebindTimer firing (1 Hz) so newly-bound components inherit the override the next
+	// second after Orbit binds them; cheap when nothing changed (TouchedThisPass==0).
+	bool bTrussMaterialOverrideEnabled = true;
+	UPROPERTY() TObjectPtr<UMaterialInterface> TrussMaterialOverride = nullptr;     // /Game asset if present
+	UPROPERTY() TObjectPtr<UMaterialInstanceDynamic> TrussMaterialMID = nullptr;    // runtime fallback (lazy)
+	UPROPERTY() TObjectPtr<UMaterialInterface> TrussMatParent = nullptr;            // BasicShapeMaterial for the MID
+	struct FTrussMaterialEntry
+	{
+		TWeakObjectPtr<UPrimitiveComponent> Comp;
+		// One entry per material slot, captured the FIRST time we override the component.
+		// Weak so a destroyed material asset doesn't keep the entry alive past the comp dying.
+		TArray<TWeakObjectPtr<UMaterialInterface>> OriginalMaterials;
+	};
+	TArray<FTrussMaterialEntry> TrussMaterialCache;
+
+	// Lazy material setup -- runs first time SetTrussMaterialOverrideEnabled(true) needs a
+	// material. Sets TrussMaterialOverride from /Game (preferred) or builds the runtime MID
+	// from BasicShapeMaterial with powdercoat PBR params.
+	void EnsureTrussMaterial();
+	// Resolve the active truss material (the /Game override wins over the MID fallback).
+	UMaterialInterface* ResolveTrussMaterial();
+	// Idempotent re-apply pass; called from Tick after RebindOrbitModels so freshly-imported
+	// Orbit geometry inherits the override on the next 1 Hz cycle. Returns the same counts
+	// the public SetTrussMaterialOverrideEnabled would return.
+	FTrussMaterialApplyCount ApplyTrussMaterialPass();
+	// Build the set of every Orbit component currently bound to a fixture (those keep the
+	// fixture-material override and must be skipped). Called from ApplyTrussMaterialPass.
+	void BuildBoundOrbitComponentSet(TSet<UPrimitiveComponent*>& Out) const;
 };
