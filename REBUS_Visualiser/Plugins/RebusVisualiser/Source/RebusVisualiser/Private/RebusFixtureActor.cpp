@@ -795,46 +795,80 @@ void ARebusFixtureActor::DumpBeamShadowStateForDebug() const
 	// `RefreshBeamShadowParams` runs the push at every CVar change and on each fixture build,
 	// so a divergence means a portal/scene push has overridden the CVar (or the master is
 	// pre-v1.0.99 and silently ignored the parameter set).
+	//
+	// v1.0.103 -- per-scalar EXISTS / MISSING flag.
+	//   The user reported v1.0.99's fix didn't materialise: the trace still runs through
+	//   occluders. Investigation showed the v1.0.99 release didn't ship a force-regen at
+	//   visualiser-subsystem startup -- it only fires when `build_rebus_base_level.py`'s
+	//   `ensure_beam_material()` runs (Tools > Execute Python Script). So an operator who
+	//   pulls v1.0.99..v1.0.102 and opens the editor without re-running the Python script
+	//   keeps the v1.0.96 cooked master with the LWC projection bug. The C++ then pushes
+	//   BeamShadowStrength=1.0 onto a MID whose master never declared it, and
+	//   `SetScalarParameterValue` silently no-ops -- the trace runs the v1.0.96 broken
+	//   shader and concludes "always unoccluded".
+	//
+	//   v1.0.103 surfaces the silent no-op directly: the MID column now reports
+	//   `Steps=8.0/EXISTS` vs `Steps=8.0/MISSING`, by querying
+	//   `UMaterialInstanceDynamic::GetScalarParameterValue` per scalar (returns false when
+	//   the master never declared it). That distinguishes "param missing" (pre-v1.0.99
+	//   stale master -- the actual root cause) from "param=0" (operator turned the CVar
+	//   off or the trace is otherwise mis-tuned), which the v1.0.99 -999 sentinel
+	//   conflated. Pair with the new `Rebus.RebuildBeamMaterial` runtime regen command.
 	if (!BeamMID)
 	{
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("DumpBeamShadow '%s': BeamMID=<null> (M_RebusBeam load failed in BuildBeamCone, "
 				 "or the cone build never ran -- pre-v1.0.99 master self-heal will rebuild on "
-				 "next editor launch). CVars: Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d."),
+				 "next editor launch). CVars: Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d. "
+				 "Operator action: run `Rebus.RebuildBeamMaterial` (editor only) to regenerate "
+				 "the master, then ClearScene+LoadScene from the portal (or restart the editor) "
+				 "to rebuild the per-fixture BeamMID."),
 			*FixtureId,
 			GRebusBeamShadowSteps, GRebusBeamShadowStrength, GRebusBeamShadowBias,
 			GRebusBeamShadowDebug);
 		return;
 	}
 
-	// Read back what's actually on the MID right now. SetScalarParameterValue / GetScalar
-	// agree on the missing-param contract: if the master never declared the scalar (pre-v1.0.96)
-	// the get returns false and the value stays at the uninitialised default of -999, which we
-	// surface so the dump makes the silent-skip obvious instead of reporting "0.0" as if it
-	// landed.
-	auto ReadMidScalar = [this](const TCHAR* Name) -> float
+	// Read back what's actually on the MID right now AND whether the master declared the
+	// scalar in the first place. SetScalarParameterValue / GetScalar agree on the missing-
+	// param contract: if the master never declared the scalar (pre-v1.0.96 / pre-v1.0.99)
+	// the get returns false. v1.0.103: surface the boolean directly per scalar so an
+	// operator can tell stale-master apart from CVar/MID misconfiguration without grepping
+	// for a -999 sentinel. The float value when missing is still reported (it'll be
+	// whatever default the lookup wrote -- usually 0.0) so the column shape stays uniform.
+	auto ReadMidScalar = [this](const TCHAR* Name, bool& bOutExists) -> float
 	{
-		float V = -999.f;
-		BeamMID->GetScalarParameterValue(FMaterialParameterInfo(Name), V);
+		float V = 0.f;
+		bOutExists = BeamMID->GetScalarParameterValue(FMaterialParameterInfo(Name), V);
 		return V;
 	};
-	const float MidSteps    = ReadMidScalar(TEXT("BeamShadowSteps"));
-	const float MidStrength = ReadMidScalar(TEXT("BeamShadowStrength"));
-	const float MidBias     = ReadMidScalar(TEXT("BeamShadowBias"));
-	const float MidDebug    = ReadMidScalar(TEXT("BeamShadowDebug"));
+	bool bStepsOk = false, bStrengthOk = false, bBiasOk = false, bDebugOk = false;
+	const float MidSteps    = ReadMidScalar(TEXT("BeamShadowSteps"),    bStepsOk);
+	const float MidStrength = ReadMidScalar(TEXT("BeamShadowStrength"), bStrengthOk);
+	const float MidBias     = ReadMidScalar(TEXT("BeamShadowBias"),     bBiasOk);
+	const float MidDebug    = ReadMidScalar(TEXT("BeamShadowDebug"),    bDebugOk);
 
-	// One-line diagnostic: "shadowing enabled, debug mode N" derived from the LIVE MID values.
-	const bool  bShadowEnabled = (MidStrength > 0.001f);
-	const int32 DebugMode      = (MidDebug > 1.5f) ? 2 : ((MidDebug > 0.5f) ? 1 : 0);
-	const TCHAR* MasterStaleNote = (MidSteps < -100.f || MidStrength < -100.f
-			|| MidBias < -100.f || MidDebug < -100.f)
-		? TEXT(" -- pre-v1.0.99 master detected (some MID scalars missing; will self-heal next launch)")
+	auto Tag = [](bool bOk) -> const TCHAR* { return bOk ? TEXT("EXISTS") : TEXT("MISSING"); };
+
+	// One-line diagnostic. v1.0.103:
+	//   * "shadowing ENABLED" requires both Strength>0 AND Strength is actually present on
+	//     the master (otherwise the shader is reading the v1.0.96 default of 0). When any
+	//     scalar is MISSING we add a stale-master note + the operator-recovery command.
+	const bool  bAnyMissing    = !(bStepsOk && bStrengthOk && bBiasOk && bDebugOk);
+	const bool  bShadowEnabled = bStrengthOk && (MidStrength > 0.001f);
+	const int32 DebugMode      = bDebugOk ? ((MidDebug > 1.5f) ? 2 : ((MidDebug > 0.5f) ? 1 : 0)) : 0;
+	const TCHAR* MasterStaleNote = bAnyMissing
+		? TEXT(" -- STALE MASTER (one or more MID scalars MISSING; the master predates v1.0.99 and the LWC projection fix DID NOT LAND -- the trace runs the broken v1.0.96 shader). Operator action: run `Rebus.RebuildBeamMaterial` (editor only) then ClearScene+LoadScene OR restart the editor")
 		: TEXT("");
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("DumpBeamShadow '%s': MID(Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d) CVars(Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d) -- shadowing %s, debug mode %d%s."),
+		TEXT("DumpBeamShadow '%s': MID(Steps=%.1f/%s Strength=%.3f/%s Bias=%.2f/%s Debug=%d/%s) "
+			 "CVars(Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d) -- shadowing %s, debug mode %d%s."),
 		*FixtureId,
-		MidSteps, MidStrength, MidBias, (int32)MidDebug,
+		MidSteps, Tag(bStepsOk),
+		MidStrength, Tag(bStrengthOk),
+		MidBias, Tag(bBiasOk),
+		(int32)MidDebug, Tag(bDebugOk),
 		GRebusBeamShadowSteps, GRebusBeamShadowStrength, GRebusBeamShadowBias, GRebusBeamShadowDebug,
 		bShadowEnabled ? TEXT("ENABLED") : TEXT("DISABLED"),
 		DebugMode, MasterStaleNote);

@@ -83,6 +83,16 @@ private:
 	// controller + pawn exist, so the caller can retry on a later tick.
 	bool TryPositionPlayerView();
 
+	// v1.0.103 -- one-shot probe at Initialize() that loads `/Game/REBUS/Materials/M_RebusBeam`
+	// and checks for the v1.0.99 parameter contract (`BeamShadowStrength` + `BeamShadowDebug`
+	// scalars). Logs a Warning naming the operator-recovery action (`Rebus.RebuildBeamMaterial`
+	// + ClearScene/LoadScene OR editor restart) when the master predates v1.0.99 -- catches
+	// the "operator pulled v1.0.99..v1.0.102 but never re-ran build_rebus_base_level.py" case
+	// that the user's "beams still going straight through objects" report against v1.0.102
+	// pinned down. Mirrors v1.0.91's IES-warning style; one-shot per session. See the
+	// `ProbeBeamMasterAtStartup` doc-comment in the .cpp for the full diagnosis chain.
+	void ProbeBeamMasterAtStartup();
+
 public:
 	// Sibling-subsystem + world accessors. Public so the data channel + console commands +
 	// the cine camera pawn glue can find what they need without friend-ing every caller.

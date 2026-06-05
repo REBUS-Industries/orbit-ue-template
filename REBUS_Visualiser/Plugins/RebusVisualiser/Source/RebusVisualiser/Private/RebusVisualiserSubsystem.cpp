@@ -69,8 +69,95 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	TickHandle = FTSTicker::GetCoreTicker().AddTicker(
 		FTickerDelegate::CreateUObject(this, &URebusVisualiserSubsystem::Tick), 0.f);
 
+	// v1.0.103 -- startup probe for the on-disk M_RebusBeam master. The user reported the
+	// v1.0.99 LWC-projection fix didn't materialise: the shaft still ran straight through
+	// occluders even though the v1.0.99 Custom-HLSL fix had landed in the Python source +
+	// the v1.0.99 master self-heal probe (`_beam_master_has_shadow_debug`) had landed in
+	// `ensure_beam_material()`. Investigation showed the self-heal ONLY fires when the
+	// Python script is invoked (Tools > Execute Python Script > `build_rebus_base_level.
+	// build()` / `ensure_beam_material()`) -- it does NOT run automatically at editor /
+	// visualiser-subsystem startup. So an operator who pulls v1.0.99 .. v1.0.102 and opens
+	// the editor without re-running the Python script keeps the v1.0.96 cooked
+	// `M_RebusBeam`. The C++ side then dutifully pushes BeamShadowStrength=1 onto a MID
+	// whose master never declared the parameter, `SetScalarParameterValue` silently
+	// no-ops, and the per-pixel shader runs the v1.0.96 broken HLSL with the LWC
+	// projection bug -- "always unoccluded" ships and the user's "beams still going
+	// straight through objects" report stands.
+	//
+	// v1.0.103 surfaces the stale master ONCE at startup with a Warning that names the
+	// operator-recovery commands (mirrors v1.0.91's IES-Warning style). This catches BOTH
+	// the no-Python-script-ever-run case and the never-restarted-since-pull case
+	// (the v1.0.99 self-heal only commits the regenerated master when invoked, not on
+	// engine load). The probe + Warning is one-shot per session; the runtime
+	// `Rebus.RebuildBeamMaterial` console command (editor-only) regenerates the master
+	// in-place via the same Python entry point so the operator never has to restart the
+	// editor in the v1.0.103+ flow.
+	ProbeBeamMasterAtStartup();
+
 	UE_LOG(LogRebusVisualiser, Log, TEXT("Visualiser subsystem initialised (streamer='%s', project='%s', model='%s')."),
 		*StreamerId, *ProjectId, *ModelId);
+}
+
+void URebusVisualiserSubsystem::ProbeBeamMasterAtStartup()
+{
+	// v1.0.103 -- check the on-disk `M_RebusBeam` master for the v1.0.99 parameter
+	// contract (`BeamShadowStrength` + `BeamShadowDebug` scalars present). When either is
+	// missing we know the master predates the v1.0.99 LWC projection fix and the per-
+	// pixel screen-space shadow trace will silently no-op on every step. We log a single
+	// Warning at startup that names the operator-recovery action so a future "beams go
+	// straight through objects" report can be diagnosed in one log grep without the
+	// operator having to discover `Rebus.DumpBeamShadow` first.
+	//
+	// The probe is best-effort: if the asset isn't loadable yet (cooked package not
+	// mounted, /Game scan still in progress on a fresh editor launch) we just bail
+	// silently -- the next `Rebus.DumpBeamShadow` run will surface the per-fixture MID
+	// MISSING flags directly, and the v1.0.99 `_beam_master_has_shadow_debug` self-heal
+	// in `ensure_beam_material()` is still authoritative when the Python script runs.
+	UMaterialInterface* BeamMaster = LoadObject<UMaterialInterface>(nullptr,
+		TEXT("/Game/REBUS/Materials/M_RebusBeam.M_RebusBeam"));
+	if (!BeamMaster)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("v1.0.103 startup probe: M_RebusBeam not found at /Game/REBUS/Materials/. "
+				 "The cone-mesh beam shaft will fall back to the procedural geometry only -- "
+				 "the v1.0.99 screen-space shadow trace will not render until the master is "
+				 "generated. Operator action: in editor, run Tools > Execute Python Script > "
+				 "`build_rebus_base_level.ensure_beam_material(force=True)` (or "
+				 "`Rebus.RebuildBeamMaterial` -- editor-only runtime regen)."));
+		return;
+	}
+
+	float V = 0.f;
+	const bool bHasStrength = BeamMaster->GetScalarParameterValue(
+		FMaterialParameterInfo(TEXT("BeamShadowStrength")), V);
+	const bool bHasDebug = BeamMaster->GetScalarParameterValue(
+		FMaterialParameterInfo(TEXT("BeamShadowDebug")), V);
+	if (!bHasStrength || !bHasDebug)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("v1.0.103 STALE BEAM MASTER detected: M_RebusBeam is missing %s%s%s -- this is "
+				 "the v1.0.99 LWC-projection / first-step-bias fix, and the per-pixel screen-"
+				 "space shadow trace WILL NOT WORK against this master (every shadow step "
+				 "lands off-screen, the trace concludes 'always unoccluded', and the cone-mesh "
+				 "shaft visibly runs straight through every occluder -- exactly the symptom "
+				 "the user reported against v1.0.99/v1.0.102). Operator action: in editor, "
+				 "run `Rebus.RebuildBeamMaterial` (v1.0.103 -- editor-only runtime regen via "
+				 "PythonScriptPlugin) AND THEN ClearScene+LoadScene from the portal (or "
+				 "restart the editor) so the per-fixture BeamMID picks up the new master. "
+				 "Verify with `Rebus.DumpBeamShadow` (every MID scalar should now show "
+				 "EXISTS) and `Rebus.BeamShadowDebug 1` (a cube placed between fixture + "
+				 "floor should appear RED inside the beam)."),
+			bHasStrength ? TEXT("") : TEXT("BeamShadowStrength "),
+			(!bHasStrength && !bHasDebug) ? TEXT("+ ") : TEXT(""),
+			bHasDebug ? TEXT("") : TEXT("BeamShadowDebug"));
+	}
+	else
+	{
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("v1.0.103 startup probe: M_RebusBeam carries the v1.0.99 parameter contract "
+				 "(BeamShadowStrength + BeamShadowDebug both EXIST). Screen-space shadow "
+				 "trace is wired correctly; verify visually with `Rebus.BeamShadowDebug 1`."));
+	}
 }
 
 void URebusVisualiserSubsystem::Deinitialize()

@@ -17,6 +17,7 @@
 #include "Engine/DirectionalLight.h"
 #include "Engine/SkyLight.h"
 #include "Interfaces/IPluginManager.h"
+#include "Modules/ModuleManager.h"
 #include "Misc/CoreDelegates.h"
 
 DEFINE_LOG_CATEGORY(LogRebusVisualiser);
@@ -46,6 +47,7 @@ namespace
 	IConsoleCommand* GDumpFixtureIesCommand = nullptr;
 	IConsoleCommand* GBeamShadowCommand = nullptr;
 	IConsoleCommand* GDumpBeamShadowCommand = nullptr;
+	IConsoleCommand* GRebuildBeamMaterialCommand = nullptr; // v1.0.103 -- editor-only runtime regen
 	IConsoleCommand* GOrbitCastShadowsCommand = nullptr;
 	// v1.0.101 -- per-fixture zoom / cone-mesh / SpotLight outer-cone runtime dump.
 	IConsoleCommand* GDumpFixtureZoomCommand = nullptr;
@@ -963,6 +965,110 @@ namespace
 		}
 	}
 
+	// v1.0.103 -- `Rebus.RebuildBeamMaterial` editor-only runtime regen of `M_RebusBeam`.
+	//
+	// Why this exists: v1.0.99 / v1.0.100 / v1.0.101 / v1.0.102 each shipped Custom-HLSL
+	// changes inside `_BEAM_RAYMARCH_HLSL` (the LWC PreViewTranslation projection fix in
+	// v1.0.99 is the smoking gun for the user's "beams still going straight through
+	// objects" report against v1.0.102). The corrected HLSL only commits to the on-disk
+	// `M_RebusBeam.uasset` when `build_rebus_base_level.py::ensure_beam_material()` runs --
+	// which previously required either Tools > Execute Python Script in the editor (manual
+	// operator action) or a fresh `-run=pythonscript` headless invocation. An operator who
+	// `git pull`ed v1.0.99+ and opened the editor without re-running the Python script kept
+	// the v1.0.96 cooked master with the LWC projection bug; the C++ side then dutifully
+	// pushed BeamShadowStrength=1 onto a MID whose master never declared it,
+	// `SetScalarParameterValue` silently no-op'd, and the trace concluded "always
+	// unoccluded" (the user-visible symptom).
+	//
+	// `Rebus.RebuildBeamMaterial` invokes the SAME Python entry point at runtime via the
+	// `PythonScriptPlugin`'s built-in `py` console command, gated behind `WITH_EDITOR` so
+	// it's a no-op in packaged builds (PythonScriptPlugin is editor-only -- see
+	// `REBUS_Visualiser.uproject` `TargetAllowList: ["Editor"]`). After the regen the
+	// existing per-fixture `BeamMID`s still reference the OLD UMaterial (the Python side
+	// deletes + recreates the asset, which leaves dangling MID parents); the operator
+	// must follow up with ClearScene + LoadScene from the portal (the data-channel flow
+	// that respawns every fixture, rebuilding each `BeamMID` off the freshly-loaded
+	// `M_RebusBeam`) OR restart the editor. We log the next-step prompt explicitly so the
+	// operator never has to guess.
+	//
+	// Defensive layout: we route through `GEngine->Exec` with the `py` command rather than
+	// linking against `IPythonScriptPlugin` directly so the call site stays insulated from
+	// any UE 5.7 API renames (the `py` console command is the documented engine-stable
+	// entry point and has been around since the PythonScriptPlugin first shipped). We
+	// still check `FModuleManager::IsModuleLoaded(TEXT("PythonScriptPlugin"))` first to
+	// produce a clean Warning when a `WITH_EDITOR` build was launched without the editor
+	// (e.g. an editor-target headless run with `-noplugins`) instead of a silent "py:
+	// unknown command" log line.
+	void HandleRebuildBeamMaterialCommand(const TArray<FString>& /*Args*/)
+	{
+#if WITH_EDITOR
+		if (!GEngine)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.RebuildBeamMaterial: GEngine null -- module not fully initialised; no-op."));
+			return;
+		}
+
+		if (!FModuleManager::Get().IsModuleLoaded(TEXT("PythonScriptPlugin")))
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.RebuildBeamMaterial: PythonScriptPlugin not loaded -- this command is "
+					 "editor-only (the regen logic lives in `build_rebus_base_level.py::"
+					 "ensure_beam_material(force=True)`, exposed via the engine's `py` console "
+					 "command which only registers when PythonScriptPlugin is loaded). "
+					 "Workaround for headless / non-editor sessions: in editor, run Tools > "
+					 "Execute Python Script > `build_rebus_base_level.ensure_beam_material(force=True)` "
+					 "and then ClearScene+LoadScene OR restart the editor."));
+			return;
+		}
+
+		// Pick a world to scope the Exec call (Editor wins over Game/PIE so the regen
+		// runs against the asset-edit world, mirroring how Tools > Execute Python Script
+		// hosts the script).
+		UWorld* World = nullptr;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			if (Ctx.WorldType == EWorldType::Editor) { World = W; break; }
+			if (Ctx.WorldType == EWorldType::Game || Ctx.WorldType == EWorldType::PIE)
+			{
+				if (!World) World = W; // fallback if no Editor world (PIE-only run)
+			}
+		}
+
+		// `py <expr>` is the engine-stable entry point. The expression matches the v1.0.99
+		// self-heal flow exactly (force-regen + write-back the .uasset), so the on-disk
+		// master picks up whatever Custom HLSL the current `_BEAM_RAYMARCH_HLSL` source
+		// declares -- v1.0.99 LWC fix on v1.0.99+ pulls, plus any later shader work.
+		const TCHAR* PyCmd = TEXT("py import build_rebus_base_level; build_rebus_base_level.ensure_beam_material(force=True)");
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.RebuildBeamMaterial: invoking `%s` via the engine's `py` console "
+				 "command (editor-only runtime regen of M_RebusBeam). The Python script "
+				 "deletes + recreates `/Game/REBUS/Materials/M_RebusBeam.uasset` with the "
+				 "current `_BEAM_RAYMARCH_HLSL` source -- expect a `RebusBaseLevel: ...` "
+				 "log block on the next line(s) confirming the regen landed."), PyCmd);
+
+		const bool bExecOk = GEngine->Exec(World, PyCmd, *GLog);
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.RebuildBeamMaterial: `py` Exec returned %s. "
+				 "NEXT-STEP -- existing per-fixture BeamMIDs still reference the OLD master "
+				 "(the Python side regenerates the .uasset in place; UMaterialInstanceDynamic "
+				 "parent pointers don't refresh automatically). Run ClearScene + LoadScene "
+				 "from the portal to respawn every fixture (which calls BuildBeamCone, which "
+				 "LoadObject's the freshly-regenerated master) -- OR restart the editor. "
+				 "Verify with `Rebus.DumpBeamShadow` (every MID scalar should show EXISTS) "
+				 "and `Rebus.BeamShadowDebug 1` (a cube placed between fixture + floor "
+				 "should appear RED inside the beam)."),
+			bExecOk ? TEXT("OK") : TEXT("FAILED"));
+#else
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Rebus.RebuildBeamMaterial: not available in non-editor builds "
+				 "(PythonScriptPlugin is editor-only per the v1.0.103 design -- "
+				 "regenerate the master in the editor and repackage)."));
+#endif
+	}
+
 	// v1.0.47: `Rebus.MeshBeams [0|1]` -- live toggle for the visible Epic beam canvas, so you can
 	// A/B against the SpotLight's VSM-shadowed fog beam (the source of the truss-gap shafts inside
 	// the cone). Routes through URebusSceneSettingsSubsystem::SetMeshBeamsEnabled, which mirrors
@@ -1294,6 +1400,10 @@ void FRebusVisualiserModule::StartupModule()
 		ECVF_Default);
 
 	// v1.0.99 per-fixture screen-space-shadow-trace runtime dump.
+	// v1.0.103 -- the dump is now the primary diagnostic for "v1.0.99 fix didn't materialise"
+	// because the per-scalar MID column reports EXISTS/MISSING explicitly (was a -999
+	// sentinel pre-v1.0.103). MISSING on any scalar = stale master = run the new
+	// `Rebus.RebuildBeamMaterial` editor-only runtime regen.
 	GDumpBeamShadowCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Rebus.DumpBeamShadow"),
 		TEXT("v1.0.99 -- dump every Rebus fixture's M_RebusBeam screen-space shadow trace "
@@ -1302,9 +1412,36 @@ void FRebusVisualiserModule::StartupModule()
 			 "debug mode N' diagnostic. Use when the operator reports the v1.0.96 shadow "
 			 "trace doesn't appear to work -- the dump proves whether RefreshBeamShadowParams "
 			 "is winning the push race, whether the master is the v1.0.99 shape (Bias+Debug "
-			 "present), and whether the master `Rebus.BeamShadow` toggle is OFF. Usage: "
-			 "Rebus.DumpBeamShadow"),
+			 "present), and whether the master `Rebus.BeamShadow` toggle is OFF. v1.0.103: "
+			 "MID column now reports EXISTS/MISSING per scalar (was a -999 sentinel) so "
+			 "stale-master is unmistakable -- MISSING means run `Rebus.RebuildBeamMaterial`. "
+			 "Usage: Rebus.DumpBeamShadow"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpBeamShadowCommand),
+		ECVF_Default);
+
+	// v1.0.103 -- editor-only runtime regen of `M_RebusBeam` via PythonScriptPlugin's
+	// `py` console command (no module link required). Fixes the user-reported regression
+	// where v1.0.99..v1.0.102 shipped Custom-HLSL changes but the on-disk master only
+	// picks them up when the operator manually runs `build_rebus_base_level.py` -- this
+	// command runs the Python entry point at runtime so an editor restart isn't required.
+	// See the `HandleRebuildBeamMaterialCommand` doc-comment for the post-regen
+	// fixture-respawn step (the existing per-fixture BeamMIDs are still parented to the
+	// old UMaterial -- ClearScene + LoadScene OR editor restart is the chaser).
+	GRebuildBeamMaterialCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.RebuildBeamMaterial"),
+		TEXT("v1.0.103 -- regenerate `/Game/REBUS/Materials/M_RebusBeam.uasset` AT RUNTIME "
+			 "by invoking `build_rebus_base_level.ensure_beam_material(force=True)` via the "
+			 "engine's `py` console command (PythonScriptPlugin). Editor-only -- no-op in "
+			 "packaged builds. Use when `Rebus.DumpBeamShadow` reports MISSING on any MID "
+			 "scalar (= the operator pulled v1.0.99+ but the on-disk master is the stale "
+			 "v1.0.96 cooked version with the LWC projection bug). After this command: "
+			 "ClearScene + LoadScene from the portal (or restart the editor) so each "
+			 "fixture respawns + rebuilds its BeamMID off the freshly-regenerated master, "
+			 "then verify with `Rebus.DumpBeamShadow` (every scalar should show EXISTS) "
+			 "and `Rebus.BeamShadowDebug 1` (a cube placed between fixture + floor should "
+			 "appear RED inside the beam). See the v1.0.103 README release block for the "
+			 "full operator checklist. Usage: Rebus.RebuildBeamMaterial"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleRebuildBeamMaterialCommand),
 		ECVF_Default);
 
 	GDumpFixtureLightsCommand = IConsoleManager::Get().RegisterConsoleCommand(
@@ -1647,6 +1784,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GDumpBeamShadowCommand);
 		GDumpBeamShadowCommand = nullptr;
+	}
+	if (GRebuildBeamMaterialCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GRebuildBeamMaterialCommand);
+		GRebuildBeamMaterialCommand = nullptr;
 	}
 	if (GOrbitCastShadowsCommand)
 	{

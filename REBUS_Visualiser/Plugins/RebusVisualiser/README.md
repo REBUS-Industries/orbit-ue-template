@@ -594,6 +594,101 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Beam-shadow trace diagnostics + stale-master detection + runtime regen (v1.0.103).**
+> User report (verbatim, against v1.0.102):
+>
+> > "Beams are still going straight through objects. the footprint is shadowed correctly."
+>
+> Screenshot context: a truss with several Rebus fixtures pointing down-right at a stage
+> prop (a cone-shaped pedestal); the visible cone-mesh beam shafts pass STRAIGHT THROUGH
+> the prop with no carve; the floor footprint UNDER the prop clearly shows the prop's
+> shadow (so `SpotLight->CastShadows` works and the prop IS in the depth buffer). v1.0.99
+> SHOULD have fixed this via the LWC PreViewTranslation projection -- and the LWC fix
+> DID land in the Python source -- but the user is reporting the visible behaviour
+> didn't change.
+>
+> **Investigation (every v1.0.99 surface verified against the live tree).**
+>
+> | Surface | Result |
+> | --- | --- |
+> | `_BEAM_RAYMARCH_HLSL` LWC projection (`build_rebus_base_level.py:491-495 + 583-595`) | ✓ correct -- `LWCHackToFloat(ResolvedView.PreViewTranslation)` cached per pixel; `TranslatedWorldPos = sp + PreViewT`; `mul(..., ResolvedView.TranslatedWorldToClip)`. The documented engine pattern. |
+> | Density modulation (line 616-621) | ✓ correct -- `shadowAtten = max(1 - BeamShadowStrength, 0)` then `d = ... * shadowAtten`. Strength=1 → d=0 → fully shadowed. |
+> | CVar defaults (`RebusFixtureActor.cpp:214-217`) | ✓ Steps=8, Strength=1.0, Bias=5.0, Debug=0. The trace is ON by default. |
+> | `RefreshBeamShadowParams` push (`RebusFixtureActor.cpp:2184`) | ✓ pushes ALL FOUR scalars on every CVar change + every fixture build. |
+> | Cone-mesh material domain | ✓ `MD_SURFACE` + `MSM_UNLIT` + `BLEND_ADDITIVE` + `two_sided=True` -- additive translucents do NOT write to SceneDepth, so the cone CANNOT self-occlude (H3 ruled out). |
+> | `_beam_master_has_shadow_debug` self-heal probe + force-regen | **ONLY fires when `ensure_beam_material()` runs from Python** (Tools > Execute Python Script > `build_rebus_base_level.build()` / `ensure_beam_material()`). It does NOT run automatically at editor / visualiser-subsystem startup. |
+>
+> **Smoking gun -- H1 (stale on-disk master).** v1.0.99 shipped the corrected Custom HLSL
+> in the Python source AND the self-heal probe inside `ensure_beam_material`, but the
+> probe + force-regen only commits the regenerated `M_RebusBeam.uasset` when the Python
+> entry point is invoked. An operator who `git pull`ed v1.0.99..v1.0.102 and opened the
+> editor without re-running the Python script kept the v1.0.96 cooked master with the
+> LWC projection bug. The C++ side dutifully pushes BeamShadowStrength=1 onto a MID whose
+> master never declared the parameter; `UMaterialInstanceDynamic::SetScalarParameterValue`
+> silently no-ops on a missing parameter; the per-pixel shader runs the v1.0.96 broken
+> HLSL with every shadow step landing off-screen; the trace concludes "always
+> unoccluded"; the beam visibly carves nothing -- exactly the user's report.
+>
+> **No shader / C++ logic bug to fix.** The v1.0.99 .. v1.0.102 corrections are all
+> correct; what's missing is the operator-side regen-trigger. v1.0.103 is therefore
+> purely defensive: surface the silent no-op, name the recovery action, and add a
+> runtime regen path so the operator never has to restart the editor again.
+>
+> **Defensive measures shipped (v1.0.103).**
+>
+> | Measure | What landed | Why |
+> | --- | --- | --- |
+> | `Rebus.DumpBeamShadow` per-scalar EXISTS / MISSING flag | Each MID column entry now reads `Steps=8.0/EXISTS` vs `Steps=8.0/MISSING` (queries `UMaterialInstanceDynamic::GetScalarParameterValue` per scalar -- returns false when the master never declared it). The "STALE MASTER" diagnostic note is now appended on ANY missing scalar with the operator-recovery command name. | Pre-v1.0.103 the dump used a `-999` sentinel that conflated "param missing" with "operator pushed -999"; the EXISTS/MISSING flag is unambiguous. An operator running `Rebus.DumpBeamShadow` against a stale master sees `Strength=0.000/MISSING` instead of `Strength=-999.000` and the recovery action is named on the same line. |
+> | `URebusVisualiserSubsystem::ProbeBeamMasterAtStartup()` startup Warning | Once at `Initialize()`, load `M_RebusBeam` and check for `BeamShadowStrength` + `BeamShadowDebug` scalars. Warning when either is missing, with the operator-recovery command + verification steps in the same log line. Mirrors v1.0.91's IES-Warning style. | An operator who pulls v1.0.99+ and launches the editor sees the Warning in the launch log without having to discover `Rebus.DumpBeamShadow` first. The v1.0.99 self-heal lives in `ensure_beam_material()` (Python); the C++ side never knew the master was stale -- v1.0.103 closes that loop. |
+> | `Rebus.RebuildBeamMaterial` editor-only runtime regen console command | Routes through the engine's `py` console command (PythonScriptPlugin) to invoke `build_rebus_base_level.ensure_beam_material(force=True)` at runtime. Gated behind `WITH_EDITOR` -- no-op in packaged builds (PythonScriptPlugin is editor-only). After the regen the existing per-fixture `BeamMID`s still reference the OLD UMaterial (the Python side deletes + recreates the asset, leaving dangling MID parents); the command logs the next-step prompt: ClearScene+LoadScene from the portal (or restart the editor) so each fixture respawns + rebuilds its `BeamMID` off the freshly-regenerated master. | Pre-v1.0.103 the operator had to either run Tools > Execute Python Script > `build_rebus_base_level.build()` (manual editor action, easy to forget after a `git pull`) or restart the editor (ditto). v1.0.103 collapses the regen step to one console command the portal can route over the existing `ConsoleCommand` data-channel descriptor. |
+>
+> **Why no shader change ships.** The v1.0.99 LWC fix is correct; the v1.0.99 density
+> modulation is correct; the v1.0.99 first-step bias (`BeamShadowBias = 5.0` cm
+> default) is correct; the v1.0.99 CVar push wiring is correct. The user's symptom is
+> 100% explained by the on-disk master predating v1.0.99 and `SetScalarParameterValue`
+> silently no-op'ing on the missing parameters. Speculatively touching the shader
+> would only mask the diagnostic and risk a real regression.
+>
+> **Operator action path (v1.0.103+).**
+>
+> 1. **Read the launch-log Warning.** Search `LogRebusVisualiser` for `STALE BEAM
+>    MASTER` -- if it appears, the on-disk `M_RebusBeam` predates v1.0.99 and the trace
+>    is silently broken. (If you see `M_RebusBeam carries the v1.0.99 parameter
+>    contract` instead, skip to step 4.)
+> 2. **Run `Rebus.RebuildBeamMaterial` from the portal console** (or in-editor
+>    console). The command invokes `build_rebus_base_level.ensure_beam_material(force=
+>    True)` via PythonScriptPlugin's `py` console command. Expect a `RebusBaseLevel:
+>    pre-v1.0.99 M_RebusBeam detected ... regenerating with the v1.0.99 fix` log line
+>    confirming the regen landed.
+> 3. **ClearScene + LoadScene from the portal** (or restart the editor) so each
+>    fixture respawns and `BuildBeamCone` `LoadObject`s the freshly-regenerated
+>    master. The post-regen log line of `Rebus.RebuildBeamMaterial` reminds the
+>    operator of this step.
+> 4. **Verify with `Rebus.DumpBeamShadow`.** Every fixture line should show
+>    `Steps=8.0/EXISTS Strength=1.000/EXISTS Bias=5.00/EXISTS Debug=0/EXISTS` with a
+>    `shadowing ENABLED, debug mode 0` diagnostic. If ANY scalar still shows MISSING
+>    the regen + respawn didn't land -- restart the editor.
+> 5. **Verify with `Rebus.BeamShadowDebug 1`.** The whole beam tints `lerp(green, red,
+>    shadowed)`. A cube placed between fixture + floor should appear RED inside the
+>    beam (the trace is finding the occluder). Then `Rebus.BeamShadowDebug 0` to
+>    return to the regular composed beam -- the cube's silhouette should now visibly
+>    carve the volumetric shaft. **This resolves the v1.0.102 user report.**
+>
+> **Files touched (v1.0.103).**
+>
+> | File | Change |
+> | --- | --- |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusFixtureActor.cpp` | `DumpBeamShadowStateForDebug` -- per-scalar EXISTS / MISSING flag (`bool bOutExists` from `GetScalarParameterValue` instead of the v1.0.99 `-999` sentinel); STALE MASTER diagnostic note now names `Rebus.RebuildBeamMaterial` directly. The null-MID path also names the same recovery command. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp` + `Public/RebusVisualiserSubsystem.h` | New `ProbeBeamMasterAtStartup()` helper called from `Initialize()`. Loads `/Game/REBUS/Materials/M_RebusBeam.M_RebusBeam` and checks `BeamShadowStrength` + `BeamShadowDebug` via `GetScalarParameterValue`. Warning naming the operator-recovery command on stale; Log on healthy; benign no-op when the asset isn't loadable yet. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusVisualiser.cpp` | New `Rebus.RebuildBeamMaterial` console command (registered alongside `Rebus.DumpBeamShadow`, cleaned up in `ShutdownModule`). Routes through `GEngine->Exec(World, TEXT("py import build_rebus_base_level; build_rebus_base_level.ensure_beam_material(force=True)"), *GLog)` so the call site is insulated from any UE 5.7 `IPythonScriptPlugin` API renames -- the engine `py` command is the documented stable entry point. Gated behind `WITH_EDITOR`; defensive `FModuleManager::IsModuleLoaded(TEXT("PythonScriptPlugin"))` check produces a clean Warning in non-editor / `-noplugins` runs. Added `#include "Modules/ModuleManager.h"`. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/README.md` | This release block. |
+>
+> No engine / OrbitConnector / Python-build-script asset is touched. The v1.0.99 shader
+> + v1.0.99 / v1.0.100 / v1.0.101 / v1.0.102 lineage remains untouched -- v1.0.103 is
+> purely diagnostic + a runtime trigger for the existing v1.0.99 self-heal so an
+> operator never has to restart the editor (or rediscover Tools > Execute Python
+> Script) to land the LWC projection fix.
+
 > **Lens material now also emits visible light following the fixture's live dimmer / colour / gobo (v1.0.102).**
 > User request (verbatim):
 >
