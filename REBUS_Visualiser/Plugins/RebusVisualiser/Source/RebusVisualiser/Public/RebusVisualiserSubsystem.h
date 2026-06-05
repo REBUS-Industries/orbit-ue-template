@@ -80,6 +80,9 @@ private:
 	// controller + pawn exist, so the caller can retry on a later tick.
 	bool TryPositionPlayerView();
 
+public:
+	// Sibling-subsystem + world accessors. Public so the data channel + console commands +
+	// the cine camera pawn glue can find what they need without friend-ing every caller.
 	URebusFixtureControlSubsystem* GetControl() const;
 	URebusSceneSettingsSubsystem* GetSceneSettings() const;
 	UWorld* GetActiveWorld() const;
