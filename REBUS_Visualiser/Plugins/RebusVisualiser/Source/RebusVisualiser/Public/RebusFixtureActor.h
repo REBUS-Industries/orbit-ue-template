@@ -746,6 +746,16 @@ private:
 	// it gets bound by RebindOrbitModels, instead of waiting up to 1 s for the periodic rebind to
 	// also call SetDriveOrbitModel(true) on it.
 	bool bDriveOrbitModel = true;
+	// v1.0.98: cached visibility state for the bound Orbit components, written by
+	// SetOrbitVisibility and re-applied at the end of BindOrbitComponents so freshly-bound
+	// components inherit the operator's chosen state. Without this cache the very first
+	// `bShowOrbitFixtures=false` ReapplyAll fires before BindOrbitComponents has populated
+	// OrbitComponents (the binding is done by URebusFixtureControlSubsystem::RebindOrbitModels
+	// on a 1Hz tick), so SetOrbitVisibility iterates an empty list and the new components
+	// spawn UE-default visible. Defaults to true (UE's default-visible behaviour) so any
+	// pre-existing call site that doesn't go through SetOrbitVisibility keeps the historical
+	// "shown" semantics.
+	bool bOrbitDesiredVisibility = true;
 	// Object id (Speckle node id) this fixture is bound to on the Orbit-import side.
 	FString BoundOrbitObjectId;
 	// The matched Orbit-imported components (weak so a re-import that destroys them is tolerated).

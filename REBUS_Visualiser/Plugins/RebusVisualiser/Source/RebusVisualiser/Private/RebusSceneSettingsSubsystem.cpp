@@ -54,6 +54,25 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// as false on first SceneState query and could re-disable the feature.
 	Values.Add(TEXT("bDriveOrbitModels"), FRebusPropertyValue::MakeBool(true));
 
+	// v1.0.98: default-hide Orbit-imported fixture geometry. With OrbitConnector loading the
+	// full GDTF/glb fixture bodies AND ARebusFixtureActor building its own control-channel mesh
+	// proxies, the operator's first-launch view shows BOTH on top of each other (the proxies
+	// driven by motion, the Orbit imports static at rest pose). Operator-requested default flip
+	// to FALSE so the live previs starts on the proxies-only view; the Orbit imports stay
+	// available and the portal can re-enable them via SetSceneProperty bShowOrbitFixtures=true
+	// or the existing `Rebus.ShowOrbitFixtures 1` console command. The console-command tolerance
+	// shim from v1.0.72 keeps the bare-prefix form (`showorbitfixtures 0`) working too.
+	//
+	// Subtle bug guarded against: ReapplyAll fires the bShowOrbitFixtures handler immediately
+	// after fixtures spawn, BEFORE the 1Hz RebindOrbitModels tick has matched the Orbit-import
+	// components onto each fixture -- so iterating ARebusFixtureActor::SetOrbitVisibility(false)
+	// at that moment hits an empty OrbitComponents array and does nothing. We mitigate that in
+	// ARebusFixtureActor: SetOrbitVisibility now caches the desired state on the actor, and
+	// BindOrbitComponents re-applies the cache at the end of every (re)bind. The result is that
+	// this seed reaches the freshly-bound Orbit components on the very first bind without any
+	// operator action. See the v1.0.98 README release block for the full timing analysis.
+	Values.Add(TEXT("bShowOrbitFixtures"), FRebusPropertyValue::MakeBool(false));
+
 	// v1.0.90: post-process Bloom / Lens Flare / Vignette exposed as portal scene properties.
 	// Seeded so SceneState round-trips them before the portal pushes its first value, and the
 	// v1.0.89 ReapplyAll re-asserts the operator's live values on every (re)spawn of the
@@ -490,6 +509,33 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 	else if (Name == TEXT("bDriveOrbitModels"))
 	{
 		SetDriveOrbitModelsEnabled(Value.bBool);
+	}
+	// --- v1.0.98 default-hide Orbit fixture geometry. Mirrors the existing console-command
+	//     handler (HandleShowOrbitFixturesCommand in RebusVisualiser.cpp) but routed through the
+	//     scene-settings catalogue so the value round-trips in SceneState and ReapplyAll
+	//     re-asserts it on every (re)spawn -- without that, a portal recycle would silently
+	//     restore UE-default-visible geometry. No early-out (mirrors the bGroundVisible /
+	//     SetMeshBeamsEnabled patterns); ARebusFixtureActor::SetOrbitVisibility caches the
+	//     state on the actor so a freshly-bound Orbit component (on the next 1Hz
+	//     RebindOrbitModels tick) inherits this visibility too -- see the v1.0.98 README block.
+	else if (Name == TEXT("bShowOrbitFixtures"))
+	{
+		if (UWorld* World = GetWorld())
+		{
+			int32 Fixtures = 0, Affected = 0;
+			for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					Affected += F->SetOrbitVisibility(Value.bBool);
+					++Fixtures;
+				}
+			}
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("bShowOrbitFixtures=%d applied to %d fixture(s), %d Orbit component(s) %s."),
+				Value.bBool ? 1 : 0, Fixtures, Affected,
+				Value.bBool ? TEXT("shown") : TEXT("hidden"));
+		}
 	}
 	// --- Stream Quality (Pixel Streaming encoder params) ---
 	else if (Name == TEXT("StreamStartBitrateMbps"))

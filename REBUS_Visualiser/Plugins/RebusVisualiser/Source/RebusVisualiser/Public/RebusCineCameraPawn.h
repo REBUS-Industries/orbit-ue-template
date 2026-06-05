@@ -44,8 +44,8 @@ struct REBUSVISUALISER_API FRebusCameraState
 	UPROPERTY() float FocusDistanceCm = 500.f;                // manual focus distance (cm)
 	UPROPERTY() bool bManualFocus = true;                     // false -> auto-focus (tracking)
 	UPROPERTY() float ExposureBiasEv = 10.f;                  // EV bias under manual exposure (v1.0.96 default +10 EV; see RebusCineCameraPawn.cpp ctor)
-	UPROPERTY() float SensorWidthMm = 24.89f;                 // Super35 default
-	UPROPERTY() float SensorHeightMm = 18.66f;                // Super35 default
+	UPROPERTY() float SensorWidthMm = 23.76f;                 // v1.0.98 default: 16:9 DSLR sensor (matches RebusCineCameraPawn ctor + ResetToDefaults)
+	UPROPERTY() float SensorHeightMm = 13.365f;               // v1.0.98 default: 16:9 DSLR sensor (matches RebusCineCameraPawn ctor + ResetToDefaults)
 };
 
 UCLASS()
@@ -71,8 +71,9 @@ public:
 	// component's UPROPERTYs into FRebusCameraState.
 	FRebusCameraState GetCameraState() const;
 
-	// Reset all cine settings to the v1.0.79 defaults (Super35 35mm f/2.8 focus@5m, manual
-	// exposure 0 EV). Used by the Rebus.CameraReset console command.
+	// Reset all cine settings to the construction-time defaults (35mm f/2.8 focus@5m,
+	// 16:9 DSLR sensor [v1.0.98], manual exposure +10 EV [v1.0.96]). Used by the
+	// Rebus.CameraReset console command.
 	void ResetToDefaults();
 
 private:

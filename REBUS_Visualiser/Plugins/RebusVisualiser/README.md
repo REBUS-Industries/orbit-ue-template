@@ -594,6 +594,139 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Operator-friendly defaults: hide Orbit fixtures + 16:9 DSLR camera sensor (v1.0.98).**
+> User request (verbatim):
+>
+> > "can you also set these as defaults
+> >
+> > Rebus.showorbitfixtures 0
+> > sensor to 16:9"
+>
+> Two contained default-value flips, both about what the operator sees on FIRST launch
+> before any portal push lands. Neither changes the wire contract or the override path --
+> the portal can still drive both via the existing scene-property / camera-state pipelines.
+>
+> **Why the flips.**
+> 1. **Default-hide Orbit-imported fixture geometry.** With OrbitConnector loading the full
+>    GDTF/glb fixture bodies AND `ARebusFixtureActor` building its own control-channel mesh
+>    proxies, the live previs shows BOTH on top of each other on a fresh launch (the proxies
+>    driven by motion, the Orbit imports static at rest pose). Operator-tested fix: hide the
+>    Orbit imports by default. The proxies remain the visible, motion-driving meshes.
+> 2. **16:9 DSLR camera sensor.** The cinematic camera defaulted to Super35 (24.89mm x
+>    18.66mm, ~4:3 cinematic) and the live previs frame didn't match the streamed surface's
+>    16:9 aspect, so the operator had to push a sensor change every session before composing
+>    a shot. Flipping the construction-time default to UE 5.7's "16:9 DSLR" preset
+>    (23.76mm x 13.365mm, exact 1.778 aspect) makes the streamed view frame-correct out of
+>    the box.
+>
+> **Part 1 -- `bShowOrbitFixtures` scene-property seed = false.**
+>
+> | Surface | Pre-v1.0.98 | v1.0.98 |
+> | --- | --- | --- |
+> | `URebusSceneSettingsSubsystem::Initialize` seed | (no seed; ConsoleCommand-only path) | `Values.Add("bShowOrbitFixtures", false)` |
+> | `ApplySceneProperty` handler | (none -- console-command-only since v1.0.70) | walks every `ARebusFixtureActor` in the world, calls `SetOrbitVisibility(bShow)` |
+> | `ARebusFixtureActor::SetOrbitVisibility` | iterates `OrbitComponents` and sets visibility | same, plus caches the desired state on the actor |
+> | `ARebusFixtureActor::BindOrbitComponents` | binds + drives, never re-asserts visibility | binds + drives, then re-applies the cached desired-visibility on every freshly-bound component |
+>
+> **Subtle bug call-out: the Orbit-fixture visibility Reapply path.** The user's design
+> note flagged the `if (Value == CurrentLiveState) return;` early-out trap (initial
+> `false -> false` no-ops). That trap doesn't fire here -- `SetOrbitVisibility` walks
+> components and calls `USceneComponent::SetVisibility(bVisible, bPropagateToChildren=true)`
+> unconditionally (mirrors the no-early-out pattern used by `bGroundVisible` and
+> `SetMeshBeamsEnabled`). The actual subtle bug we hit and fixed is timing-shaped:
+>
+> * `ReapplyAll` fires once after `EnsureSceneEnvironment` and once after fixtures spawn (in
+>   `URebusVisualiserSubsystem`). At BOTH of those moments the Orbit-import components have
+>   not yet been matched onto the fixtures -- the matching is done by
+>   `URebusFixtureControlSubsystem::RebindOrbitModels` on the visualiser subsystem's 1Hz
+>   tick. So the `bShowOrbitFixtures=false` handler iterates every `ARebusFixtureActor`, but
+>   each actor's `OrbitComponents` array is still empty, and the loop hides nothing.
+> * Up to 1 s later, `RebindOrbitModels` matches and binds the components via
+>   `ARebusFixtureActor::BindOrbitComponents`. Without v1.0.98 those new components inherit
+>   UE's default-visible state -- the seed never reaches them.
+>
+> Fix: `ARebusFixtureActor::SetOrbitVisibility` now writes the desired state to a new
+> `bOrbitDesiredVisibility` member (defaults to `true` so legacy call sites are unchanged).
+> `BindOrbitComponents` re-applies the cached state on every (re)bind. So the seed-driven
+> `false` reaches the freshly-bound Orbit components on the very first bind without a
+> recycle, and a portal push of `bShowOrbitFixtures=true` followed by an OrbitConnector
+> re-import keeps the components visible too.
+>
+> **Console-command tolerance (v1.0.72) preserved.** The user typed
+> `Rebus.showorbitfixtures 0` (no `Rebus.` prefix variant: `showorbitfixtures 0`); both
+> still route correctly via the v1.0.72 fixture-channel `ConsoleCommand` shim that retries
+> the bare name with the `Rebus.` prefix on `success=0`. The console command itself is
+> unchanged (`HandleShowOrbitFixturesCommand` still walks every Game/PIE world and toggles
+> visibility per fixture); v1.0.98 just adds the SCENE-PROPERTY path so SceneState
+> round-trips it and `ReapplyAll` re-asserts it on respawn.
+>
+> **Part 2 -- 16:9 DSLR camera sensor (`ARebusCineCameraPawn`).**
+>
+> | Field | Pre-v1.0.98 (Super35) | v1.0.98 (16:9 DSLR) |
+> | --- | --- | --- |
+> | `Filmback.SensorWidth`        | 24.89 mm | **23.76 mm** |
+> | `Filmback.SensorHeight`       | 18.66 mm | **13.365 mm** |
+> | `Filmback.SensorAspectRatio`  | 1.333 (4:3 cinematic) | **1.778 (exact 16:9)** |
+> | `FRebusCameraState::SensorWidthMm` initial | 24.89 | **23.76** |
+> | `FRebusCameraState::SensorHeightMm` initial | 18.66 | **13.365** |
+>
+> Applied in three places (constructor, `ResetToDefaults`, and the `FRebusCameraState`
+> initial values broadcast on the first `BroadcastHandshake` / force-push) so portal-side
+> state matches the cine component's live filmback before the operator pushes a value. The
+> v1.0.96 `AutoExposureBias = +10 EV` default is preserved untouched alongside the new
+> sensor lines (the +10 EV change addressed live-previs brightness; the sensor change
+> addresses framing, orthogonal axes).
+>
+> **Sensor preset note: 16:9 DSLR vs 16:9 Digital Film.** UE 5.7 ships two 16:9 presets in
+> `UCineCameraComponent::FilmbackPresets`: "16:9 DSLR" (23.76 x 13.365 mm) and "16:9
+> Digital Film" (slightly different dimensions). We chose **DSLR** because it's the more
+> common reference for live-streaming bodies (DSLR/mirrorless cameras feeding studio
+> multiviewers) which is the workflow the live previs is plugged into. Operators who need
+> Digital Film numbers can push them via the existing `SetSensorSizeMm` / `SetCameraSensor`
+> wire descriptor; this is JUST the construction-time landing value.
+>
+> **Streaming-aspect distinction (operator note).** The pixel-streaming pipeline has its
+> own aspect ratio governed by the streaming surface resolution
+> (`PixelStreaming2.WebRTC.*`, encoder render-target). Setting the camera SENSOR to 16:9
+> aligns the previs FRAME with the streamed surface's typical 16:9 aspect, but it does NOT
+> reconfigure the streaming surface itself. If the operator overrides the streaming
+> resolution (custom `r.SetRes` / encoder target) to a non-16:9 ratio they'll get pillar /
+> letter-boxing in the streamed feed regardless of sensor size; that's expected, and the
+> fix is on the streaming-config side. Future operators reading this README: don't
+> conflate the two.
+>
+> **Operator overrides are unchanged.** Both flips are JUST default seeds; the existing
+> wire pipelines still drive live state.
+>
+> * **Part 1 (Orbit fixtures).** Portal-side: `SetSceneProperty name="bShowOrbitFixtures"
+>   value=true|false` (round-trips in `SceneState`, re-asserted on respawn via
+>   `ReapplyAll`). Console-side: `Rebus.ShowOrbitFixtures 1|0` -- and the v1.0.72 prefix
+>   tolerance shim keeps the bare-name form (`showorbitfixtures 0`) working too.
+> * **Part 2 (camera sensor).** Portal-side: the existing camera-state push descriptor
+>   (`SetCameraSensor` / equivalent state push) drives `SetSensorSizeMm(width, height)`,
+>   which clamps to (1..100, 1..100). The `Rebus.CameraReset` console command lands on the
+>   new 16:9 DSLR seed via `ResetToDefaults`.
+>
+> **Files touched.**
+>
+> * `Source/RebusVisualiser/Public/RebusFixtureActor.h` -- new
+>   `bOrbitDesiredVisibility` member (defaults true; mutated by `SetOrbitVisibility`).
+> * `Source/RebusVisualiser/Private/RebusFixtureActor.cpp` -- `SetOrbitVisibility` writes
+>   the cache; `BindOrbitComponents` re-applies it after every (re)bind.
+> * `Source/RebusVisualiser/Private/RebusSceneSettingsSubsystem.cpp` -- new
+>   `bShowOrbitFixtures=false` seed in `Initialize`; new `ApplySceneProperty` branch that
+>   walks every `ARebusFixtureActor` in this world and calls `SetOrbitVisibility`.
+> * `Source/RebusVisualiser/Public/RebusCineCameraPawn.h` -- `FRebusCameraState`
+>   initial sensor values flipped to 23.76 / 13.365.
+> * `Source/RebusVisualiser/Private/RebusCineCameraPawn.cpp` -- ctor + `ResetToDefaults`
+>   set Filmback to 23.76 x 13.365 with `SensorAspectRatio = 1.778`. The reset log line
+>   reads "v1.0.98 defaults (35mm f/2.8 focus@5m 16:9 DSLR manual EV+10)" so the operator
+>   can verify the landing.
+>
+> No engine / OrbitConnector / Epic-DMX-Fixtures asset is touched. The v1.0.96
+> AutoExposureBias = +10 EV default + the v1.0.96 / v1.0.97 post-process and material
+> changes are preserved verbatim.
+
 > **Every Rebus-authored Python master material is now double-sided (v1.0.97).**
 > User request (verbatim):
 >

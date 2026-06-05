@@ -23,18 +23,29 @@ ARebusCineCameraPawn::ARebusCineCameraPawn(const FObjectInitializer& ObjectIniti
 	// it for pitch + yaw, identical to what UCameraComponent does on the stock DefaultPawn.
 	CineCamera->bUsePawnControlRotation = true;
 
-	// v1.0.79 cine defaults: Super35 sensor + 35mm f/2.8 prime + focus@5m, manual exposure
-	// 0 EV. Super35 is the cinema-camera-equivalent crop most modern film cameras use; 35mm
-	// f/2.8 is a neutral "see the whole stage but not wide" reference that matches what the
-	// portal's preview thumbnail expects. Focus@5m keeps a typical close-mid stage target in
-	// the depth of field at f/2.8 without bokeh-blurring everything behind it.
+	// v1.0.79 cine defaults: 35mm f/2.8 prime + focus@5m, manual exposure 0 EV. 35mm
+	// f/2.8 is a neutral "see the whole stage but not wide" reference that matches what
+	// the portal's preview thumbnail expects. Focus@5m keeps a typical close-mid stage
+	// target in the depth of field at f/2.8 without bokeh-blurring everything behind it.
 	CineCamera->SetCurrentFocalLength(35.f);
 	CineCamera->SetCurrentAperture(2.8f);
 	CineCamera->FocusSettings.FocusMethod = ECameraFocusMethod::Manual;
 	CineCamera->FocusSettings.ManualFocusDistance = 500.f; // cm
 
-	CineCamera->Filmback.SensorWidth  = 24.89f;
-	CineCamera->Filmback.SensorHeight = 18.66f;
+	// v1.0.98: default sensor flipped from Super35 (24.89mm x 18.66mm, ~4:3 cinematic) to
+	// UE 5.7's "16:9 DSLR" preset (23.76mm x 13.365mm, exact 16:9 aspect = 1.778). Operator
+	// requested the camera sensor match the live-streaming aspect by default so the previs
+	// and the streamed surface frame the same content without operator-side correction.
+	// 16:9 DSLR is preferred over the alternate "16:9 Digital Film" preset because it's the
+	// more common live-streaming reference (DSLR/mirrorless bodies feeding studio multiviewers).
+	// Portal still overrides per-shot via SetSensorSizeMm / the SetCameraSensor wire descriptor;
+	// this is JUST the construction-time seed the operator sees before any portal push lands.
+	CineCamera->Filmback.SensorWidth        = 23.76f;
+	CineCamera->Filmback.SensorHeight       = 13.365f;
+	// SensorAspectRatio is a stored field on FCameraFilmbackSettings in UE 5.7 (not derived
+	// at read time). Set it explicitly so a SceneState read-back / portal query reports the
+	// canonical 16:9 (1.778) value without waiting for a Width/Height edit to recompute it.
+	CineCamera->Filmback.SensorAspectRatio  = 1.778f;
 
 	// Manual exposure (the key bit the user asked for). Without these overrides, UE auto-
 	// exposure rebalances every time the lights cut on/off, which reads to the audience as
@@ -141,13 +152,17 @@ void ARebusCineCameraPawn::ResetToDefaults()
 	CineCamera->SetCurrentAperture(2.8f);
 	CineCamera->FocusSettings.FocusMethod = ECameraFocusMethod::Manual;
 	CineCamera->FocusSettings.ManualFocusDistance = 500.f;
-	CineCamera->Filmback.SensorWidth = 24.89f;
-	CineCamera->Filmback.SensorHeight = 18.66f;
+	// v1.0.98 -- ResetToDefaults lands on the 16:9 DSLR sensor (23.76mm x 13.365mm) so the
+	// reset matches the construction-time default. See the ctor doc-comment for the rationale
+	// (live-streaming aspect parity).
+	CineCamera->Filmback.SensorWidth       = 23.76f;
+	CineCamera->Filmback.SensorHeight      = 13.365f;
+	CineCamera->Filmback.SensorAspectRatio = 1.778f;
 	CineCamera->PostProcessSettings.bOverride_AutoExposureMethod = true;
 	CineCamera->PostProcessSettings.AutoExposureMethod = AEM_Manual;
 	CineCamera->PostProcessSettings.bOverride_AutoExposureBias = true;
 	// v1.0.96 -- ResetToDefaults now lands on +10 EV to match the construction-time default.
 	// See the ctor doc-comment for the rationale (live-previs pixel-streaming brightness).
 	CineCamera->PostProcessSettings.AutoExposureBias = 10.f;
-	UE_LOG(LogRebusVisualiser, Log, TEXT("RebusCineCameraPawn: reset to v1.0.96 defaults (35mm f/2.8 focus@5m Super35 manual EV+10)."));
+	UE_LOG(LogRebusVisualiser, Log, TEXT("RebusCineCameraPawn: reset to v1.0.98 defaults (35mm f/2.8 focus@5m 16:9 DSLR manual EV+10)."));
 }

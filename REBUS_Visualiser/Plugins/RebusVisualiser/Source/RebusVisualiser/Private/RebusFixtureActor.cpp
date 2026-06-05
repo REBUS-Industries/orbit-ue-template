@@ -2884,6 +2884,25 @@ void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Com
 	{
 		DriveOrbitModelFromPanTilt(PanDeg.Current, TiltDeg.Current);
 	}
+
+	// v1.0.98: re-assert the cached desired visibility on every freshly-bound component. The
+	// scene-property seed `bShowOrbitFixtures=false` lands in the scene-settings catalogue at
+	// Initialize time and ApplySceneProperty fires SetOrbitVisibility(false) once the fixtures
+	// spawn -- but that runs BEFORE RebindOrbitModels has matched and bound the Orbit-import
+	// components on its 1Hz tick, so OrbitComponents was empty and no comp was actually hidden.
+	// Apply the cached state here so this (and every subsequent) bind respects the operator's
+	// chosen state without an extra round-trip through the scene subsystem. SetOrbitVisibility
+	// is happy with bOrbitDesiredVisibility's default true => existing call sites that never
+	// touched the new path still get UE-default-visible behaviour.
+	if (!bOrbitDesiredVisibility)
+	{
+		for (const TWeakObjectPtr<USceneComponent>& Weak : OrbitComponents)
+		{
+			USceneComponent* C = Weak.Get();
+			if (!C) continue;
+			C->SetVisibility(false, /*bPropagateToChildren*/ true);
+		}
+	}
 }
 
 void ARebusFixtureActor::ClearOrbitBinding()
@@ -2907,6 +2926,15 @@ int32 ARebusFixtureActor::SetOrbitVisibility(bool bVisible)
 	// hides as one unit). Returns the count actually toggled so the console command can log
 	// a meaningful summary -- weak handles that have died (re-import / late teardown) are
 	// silently skipped.
+	//
+	// v1.0.98: cache the desired state on the actor before iterating. BindOrbitComponents
+	// reads this cache at the end of every (re)bind and re-applies the visibility, so a
+	// `bShowOrbitFixtures=false` push that arrives BEFORE the 1Hz RebindOrbitModels tick has
+	// populated OrbitComponents still hides the components on the first bind (rather than
+	// silently iterating an empty list and leaving the freshly-bound components UE-default
+	// visible). Required for the v1.0.98 "default-hide Orbit fixtures" seed to actually fire
+	// on first launch -- see the v1.0.98 README release block for the timing analysis.
+	bOrbitDesiredVisibility = bVisible;
 	int32 Affected = 0;
 	for (const TWeakObjectPtr<USceneComponent>& Weak : OrbitComponents)
 	{
