@@ -43,7 +43,7 @@ struct REBUSVISUALISER_API FRebusCameraState
 	UPROPERTY() float Aperture = 2.8f;                        // f-stop (current iris)
 	UPROPERTY() float FocusDistanceCm = 500.f;                // manual focus distance (cm)
 	UPROPERTY() bool bManualFocus = true;                     // false -> auto-focus (tracking)
-	UPROPERTY() float ExposureBiasEv = 0.f;                   // EV bias under manual exposure
+	UPROPERTY() float ExposureBiasEv = 10.f;                  // EV bias under manual exposure (v1.0.96 default +10 EV; see RebusCineCameraPawn.cpp ctor)
 	UPROPERTY() float SensorWidthMm = 24.89f;                 // Super35 default
 	UPROPERTY() float SensorHeightMm = 18.66f;                // Super35 default
 };

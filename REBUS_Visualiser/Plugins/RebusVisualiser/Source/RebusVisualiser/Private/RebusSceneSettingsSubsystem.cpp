@@ -55,17 +55,26 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	Values.Add(TEXT("bDriveOrbitModels"), FRebusPropertyValue::MakeBool(true));
 
 	// v1.0.90: post-process Bloom / Lens Flare / Vignette exposed as portal scene properties.
-	// Seeded with UE 5.7's stock FPostProcessSettings defaults so SceneState round-trips them
-	// before the portal pushes its first value, and the v1.0.89 ReapplyAll re-asserts the
-	// operator's live values on every (re)spawn of the unbound PostProcessVolume. The handlers
-	// below set the matching `bOverride_<Field>` flag on the volume so the values actually take
-	// effect (a PP volume with bOverride=false ignores the field entirely). BloomThreshold is
-	// signed -- -1.0 disables thresholding (UE convention) and is preserved verbatim. The
-	// LensFlareTint default is pure white so flares carry the source colour by default;
-	// operators tint via the existing {r,g,b,a} JSON colour wire path.
-	Values.Add(TEXT("BloomIntensity"), FRebusPropertyValue::MakeNumber(0.675));
+	// Seeded so SceneState round-trips them before the portal pushes its first value, and the
+	// v1.0.89 ReapplyAll re-asserts the operator's live values on every (re)spawn of the
+	// unbound PostProcessVolume. The handlers below set the matching `bOverride_<Field>` flag
+	// on the volume so the values actually take effect (a PP volume with bOverride=false
+	// ignores the field entirely). BloomThreshold is signed -- -1.0 disables thresholding (UE
+	// convention) and is preserved verbatim. The LensFlareTint default is pure white so flares
+	// carry the source colour by default; operators tint via the existing {r,g,b,a} JSON
+	// colour wire path.
+	//
+	// v1.0.96 default-value adjustments (operator-requested, paired with the camera +10 EV
+	// default in RebusCineCameraPawn.cpp):
+	//   * BloomIntensity: 0.675 -> 0.2. Spotlights still glow on the camera but the LED matrix
+	//     walls don't overbloom on the live feed.
+	//   * LensFlareIntensity: 1.0 -> 0.0. Disabled by default to keep the streamed view crisp;
+	//     operators can re-enable per shot from the portal via SetSceneProperty LensFlareIntensity.
+	// These are JUST DEFAULT SEEDS -- the portal can override any of them via the existing
+	// scene-property push pipeline, and the SceneState read-back will reflect any override.
+	Values.Add(TEXT("BloomIntensity"), FRebusPropertyValue::MakeNumber(0.2));
 	Values.Add(TEXT("BloomThreshold"), FRebusPropertyValue::MakeNumber(-1.0));
-	Values.Add(TEXT("LensFlareIntensity"), FRebusPropertyValue::MakeNumber(1.0));
+	Values.Add(TEXT("LensFlareIntensity"), FRebusPropertyValue::MakeNumber(0.0));
 	Values.Add(TEXT("LensFlareTint"), FRebusPropertyValue::MakeColor(FLinearColor::White));
 	Values.Add(TEXT("LensFlareBokehSize"), FRebusPropertyValue::MakeNumber(3.0));
 	Values.Add(TEXT("LensFlareThreshold"), FRebusPropertyValue::MakeNumber(8.0));

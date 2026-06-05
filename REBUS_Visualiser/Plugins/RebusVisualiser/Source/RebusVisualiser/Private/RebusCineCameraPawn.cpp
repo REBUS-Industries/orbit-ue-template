@@ -42,10 +42,17 @@ ARebusCineCameraPawn::ARebusCineCameraPawn(const FObjectInitializer& ObjectIniti
 	// a blackout, masks the user's actual EV-based grading on the portal, and visually
 	// interacts with the v1.0.78 Lumen fast-response pack (the GI cuts instantly but the
 	// camera then slowly re-exposes, so the audience sees a fade anyway).
+	//
+	// v1.0.96: AutoExposureBias DEFAULT lifted from 0 EV to +10 EV. Rationale: live previs
+	// in the pixel-streaming context runs unattended without an auto-exposure ramp, and dim
+	// stage lights wash out on a flat exposure -- +10 EV is the operator-tested landing value
+	// that keeps the visible IES pool bright on first spawn. The portal can still push any EV
+	// via SetCameraExposure, and the SceneState read-back reflects the override; this is JUST
+	// the construction-time seed the operator sees before any portal push lands.
 	CineCamera->PostProcessSettings.bOverride_AutoExposureMethod = true;
 	CineCamera->PostProcessSettings.AutoExposureMethod = AEM_Manual;
 	CineCamera->PostProcessSettings.bOverride_AutoExposureBias = true;
-	CineCamera->PostProcessSettings.AutoExposureBias = 0.f;
+	CineCamera->PostProcessSettings.AutoExposureBias = 10.f;
 	// Clamp manual EV so portal slider extremes don't crush blacks or blow highlights to
 	// pure white -- the cine camera respects these clamps internally.
 	CineCamera->PostProcessSettings.bOverride_AutoExposureMinBrightness = true;
@@ -114,8 +121,13 @@ FRebusCameraState ARebusCineCameraPawn::GetCameraState() const
 		S.Aperture = CineCamera->CurrentAperture;
 		S.FocusDistanceCm = CineCamera->FocusSettings.ManualFocusDistance;
 		S.bManualFocus = (CineCamera->FocusSettings.FocusMethod == ECameraFocusMethod::Manual);
+		// v1.0.96 -- when the override flag is off we report the construction-time default
+		// (10 EV) instead of 0 so a SceneState read-back round-trips the new landing value
+		// even before the operator pushes one explicitly. The ctor sets bOverride to true so
+		// in normal usage this fallback never fires; it's only reached if some out-of-process
+		// caller turned the override off (today: nobody does).
 		S.ExposureBiasEv = CineCamera->PostProcessSettings.bOverride_AutoExposureBias
-			? CineCamera->PostProcessSettings.AutoExposureBias : 0.f;
+			? CineCamera->PostProcessSettings.AutoExposureBias : 10.f;
 		S.SensorWidthMm = CineCamera->Filmback.SensorWidth;
 		S.SensorHeightMm = CineCamera->Filmback.SensorHeight;
 	}
@@ -134,6 +146,8 @@ void ARebusCineCameraPawn::ResetToDefaults()
 	CineCamera->PostProcessSettings.bOverride_AutoExposureMethod = true;
 	CineCamera->PostProcessSettings.AutoExposureMethod = AEM_Manual;
 	CineCamera->PostProcessSettings.bOverride_AutoExposureBias = true;
-	CineCamera->PostProcessSettings.AutoExposureBias = 0.f;
-	UE_LOG(LogRebusVisualiser, Log, TEXT("RebusCineCameraPawn: reset to v1.0.79 defaults (35mm f/2.8 focus@5m Super35 manual EV0)."));
+	// v1.0.96 -- ResetToDefaults now lands on +10 EV to match the construction-time default.
+	// See the ctor doc-comment for the rationale (live-previs pixel-streaming brightness).
+	CineCamera->PostProcessSettings.AutoExposureBias = 10.f;
+	UE_LOG(LogRebusVisualiser, Log, TEXT("RebusCineCameraPawn: reset to v1.0.96 defaults (35mm f/2.8 focus@5m Super35 manual EV+10)."));
 }

@@ -341,6 +341,11 @@ private:
 	// v1.0.47 `Rebus.HeroShadowScatter` CVar's OnChanged sink can re-apply the new scatter live.
 public:
 	void RefreshBeamShadowMode();
+	// v1.0.96 -- push the three screen-space-shadow-trace scalars onto this fixture's BeamMID
+	// (M_RebusBeam) so the Custom HLSL shadow trace picks up the operator's current CVar values.
+	// Called from `BuildBeamCone` for the initial seed and from the `Rebus.BeamShadow*` CVar
+	// refresh sinks (which walk every fixture). Silently no-ops when BeamMID is null.
+	void RefreshBeamShadowParams();
 private:
 	float ResolveOuterHalfDeg() const; // current outer cone half-angle (zoom range + iris), degrees
 	void RefreshMotion();         // re-solve pan/tilt and push transforms to groups + light

@@ -594,6 +594,222 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Self-shadowed cone-mesh raymarch (screen-space shadow trace) + camera/post-process defaults (v1.0.96).**
+> User report (verbatim):
+>
+> > "Are we able to simulate volumetric shadows are the raymarch cone-mesh beam so the beam
+> > doesnt go through objects?
+> >
+> > Can we default exposure to +10 and turn lens flare to 0, bloom to 0.2"
+>
+> Two coupled deliverables shipped together because both adjust the operator's first-launch
+> visual baseline:
+>
+> ---
+>
+> **PART A -- Screen-space shadow trace on the M_RebusBeam cone-mesh raymarch.**
+>
+> Pre-v1.0.96 the cone-mesh raymarch (`M_RebusBeam`, `_BEAM_RAYMARCH_HLSL` in
+> `build_rebus_base_level.py`) only soft-clipped its visible shaft against `SceneDepth` at
+> the fragment's own pixel -- the shaft faded where it physically met the floor / a wall,
+> but at every shaft sample BEHIND an in-frame occluder the shader had no knowledge of
+> whether that step was reachable from the SpotLight. Result: a cube placed between the
+> fixture and the floor would receive a solid floor-shadow (v1.0.94's job) but the
+> volumetric beam itself rendered THROUGH the cube as if nothing was there.
+>
+> **The fix: per-shaft-sample screen-space shadow ray trace, inside the existing march
+> loop.** For each step along the view ray at world position `wp`, the shader now marches
+> a small number of additional steps from `wp` toward the SpotLight position `bo`. At each
+> shadow step it world-to-screen projects via `ResolvedView.TranslatedWorldToClip`, samples
+> `CalcSceneDepth(uv)` at the projected UV, and compares against the step's camera-Z
+> (`clip.w` in UE perspective projection). If any shadow step finds an opaque feature in
+> front of itself (depth-buffer Z < step.cameraZ), the shaft sample is marked SHADOWED and
+> its density contribution is attenuated by `1 - BeamShadowStrength`. Result: a feature
+> visible to the camera between the fixture and the floor visibly CUTS the volumetric
+> shaft at the occluder's silhouette.
+>
+> **Why screen-space and not Mesh-Distance-Field (the canonical UE technique).** The PRISM
+> deployment runtime-imports its truss / set-piece / rig geometry through OrbitConnector as
+> glTF blobs -- those meshes never go through the static-mesh cooking pipeline, so they
+> carry NO Mesh Distance Fields at runtime. A material can't DF-trace what isn't built.
+> UE 5.7's Virtual Shadow Map sampling from a non-engine Custom HLSL node is fragile (no
+> documented entry point on translucent surface materials), so we chose the pragmatic,
+> robust path that works for ANY in-frame geometry without per-mesh authoring: screen-space
+> shadow tracing. **MDF fallback for cooked rigs is documented future work** -- if/when
+> Orbit-imported meshes are promoted into the cook pipeline, the shader can be extended to
+> tap the DF and consult on-screen-vs-off-screen on a per-step basis.
+>
+> **Algorithm (per shaft sample inside the existing march loop, after `d` is computed but
+> before composing it into the transmittance):**
+>
+> 1. `toLight = bo - wp; dToLight = |toLight|; sdir = toLight / dToLight`.
+> 2. March `BeamShadowSteps` steps from `wp` toward `bo`, step distance
+>    `sdt = dToLight / BeamShadowSteps`. The shadow march MUST NOT exceed `dToLight` --
+>    we clamp `sj < dToLight` so a far-away occluder behind the light can't falsely shadow
+>    the shaft.
+> 3. At each step, world position -> NDC -> ScreenUV via
+>    `mul(float4(sp - ro, 1), ResolvedView.TranslatedWorldToClip)` (subtract the camera
+>    ray-origin `ro` first to go absolute-world -> camera-relative; the matrix expects
+>    translated/camera-relative input in UE 5.7's LWC era).
+> 4. Tap `CalcSceneDepth(uv)` at the projected UV. If `sd + perStepBias < step.cameraZ`,
+>    the step is OCCLUDED from the camera's view -> something opaque is in front of it ->
+>    the step is shadowed from the light too (under the screen-space assumption). The
+>    `BeamShadowBias` (0.5 cm authored default) is the additive cm tolerance that skips
+>    the shaft sample's own pixel as its own occluder when the very first shadow step
+>    lands on the same screen pixel; a further per-step `0.01 * sdt` term scales with the
+>    step distance to remain robust at long shadow rays.
+> 5. If ANY step hits an occluder, mark the sample shadowed and attenuate density by
+>    `1 - BeamShadowStrength`. Strength = 1 -> the shadowed sample contributes nothing
+>    (full shadow). Strength = 0 -> the `[branch]` gate in the shader takes the whole
+>    trace OUT of the per-pixel cost.
+>
+> The shadow trace is wrapped in `[loop]` (HLSL DX-SM5+) so the compiler doesn't try to
+> unroll it. The shaft-sample's own contribution to `SceneDepth` is excluded via the
+> `BeamShadowBias` per-step offset (or by skipping the very first shadow step when the
+> linear offset minus bias is <= 0).
+>
+> **Limitations (these are the trade-offs vs MDF).**
+>
+> * Only handles occluders **visible to the camera** (screen-space). An off-screen
+>   occluder doesn't cast shadow into the shaft -- its depth isn't in the depth buffer.
+> * Cost ~ `StepCount * BeamShadowSteps` SceneDepth taps per beam pixel.
+>   `32 * 8 = 256 taps/pixel` is the design point; keep `Rebus.BeamShadowSteps` <= 16.
+> * No MDF fallback (Orbit-imported meshes lack SDFs at runtime); future work.
+> * If sharp edges / banding appears in the field, the FUTURE-WORK option is to jitter
+>   the shadow steps with `Rand0to1` / `DitherTemporalAA` -- NOT implemented in v1.0.96
+>   because the operator-tested visuals were acceptable without it.
+>
+> **New material parameters on `M_RebusBeam` (Python-authored, see
+> `_build_beam_master` + `_BEAM_RAYMARCH_HLSL`):**
+>
+> | Param | Type | Default | Notes |
+> | --- | --- | --- | --- |
+> | `BeamShadowSteps` | scalar | 8 | Shadow trace steps per shaft sample (shader clamps to [1, 16]). |
+> | `BeamShadowStrength` | scalar | 1.0 | 0 = trace runs but does nothing (visually disabled); 1 = full shadow on any sample whose ray hits an occluder. The shader's `[branch] if (BeamShadowStrength > 0.001)` gate takes the trace OUT of the per-pixel cost when strength is exactly 0. |
+> | `BeamShadowBias` | scalar | 0.5 | Per-step bias offset in cm to prevent self-shadowing on the shaft sample's own screen pixel. Not exposed via CVar in v1.0.96 -- if banding appears in the field we'll promote it. |
+>
+> **Self-heal on the regenerated `M_RebusBeam` master.** Mirroring the v1.0.86
+> (`_master_has_tiling_meters`) and v1.0.93 (`_fixture_lens_master_is_current`) self-heal
+> patterns, `ensure_beam_material()` (non-force path) probes the existing master via
+> `_beam_master_has_shadow_steps()`: if the on-disk master lacks the three
+> `BeamShadow*` scalar parameters it's treated as pre-v1.0.96, force-regen is triggered,
+> and a Warning is logged: *"RebusBaseLevel: pre-v1.0.96 M_RebusBeam detected (missing
+> BeamShadowSteps/BeamShadowStrength/BeamShadowBias); regenerating with screen-space
+> shadow trace."* Anyone who customised the master in the editor loses those edits on
+> first v1.0.96 startup -- they should re-apply them after the regen (acceptable for an
+> additive parameter upgrade; the regen logs a Warning so the change isn't silent).
+>
+> **New CVars + handlers (live, refresh sinks walk every fixture and re-push the BeamMID):**
+>
+> ```text
+> Rebus.BeamShadowSteps <n>       # default 8; shader clamps [1, 16]
+> Rebus.BeamShadowStrength <0..1> # default 1.0; 0 = visually disabled
+> Rebus.BeamShadow [0|1|status]   # MASTER toggle. OFF saves prior strength + writes 0;
+>                                 # ON restores saved prior (default 1.0 on a fresh
+>                                 # launch). `status` logs without mutating either.
+> ```
+>
+> `Rebus.BeamShadowSteps` and `Rebus.BeamShadowStrength` are `FAutoConsoleVariableRef`
+> CVars in `RebusFixtureActor.cpp` (paired globals `GRebusBeamShadowSteps` /
+> `GRebusBeamShadowStrength`); their refresh sinks share a helper
+> `RefreshBeamShadowParamsOnEveryFixture` that walks every Rebus fixture in every loaded
+> world and calls `ARebusFixtureActor::RefreshBeamShadowParams` (which pushes the three
+> scalars onto the per-fixture BeamMID). `Rebus.BeamShadow` is a console COMMAND in
+> `RebusVisualiser.cpp` (binary semantics with prior-value storage -- can't be a pure
+> CVar) that routes through the existing `Rebus.BeamShadowStrength` CVar so the refresh
+> sink walks every fixture exactly once on the toggle.
+>
+> **C++ push path.** `ARebusFixtureActor::BuildBeamCone` calls
+> `RefreshBeamShadowParams()` right after the M_RebusBeam MID is created, so a
+> fresh-spawn fixture starts with the operator's current CVar values (not the master's
+> authored defaults). Subsequent CVar changes re-push via the refresh sink. Pre-v1.0.96
+> M_RebusBeam masters lack the `BeamShadow*` scalars -- `SetScalarParameterValue` on a
+> missing parameter is a silent no-op, so this is safe to call even when the editor
+> hasn't yet regenerated the master.
+>
+> ---
+>
+> **PART B -- Camera + post-process defaults: +10 EV, bloom 0.2, lens flare 0.0.**
+>
+> Three operator-requested default-value changes paired with Part A because they
+> co-define the first-launch visual baseline (a freshly-spawned project that opens
+> without portal connectivity should land on a usable look):
+>
+> | Where | Field | v1.0.95 -> v1.0.96 | Rationale |
+> | --- | --- | --- | --- |
+> | `ARebusCineCameraPawn` ctor + `ResetToDefaults` | `AutoExposureBias` | `0.f` -> `10.f` | Live previs in pixel-streaming context runs unattended without an auto-exposure ramp; +10 EV keeps dim stage lights visible on the live feed. |
+> | `URebusSceneSettingsSubsystem::Initialize` seed | `BloomIntensity` | `0.675` -> `0.2` | Spotlights still glow on camera but the LED-matrix walls don't overbloom. |
+> | `URebusSceneSettingsSubsystem::Initialize` seed | `LensFlareIntensity` | `1.0` -> `0.0` | Disabled by default to keep the streamed view crisp; operator re-enables per shot via the portal. |
+>
+> Also updated for symmetry: `FRebusCameraState::ExposureBiasEv` default in
+> `RebusCineCameraPawn.h` flipped to `10.f`, and the fallback EV reported by
+> `GetCameraState` when `bOverride_AutoExposureBias = false` (a path that never fires
+> today, but the read-back default should match) flipped to `10.f`. The `ResetToDefaults`
+> log line now reads `manual EV+10` (was `manual EV0`).
+>
+> **These are JUST DEFAULT SEEDS.** The portal can override any of them via the
+> scene-property push pipeline (`SetSceneProperty BloomIntensity / LensFlareIntensity` +
+> the existing `SetCameraExposure` data-channel descriptor), and the SceneState /
+> CameraState read-back will reflect any override. The construction-time landing values
+> are what the operator sees on FIRST SPAWN before any portal push lands.
+>
+> ---
+>
+> **Operator checklist after rebuilding to v1.0.96.**
+>
+> 1. **Launch the editor.** On a project that already has a baked `M_RebusBeam` (any
+>    pre-v1.0.96 form), the first `ensure_beam_material()` call (idempotent startup hook)
+>    should log a Warning: *"pre-v1.0.96 M_RebusBeam detected (missing BeamShadowSteps/
+>    BeamShadowStrength/BeamShadowBias); regenerating with screen-space shadow trace."*
+>    If you don't see this Warning + the master isn't regenerating, run Tools > Execute
+>    Python Script > `build_rebus_base_level.py` manually (the `build()` entry point
+>    force-regens every material).
+> 2. **Spawn a fixture.** First-spawn defaults: camera AutoExposureBias = +10 EV, scene
+>    BloomIntensity = 0.2, LensFlareIntensity = 0.0. The visible shaft should look
+>    indistinguishable from v1.0.95 in the empty-stage case (no occluder between fixture
+>    and floor -> no shadow path possible).
+> 3. **Drop a Cube actor between a fixture and the floor** at half the throw distance.
+>    The shaft should visibly CUT at the cube's silhouette: behind the cube the
+>    volumetric beam goes dark. The lit floor pool below the cube remains carved by the
+>    v1.0.94 solid shadow (independent code path). The v1.0.42 DMX-style soft depth fade
+>    at the geometry contact point is unaffected.
+> 4. **A/B the strength**: `Rebus.BeamShadowStrength 0` -> beam goes back to v1.0.95
+>    "shaft passes through occluder" behaviour; `Rebus.BeamShadowStrength 1` -> full
+>    shadow. The CVar log line on each change reads
+>    `Rebus.BeamShadowStrength -> <x>, refreshed N fixture(s) (BeamMID re-pushed; ...)`.
+> 5. **Master toggle**: `Rebus.BeamShadow 0` saves the live strength + writes 0;
+>    `Rebus.BeamShadow 1` restores the saved prior. `Rebus.BeamShadow status` logs the
+>    live + saved values without mutating either.
+> 6. **Tune step count**: `Rebus.BeamShadowSteps 16` for higher-quality tracing
+>    (more SceneDepth taps per pixel); `Rebus.BeamShadowSteps 4` for faster (visible
+>    quantisation in motion is the trade-off).
+> 7. **Verify exposure / bloom / lens-flare on first launch.** With nothing pushed from
+>    the portal, the camera should auto-land at +10 EV (visibly brighter than the
+>    pre-v1.0.96 default), bloom modest, no lens flares. If any of these don't match,
+>    check the log for the v1.0.96 ctor + `Initialize` lines.
+>
+> **MDF fallback** as documented future work -- when Orbit-imported meshes are promoted
+> into the cook pipeline (so they carry SDFs), the shadow trace can be extended to tap
+> the DF for off-screen occluders. Not in v1.0.96 because the runtime imports preclude
+> SDF generation. **Jitter** (`Rand0to1` / `DitherTemporalAA`) on the shadow steps is
+> documented as future work if visual banding ever shows up; not implemented in v1.0.96
+> because operator-tested visuals were acceptable without it.
+>
+> **Files touched (v1.0.96).**
+>
+> | File | Change |
+> | --- | --- |
+> | `REBUS_Visualiser/Content/Python/build_rebus_base_level.py` | Extended `_BEAM_RAYMARCH_HLSL` with screen-space shadow trace; added 3 new scalar params to `_build_beam_master`; new `_beam_master_has_shadow_steps()` self-heal probe; `ensure_beam_material()` non-force path now promotes to force-regen + Warning. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusFixtureActor.cpp` | New globals `GRebusBeamShadowSteps` / `GRebusBeamShadowStrength` + `FAutoConsoleVariableRef` CVars + shared `RefreshBeamShadowParamsOnEveryFixture` refresh helper; new `ARebusFixtureActor::RefreshBeamShadowParams()` impl; `BuildBeamCone` seeds the BeamMID with the live CVar values. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Public/RebusFixtureActor.h` | Declare `RefreshBeamShadowParams()` (public). |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusVisualiser.cpp` | Register `Rebus.BeamShadow` console command (master toggle + status); `HandleBeamShadowCommand` save/restores the prior strength via `IConsoleManager` lookup of `Rebus.BeamShadowStrength`. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusCineCameraPawn.cpp` | `AutoExposureBias` default `0.f -> 10.f` (ctor + `ResetToDefaults` + `GetCameraState` fallback); reset-log line updated. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Public/RebusCineCameraPawn.h` | `FRebusCameraState::ExposureBiasEv` default `0.f -> 10.f`. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusSceneSettingsSubsystem.cpp` | `Initialize` seeds: `BloomIntensity 0.675 -> 0.2`, `LensFlareIntensity 1.0 -> 0.0`. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/README.md` | This release block. |
+>
+> ---
+>
 > **InternalBeam retired + lens visibility restored + volumetric shadow plumbing on the Epic-beam SpotLight (v1.0.95).**
 > User report (verbatim):
 >

@@ -321,6 +321,40 @@ _BEAM_RAYMARCH_HLSL = """
 // geometry (DMX soft-particle look) instead of a hard scene-depth clip. The actual cast light stays
 // IES-driven on the USpotLightComponent (more accurate than stock DMX, which uses a light-function
 // cookie). Output: float4(rgb beam colour, a coverage).
+//
+// v1.0.96 SCREEN-SPACE SHADOW TRACE -- the visible shaft now self-shadows so an occluder between
+// the fixture and the floor visibly CUTS the beam. The trade-off (vs Mesh-Distance-Field tracing,
+// which the runtime glTF-imported truss meshes have no SDFs for): the algorithm is SCREEN-SPACE,
+// so an off-screen occluder never casts shadow into the shaft (its depth isn't in the depth
+// buffer). MDF fallback is documented as future work (see README v1.0.96).
+//
+// Algorithm (per shaft sample inside the existing march loop, after the density `d` is computed
+// but before composing it into the transmittance):
+//   1. toLight = (bo - wp); dToLight = |toLight|; sdir = toLight / dToLight.
+//   2. March BeamShadowSteps steps from `wp` toward `bo` (the SpotLight position), at step
+//      distance sdt = dToLight / BeamShadowSteps. The shadow march MUST NOT exceed dToLight --
+//      we clamp `sj < dToLight` so a far occluder behind the light can't falsely shadow us.
+//   3. At each step, world-position -> NDC -> ScreenUV via ResolvedView.TranslatedWorldToClip
+//      (subtract the camera ray-origin ro first to go absolute-world -> camera-relative; the
+//      matrix expects translated/camera-relative input in UE 5.7).
+//   4. Tap CalcSceneDepth(uv) at the projected UV. If sd + perStepBias < step.cameraZ (= clip.w
+//      in UE perspective projection), the step is OCCLUDED from the camera's view -> something
+//      opaque is between the camera and the step -> the step is shadowed from the light too
+//      (under the screen-space assumption: the occluder is on the screen and obstructs the
+//      light-ray we're tracing). BeamShadowBias is the additive per-step camera-Z tolerance
+//      (cm) to prevent the shaft sample being read as its own occluder when the very first
+//      step lands on its own pixel; further bias `0.01 * sdt` scales with the step distance
+//      to remain robust at long shadow rays.
+//   5. If ANY step hits an occluder we mark the sample as shadowed and attenuate the density
+//      contribution by (1 - BeamShadowStrength). Strength=1 -> the shadowed sample contributes
+//      nothing (full shadow). Strength=0 -> the trace runs but does nothing (master OFF).
+//
+// Limitations (documented in README v1.0.96):
+//   * Screen-space only -- off-screen occluders don't cast.
+//   * Cost ~ StepCount * BeamShadowSteps SceneDepth taps per pixel. Keep BeamShadowSteps low
+//     (default 8, clamped to 16) -- 32 march * 8 shadow = 256 taps/pixel is the design point.
+//   * No MDF fallback (Orbit-imported meshes lack SDFs at runtime).
+//   * The shadow trace is wrapped in `[loop]` (HLSL DX-SM5+) so the compiler doesn't unroll.
 float3 ro = CamPos.xyz;
 float3 pp = PixelPos.xyz;
 float3 toPix = pp - ro;
@@ -436,7 +470,60 @@ for (int i = 0; i < MAXSTEPS; ++i)
             float srcAtten = 1.0 / (1.0 + fall * dn * dn);
             float nf = saturate(t / NEAR_FADE_CM);              // soft near-camera fade
             float softOcc = saturate((tOcc - t) / DEPTH_FADE_CM); // DMX-style soft fade at geometry
-            float d = BeamDensity * core * widthNorm * srcAtten * nf * softOcc;
+            // v1.0.96 screen-space shadow trace: march toward the SpotLight at `bo` and tap
+            // SceneDepth at each step's projected screen UV. The sample is shadowed when any
+            // step finds an opaque feature in front of it. See the file-header doc-comment for
+            // the full algorithm. The trace is gated on BeamShadowStrength > 0 so the master
+            // toggle (Rebus.BeamShadow 0) takes the branch out of the per-pixel cost.
+            float shadowAtten = 1.0;
+            [branch]
+            if (BeamShadowStrength > 0.001)
+            {
+                float3 toLight = bo - wp;
+                float dToLight = length(toLight);
+                if (dToLight > 0.001)
+                {
+                    float3 sdir = toLight / dToLight;
+                    int sSteps = (int)clamp(BeamShadowSteps, 1.0, 16.0);
+                    float sdt = dToLight / (float)sSteps;
+                    float biasBase = max(BeamShadowBias, 0.0);
+                    bool sOccluded = false;
+                    [loop]
+                    for (int j = 0; j < 16; ++j)
+                    {
+                        if (j >= sSteps) { break; }
+                        // Per-step offset: (j+1) * sdt is the linear step distance from wp
+                        // toward bo; subtract the bias to avoid self-occlusion on the very
+                        // first step landing on the shaft sample's own screen pixel.
+                        float sj = sdt * ((float)j + 1.0) - biasBase;
+                        if (sj <= 0.0) { continue; }
+                        // Clamp the march distance so a far-away occluder BEHIND the light
+                        // can't falsely shadow the shaft (per the v1.0.96 spec).
+                        if (sj >= dToLight) { break; }
+                        float3 sp = wp + sdir * sj;
+                        // sp - ro: absolute world -> camera-relative (translated world). UE
+                        // 5.7's ResolvedView.TranslatedWorldToClip expects translated input.
+                        float3 spRel = sp - ro;
+                        float4 clipP = mul(float4(spRel, 1.0), ResolvedView.TranslatedWorldToClip);
+                        if (clipP.w <= 0.001) { continue; }
+                        float2 ndc = clipP.xy / clipP.w;
+                        // Off-screen step -> can't sample the depth buffer, skip.
+                        if (any(abs(ndc) > 1.0)) { continue; }
+                        // NDC -> UV (UE Y is flipped relative to NDC).
+                        float2 uv = ndc * float2(0.5, -0.5) + 0.5;
+                        // SceneDepth at uv is linear camera-Z in cm; clip.w in UE perspective
+                        // projection is also camera-Z, so the comparison is consistent.
+                        float sd = CalcSceneDepth(uv);
+                        float stepBias = 0.01 * sdt; // per-step robust-mode bias (cm)
+                        if (sd + stepBias < clipP.w) { sOccluded = true; break; }
+                    }
+                    if (sOccluded)
+                    {
+                        shadowAtten = max(1.0 - BeamShadowStrength, 0.0);
+                    }
+                }
+            }
+            float d = BeamDensity * core * widthNorm * srcAtten * nf * softOcc * shadowAtten;
             float a = 1.0 - exp(-d * dt);
             trans *= (1.0 - a);
         }
@@ -465,10 +552,18 @@ def _build_beam_master(mat):
     math matches the procedural mesh exactly. StepCount + BeamDensity tune the march.
 
     Unlit + two-sided + ADDITIVE so it never shows a black card when dark and back faces still draw
-    when the camera is inside (the back wall is the fragment that carries the shaft). Light-BLOCKING
-    volumetric shadows on runtime-imported trusses are NOT done in this
-    shader (runtime glTF meshes have no mesh distance fields, so a material can't trace them) --
-    that is the native VSM fog hybrid on hero beams (see RebusFixtureActor::RefreshBeamShadowMode).
+    when the camera is inside (the back wall is the fragment that carries the shaft).
+
+    v1.0.96: the shader now self-shadows via a SCREEN-SPACE shadow trace per shaft sample (march
+    toward the SpotLight, tap SceneDepth at each step's projected UV; if the depth buffer shows
+    an occluder in front of the step the sample is shadowed -> density attenuated by
+    `1 - BeamShadowStrength`). See the `_BEAM_RAYMARCH_HLSL` doc-comment for the full algorithm
+    + limitations. Mesh-Distance-Field tracing on the runtime glTF-imported truss meshes is
+    documented future work (the imported meshes have no SDFs at runtime, so a material can't
+    DF-trace them). The pre-v1.0.96 hero-beam native VSM fog hybrid (
+    RebusFixtureActor::RefreshBeamShadowMode) is preserved and unchanged -- it carves the
+    SEPARATE soft per-light fog halo, on top of which the v1.0.96 trace carves the crisp
+    cone-mesh shaft.
     """
     mel = unreal.MaterialEditingLibrary
 
@@ -496,20 +591,30 @@ def _build_beam_master(mat):
     beamlen = _scalar("BeamLength", 6000.0, 260)
     lensrad = _scalar("LensRadius", 2.0, 340)
     farrad = _scalar("FarRadius", 1000.0, 420)
+    # v1.0.96 screen-space shadow trace parameters. See the _BEAM_RAYMARCH_HLSL doc-comment for
+    # the full algorithm. BeamShadowSteps is clamped to [1, 16] inside the shader so a runaway
+    # CVar can't blow the per-pixel cost; default 8 is the design point paired with StepCount=32
+    # (32 * 8 = 256 SceneDepth taps per beam pixel). BeamShadowStrength = 1 means "fully shadow
+    # any sample whose shadow ray hits an occluder" -- 0 disables the trace via the
+    # `if (BeamShadowStrength > 0.001) [branch]` gate in the shader. BeamShadowBias is the
+    # additive cm tolerance used to skip the shaft sample's own pixel as its own occluder.
+    shadowsteps = _scalar("BeamShadowSteps", 8.0, 500)
+    shadowstrength = _scalar("BeamShadowStrength", 1.0, 580)
+    shadowbias = _scalar("BeamShadowBias", 0.5, 660)
 
-    beamorigin = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 500)
+    beamorigin = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 740)
     beamorigin.set_editor_property("parameter_name", "BeamOrigin")
     beamorigin.set_editor_property("default_value", unreal.LinearColor(0.0, 0.0, 0.0, 0.0))
 
-    beamdir = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 580)
+    beamdir = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 820)
     beamdir.set_editor_property("parameter_name", "BeamDir")
     beamdir.set_editor_property("default_value", unreal.LinearColor(1.0, 0.0, 0.0, 0.0))
 
     # ---- Scene/view inputs (engine nodes) ----
-    campos = mel.create_material_expression(mat, unreal.MaterialExpressionCameraPositionWS, -1100, 680)
-    pixelpos = mel.create_material_expression(mat, unreal.MaterialExpressionWorldPosition, -1100, 760)
-    scenedepth = mel.create_material_expression(mat, unreal.MaterialExpressionSceneDepth, -1100, 840)
-    pixeldepth = mel.create_material_expression(mat, unreal.MaterialExpressionPixelDepth, -1100, 920)
+    campos = mel.create_material_expression(mat, unreal.MaterialExpressionCameraPositionWS, -1100, 900)
+    pixelpos = mel.create_material_expression(mat, unreal.MaterialExpressionWorldPosition, -1100, 980)
+    scenedepth = mel.create_material_expression(mat, unreal.MaterialExpressionSceneDepth, -1100, 1060)
+    pixeldepth = mel.create_material_expression(mat, unreal.MaterialExpressionPixelDepth, -1100, 1140)
 
     # ---- Custom raymarch node ----
     custom = mel.create_material_expression(mat, unreal.MaterialExpressionCustom, -500, 100)
@@ -522,6 +627,8 @@ def _build_beam_master(mat):
         "BeamColor", "BeamIntensity", "BeamSharpness", "BeamFalloff",
         "StepCount", "BeamDensity", "BeamOrigin", "BeamDir",
         "BeamLength", "LensRadius", "FarRadius",
+        # v1.0.96 screen-space shadow trace inputs.
+        "BeamShadowSteps", "BeamShadowStrength", "BeamShadowBias",
     ]
     custom_inputs = []
     for n in input_names:
@@ -535,6 +642,7 @@ def _build_beam_master(mat):
         "BeamColor": color, "BeamIntensity": intensity, "BeamSharpness": sharp, "BeamFalloff": falloff,
         "StepCount": stepcount, "BeamDensity": density, "BeamOrigin": beamorigin, "BeamDir": beamdir,
         "BeamLength": beamlen, "LensRadius": lensrad, "FarRadius": farrad,
+        "BeamShadowSteps": shadowsteps, "BeamShadowStrength": shadowstrength, "BeamShadowBias": shadowbias,
     }
     for n in input_names:
         mel.connect_material_expressions(src_for[n], "", custom, n)
@@ -559,10 +667,42 @@ def _build_beam_master(mat):
     mel.recompile_material(mat)
 
 
+def _beam_master_has_shadow_steps(master):
+    """v1.0.96 self-heal probe -- True when the on-disk master is the v1.0.96 version that
+    exposes the screen-space shadow trace parameter set (`BeamShadowSteps` + `BeamShadowStrength`
+    + `BeamShadowBias` scalars). Pre-v1.0.96 masters lack these scalars and need a force-regen
+    so the per-fixture MID picks up the new Custom HLSL node + parameter contract on the next
+    editor launch. Mirrors v1.0.86's `_master_has_tiling_meters` pattern exactly.
+    """
+    try:
+        info = unreal.MaterialEditingLibrary.get_scalar_parameter_names(master)
+    except Exception:  # noqa: BLE001
+        return False
+    names = [str(n) for n in info]
+    return ("BeamShadowSteps" in names
+            and "BeamShadowStrength" in names
+            and "BeamShadowBias" in names)
+
+
 def ensure_beam_material(force=False):
     """Generate the faux-volumetric beam master material. Idempotent (only creates when missing)
-    unless force=True (delete + regenerate, e.g. during a full build())."""
+    unless force=True (delete + regenerate, e.g. during a full build()).
+
+    v1.0.96 self-heal: when an EXISTING master is on disk but is missing the v1.0.96 screen-
+    space shadow trace parameter contract (no `BeamShadowSteps`/`BeamShadowStrength`/
+    `BeamShadowBias` scalars), promote the call to a force-regen so the C++ MID push picks up
+    the new shape on the next launch -- log a Warning so the change is auditable. Mirrors
+    v1.0.86 (`_master_has_tiling_meters`) and v1.0.93 (`_fixture_lens_master_is_current`).
+    """
     tools = unreal.AssetToolsHelpers.get_asset_tools()
+
+    if not force and unreal.EditorAssetLibrary.does_asset_exist(BEAM_PATH):
+        existing = unreal.EditorAssetLibrary.load_asset(BEAM_PATH)
+        if existing is not None and not _beam_master_has_shadow_steps(existing):
+            unreal.log_warning("RebusBaseLevel: pre-v1.0.96 M_RebusBeam detected "
+                               "(missing BeamShadowSteps/BeamShadowStrength/BeamShadowBias); "
+                               "regenerating with screen-space shadow trace.")
+            force = True
 
     if force and unreal.EditorAssetLibrary.does_asset_exist(BEAM_PATH):
         unreal.EditorAssetLibrary.delete_asset(BEAM_PATH)

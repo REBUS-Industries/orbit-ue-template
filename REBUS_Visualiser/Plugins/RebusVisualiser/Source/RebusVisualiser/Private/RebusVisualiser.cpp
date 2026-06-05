@@ -44,6 +44,7 @@ namespace
 	IConsoleCommand* GOverrideTrussMaterialCommand = nullptr;
 	IConsoleCommand* GSetGroundTilingCommand = nullptr;
 	IConsoleCommand* GDumpFixtureIesCommand = nullptr;
+	IConsoleCommand* GBeamShadowCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -792,6 +793,72 @@ namespace
 		}
 	}
 
+	// v1.0.96 -- `Rebus.BeamShadow [0|1]` master toggle for the M_RebusBeam screen-space shadow
+	// trace. Mirrors the operator's mental model of "is the shaft self-shadowing on or off?"
+	// without losing the tuned strength: OFF saves the live `Rebus.BeamShadowStrength` value
+	// into a file-static prior and forces strength = 0 (which the shader's `[branch] if (...)`
+	// gate takes the whole trace out of the per-pixel cost for); ON restores the saved prior
+	// (default 1.0 on a fresh launch where the toggle's never been touched). Both transitions
+	// route through the existing `Rebus.BeamShadowStrength` CVar so the refresh sink walks
+	// every fixture exactly once.
+	//
+	// Why a CONSOLE COMMAND (not a CVar): the binary semantics (save/restore the underlying
+	// float) need a custom handler. Pure-CVar bools can't store the prior value, and a
+	// CVar-on-CVar dependency would race with portal-driven strength pushes. The command
+	// pattern matches v1.0.47 `Rebus.MeshBeams` and keeps the state self-contained.
+	float GBeamShadowPriorStrength = 1.f; // last non-zero strength captured by `Rebus.BeamShadow 0`
+	void HandleBeamShadowCommand(const TArray<FString>& Args)
+	{
+		IConsoleVariable* StrengthCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowStrength"));
+		if (!StrengthCVar)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.BeamShadow: Rebus.BeamShadowStrength CVar not registered yet (fixture module not loaded?); no-op."));
+			return;
+		}
+
+		// No arg / "status" -> diagnostic only, never mutates state. Returns the live strength
+		// + the saved prior so the operator can see at a glance which one would land on the
+		// next `Rebus.BeamShadow 1`.
+		const bool bArgGiven = Args.Num() > 0;
+		const float LiveStrength = StrengthCVar->GetFloat();
+		if (!bArgGiven || (Args.Num() > 0 && Args[0].Equals(TEXT("status"), ESearchCase::IgnoreCase)))
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.BeamShadow status: live Rebus.BeamShadowStrength=%.3f (savedPrior=%.3f). "
+					 "Use `Rebus.BeamShadow 0` to disable (strength -> 0; saves prior). "
+					 "Use `Rebus.BeamShadow 1` to enable (restores prior, default 1.0)."),
+				LiveStrength, GBeamShadowPriorStrength);
+			return;
+		}
+
+		const bool bEnable = ParseBoolArg(Args, true);
+		if (!bEnable)
+		{
+			// OFF -- save the live strength (only when it's non-zero so a double-off doesn't
+			// clobber the prior with 0) then force strength to 0. The CVar's refresh sink
+			// walks every fixture and re-pushes the new value through `RefreshBeamShadowParams`.
+			if (LiveStrength > 0.001f)
+			{
+				GBeamShadowPriorStrength = LiveStrength;
+			}
+			StrengthCVar->Set(TEXT("0.0"), ECVF_SetByConsole);
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.BeamShadow 0: master OFF -- Rebus.BeamShadowStrength %.3f -> 0.0 (saved prior=%.3f for next ON)."),
+				LiveStrength, GBeamShadowPriorStrength);
+		}
+		else
+		{
+			// ON -- restore the saved prior. If the operator never touched the toggle the
+			// prior is the v1.0.96 default (1.0), so a first-time ON lands a sensible value.
+			const float Restore = (GBeamShadowPriorStrength > 0.001f) ? GBeamShadowPriorStrength : 1.0f;
+			StrengthCVar->Set(*FString::SanitizeFloat(Restore), ECVF_SetByConsole);
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.BeamShadow 1: master ON -- Rebus.BeamShadowStrength %.3f -> %.3f (restored prior)."),
+				LiveStrength, Restore);
+		}
+	}
+
 	// v1.0.47: `Rebus.MeshBeams [0|1]` -- live toggle for the visible Epic beam canvas, so you can
 	// A/B against the SpotLight's VSM-shadowed fog beam (the source of the truss-gap shafts inside
 	// the cone). Routes through URebusSceneSettingsSubsystem::SetMeshBeamsEnabled, which mirrors
@@ -1065,6 +1132,24 @@ void FRebusVisualiserModule::StartupModule()
 			 "VSM-shadowed fog beam, which is what carves the truss-gap shafts). "
 			 "Usage: Rebus.MeshBeams [0|1]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleMeshBeamsCommand),
+		ECVF_Default);
+
+	// v1.0.96 -- screen-space shadow trace master toggle. Paired with the `Rebus.BeamShadowSteps`
+	// + `Rebus.BeamShadowStrength` CVars defined in RebusFixtureActor.cpp; the toggle saves/
+	// restores the strength so flicking the master off doesn't lose the operator's tuned value.
+	// See the HandleBeamShadowCommand doc-comment for the save/restore semantics.
+	GBeamShadowCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.BeamShadow"),
+		TEXT("v1.0.96 -- master toggle for the M_RebusBeam screen-space shadow trace. "
+			 "`Rebus.BeamShadow 0` forces Rebus.BeamShadowStrength to 0 (the shader's "
+			 "`[branch] if (BeamShadowStrength > 0.001)` gate then takes the whole trace OUT of "
+			 "the per-pixel cost) and saves the prior strength. `Rebus.BeamShadow 1` restores "
+			 "the saved prior (default 1.0 on a fresh launch). No arg / `status` logs the live "
+			 "strength + saved prior without mutating either. Pair with `Rebus.BeamShadowSteps "
+			 "<n>` (default 8, clamp [1,16]) and `Rebus.BeamShadowStrength <0..1>` (default 1.0) "
+			 "for tuning. See the README v1.0.96 release block for the algorithm + limitations. "
+			 "Usage: Rebus.BeamShadow [0|1|status]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleBeamShadowCommand),
 		ECVF_Default);
 
 	GDumpFixtureLightsCommand = IConsoleManager::Get().RegisterConsoleCommand(
@@ -1377,6 +1462,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GDumpFixtureIesCommand);
 		GDumpFixtureIesCommand = nullptr;
+	}
+	if (GBeamShadowCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GBeamShadowCommand);
+		GBeamShadowCommand = nullptr;
 	}
 	// v1.0.73 / v1.0.78: restore both CVar packs to their snapshotted values so a hot-reload
 	// of the module doesn't leak a permanent override into the engine session. Both packs
