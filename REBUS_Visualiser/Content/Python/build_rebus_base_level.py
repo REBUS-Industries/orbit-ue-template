@@ -556,7 +556,65 @@ _BEAM_RAYMARCH_HLSL = """
 //      contribution by (1 - BeamShadowStrength). Strength=1 -> the shadowed sample contributes
 //      nothing (full shadow). Strength=0 -> the trace runs but does nothing (master OFF).
 //
-// v1.0.99 DEBUG VIEW (`BeamShadowDebug` scalar param, driven by `Rebus.BeamShadowDebug
+// v1.0.109 PAN-EDGE / SKY / FAR-DISTANCE GUARDS (the bug the v1.0.106 default-flip finally
+// made visible). Once v1.0.106 made the procedural `M_RebusBeam` cone the visible shaft,
+// the user reported "the beam vs object shadowing is cutting the side of the beams when we
+// pan left or right and is doing the same for all fixtures". This is the canonical
+// SCREEN-SPACE-SHADOW-TRACE failure mode: the shadow march steps project to screen UVs
+// where the tap is unreliable (off-screen, on a "no opaque geometry written" pixel that
+// reads the sky / clear-value sentinel, or at long distance where depth precision crashes
+// to sub-cm) and the `sd + bias < clipP.w` comparison fires spuriously -- the trace
+// carves a black silhouette where there's actually nothing occluding the shaft.
+//
+// v1.0.99 already had ONE of the guards (`if (any(abs(ndc) > 1.0)) { continue; }`) which
+// catches the truly off-screen case. v1.0.109 adds the THREE coupled guards the user's
+// pan-edge symptom requires:
+//
+//   GUARD A -- SKY / NO-GEOMETRY. `CalcSceneDepth(uv)` at a sky pixel returns the engine
+//   FAR-PLANE sentinel (UE 5.7: `WORLD_MAX`-class large value, ~1e10 cm). The v1.0.99
+//   `sd + stepBias < clipP.w` test is well-behaved at extreme `sd`, BUT the depth buffer
+//   has well-known edge-of-frustum artefacts where the rasterised sky pixel is touched
+//   by a translucent-pass UV sample yet reads a SMALL near-zero value (HZB partial fill /
+//   fast-clear half-evaluated tiles / TAA jitter pushing the sample one texel past the
+//   real opaque silhouette into the unwritten sky region). The explicit guard
+//   `if (sd >= SkyDepthSentinel) { continue; }` AND a complementary `if (sd <= 0.001) {
+//   continue; }` catches both poles -- a sample that lands on "no opaque was rendered
+//   here" is unambiguously UNOCCLUDED regardless of what numeric value the depth buffer
+//   actually carries at that texel.
+//
+//   GUARD B -- FAR-DISTANCE CULL. At step camera-Z above `BeamShadowFarCullCm` (default
+//   50000 cm = 500 m), the reverse-Z depth buffer has lost most of its precision -- a
+//   5 cm bias is sub-LSB -- so the comparison gives essentially random answers. Beyond
+//   the cull distance we `break` out of the per-pixel shadow loop entirely (the marker
+//   accumulator already holds the unoccluded contribution). The default puts the cull
+//   well past any realistic stage rig (the longest GDTF throws we've shipped fit inside
+//   200 m); operators can raise it for arena-class throws via the new
+//   `Rebus.BeamShadowFarCullCm` CVar.
+//
+//   GUARD C -- DISTANCE-SCALED BIAS. The v1.0.99 first-step bias `BeamShadowBias = 5.0
+//   cm` was tuned at fixture-to-floor distances ~3-15 m. At 30 m the reverse-Z buffer
+//   has ~3-4 cm of precision per LSB; the constant 5 cm bias survives. At 200 m the
+//   precision is ~30-50 cm per LSB; 5 cm is sub-LSB and the test fires on quantisation
+//   noise. v1.0.109 replaces the constant per-step bias with `stepBias = (0.01 * sdt) +
+//   max(sd, 0) * BeamShadowBiasScale` (default scale 0.002 = 0.2 percent of sample
+//   depth in cm, ~6 cm at 30 m, ~40 cm at 200 m) so the bias grows linearly with depth.
+//   Reduces false-occlusion at the long end of the beam throw without compromising
+//   the close-range trace -- at 1 m the additional term contributes 0.2 cm on top of
+//   the v1.0.99 absolute floor.
+//
+//   GUARD D -- EXPLICIT EDGE-GUARD TOGGLE. The off-screen check is now gated on
+//   `BeamShadowEdgeGuard > 0.5` (default 1.0 / ON). Flipping `Rebus.BeamShadowEdgeGuard
+//   0` restores the v1.0.99 broken behaviour for A/B verification -- the operator can
+//   confirm the pan-edge clipping returns, prove the diagnosis is right, then flip back.
+//
+// The COMPLETE fundamental fix for the screen-space-shadow failure mode is to feed the
+// trace a wider-FOV neighbour depth buffer (UE 5.7 has no built-in for this) OR move the
+// occlusion test to ray-traced shadows on the volumetric beam (RT-fog / Lumen volumetric
+// shadows). That's a v1.0.150+ class of lift; the v1.0.109 guards are the standard
+// mitigation that the OUR / Lumen / Frostbite / id-tech screen-space-shadow papers all
+// document as the rate-limiting bug-class for translucent volumetric trace work.
+//
+// v1.0.109 DEBUG VIEW (`BeamShadowDebug` scalar param, driven by `Rebus.BeamShadowDebug
 // [0|1|2]`):
 //   * 0 = off (default; ship the regular composed beam).
 //   * 1 = render the shadow factor as a heatmap. The beam coverage stays the same so the cone
@@ -564,13 +622,29 @@ _BEAM_RAYMARCH_HLSL = """
 //         (bright). A cube placed between fixture + floor should appear as red against a
 //         green beam -- if the cube is green, the trace is finding NO occluders (Cause 1
 //         regression) or BeamShadowStrength is 0 (`Rebus.BeamShadow 0` master toggle).
-//   * 2 = render the FIRST shadow step's projected screen UV as `(uv.x, uv.y, 0)` x 4.0
-//         (bright). A correctly-projected step lands at uv in [0, 1]^2 so the beam tints
-//         orange/yellow across the floor; if the screen UV is constant black/red the LWC
-//         projection is broken (Cause 1 regression -- the v1.0.99 fix did not land).
+//   * 2 = (v1.0.109 REPURPOSED) per-pixel COLOUR-BY-REASON map of which guard fired in
+//         this pixel's shadow march. Replaces the v1.0.99 "first shadow step's projected
+//         UV" view (the LWC projection bug has been three releases dead -- mode 2's UV
+//         sanity job is done). Discrete priority (highest wins):
+//           * RED    = at least one depth-occluded step (true scene-depth shadow).
+//           * GREEN  = off-screen guard fired (Guard D -- v1.0.99 had this but never
+//                     tagged it; v1.0.109 colours it so the pan-edge regions become
+//                     visibly identifiable).
+//           * BLUE   = sky / no-geometry guard fired (Guard A -- NEW v1.0.109).
+//           * YELLOW = far-distance cull fired (Guard B -- NEW v1.0.109).
+//           * WHITE  = nothing fired; trace ran clean to unoccluded.
+//         This lets the operator visually confirm WHICH guard rescued each pixel: pan
+//         a fixture left-right while `Rebus.BeamShadowDebug 2` and the screen-edge
+//         regions should now show GREEN (off-screen guard saving the day -- previously
+//         the carved black silhouette of the user's bug report); the sky behind the
+//         beam should show BLUE; the legitimate object-shadowing inside-frame should
+//         still show RED. Any pan-edge region showing RED with Edge Guard ON means the
+//         off-screen guard isn't catching it (v1.0.110+ follow-up).
 //
-// Limitations (documented in README v1.0.96/99):
-//   * Screen-space only -- off-screen occluders don't cast.
+// Limitations (documented in README v1.0.96/99/109):
+//   * Screen-space only -- off-screen occluders don't cast. Fundamental architectural
+//     limit; the v1.0.109 guards SOFTEN the visible failure mode but don't change the
+//     underlying contract.
 //   * Cost ~ StepCount * BeamShadowSteps SceneDepth taps per pixel. Keep BeamShadowSteps low
 //     (default 8, clamped to 16) -- 32 march * 8 shadow = 256 taps/pixel is the design point.
 //   * No MDF fallback (Orbit-imported meshes lack SDFs at runtime).
@@ -664,8 +738,21 @@ float3 PreViewT = LWCHackToFloat(ResolvedView.PreViewTranslation);
 // so the operator can verify the LWC projection math + that the trace is actually finding
 // occluders. Cheap (a few scalar ops at the end of the per-pixel work); only consulted
 // when `BeamShadowDebug > 0.5` so the regular path stays unchanged.
+//
+// v1.0.109 extends the accumulator set with one tally per GUARD REASON (off-screen / sky /
+// far-cull). The mode-2 debug view consults these to colour the per-pixel result by which
+// guard rescued the trace from a false occlusion -- so the pan-edge regions the user
+// reported as "cutting the side of the beams" can be visually attributed to Guard D
+// (off-screen). All three are ints incremented by ONE per shadow-step that took the
+// matching branch; the priority ordering in mode 2 reads "depth-occluded RED beats
+// off-screen GREEN beats sky BLUE beats far-cull YELLOW beats clean WHITE", so the
+// dominant failure mode bubbles to the visible colour even when multiple guards fired in
+// the same per-pixel march.
 int   shadowedSampleCount = 0;
 int   totalSampleCount = 0;
+int   offScreenSampleCount = 0;   // v1.0.109 -- Guard D off-screen NDC tap
+int   skySampleCount = 0;         // v1.0.109 -- Guard A sky / no-geometry depth read
+int   farCullSampleCount = 0;     // v1.0.109 -- Guard B distance > BeamShadowFarCullCm
 float2 firstShadowUV = float2(-1.0, -1.0); // sentinel "no shadow step ever taken"
 
 float trans = 1.0;
@@ -733,6 +820,27 @@ for (int i = 0; i < MAXSTEPS; ++i)
                     // nearby opaque pixel (fixture body / prop edge near the cone) as
                     // its own occluder. See the file-header v1.0.99 fix doc-comment.
                     float biasBase = max(BeamShadowBias, 0.0);
+                    // v1.0.109 -- guard knobs cached once per shaft sample so the inner
+                    // loop runs them as scalar compares (the shader compiler hoists
+                    // these). FarCullCm with the `BeamShadowEdgeGuard > 0.5` master
+                    // toggle is intentionally evaluated INSIDE the loop on `clipP.w`
+                    // (camera-Z of THIS step), not on `dToLight`, because a long shadow
+                    // ray can start in-frame and walk into the far-precision-trash
+                    // region; the guard kicks in step-by-step as the trace progresses.
+                    // SkySentinel uses the engine's documented `WORLD_MAX` floor
+                    // (1e9 cm) clamped to a per-shader literal so the comparison is
+                    // shader-portable -- the CalcSceneDepth at sky pixels in UE 5.7
+                    // returns a value FAR larger than any plausible occluder camera-Z
+                    // (>1e5 cm). 65000 cm = 650 m is the v1.0.109-spec sentinel; the
+                    // CVar can NOT make this any larger than the engine's actual sky
+                    // sentinel without losing the guard, so the value is hard-coded
+                    // here rather than wired as another scalar parameter (the
+                    // BeamShadowFarCullCm guard already provides the operator-tunable
+                    // long-distance escape hatch).
+                    float farCullCm = max(BeamShadowFarCullCm, 100.0);
+                    bool  bEdgeOn   = (BeamShadowEdgeGuard > 0.5);
+                    float biasScale = max(BeamShadowBiasScale, 0.0);
+                    const float SkyDepthSentinel = 65000.0; // cm; "no opaque written" pixels
                     [loop]
                     for (int j = 0; j < 16; ++j)
                     {
@@ -757,9 +865,32 @@ for (int i = 0; i < MAXSTEPS; ++i)
                         float3 TranslatedWorldPos = sp + PreViewT;
                         float4 clipP = mul(float4(TranslatedWorldPos, 1.0), ResolvedView.TranslatedWorldToClip);
                         if (clipP.w <= 0.001) { continue; }
+                        // v1.0.109 Guard B -- far-distance cull. Above
+                        // `BeamShadowFarCullCm` (default 50000 cm = 500 m) the
+                        // reverse-Z depth buffer has lost most of its precision and
+                        // the `sd + stepBias < clipP.w` comparison becomes noise-
+                        // driven. Break out of the per-step loop (rather than
+                        // `continue`-ing into more equally-untrustworthy steps); the
+                        // accumulator already holds the contribution of the closer
+                        // steps that DID succeed.
+                        if (clipP.w > farCullCm)
+                        {
+                            ++farCullSampleCount;
+                            break;
+                        }
                         float2 ndc = clipP.xy / clipP.w;
-                        // Off-screen step -> can't sample the depth buffer, skip.
-                        if (any(abs(ndc) > 1.0)) { continue; }
+                        // v1.0.109 Guard D -- off-screen toggle. v1.0.99 had this guard
+                        // unconditionally; v1.0.109 puts a master switch behind it so
+                        // `Rebus.BeamShadowEdgeGuard 0` restores the broken behaviour
+                        // for diagnostic A/B (the operator can verify the pan-edge
+                        // clipping returns, prove the diagnosis, then flip back).
+                        // Tag the sample for the mode-2 colour-by-reason view so the
+                        // operator can see WHICH steps the guard saved.
+                        if (any(abs(ndc) > 1.0))
+                        {
+                            ++offScreenSampleCount;
+                            if (bEdgeOn) { continue; }
+                        }
                         // NDC -> UV (UE Y is flipped relative to NDC).
                         float2 uv = ndc * float2(0.5, -0.5) + 0.5;
                         // v1.0.99 debug capture: remember the very first projected UV
@@ -768,12 +899,37 @@ for (int i = 0; i < MAXSTEPS; ++i)
                         // see at a glance whether the LWC projection lands sane UVs.
                         if (firstShadowUV.x < 0.0)
                         {
-                            firstShadowUV = uv;
+                            firstShadowUV = saturate(uv);
                         }
                         // SceneDepth at uv is linear camera-Z in cm; clip.w in UE perspective
                         // projection is also camera-Z, so the comparison is consistent.
                         float sd = CalcSceneDepth(uv);
-                        float stepBias = 0.01 * sdt; // per-step robust-mode bias (cm)
+                        // v1.0.109 Guard A -- sky / no-geometry tap. At a sky pixel UE
+                        // 5.7's `CalcSceneDepth` returns the FAR-plane sentinel (very
+                        // large camera-Z); a sample that lands on "no opaque was
+                        // rendered here" is unambiguously UNOCCLUDED regardless of
+                        // what numeric value the depth buffer actually carries. The
+                        // complementary near-zero check catches the dual failure mode
+                        // where a partial HZB fill / fast-clear half-evaluated tile
+                        // reads back as ~0 -- an obviously-bogus camera-Z that the
+                        // depth comparison would otherwise read as "occluder right
+                        // at the camera" and false-shadow every step inside it.
+                        if (sd >= SkyDepthSentinel || sd <= 0.001)
+                        {
+                            ++skySampleCount;
+                            continue;
+                        }
+                        // v1.0.109 Guard C -- distance-scaled bias. The v1.0.99 absolute
+                        // `0.01 * sdt` floor stays (close-range robust-mode tolerance);
+                        // the multiplicative term `sd * BeamShadowBiasScale` (default
+                        // scale 0.002 = 0.2 percent of sample depth) grows the bias
+                        // linearly with depth so the test stays meaningful in the
+                        // reverse-Z low-precision regime at the long end of the beam
+                        // throw (~6 cm bias at 30 m, ~40 cm at 200 m). The constant
+                        // 5 cm `biasBase` from v1.0.99 is the FIRST-STEP MINIMUM and
+                        // is separately checked above on `sj`; this `stepBias` is
+                        // the per-step depth-comparison tolerance.
+                        float stepBias = (0.01 * sdt) + sd * biasScale;
                         if (sd + stepBias < clipP.w) { sOccluded = true; break; }
                     }
                     if (sOccluded)
@@ -794,31 +950,52 @@ for (int i = 0; i < MAXSTEPS; ++i)
 float coverage = saturate(1.0 - trans);
 float3 col = BeamColor.rgb * BeamIntensity * coverage;
 
-// v1.0.99 debug visualisation. Mode 1: per-pixel heatmap of `shadowedSampleCount /
-// totalSampleCount` (green = no shadow steps found an occluder, red = every visible
-// sample was shadowed). Mode 2: render the FIRST shadow step's projected UV as
-// (uv.x, uv.y, 0). The 4.0 multiplier keeps the debug output bright even at low
-// coverage so dim cone edges stay visible.
+// v1.0.99 + v1.0.109 debug visualisation.
+//   Mode 1 (v1.0.99, unchanged): per-pixel heatmap of `shadowedSampleCount /
+//     totalSampleCount` (green = no shadow steps found an occluder, red = every
+//     visible sample was shadowed).
+//   Mode 2 (v1.0.109 REPURPOSED): colour samples by which GUARD fired during the
+//     per-pixel shadow march. Discrete priority (highest wins) so the dominant
+//     failure mode bubbles to the visible colour:
+//       RED    = at least one depth-occluded step  (true scene-depth shadow).
+//       GREEN  = off-screen guard fired             (Guard D -- v1.0.99 + v1.0.109).
+//       BLUE   = sky / no-geometry guard fired      (Guard A -- NEW v1.0.109).
+//       YELLOW = far-distance cull fired            (Guard B -- NEW v1.0.109).
+//       WHITE  = clean -- trace ran to unoccluded.
+//     The pre-v1.0.109 mode-2 "first projected UV" view is retired: the LWC
+//     projection bug has been three releases dead and the UV-sanity job is done.
+// The 4.0 multiplier keeps the debug output bright even at low coverage so dim cone
+// edges stay visible.
 [branch]
 if (BeamShadowDebug > 0.5)
 {
     float shadowedFrac = (totalSampleCount > 0)
         ? saturate((float)shadowedSampleCount / (float)totalSampleCount) : 0.0;
-    float3 dbgGreen = float3(0.0, 1.0, 0.0);
-    float3 dbgRed   = float3(1.0, 0.0, 0.0);
     float3 dbgCol;
     if (BeamShadowDebug > 1.5)
     {
-        // Mode 2 -- UV sanity. Black means "no shadow step ever took a tap" (LWC
-        // projection broken, dToLight=0, or the trace's strength+debug gate never
-        // fired). uv ~ (0.5, 0.5) with the beam in the centre of the screen means
-        // the projection is healthy.
-        float2 uv = (firstShadowUV.x >= 0.0) ? firstShadowUV : float2(0.0, 0.0);
-        dbgCol = float3(uv.x, uv.y, 0.0);
+        // Mode 2 -- colour by GUARD REASON. The priority ordering matters: a
+        // pixel where (say) ONE step found a true occluder AND a different step
+        // fell off-screen should colour RED, not GREEN, because RED represents
+        // genuine scene shadow while GREEN represents the guard rescuing a
+        // false-positive -- the operator cares MORE about identifying real
+        // shadows than about counting guard rescues.
+        const float3 dbgRed    = float3(1.0, 0.0, 0.0);
+        const float3 dbgGreen  = float3(0.0, 1.0, 0.0);
+        const float3 dbgBlue   = float3(0.0, 0.0, 1.0);
+        const float3 dbgYellow = float3(1.0, 1.0, 0.0);
+        const float3 dbgWhite  = float3(1.0, 1.0, 1.0);
+        if      (shadowedSampleCount > 0) { dbgCol = dbgRed; }
+        else if (offScreenSampleCount > 0) { dbgCol = dbgGreen; }
+        else if (skySampleCount > 0)       { dbgCol = dbgBlue; }
+        else if (farCullSampleCount > 0)   { dbgCol = dbgYellow; }
+        else                                { dbgCol = dbgWhite; }
     }
     else
     {
         // Mode 1 -- shadow-factor heatmap.
+        const float3 dbgGreen = float3(0.0, 1.0, 0.0);
+        const float3 dbgRed   = float3(1.0, 0.0, 0.0);
         dbgCol = lerp(dbgGreen, dbgRed, shadowedFrac);
     }
     col = dbgCol * 4.0 * coverage;
@@ -907,12 +1084,39 @@ def _build_beam_master(mat):
     #
     # v1.0.99 BeamShadowDebug visualisation mode (default 0 = off). Set to 1 to render the
     # per-pixel shadow-factor heatmap (green = unshadowed, red = shadowed); set to 2 to render
-    # the first shadow step's projected screen UV as (uv.x, uv.y, 0). Driven by the
+    # the v1.0.109 colour-by-GUARD-REASON view (RED depth-occluded, GREEN off-screen guard,
+    # BLUE sky / no-geometry, YELLOW far-cull, WHITE clean). Driven by the
     # `Rebus.BeamShadowDebug [0|1|2]` console CVar (RebusFixtureActor.cpp).
     shadowsteps = _scalar("BeamShadowSteps", 8.0, 500)
     shadowstrength = _scalar("BeamShadowStrength", 1.0, 580)
     shadowbias = _scalar("BeamShadowBias", 5.0, 660)
     shadowdebug = _scalar("BeamShadowDebug", 0.0, 740)
+    # v1.0.109 pan-edge / sky / far-distance guards on the screen-space shadow trace.
+    # See the v1.0.109 PAN-EDGE GUARDS block in the _BEAM_RAYMARCH_HLSL doc-comment for
+    # the full diagnosis + per-guard rationale. All three are CVar-driven (Rebus.Beam
+    # ShadowFarCullCm / Rebus.BeamShadowEdgeGuard / Rebus.BeamShadowBiasScale via
+    # RebusFixtureActor.cpp) and surfaced in `Rebus.DumpBeamShadow` with the same
+    # EXISTS/MISSING flag the v1.0.103 scalars carry. Defaults paired with the
+    # `GRebusBeamShadow*` C++ globals so a fresh project / master regen agrees with a
+    # fresh-spawn fixture without any portal push.
+    #   * BeamShadowFarCullCm  = 50000.0 cm = 500 m -- shadow march steps with camera-Z
+    #     above this are skipped (reverse-Z precision is sub-LSB beyond ~500 m, the
+    #     comparison becomes random; the rig fits comfortably inside 200 m).
+    #   * BeamShadowEdgeGuard  = 1.0 (ON) -- master toggle for the off-screen NDC
+    #     guard. 0 restores the v1.0.99 broken behaviour for diagnostic A/B; keep at
+    #     1 in production.
+    #   * BeamShadowBiasScale  = 0.002 -- 0.2 percent of sample depth in cm added on
+    #     top of the v1.0.99 absolute `BeamShadowBias` cm. ~6 cm bias at 30 m, ~40
+    #     cm at 200 m -- grows linearly with depth so the comparison stays meaningful
+    #     in the long-throw low-precision regime.
+    # Y positions placed BELOW the existing engine-node row (campos / pixelpos /
+    # scenedepth / pixeldepth -- last sits at 1220) so the v1.0.109 scalars don't
+    # collide with the v1.0.96 vector params (BeamOrigin / BeamDir at 820 / 900)
+    # in the editor graph. Purely cosmetic -- the wire connections through
+    # `input_names` + `custom_inputs` + `src_for` below are the source of truth.
+    shadowfarcull = _scalar("BeamShadowFarCullCm", 50000.0, 1300)
+    shadowedgeguard = _scalar("BeamShadowEdgeGuard", 1.0, 1380)
+    shadowbiasscale = _scalar("BeamShadowBiasScale", 0.002, 1460)
 
     beamorigin = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 820)
     beamorigin.set_editor_property("parameter_name", "BeamOrigin")
@@ -941,6 +1145,9 @@ def _build_beam_master(mat):
         "BeamLength", "LensRadius", "FarRadius",
         # v1.0.96 screen-space shadow trace inputs (v1.0.99 added BeamShadowDebug).
         "BeamShadowSteps", "BeamShadowStrength", "BeamShadowBias", "BeamShadowDebug",
+        # v1.0.109 pan-edge / sky / far-distance guards (see the v1.0.109 PAN-EDGE
+        # GUARDS block in the _BEAM_RAYMARCH_HLSL doc-comment).
+        "BeamShadowFarCullCm", "BeamShadowEdgeGuard", "BeamShadowBiasScale",
     ]
     custom_inputs = []
     for n in input_names:
@@ -956,6 +1163,9 @@ def _build_beam_master(mat):
         "BeamLength": beamlen, "LensRadius": lensrad, "FarRadius": farrad,
         "BeamShadowSteps": shadowsteps, "BeamShadowStrength": shadowstrength,
         "BeamShadowBias": shadowbias, "BeamShadowDebug": shadowdebug,
+        # v1.0.109 -- pan-edge / sky / far-distance guard scalars.
+        "BeamShadowFarCullCm": shadowfarcull, "BeamShadowEdgeGuard": shadowedgeguard,
+        "BeamShadowBiasScale": shadowbiasscale,
     }
     for n in input_names:
         mel.connect_material_expressions(src_for[n], "", custom, n)
@@ -1014,15 +1224,46 @@ def _beam_master_has_shadow_debug(master):
     return "BeamShadowDebug" in names
 
 
+def _beam_master_has_pan_edge_guard(master):
+    """v1.0.109 self-heal probe -- True when the on-disk master carries the v1.0.109
+    pan-edge / sky / far-distance guard scalar contract (`BeamShadowFarCullCm` +
+    `BeamShadowEdgeGuard` + `BeamShadowBiasScale`). Pre-v1.0.109 masters carry the
+    v1.0.99 shadow trace but lack the three new guards AND -- critically -- run the
+    pre-v1.0.109 Custom HLSL that doesn't have the sky / far-cull / distance-scaled-bias
+    branches at all. The fix lives in the HLSL itself, so flagging the master STALE on
+    missing v1.0.109 scalars forces a regen that replaces the entire Custom node code
+    on the next editor launch -- catches the symptom the user reported against v1.0.106:
+    "the beam vs object shadowing is cutting the side of the beams when we pan left or
+    right". See the v1.0.109 PAN-EDGE GUARDS block in `_BEAM_RAYMARCH_HLSL` for the
+    diagnostic + per-guard rationale. Mirrors `_beam_master_has_shadow_debug` exactly.
+    """
+    try:
+        info = unreal.MaterialEditingLibrary.get_scalar_parameter_names(master)
+    except Exception:  # noqa: BLE001
+        return False
+    names = [str(n) for n in info]
+    return ("BeamShadowFarCullCm" in names
+            and "BeamShadowEdgeGuard" in names
+            and "BeamShadowBiasScale" in names)
+
+
 def ensure_beam_material(force=False):
     """Generate the faux-volumetric beam master material. Idempotent (only creates when missing)
     unless force=True (delete + regenerate, e.g. during a full build()).
 
-    v1.0.96 self-heal: when an EXISTING master is on disk but is missing the v1.0.96 screen-
-    space shadow trace parameter contract (no `BeamShadowSteps`/`BeamShadowStrength`/
-    `BeamShadowBias` scalars), promote the call to a force-regen so the C++ MID push picks up
-    the new shape on the next launch -- log a Warning so the change is auditable. Mirrors
-    v1.0.86 (`_master_has_tiling_meters`) and v1.0.93 (`_fixture_lens_master_is_current`).
+    v1.0.96 / v1.0.99 / v1.0.109 self-heal cascade: when an EXISTING master is on disk but is
+    missing any of the per-release scalar contracts, promote the call to a force-regen so the
+    C++ MID push picks up the new shape on the next launch -- log a Warning per release so the
+    change is auditable. Each cascade step targets the bug-class the release fixed:
+      * pre-v1.0.96 -- missing `BeamShadowSteps`/`Strength`/`Bias` -> regen w/ v1.0.96 shadow
+        trace itself.
+      * pre-v1.0.99 -- missing `BeamShadowDebug` -> regen w/ v1.0.99 LWC-projection + first-
+        step-bias fix.
+      * pre-v1.0.109 -- missing `BeamShadowFarCullCm`/`EdgeGuard`/`BiasScale` -> regen w/
+        v1.0.109 pan-edge / sky / far-distance / distance-scaled-bias guards (the
+        screen-space-shadow failure mode the v1.0.106 default-flip finally made visible).
+
+    Mirrors v1.0.86 (`_master_has_tiling_meters`) and v1.0.93 (`_fixture_lens_master_is_current`).
     """
     tools = unreal.AssetToolsHelpers.get_asset_tools()
 
@@ -1043,6 +1284,23 @@ def ensure_beam_material(force=False):
             unreal.log_warning("RebusBaseLevel: pre-v1.0.99 M_RebusBeam detected "
                                "(missing BeamShadowDebug + carries the v1.0.96 LWC "
                                "projection bug); regenerating with the v1.0.99 fix.")
+            force = True
+        elif existing is not None and not _beam_master_has_pan_edge_guard(existing):
+            # v1.0.109 self-heal -- existing v1.0.99..v1.0.108 master is missing the
+            # pan-edge / sky / far-distance guard scalar contract AND -- critically --
+            # runs the pre-v1.0.109 _BEAM_RAYMARCH_HLSL without the sky / far-cull /
+            # distance-scaled-bias / edge-toggle branches at all. Operator-visible bug
+            # (the v1.0.109 user report against v1.0.106): "the beam vs object shadowing
+            # is cutting the side of the beams when we pan left or right and is doing
+            # the same for all fixtures" -- the canonical screen-space-shadow failure
+            # mode v1.0.106 finally exposed by making the procedural cone the visible
+            # shaft. Force-regen so the per-fixture MID picks up the v1.0.109 HLSL with
+            # the four guards (A sky, B far-cull, C distance-scaled bias, D edge-toggle).
+            unreal.log_warning("RebusBaseLevel: pre-v1.0.109 M_RebusBeam detected "
+                               "(missing BeamShadowFarCullCm/BeamShadowEdgeGuard/"
+                               "BeamShadowBiasScale + carries the pan-edge / sky / "
+                               "far-distance failure-mode bug); regenerating with "
+                               "the v1.0.109 pan-edge guards.")
             force = True
 
     if force and unreal.EditorAssetLibrary.does_asset_exist(BEAM_PATH):

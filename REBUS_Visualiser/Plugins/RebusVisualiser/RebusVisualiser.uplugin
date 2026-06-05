@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
 	"Version": 1,
-	"VersionName": "1.0.108",
+	"VersionName": "1.0.109",
 	"FriendlyName": "Rebus Visualiser",
 	"Description": "Fixture-control + Pixel Streaming 2 data-channel plugin for the REBUS/ORBIT PRISM Visualiser. Consumes the portal's /api/ue/* REST contract and the bidirectional PS2 data-channel descriptors, drives moving-head fixtures with Speckle/Orbit viewer motion parity, and reports state back to the portal.",
 	"Category": "REBUS",

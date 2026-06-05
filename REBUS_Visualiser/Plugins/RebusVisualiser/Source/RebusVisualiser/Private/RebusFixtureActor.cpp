@@ -232,6 +232,32 @@ float GRebusBeamShadowStrength = 1.f;
 float GRebusBeamShadowBias = 5.f;
 int32 GRebusBeamShadowDebug = 0;
 
+// v1.0.109 -- pan-edge / sky / far-distance guard CVars on the same M_RebusBeam screen-space
+// shadow trace. Push through the same `RefreshBeamShadowParamsOnEveryFixture` sink the
+// v1.0.96 / v1.0.99 trace scalars use so the four-scalar v1.0.99 contract becomes a
+// seven-scalar v1.0.109 contract -- one chokepoint, one log line per flip, no risk of half-
+// pushed state. See the v1.0.109 PAN-EDGE GUARDS block in build_rebus_base_level.py::
+// _BEAM_RAYMARCH_HLSL for the diagnostic + per-guard rationale + the README v1.0.109
+// release block for the operator checklist.
+//
+// Defaults paired with the master's authored defaults so a fresh project / regen agrees
+// with a fresh-spawn fixture without any portal push:
+//   * BeamShadowFarCullCm = 50000.0 cm = 500 m (Guard B). Shadow march steps with
+//     camera-Z beyond this are skipped entirely -- reverse-Z precision is sub-LSB beyond
+//     ~500 m, so the depth comparison gives random answers. The longest realistic stage
+//     throw is ~200 m; the default leaves a 2.5x headroom before the cull kicks in.
+//   * BeamShadowEdgeGuard = 1 (ON; Guard D). Master toggle for the off-screen NDC guard.
+//     0 restores the v1.0.99 broken behaviour so the operator can A/B verify the diagnosis
+//     ("pan-edge clipping returns when 0, stays fixed when 1" is the verification gate).
+//   * BeamShadowBiasScale = 0.002 (Guard C). 0.2 percent of sample depth in cm added to
+//     the per-step depth-comparison tolerance on top of the v1.0.99 absolute floor
+//     (`BeamShadowBias` cm, the FIRST-STEP MINIMUM). At 30 m the added term is ~6 cm,
+//     at 200 m it is ~40 cm -- grows linearly with depth so the test stays meaningful in
+//     the long-throw low-precision regime.
+float GRebusBeamShadowFarCullCm = 50000.f;
+int32 GRebusBeamShadowEdgeGuard = 1;
+float GRebusBeamShadowBiasScale = 0.002f;
+
 // Refresh sink shared by both shadow CVars: walk every Rebus fixture and re-push the new
 // values to the BeamMID. Cheap (a handful of float param sets per fixture); no proxy rebuild
 // needed since these are translucent-shaft scalars only.
@@ -320,16 +346,86 @@ FAutoConsoleVariableRef CVarRebusBeamShadowBias(
 FAutoConsoleVariableRef CVarRebusBeamShadowDebug(
 	TEXT("Rebus.BeamShadowDebug"),
 	GRebusBeamShadowDebug,
-	TEXT("v1.0.99 -- M_RebusBeam screen-space shadow trace debug-view (default 0 = off). "
-		 "1 = shadow-factor heatmap (green=unshadowed, red=shadowed -- a cube placed between "
-		 "fixture + floor should appear red in this view; if the cube is still green, the "
-		 "trace found no occluders). 2 = first shadow-step UV sanity (beam tints by the "
-		 "projected UV; constant near-black means the LWC projection is broken). Live -- "
-		 "changing this walks every Rebus fixture and re-pushes the scalar onto the BeamMID. "
-		 "See the v1.0.99 README release block for the operator checklist."),
+	TEXT("v1.0.99 + v1.0.109 -- M_RebusBeam screen-space shadow trace debug-view (default 0 = "
+		 "off). 1 = shadow-factor heatmap (green=unshadowed, red=shadowed -- a cube placed "
+		 "between fixture + floor should appear red in this view; if the cube is still green, "
+		 "the trace found no occluders). 2 (v1.0.109 REPURPOSED) = per-pixel colour-by-GUARD-"
+		 "REASON: RED depth-occluded, GREEN off-screen guard (Guard D -- the v1.0.109 pan-edge "
+		 "rescue), BLUE sky / no-geometry guard (Guard A), YELLOW far-distance cull (Guard B), "
+		 "WHITE clean. With mode 2, the pan-edge regions of the user's v1.0.106 bug report "
+		 "should now show GREEN -- the off-screen guard is doing its job; if they still show "
+		 "RED with Rebus.BeamShadowEdgeGuard 1, the v1.0.110+ follow-up has work to do. The "
+		 "pre-v1.0.109 mode-2 'first projected UV' view is retired (the LWC projection has "
+		 "been three releases dead). Live -- changing this walks every Rebus fixture and "
+		 "re-pushes the scalar onto the BeamMID. See the v1.0.99 / v1.0.109 README release "
+		 "blocks for the operator checklist."),
 	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
 	{
 		RefreshBeamShadowParamsOnEveryFixture(TEXT("Rebus.BeamShadowDebug"), (float)CVar->GetInt());
+	}),
+	ECVF_Default);
+
+// v1.0.109 -- pan-edge / sky / far-distance guard CVars on the M_RebusBeam screen-space
+// shadow trace. All three push through the same `RefreshBeamShadowParamsOnEveryFixture`
+// sink as the v1.0.96 / v1.0.99 trace scalars (one chokepoint, four-scalar v1.0.99
+// contract becomes seven-scalar v1.0.109). See the v1.0.109 PAN-EDGE GUARDS block in
+// build_rebus_base_level.py::_BEAM_RAYMARCH_HLSL for the diagnostic + per-guard rationale
+// + README v1.0.109 release block for the full operator checklist.
+FAutoConsoleVariableRef CVarRebusBeamShadowFarCullCm(
+	TEXT("Rebus.BeamShadowFarCullCm"),
+	GRebusBeamShadowFarCullCm,
+	TEXT("v1.0.109 -- M_RebusBeam screen-space shadow trace FAR-DISTANCE CULL in cm "
+		 "(default 50000.0 = 500 m). Shadow march steps with camera-Z beyond this are "
+		 "skipped entirely (Guard B) -- reverse-Z precision is sub-LSB beyond ~500 m, the "
+		 "depth comparison gives essentially random answers and the trace fires noise-driven "
+		 "false-occlusions. The default leaves a 2.5x headroom past the longest realistic "
+		 "stage throw (~200 m). Raise for arena-class throws if the operator reports the "
+		 "trace clipping legitimate downrange occluders; lower for tighter rigs to skip "
+		 "more long-distance tap cost. Live -- changing this walks every Rebus fixture and "
+		 "re-pushes the scalar onto the BeamMID; `Rebus.BeamShadowDebug 2` paints YELLOW "
+		 "on pixels where this guard fired."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamShadowParamsOnEveryFixture(TEXT("Rebus.BeamShadowFarCullCm"), CVar->GetFloat());
+	}),
+	ECVF_Default);
+
+FAutoConsoleVariableRef CVarRebusBeamShadowEdgeGuard(
+	TEXT("Rebus.BeamShadowEdgeGuard"),
+	GRebusBeamShadowEdgeGuard,
+	TEXT("v1.0.109 -- M_RebusBeam screen-space shadow trace OFF-SCREEN GUARD master toggle "
+		 "(default 1 = ON). When 1, shadow march steps whose projected UV falls outside "
+		 "[-1, 1]^2 NDC are SKIPPED (Guard D) -- v1.0.99 had this guard unconditionally; "
+		 "v1.0.109 puts the master switch behind it so the operator can A/B verify the fix. "
+		 "Set 0 to restore the v1.0.99 broken behaviour: the pan-edge clipping the user "
+		 "reported against v1.0.106 should return (the canonical screen-space-shadow failure "
+		 "mode where the trace samples sky / undefined depth pixels at the screen edge and "
+		 "concludes 'occluded'). Set back to 1 to confirm the diagnosis -- the clipping "
+		 "should disappear again. Live -- changing this walks every Rebus fixture and "
+		 "re-pushes the scalar onto the BeamMID; `Rebus.BeamShadowDebug 2` paints GREEN on "
+		 "pixels where this guard fired."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamShadowParamsOnEveryFixture(TEXT("Rebus.BeamShadowEdgeGuard"), (float)CVar->GetInt());
+	}),
+	ECVF_Default);
+
+FAutoConsoleVariableRef CVarRebusBeamShadowBiasScale(
+	TEXT("Rebus.BeamShadowBiasScale"),
+	GRebusBeamShadowBiasScale,
+	TEXT("v1.0.109 -- M_RebusBeam screen-space shadow trace DISTANCE-SCALED BIAS multiplier "
+		 "(default 0.002 = 0.2 percent of sample depth in cm). Per-step depth-comparison "
+		 "tolerance = (0.01 * sdt) + sd * BeamShadowBiasScale + `BeamShadowBias` cm (the "
+		 "v1.0.99 absolute floor / FIRST-STEP MINIMUM). At 30 m the added term contributes "
+		 "~6 cm; at 200 m ~40 cm -- grows linearly with depth so the comparison stays "
+		 "meaningful in the reverse-Z low-precision regime at the long end of the beam "
+		 "throw. Raise to 0.003-0.005 if the operator reports the beam shaft self-shadowing "
+		 "at extreme distances despite `BeamShadowEdgeGuard 1`; lower to 0.001 for tighter "
+		 "rigs where the v1.0.99 absolute floor is already sufficient. Live -- the refresh "
+		 "sink walks every Rebus fixture and re-pushes the scalar onto the BeamMID."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamShadowParamsOnEveryFixture(TEXT("Rebus.BeamShadowBiasScale"), CVar->GetFloat());
 	}),
 	ECVF_Default);
 
@@ -1080,23 +1176,27 @@ void ARebusFixtureActor::DumpBeamShadowStateForDebug() const
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("DumpBeamShadow '%s': BeamMID=<null> (M_RebusBeam load failed in BuildBeamCone, "
 				 "or the cone build never ran -- pre-v1.0.99 master self-heal will rebuild on "
-				 "next editor launch). CVars: Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d. "
+				 "next editor launch). CVars: Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d "
+				 "FarCullCm=%.0f EdgeGuard=%d BiasScale=%.4f. "
 				 "Operator action: run `Rebus.RebuildBeamMaterial` (editor only) to regenerate "
 				 "the master, then ClearScene+LoadScene from the portal (or restart the editor) "
 				 "to rebuild the per-fixture BeamMID."),
 			*FixtureId,
 			GRebusBeamShadowSteps, GRebusBeamShadowStrength, GRebusBeamShadowBias,
-			GRebusBeamShadowDebug);
+			GRebusBeamShadowDebug,
+			GRebusBeamShadowFarCullCm, GRebusBeamShadowEdgeGuard, GRebusBeamShadowBiasScale);
 		return;
 	}
 
 	// Read back what's actually on the MID right now AND whether the master declared the
 	// scalar in the first place. SetScalarParameterValue / GetScalar agree on the missing-
-	// param contract: if the master never declared the scalar (pre-v1.0.96 / pre-v1.0.99)
-	// the get returns false. v1.0.103: surface the boolean directly per scalar so an
-	// operator can tell stale-master apart from CVar/MID misconfiguration without grepping
-	// for a -999 sentinel. The float value when missing is still reported (it'll be
+	// param contract: if the master never declared the scalar (pre-v1.0.96 / pre-v1.0.99 /
+	// pre-v1.0.109) the get returns false. v1.0.103: surface the boolean directly per scalar
+	// so an operator can tell stale-master apart from CVar/MID misconfiguration without
+	// grepping for a -999 sentinel. The float value when missing is still reported (it'll be
 	// whatever default the lookup wrote -- usually 0.0) so the column shape stays uniform.
+	// v1.0.109: extends the read-back to the three new pan-edge / sky / far-distance guard
+	// scalars so a stale (pre-v1.0.109) master is named directly in the dump.
 	auto ReadMidScalar = [this](const TCHAR* Name, bool& bOutExists) -> float
 	{
 		float V = 0.f;
@@ -1108,18 +1208,30 @@ void ARebusFixtureActor::DumpBeamShadowStateForDebug() const
 	const float MidStrength = ReadMidScalar(TEXT("BeamShadowStrength"), bStrengthOk);
 	const float MidBias     = ReadMidScalar(TEXT("BeamShadowBias"),     bBiasOk);
 	const float MidDebug    = ReadMidScalar(TEXT("BeamShadowDebug"),    bDebugOk);
+	// v1.0.109 -- pan-edge / sky / far-distance guard scalars (the v1.0.109 contract).
+	bool bFarCullOk = false, bEdgeGuardOk = false, bBiasScaleOk = false;
+	const float MidFarCull   = ReadMidScalar(TEXT("BeamShadowFarCullCm"), bFarCullOk);
+	const float MidEdgeGuard = ReadMidScalar(TEXT("BeamShadowEdgeGuard"), bEdgeGuardOk);
+	const float MidBiasScale = ReadMidScalar(TEXT("BeamShadowBiasScale"), bBiasScaleOk);
 
 	auto Tag = [](bool bOk) -> const TCHAR* { return bOk ? TEXT("EXISTS") : TEXT("MISSING"); };
 
-	// One-line diagnostic. v1.0.103:
+	// One-line diagnostic. v1.0.103/109:
 	//   * "shadowing ENABLED" requires both Strength>0 AND Strength is actually present on
 	//     the master (otherwise the shader is reading the v1.0.96 default of 0). When any
 	//     scalar is MISSING we add a stale-master note + the operator-recovery command.
-	const bool  bAnyMissing    = !(bStepsOk && bStrengthOk && bBiasOk && bDebugOk);
+	//   * v1.0.109: bAnyMissing now ORs the three new guard scalars too -- a pre-v1.0.109
+	//     master shows MISSING on EdgeGuard / FarCullCm / BiasScale and the stale-master
+	//     note then names the v1.0.109 pan-edge fix specifically.
+	const bool  bV99Missing    = !(bStepsOk && bStrengthOk && bBiasOk && bDebugOk);
+	const bool  bV109Missing   = !(bFarCullOk && bEdgeGuardOk && bBiasScaleOk);
+	const bool  bAnyMissing    = bV99Missing || bV109Missing;
 	const bool  bShadowEnabled = bStrengthOk && (MidStrength > 0.001f);
 	const int32 DebugMode      = bDebugOk ? ((MidDebug > 1.5f) ? 2 : ((MidDebug > 0.5f) ? 1 : 0)) : 0;
 	const TCHAR* MasterStaleNote = bAnyMissing
-		? TEXT(" -- STALE MASTER (one or more MID scalars MISSING; the master predates v1.0.99 and the LWC projection fix DID NOT LAND -- the trace runs the broken v1.0.96 shader). Operator action: run `Rebus.RebuildBeamMaterial` (editor only) then ClearScene+LoadScene OR restart the editor")
+		? (bV99Missing
+			? TEXT(" -- STALE MASTER (v1.0.99 scalars MISSING; the master predates v1.0.99 and the LWC projection fix DID NOT LAND -- the trace runs the broken v1.0.96 shader). Operator action: run `Rebus.RebuildBeamMaterial` (editor only) then ClearScene+LoadScene OR restart the editor")
+			: TEXT(" -- STALE MASTER (v1.0.109 pan-edge guard scalars MISSING; the master predates the v1.0.109 sky / far-cull / edge-toggle / distance-scaled-bias fix -- the trace runs the v1.0.99 shader that causes the pan-edge beam clipping the user reported against v1.0.106). Operator action: run `Rebus.RebuildBeamMaterial` (editor only) then ClearScene+LoadScene OR restart the editor"))
 		: TEXT("");
 
 	// v1.0.106 -- report which beam path is currently rendering on this fixture so the
@@ -1140,22 +1252,32 @@ void ARebusFixtureActor::DumpBeamShadowStateForDebug() const
 	// `BeamConeRadiusScale` per-fixture override pattern in `DumpFixtureZoom`).
 	const TCHAR* BeamPath = bUsingEpicBeam ? TEXT("Epic") : TEXT("Procedural");
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("DumpBeamShadow '%s' Beam=%s Prefer=%s MID(Steps=%.1f/%s Strength=%.3f/%s Bias=%.2f/%s Debug=%d/%s) "
-			 "CVars(Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d) -- shadowing %s, debug mode %d%s%s."),
+		TEXT("DumpBeamShadow '%s' Beam=%s Prefer=%s "
+			 "MID(Steps=%.1f/%s Strength=%.3f/%s Bias=%.2f/%s Debug=%d/%s "
+				 "FarCullCm=%.0f/%s EdgeGuard=%d/%s BiasScale=%.4f/%s) "
+			 "CVars(Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d "
+				 "FarCullCm=%.0f EdgeGuard=%d BiasScale=%.4f) "
+			 "-- shadowing %s, debug mode %d%s%s."),
 		*FixtureId, BeamPath, bPreferProceduralBeam ? TEXT("Y") : TEXT("N"),
 		MidSteps, Tag(bStepsOk),
 		MidStrength, Tag(bStrengthOk),
 		MidBias, Tag(bBiasOk),
 		(int32)MidDebug, Tag(bDebugOk),
+		MidFarCull, Tag(bFarCullOk),
+		(int32)MidEdgeGuard, Tag(bEdgeGuardOk),
+		MidBiasScale, Tag(bBiasScaleOk),
 		GRebusBeamShadowSteps, GRebusBeamShadowStrength, GRebusBeamShadowBias, GRebusBeamShadowDebug,
+		GRebusBeamShadowFarCullCm, GRebusBeamShadowEdgeGuard, GRebusBeamShadowBiasScale,
 		bShadowEnabled ? TEXT("ENABLED") : TEXT("DISABLED"),
 		DebugMode, MasterStaleNote,
 		bUsingEpicBeam
-			? TEXT(" -- WARNING: Beam=Epic means the v1.0.96 / v1.0.99 shadow trace is BYPASSED "
-				   "on this fixture (the trace lives on M_RebusBeam, not on M_Beam_Master). The "
-				   "MID column above describes the HIDDEN procedural cone. To make the trace render, "
-				   "flip `Rebus.PreferProceduralBeam 1` (default since v1.0.106) -- the procedural "
-				   "cone becomes the visible shaft. Epic-beam parity for the trace is queued for v1.0.107.")
+			? TEXT(" -- WARNING: Beam=Epic means the v1.0.96 / v1.0.99 / v1.0.109 shadow trace is "
+				   "BYPASSED on this fixture (the trace lives on M_RebusBeam, not on M_Beam_Master). "
+				   "The MID column above describes the HIDDEN procedural cone. To make the trace "
+				   "render, flip `Rebus.PreferProceduralBeam 1` (default since v1.0.106) -- the "
+				   "procedural cone becomes the visible shaft. Epic-beam parity for the trace is "
+				   "queued for v1.0.150+ as a class-of-lift (mirroring the v1.0.96..v1.0.106 work "
+				   "on Epic's M_Beam_Master).")
 			: TEXT(""));
 }
 
@@ -3140,19 +3262,25 @@ void ARebusFixtureActor::UpdateBeamConeGeometry()
 
 void ARebusFixtureActor::RefreshBeamShadowParams()
 {
-	// v1.0.96/99 -- push the screen-space-shadow-trace scalars onto this fixture's BeamMID.
+	// v1.0.96/99/109 -- push the screen-space-shadow-trace scalars onto this fixture's BeamMID.
 	// Safe to call when BeamMID is null (the M_RebusBeam load failed in BuildBeamCone, or this
 	// fixture pre-dates the v1.0.96 self-heal regen): the early return matches the rest of the
 	// MID-push helpers and the CVar refresh sink walks every fixture, including those without
 	// a BeamMID, without crashing.
 	//
-	// v1.0.99: pushes ALL FOUR scalars now -- BeamShadowSteps + BeamShadowStrength were the
-	// v1.0.96 set, BeamShadowBias is now CVar-driven (was hard-coded to 0.5 in v1.0.96),
-	// BeamShadowDebug is the new v1.0.99 debug-view selector. SetScalarParameterValue on a
-	// missing parameter is a silent no-op so the call is safe even when the editor hasn't
-	// yet regenerated the master to v1.0.99 -- the first launch will trigger
-	// `_beam_master_has_shadow_debug` self-heal in `ensure_beam_material`
-	// (build_rebus_base_level.py) and the next refresh will land all four cleanly.
+	// v1.0.99: pushes ALL FOUR v1.0.96/99 scalars -- BeamShadowSteps + BeamShadowStrength were
+	// the v1.0.96 set, BeamShadowBias is now CVar-driven (was hard-coded to 0.5 in v1.0.96),
+	// BeamShadowDebug is the new v1.0.99 debug-view selector.
+	//
+	// v1.0.109: extends the push to the three new pan-edge / sky / far-distance guards
+	// (BeamShadowFarCullCm + BeamShadowEdgeGuard + BeamShadowBiasScale). SetScalarParameter
+	// Value on a missing parameter is a silent no-op so the call is safe even when the editor
+	// hasn't yet regenerated the master to v1.0.109 -- the first launch will trigger
+	// `_beam_master_has_pan_edge_guard` self-heal in `ensure_beam_material`
+	// (build_rebus_base_level.py) and the next refresh will land all SEVEN cleanly. The
+	// v1.0.103 `Rebus.DumpBeamShadow` per-scalar EXISTS/MISSING flag surfaces the pre-
+	// v1.0.109-master case to the operator directly so the silent no-op isn't a silent
+	// regression.
 	if (!BeamMID) return;
 
 	BeamMID->SetScalarParameterValue(TEXT("BeamShadowSteps"),
@@ -3165,6 +3293,24 @@ void ARebusFixtureActor::RefreshBeamShadowParams()
 	// branches on `> 0.5` and `> 1.5` thresholds, so pushing the int verbatim is fine.
 	BeamMID->SetScalarParameterValue(TEXT("BeamShadowDebug"),
 		(float)FMath::Clamp(GRebusBeamShadowDebug, 0, 2));
+
+	// v1.0.109 guard scalars. Clamps mirror the shader-side floors (the HLSL caches
+	// `max(BeamShadowFarCullCm, 100.0)` per shaft sample so a runaway negative push can't
+	// disable the cull entirely; the C++ clamp here keeps the value sane BEFORE the shader's
+	// own floor takes over, so the EXISTS/MISSING dump reflects what the operator pushed
+	// rather than what the shader resolved).
+	BeamMID->SetScalarParameterValue(TEXT("BeamShadowFarCullCm"),
+		FMath::Max(GRebusBeamShadowFarCullCm, 100.f));
+	// EdgeGuard is a 0/1 int on the CVar side, pushed as a float so the shader's
+	// `if (BeamShadowEdgeGuard > 0.5)` gate has unambiguous endpoints.
+	BeamMID->SetScalarParameterValue(TEXT("BeamShadowEdgeGuard"),
+		(float)FMath::Clamp(GRebusBeamShadowEdgeGuard, 0, 1));
+	// BiasScale: 0 disables the multiplicative term (the v1.0.99 absolute floor is then the
+	// only bias source -- equivalent to pre-v1.0.109 behaviour). Upper bound 0.02 (2 percent
+	// of sample depth) is well past useful but stays finite so a 1e6 portal push doesn't
+	// produce a NaN at extreme distances.
+	BeamMID->SetScalarParameterValue(TEXT("BeamShadowBiasScale"),
+		FMath::Clamp(GRebusBeamShadowBiasScale, 0.f, 0.02f));
 }
 
 void ARebusFixtureActor::RefreshBeamRadialParams()

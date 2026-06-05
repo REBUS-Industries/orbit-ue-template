@@ -594,6 +594,222 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Screen-space beam-shadow off-screen + sky + distance guards (fix pan-edge clipping) (v1.0.109).**
+>
+> User report (verbatim):
+>
+> > "the beam vs object shadowing is cutting the side of the beams when we pan left or right and is doing the same for all fixtures"
+>
+> **The five-release arc the v1.0.106 default-flip finally exposed.**
+> v1.0.96 introduced the screen-space self-shadow trace in `M_RebusBeam`'s
+> Custom HLSL. v1.0.99 fixed the LWC projection bug that had every shadow
+> step landing off-screen + introduced the FIRST-STEP MINIMUM bias. v1.0.103
+> shipped diagnostics (`Rebus.DumpBeamShadow` EXISTS/MISSING per scalar +
+> startup probe + runtime regen) on the stale-master hypothesis. v1.0.106
+> made `Rebus.PreferProceduralBeam 1` the default so the procedural cone --
+> which carries the trace -- became the visible shaft (previously Epic's
+> `MI_Beam` canvas had been the visible material since v1.0.43, hiding the
+> v1.0.96..v1.0.103 work entirely). The shadow trace finally rendered on
+> the user's install -- and immediately exposed the v1.0.99 trace's NEXT
+> bug: the canonical SCREEN-SPACE-SHADOW failure mode. When the cone-mesh
+> shaft sweeps across the camera frustum, the per-pixel shadow march taps
+> SceneDepth at projected UVs that are either off-screen, on a "no opaque
+> geometry written" sky pixel that reads the depth-buffer's clear / partial-
+> fill sentinel, or at long camera-Z where reverse-Z precision crashes to
+> sub-cm. The `sd + stepBias < clipP.w` comparison then fires on noise and
+> the trace carves a black silhouette where there's actually nothing
+> occluding the shaft. Visually: the beam shaft is CUT along the screen
+> edges as the operator pans -- exactly the user's report.
+>
+> **Diagnostic note: v1.0.99 already HAD the off-screen guard, but it was
+> the only one.** The v1.0.99 `_BEAM_RAYMARCH_HLSL` carried
+> `if (any(abs(ndc) > 1.0)) { continue; }` as a per-step skip -- which IS
+> correct for the strictly off-screen case. The pan-edge failure is the
+> COMPOUND case: a step that's just-inside the frustum where the depth
+> buffer texel is unreliable (HZB partial fill / fast-clear sentinel /
+> sky reading 0 instead of FAR), OR a downrange step where the reverse-Z
+> bias-vs-depth-precision ratio has flipped negative. The v1.0.99 guard
+> doesn't catch either -- the trace runs into the unreliable-depth pixel
+> with no escape hatch and fires false-occluded. v1.0.109 ships the four
+> coupled guards that the OUR / Lumen / Frostbite / id-tech screen-space-
+> shadow papers all document as the standard mitigation for translucent
+> volumetric trace work:
+>
+> | Guard | Where it fires | What it prevents |
+> | --- | --- | --- |
+> | A -- Sky / no-geometry | `sd >= SkyDepthSentinel` (65000 cm = 650 m) OR `sd <= 0.001` cm | A sky pixel whose depth buffer reads back as 0 (HZB partial fill / fast-clear half-evaluated tile / TAA sample pushing one texel past the silhouette) producing a false "occluder right at the camera". |
+> | B -- Far-distance cull | `clipP.w > BeamShadowFarCullCm` (default 50000 cm = 500 m) | Reverse-Z precision is sub-LSB beyond ~500 m; the `sd + stepBias < clipP.w` comparison gives essentially random answers. v1.0.109 `break`s out of the per-step loop rather than `continue`-ing into more equally-untrustworthy steps. |
+> | C -- Distance-scaled bias | `stepBias = (0.01 * sdt) + sd * BeamShadowBiasScale` (default 0.002) | The v1.0.99 absolute `0.01 * sdt` floor is fine at close range. At long throw (~200 m) the reverse-Z buffer has ~30-50 cm/LSB precision; a constant 5 cm bias is sub-LSB and the test fires on quantisation noise. The multiplicative term grows the bias linearly with depth (~6 cm at 30 m, ~40 cm at 200 m). |
+> | D -- Off-screen toggle | `BeamShadowEdgeGuard > 0.5` master switch around the v1.0.99 `any(abs(ndc) > 1.0)` skip | Lets the operator A/B verify the diagnosis: flip 0 to restore v1.0.99 broken behaviour (pan-edge clipping returns); flip 1 to confirm the fix landed. Defaults to 1 (ON). |
+>
+> **What lands in v1.0.109.**
+>
+> The Python `_BEAM_RAYMARCH_HLSL` Custom node gets the four guards
+> installed in the per-step shadow loop, the per-pixel debug-view
+> accumulators get one tally per guard reason, and the master material gets
+> three new scalar params (`BeamShadowFarCullCm` / `BeamShadowEdgeGuard` /
+> `BeamShadowBiasScale`) wired through the existing `input_names +
+> custom_inputs + src_for` plumbing. The C++ side adds matching CVars +
+> `RefreshBeamShadowParams` push + `Rebus.DumpBeamShadow` EXISTS/MISSING
+> reporting + `URebusVisualiserSubsystem::ProbeBeamMasterAtStartup` extension
+> that distinguishes "pre-v1.0.99" from "pre-v1.0.109" stale-master
+> regimes in the launch-log Warning. The new self-heal probe
+> `_beam_master_has_pan_edge_guard()` mirrors v1.0.96 / v1.0.99 patterns
+> exactly -- when the on-disk master is missing the v1.0.109 scalar
+> contract, `ensure_beam_material()` force-regens with a Warning naming
+> the v1.0.109 fix so an operator who pulls v1.0.109 and opens the editor
+> picks up the corrected HLSL on the first Python-script run.
+>
+> **New CVars (mirror the v1.0.96 / v1.0.99 `Rebus.BeamShadow*` pattern).**
+>
+> | CVar | Default | Recommended range | Notes |
+> | --- | --- | --- | --- |
+> | `Rebus.BeamShadowFarCullCm` | `50000.0` (cm = 500 m) | `20000-200000` | Shadow march steps with camera-Z above this are skipped (Guard B). Raise for arena-class throws if the operator reports the trace clipping legitimate downrange occluders; lower for tighter rigs to skip more long-distance tap cost. |
+> | `Rebus.BeamShadowEdgeGuard` | `1` (ON) | `0-1` | Master toggle for the off-screen NDC guard (Guard D). `0` restores the v1.0.99 broken behaviour for A/B verification; `1` is the v1.0.109 fix in force. |
+> | `Rebus.BeamShadowBiasScale` | `0.002` | `0.001-0.005` | Multiplicative-per-cm bias on top of the v1.0.99 absolute `BeamShadowBias` floor (Guard C). 0.2 percent of sample depth in cm. Raise for tighter false-occlusion control at extreme distances; lower for sharper detection of legitimate close-range occluders. |
+>
+> Each pushes through `RefreshBeamShadowParamsOnEveryFixture` -- the same
+> refresh sink the v1.0.96 / v1.0.99 `Rebus.BeamShadow{Steps,Strength,Bias,
+> Debug}` CVars use. One chokepoint, one log line per flip, no risk of
+> half-pushed state. The v1.0.99 four-scalar shadow contract becomes a
+> v1.0.109 seven-scalar contract; the v1.0.103 EXISTS/MISSING dump shape
+> extends to all seven.
+>
+> **`Rebus.BeamShadowDebug 2` REPURPOSED -- per-pixel colour-by-GUARD-REASON.**
+> The pre-v1.0.109 mode-2 view ("first shadow step's projected screen UV
+> as `(uv.x, uv.y, 0)`") is retired -- the LWC projection bug has been
+> three releases dead and the UV-sanity job is done. v1.0.109 replaces
+> mode 2 with a discrete-priority colour map of which guard fired in
+> each pixel's per-step shadow march:
+>
+> | Colour | Meaning | Operator action |
+> | --- | --- | --- |
+> | **RED** | At least one depth-occluded step (true scene-depth shadow). | None -- this is the trace working as designed. |
+> | **GREEN** | Off-screen guard fired (Guard D -- v1.0.99 + v1.0.109). | None -- this is the v1.0.109 rescue from the pan-edge clipping. The user's "cutting the side of the beams when we pan" regions should paint GREEN under v1.0.109. |
+> | **BLUE** | Sky / no-geometry guard fired (Guard A -- NEW v1.0.109). | None -- the sample landed on a sky pixel. Common at the bottom of arena beams pointing at high ceilings. |
+> | **YELLOW** | Far-distance cull fired (Guard B -- NEW v1.0.109). | If unexpectedly widespread, raise `Rebus.BeamShadowFarCullCm` (the operator's rig may have throws past 500 m). |
+> | **WHITE** | Clean -- trace ran to unoccluded with no guard rescue. | None -- everything's healthy. |
+>
+> Priority ordering matters: a pixel where (say) ONE step found a true
+> occluder AND a different step fell off-screen colours RED, not GREEN,
+> because RED represents genuine scene shadow while GREEN represents the
+> guard rescuing a false-positive -- the operator cares MORE about
+> identifying real shadows than about counting guard rescues.
+>
+> Mode 1 is unchanged (per-pixel `shadowedFraction` heatmap, green=
+> unshadowed, red=shadowed -- the v1.0.99 contract).
+>
+> **What's intentionally NOT fixed in v1.0.109.**
+> Screen-space-shadow remains FUNDAMENTALLY screen-space: off-screen
+> occluders still cannot cast into the shaft (their depth isn't in the
+> depth buffer). The v1.0.109 guards SOFTEN the visible failure mode
+> (pan-edge clipping, sky-bleed, far-distance noise) but the underlying
+> contract is unchanged. The COMPLETE fundamental fix is to feed the
+> trace either (a) a wider-FOV neighbour depth buffer (UE 5.7 has no
+> built-in for this) OR (b) move occlusion to ray-traced shadows on the
+> volumetric beam (RT-fog / Lumen volumetric shadows). That's a v1.0.150+
+> class of lift -- a new shadow architecture, not an iteration on the
+> screen-space trace.
+>
+> **Operator action path (v1.0.109+).**
+>
+> 1. **Default ON does the right thing.** Launch the editor / packaged
+>    build; the default `Rebus.BeamShadowEdgeGuard = 1` plus the new
+>    `Rebus.BeamShadowFarCullCm = 50000.0` and `Rebus.BeamShadowBiasScale
+>    = 0.002` mean the four v1.0.109 guards are live on every fixture from
+>    the first frame. Pan a fixture left-right across the camera FOV; the
+>    beam shaft should remain UNCUT at the screen edges -- the user-
+>    reported pan-edge clipping is resolved.
+>
+> 2. **Read the launch-log Warning.** Search `LogRebusVisualiser` for
+>    `v1.0.109 STALE BEAM MASTER` -- if it appears, the on-disk
+>    `M_RebusBeam` predates v1.0.109 (v1.0.99..v1.0.108 master) and the
+>    pan-edge guards aren't in the shader yet. (If you see
+>    `v1.0.103 + v1.0.109 startup probe: M_RebusBeam carries the v1.0.99
+>    + v1.0.109 parameter contracts` instead, skip to step 5.)
+>
+> 3. **Run `Rebus.RebuildBeamMaterial` from the portal console** (or
+>    in-editor console). The v1.0.103 command invokes
+>    `build_rebus_base_level.ensure_beam_material(force=True)` via
+>    PythonScriptPlugin -- the v1.0.109 `_beam_master_has_pan_edge_guard`
+>    self-heal will pick up the missing scalars and force the regen with
+>    the v1.0.109 HLSL. Expect a `RebusBaseLevel: pre-v1.0.109 M_RebusBeam
+>    detected ... regenerating with the v1.0.109 pan-edge guards` log
+>    line confirming the regen landed.
+>
+> 4. **ClearScene + LoadScene from the portal** (or restart the editor)
+>    so each fixture respawns and `BuildBeamCone` `LoadObject`s the
+>    freshly-regenerated master.
+>
+> 5. **Verify with `Rebus.DumpBeamShadow`.** Every fixture line should
+>    show all SEVEN MID scalars as EXISTS: `Steps=8.0/EXISTS
+>    Strength=1.000/EXISTS Bias=5.00/EXISTS Debug=0/EXISTS
+>    FarCullCm=50000/EXISTS EdgeGuard=1/EXISTS BiasScale=0.0020/EXISTS`.
+>    If any v1.0.109 scalar still shows MISSING the regen + respawn didn't
+>    land -- restart the editor.
+>
+> 6. **Verify visually with `Rebus.BeamShadowDebug 2`.** Pan a fixture
+>    left-right; the pan-edge regions of the beam shaft should paint
+>    GREEN (Guard D -- off-screen guard firing); inside-frame depth
+>    shadows on cubes / props should still paint RED; sky behind the beam
+>    BLUE; downrange-past-500m YELLOW; everything else WHITE. Then
+>    `Rebus.BeamShadowDebug 0` to return to the regular composed beam --
+>    the shaft should remain UNCUT at the screen edges.
+>
+> 7. **A/B verification of the fix.** Push `Rebus.BeamShadowEdgeGuard 0`;
+>    the pan-edge clipping the user reported should RETURN (the v1.0.99
+>    broken behaviour is restored). Push `Rebus.BeamShadowEdgeGuard 1`;
+>    the clipping should disappear again. This proves the v1.0.109
+>    diagnosis is right -- the missing off-screen master toggle was the
+>    rate-limiting guard, NOT a different bug.
+>
+> **Files touched (v1.0.109).**
+>
+> | File | Change |
+> | --- | --- |
+> | `REBUS_Visualiser/Content/Python/build_rebus_base_level.py` | `_BEAM_RAYMARCH_HLSL` -- new file-header `v1.0.109 PAN-EDGE / SKY / FAR-DISTANCE GUARDS` block; new per-pixel accumulators `offScreenSampleCount / skySampleCount / farCullSampleCount`; per-step guard installations (sky / far-cull / edge-toggle / distance-scaled-bias); mode-2 debug visualisation REPURPOSED to colour-by-GUARD-REASON. `_build_beam_master` -- three new scalar params (`BeamShadowFarCullCm` 50000.0, `BeamShadowEdgeGuard` 1.0, `BeamShadowBiasScale` 0.002) wired through `input_names + custom_inputs + src_for`. New `_beam_master_has_pan_edge_guard` self-heal probe; `ensure_beam_material` chain extended with a v1.0.109 force-regen branch. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusFixtureActor.cpp` | New globals `GRebusBeamShadowFarCullCm` / `GRebusBeamShadowEdgeGuard` / `GRebusBeamShadowBiasScale` + three `FAutoConsoleVariableRef` blocks routed through the existing `RefreshBeamShadowParamsOnEveryFixture` sink. `RefreshBeamShadowParams` extended to push all SEVEN scalars now (clamped per the v1.0.109 sane-range spec). `DumpBeamShadowStateForDebug` extended to read back the three new scalars with EXISTS/MISSING flags; the stale-master diagnostic note distinguishes "pre-v1.0.99" (missing Debug) from "pre-v1.0.109" (missing pan-edge guards) and names the right operator recovery for each. The `Rebus.BeamShadowDebug` CVar help text updated to document the v1.0.109 mode-2 repurposing. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp` | `ProbeBeamMasterAtStartup` extended -- when the master carries the v1.0.99 contract but is MISSING `BeamShadowEdgeGuard`, log a `v1.0.109 STALE BEAM MASTER` Warning naming the pan-edge fix specifically (distinct log line from the v1.0.103 "pre-v1.0.99" warning so the operator can grep). Healthy-master log line bumped to mention both v1.0.99 + v1.0.109 contracts. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusVisualiser.cpp` | `HandleDumpBeamShadowCommand` extended -- the CVar header line now surfaces all SEVEN `Rebus.BeamShadow*` knobs in one paste-friendly block. `Rebus.DumpBeamShadow` help text updated for the v1.0.109 scalar set + the v1.0.103-vs-v1.0.109 stale-master distinction. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/RebusVisualiser.uplugin` | `VersionName` bumped `1.0.108` -> `1.0.109`. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/README.md` | This release block. |
+>
+> No engine / `OrbitConnector` / `glTFRuntime` / Epic-DMX-Fixtures asset
+> is touched. The v1.0.96 / v1.0.99 / v1.0.103 / v1.0.106 / v1.0.107 /
+> v1.0.108 lineage is preserved verbatim -- v1.0.109 is strictly additive
+> on the same `M_RebusBeam` Custom HLSL graph (the v1.0.108 radial-
+> sharpness rework on `BeamSharpness` / `BeamDensity` / `BeamFalloff` is
+> orthogonal and untouched).
+>
+> **v1.0.150+ follow-up (off-screen-occluder fundamental fix).** The
+> v1.0.109 guards mitigate the screen-space failure mode but don't
+> change the underlying contract: off-screen occluders still can't cast
+> into the shaft. Two architectural paths investigated for a future
+> release:
+>
+> 1. **Wider-FOV neighbour depth buffer.** Sample a secondary depth pass
+>    rendered at e.g. 1.5x the main camera's FOV. UE 5.7 has no built-in;
+>    would require a custom SceneViewExtension that allocates an off-
+>    screen render target, renders the scene's opaque depth into it at
+>    the wider FOV, and exposes it as a `MaterialParameterCollection`
+>    texture. Cost: roughly one extra opaque pass per beam-rendering
+>    frame; precision: depends on the secondary-FOV resolution. Catches
+>    the canonical case where a hanging truss is just out of the camera
+>    frustum but still blocks the beam-light from reaching the shaft.
+>
+> 2. **Ray-traced shadows on the volumetric beam.** Replace the
+>    screen-space trace with RT volumetric-shadow taps in the same
+>    Custom HLSL. Lumen + RT-shadow context is in flight in UE 5.7+
+>    but the volumetric-fog / translucent-surface integration is
+>    incomplete; would require an engine fork or wait for UE 5.8/5.9.
+>    Cost: hardware RT-shadow tap (~1-3 ms per beam in shipping
+>    titles); precision: full-scene accurate.
+>
+> Path 1 is the more conservative class of lift; Path 2 is the right
+> long-term answer when the engine support matures. Neither is in
+> v1.0.109 scope -- the v1.0.109 guards are the standard mitigation
+> shipping today.
+
 > **Cone-mesh radius + raymarch sharpness match the lit footprint edge (half-intensity geometry) (v1.0.108).**
 >
 > User report (verbatim):

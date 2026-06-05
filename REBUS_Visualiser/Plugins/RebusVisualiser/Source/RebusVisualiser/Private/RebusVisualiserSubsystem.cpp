@@ -202,6 +202,13 @@ void URebusVisualiserSubsystem::ProbeBeamMasterAtStartup()
 		FMaterialParameterInfo(TEXT("BeamShadowStrength")), V);
 	const bool bHasDebug = BeamMaster->GetScalarParameterValue(
 		FMaterialParameterInfo(TEXT("BeamShadowDebug")), V);
+	// v1.0.109 -- also probe for the pan-edge guard scalar contract. A master that carries
+	// the v1.0.99 trace but is missing the v1.0.109 guards is the case the user reported
+	// against v1.0.106 ("the beam vs object shadowing is cutting the side of the beams when
+	// we pan left or right"). Naming the v1.0.109 fix directly in the warning beats forcing
+	// the operator to discover the symptom by trial and error.
+	const bool bHasEdgeGuard = BeamMaster->GetScalarParameterValue(
+		FMaterialParameterInfo(TEXT("BeamShadowEdgeGuard")), V);
 	if (!bHasStrength || !bHasDebug)
 	{
 		UE_LOG(LogRebusVisualiser, Warning,
@@ -221,12 +228,41 @@ void URebusVisualiserSubsystem::ProbeBeamMasterAtStartup()
 			(!bHasStrength && !bHasDebug) ? TEXT("+ ") : TEXT(""),
 			bHasDebug ? TEXT("") : TEXT("BeamShadowDebug"));
 	}
+	else if (!bHasEdgeGuard)
+	{
+		// v1.0.109 -- master is v1.0.99-compatible but predates the pan-edge guard set. The
+		// shadow trace works on the cube-in-middle-of-beam case (the v1.0.99 contract is
+		// intact) but pan-edge clipping returns the moment the operator pans a fixture
+		// laterally across the camera FOV. Different log line so the operator can distinguish
+		// the two stale-master regimes in one grep.
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("v1.0.109 STALE BEAM MASTER detected: M_RebusBeam carries the v1.0.99 trace "
+				 "(BeamShadowStrength + BeamShadowDebug both EXIST) but is MISSING the "
+				 "v1.0.109 pan-edge guard scalar contract (BeamShadowEdgeGuard / FarCullCm / "
+				 "BiasScale). The screen-space shadow trace WILL WORK on cube-in-middle-of-"
+				 "beam occluders (the v1.0.99 contract is intact) but the pan-edge beam "
+				 "clipping the user reported against v1.0.106 ('the beam vs object shadowing "
+				 "is cutting the side of the beams when we pan left or right') WILL RETURN. "
+				 "Operator action: in editor, run `Rebus.RebuildBeamMaterial` (v1.0.103 "
+				 "editor-only runtime regen via PythonScriptPlugin) AND THEN ClearScene+"
+				 "LoadScene from the portal (or restart the editor) so the per-fixture "
+				 "BeamMID picks up the new master with the v1.0.109 sky / far-cull / edge-"
+				 "toggle / distance-scaled-bias guards. Verify with `Rebus.DumpBeamShadow` "
+				 "(every MID scalar including FarCullCm + EdgeGuard + BiasScale should now "
+				 "show EXISTS) and `Rebus.BeamShadowDebug 2` (pan-edge regions should paint "
+				 "GREEN -- the off-screen guard catching the false-occlusion that previously "
+				 "clipped the beam shaft)."));
+	}
 	else
 	{
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("v1.0.103 startup probe: M_RebusBeam carries the v1.0.99 parameter contract "
-				 "(BeamShadowStrength + BeamShadowDebug both EXIST). Screen-space shadow "
-				 "trace is wired correctly; verify visually with `Rebus.BeamShadowDebug 1`."));
+			TEXT("v1.0.103 + v1.0.109 startup probe: M_RebusBeam carries the v1.0.99 + v1.0.109 "
+				 "parameter contracts (BeamShadowStrength + BeamShadowDebug + BeamShadowEdge"
+				 "Guard all EXIST). Screen-space shadow trace is wired correctly and the "
+				 "v1.0.109 pan-edge guards are live; verify visually with `Rebus.BeamShadow"
+				 "Debug 1` (cube-in-beam should be RED) and `Rebus.BeamShadowDebug 2` (pan-"
+				 "edge regions should paint GREEN -- the off-screen guard catching what would "
+				 "have been false-occlusion under v1.0.99)."));
 	}
 }
 

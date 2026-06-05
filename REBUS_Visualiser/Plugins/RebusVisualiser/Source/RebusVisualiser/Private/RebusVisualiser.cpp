@@ -945,16 +945,26 @@ namespace
 	void HandleDumpBeamShadowCommand(const TArray<FString>& /*Args*/)
 	{
 		if (!GEngine) return;
-		IConsoleVariable* StepsCVar    = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowSteps"));
-		IConsoleVariable* StrengthCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowStrength"));
-		IConsoleVariable* BiasCVar     = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowBias"));
-		IConsoleVariable* DebugCVar    = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowDebug"));
+		IConsoleVariable* StepsCVar       = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowSteps"));
+		IConsoleVariable* StrengthCVar    = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowStrength"));
+		IConsoleVariable* BiasCVar        = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowBias"));
+		IConsoleVariable* DebugCVar       = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowDebug"));
+		// v1.0.109 -- pan-edge / sky / far-distance guard CVars surfaced in the header
+		// line so the operator can see every Rebus.BeamShadow* knob in one pasted block.
+		IConsoleVariable* FarCullCVar     = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowFarCullCm"));
+		IConsoleVariable* EdgeGuardCVar   = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowEdgeGuard"));
+		IConsoleVariable* BiasScaleCVar   = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowBiasScale"));
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("DumpBeamShadow CVars: Rebus.BeamShadowSteps=%s Rebus.BeamShadowStrength=%s Rebus.BeamShadowBias=%s Rebus.BeamShadowDebug=%s"),
-			StepsCVar    ? *StepsCVar->GetString()    : TEXT("<unregistered>"),
-			StrengthCVar ? *StrengthCVar->GetString() : TEXT("<unregistered>"),
-			BiasCVar     ? *BiasCVar->GetString()     : TEXT("<unregistered>"),
-			DebugCVar    ? *DebugCVar->GetString()    : TEXT("<unregistered>"));
+			TEXT("DumpBeamShadow CVars: Rebus.BeamShadowSteps=%s Rebus.BeamShadowStrength=%s "
+				 "Rebus.BeamShadowBias=%s Rebus.BeamShadowDebug=%s "
+				 "Rebus.BeamShadowFarCullCm=%s Rebus.BeamShadowEdgeGuard=%s Rebus.BeamShadowBiasScale=%s"),
+			StepsCVar      ? *StepsCVar->GetString()      : TEXT("<unregistered>"),
+			StrengthCVar   ? *StrengthCVar->GetString()   : TEXT("<unregistered>"),
+			BiasCVar       ? *BiasCVar->GetString()       : TEXT("<unregistered>"),
+			DebugCVar      ? *DebugCVar->GetString()      : TEXT("<unregistered>"),
+			FarCullCVar    ? *FarCullCVar->GetString()    : TEXT("<unregistered>"),
+			EdgeGuardCVar  ? *EdgeGuardCVar->GetString()  : TEXT("<unregistered>"),
+			BiasScaleCVar  ? *BiasScaleCVar->GetString()  : TEXT("<unregistered>"));
 
 		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
 		{
@@ -1684,15 +1694,19 @@ void FRebusVisualiserModule::StartupModule()
 	// `Rebus.RebuildBeamMaterial` editor-only runtime regen.
 	GDumpBeamShadowCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Rebus.DumpBeamShadow"),
-		TEXT("v1.0.99 -- dump every Rebus fixture's M_RebusBeam screen-space shadow trace "
-			 "state in one line each: live MID values (Steps/Strength/Bias/Debug as actually "
-			 "read by the per-pixel shader) + global CVar values + a 'shadowing enabled, "
-			 "debug mode N' diagnostic. Use when the operator reports the v1.0.96 shadow "
-			 "trace doesn't appear to work -- the dump proves whether RefreshBeamShadowParams "
-			 "is winning the push race, whether the master is the v1.0.99 shape (Bias+Debug "
-			 "present), and whether the master `Rebus.BeamShadow` toggle is OFF. v1.0.103: "
-			 "MID column now reports EXISTS/MISSING per scalar (was a -999 sentinel) so "
-			 "stale-master is unmistakable -- MISSING means run `Rebus.RebuildBeamMaterial`. "
+		TEXT("v1.0.99 / v1.0.109 -- dump every Rebus fixture's M_RebusBeam screen-space shadow "
+			 "trace state in one line each: live MID values (Steps/Strength/Bias/Debug as "
+			 "actually read by the per-pixel shader, PLUS the v1.0.109 pan-edge guard set "
+			 "FarCullCm/EdgeGuard/BiasScale) + global CVar values + a 'shadowing enabled, "
+			 "debug mode N' diagnostic. Use when the operator reports the shadow trace "
+			 "doesn't appear to work OR the v1.0.109 pan-edge beam clipping returned -- the "
+			 "dump proves whether RefreshBeamShadowParams is winning the push race against "
+			 "any portal override and whether the master scalar contract is the v1.0.109 "
+			 "shape (FarCullCm + EdgeGuard + BiasScale present). v1.0.103: the MID column "
+			 "now reports EXISTS/MISSING per scalar (was a -999 sentinel) so stale-master "
+			 "is unmistakable. v1.0.109: the stale-master note now distinguishes 'pre-"
+			 "v1.0.99' (LWC projection bug, missing Debug) from 'pre-v1.0.109' (pan-edge "
+			 "guards missing). MISSING on any scalar means run `Rebus.RebuildBeamMaterial`. "
 			 "Usage: Rebus.DumpBeamShadow"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpBeamShadowCommand),
 		ECVF_Default);
