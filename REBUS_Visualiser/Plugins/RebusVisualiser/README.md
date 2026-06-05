@@ -594,6 +594,70 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **CameraState delivery diagnostics + first-spawn force-push (v1.0.82).**
+> User: *"we are not seeing the camera data in our portal, we have used the notes you gave us"*.
+>
+> **Diagnosis.** Three plausible failure modes for "portal isn't receiving CameraState":
+>
+> 1. **Cine pawn not spawned yet at handshake.** `TrySendReady` gates on
+>    `bChannelReady && bSceneLoaded && bEnvEnsured` -- it does NOT gate on
+>    `bViewPositioned`. So `bReadySent` (and the handshake's `BroadcastCameraStateIfChanged(force=true)`)
+>    can fire **before** `TryPositionPlayerView` has a `PlayerController` to possess. The
+>    forced broadcast runs against a null pawn and silently no-ops; only the periodic delta
+>    stream remains, and a static camera now sits at its default values so dead-zone
+>    rejection never fires the second-chance send.
+> 2. **No connected viewer at the moment of broadcast.** The PS2 streamer's
+>    `SendAllPlayersMessage` is a no-op when `GetConnectedPlayers().Num() == 0`. The existing
+>    "Sending 'CameraState' (Response, N players)" log line in `RebusDataChannel.cpp` already
+>    reports `N`; if it's `0`, the message went to nobody.
+> 3. **Portal frontend not listening for `type:"CameraState"`.** UE is shipping the event,
+>    but the portal's event router has no handler bound.
+>
+> **Fixes shipped in v1.0.82.**
+>
+> - **First-spawn force-push.** `TryPositionPlayerView` now calls
+>   `BroadcastCameraStateIfChanged(force=true)` immediately after a successful pawn spawn
+>   IF `bReadySent && Channel.IsValid()`. Covers the race in (1) -- the moment the pawn
+>   becomes the view target, the portal gets a complete snapshot.
+> - **Inbound descriptor trace.** Every camera descriptor (Request / SetCamera*) logs
+>   `HandleCameraDescriptor: type='X' pawn=Name|NULL readySent=0|1 channel=0|1`. Single line
+>   per inbound -- portals send these at <30Hz so no spam.
+> - **Pawn-null warning.** If a `SetCamera*` lands before the pawn exists,
+>   `HandleCameraDescriptor` now logs a `Warning` explaining the descriptor was accepted but
+>   had no effect (instead of silently dropping it).
+> - **Broadcaster trace (`Verbose`).** Every actual `SendCameraState` logs the snapshot it
+>   shipped. `Log`-level when something rejected the broadcast (channel null / pawn null on
+>   a forced send).
+>
+> **New console commands.**
+>
+> ```
+> Rebus.CameraStreamStatus
+>   One-shot dump:
+>     - subsystem alive yes/no
+>     - cine pawn alive yes/no (with name)
+>     - live camera snapshot the next broadcast WOULD ship
+>   Pair this with the existing "Sending 'CameraState' (Response, N players)" log to
+>   verify N >= 1 (otherwise no portal will see it).
+>
+> Rebus.SendCameraState
+>   Force one CameraState onto the wire NOW (synthesises a portal-side RequestCameraState).
+>   Use to verify the wire end-to-end without portal cooperation. Read the next "Sending
+>   'CameraState'..." log line to see how many viewers it went to.
+> ```
+>
+> **Operator checklist when the portal still doesn't see CameraState.**
+>
+> 1. Run `Rebus.CameraStreamStatus` -- if `cinePawn=NULL`, the stream physically can't
+>    fire yet. Wait for the level to begin play (the log line `RebusCineCameraPawn spawned +
+>    possessed` confirms it).
+> 2. Run `Rebus.SendCameraState` -- if `Sending 'CameraState' (Response, 0 players)`, the
+>    PS2 streamer has no connected viewer (the portal's data track hasn't opened, or the
+>    `-PixelStreamingID=` token mismatches `streamerId` the portal targets).
+> 3. If `players >= 1` but the portal UI doesn't update, the failure is portal-side. The
+>    event ships as `type:"CameraState"` -- confirm the portal's response listener subscribes
+>    to that exact type string (case-sensitive).
+
 > **Live state stream for every portal-exposed control (v1.0.80).**
 > User asked: *"all the controls we expose to our portal, can these live stream their state, so
 > all the fixture settings are streamed so everything is always in sync"*. Yes. v1.0.80

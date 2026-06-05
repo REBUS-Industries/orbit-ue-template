@@ -38,6 +38,8 @@ namespace
 	IConsoleCommand* GLumenFastResponseCommand = nullptr;
 	IConsoleCommand* GCameraSnapshotCommand = nullptr;
 	IConsoleCommand* GCameraResetCommand = nullptr;
+	IConsoleCommand* GCameraStreamStatusCommand = nullptr;
+	IConsoleCommand* GSendCameraStateCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -314,6 +316,78 @@ namespace
 			return;
 		}
 		Cam->ResetToDefaults();
+	}
+
+	// v1.0.82 helper: pluck the live URebusVisualiserSubsystem from any active world. There
+	// can only be one game-instance subsystem, but we iterate worlds so it works identically
+	// in PIE + packaged.
+	URebusVisualiserSubsystem* FindLiveVisualiserSubsystem()
+	{
+		if (!GEngine) return nullptr;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+			if (UGameInstance* GI = World->GetGameInstance())
+			{
+				if (URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>())
+				{
+					return Viz;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	// v1.0.82 `Rebus.CameraStreamStatus` -- dump the entire camera-stream chain in one log
+	// line so the operator can diagnose "portal isn't receiving CameraState":
+	//   1. Visualiser subsystem alive?     -> if no, no scene was ever started
+	//   2. Cine pawn alive?                 -> if no, TryPositionPlayerView hasn't run yet
+	//   3. Live snapshot of the pawn        -> proves what state WOULD ship out right now
+	// Pair this with the existing data-channel "Sending 'CameraState' (Response, N players)"
+	// log to confirm the message reached the wire AND that there's >=1 connected viewer.
+	void HandleCameraStreamStatusCommand(const TArray<FString>& /*Args*/)
+	{
+		URebusVisualiserSubsystem* Viz = FindLiveVisualiserSubsystem();
+		ARebusCineCameraPawn* Cam = Viz ? Viz->GetCineCameraPawn() : nullptr;
+		if (!Cam) Cam = FindLiveCineCameraPawn(); // fallback in case Viz isn't ready
+
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.CameraStreamStatus: subsystem=%s cinePawn=%s%s"),
+			Viz ? TEXT("ALIVE") : TEXT("NULL (no game world / subsystem)"),
+			Cam ? *Cam->GetName() : TEXT("NULL (TryPositionPlayerView hasn't spawned it yet)"),
+			Cam ? TEXT("") : TEXT(" -- portal will receive zero CameraState until a PlayerController exists."));
+		if (Cam)
+		{
+			const FRebusCameraState S = Cam->GetCameraState();
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.CameraStreamStatus: live snapshot loc=(%.1f,%.1f,%.1f) rot=(P%.2f,Y%.2f,R%.2f) "
+					 "focal=%.1fmm fStop=%.2f focus=%.0fcm ev=%.2f sensor=%.2fx%.2fmm"),
+				S.Location.X, S.Location.Y, S.Location.Z,
+				S.Rotation.Pitch, S.Rotation.Yaw, S.Rotation.Roll,
+				S.FocalLengthMm, S.Aperture, S.FocusDistanceCm, S.ExposureBiasEv,
+				S.SensorWidthMm, S.SensorHeightMm);
+		}
+	}
+
+	// v1.0.82 `Rebus.SendCameraState` -- force one CameraState onto the wire NOW (same as
+	// the portal-side RequestCameraState descriptor). Useful for verifying the data channel
+	// is delivering AT ALL without needing portal cooperation -- if this runs but no one
+	// receives it, the failure is on the PS2 transport (no connected viewer, streamer-id
+	// mismatch, frontend not listening for type:"CameraState"), not the broadcast layer.
+	void HandleSendCameraStateCommand(const TArray<FString>& /*Args*/)
+	{
+		URebusVisualiserSubsystem* Viz = FindLiveVisualiserSubsystem();
+		if (!Viz)
+		{
+			UE_LOG(LogRebusVisualiser, Warning, TEXT("Rebus.SendCameraState: visualiser subsystem null -- can't send."));
+			return;
+		}
+		// Synthesise a RequestCameraState descriptor and route it through the existing handler,
+		// so the diagnostic exactly matches what the portal would trigger.
+		TSharedPtr<FJsonObject> Empty = MakeShared<FJsonObject>();
+		const bool bHandled = Viz->HandleCameraDescriptor(TEXT("RequestCameraState"), Empty);
+		UE_LOG(LogRebusVisualiser, Log, TEXT("Rebus.SendCameraState: dispatched (handled=%d) -- check the next 'Sending CameraState (Response, N players)' line in the log."), (int32)bHandled);
 	}
 
 	// v1.0.75: `Rebus.GoboRTSize <pixels>` -- rebuild every fixture's gobo render target at a
@@ -904,6 +978,28 @@ void FRebusVisualiserModule::StartupModule()
 			 "SetCameraTransform from the portal."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleCameraResetCommand),
 		ECVF_Default);
+
+	// v1.0.82 diagnostics for 'portal not receiving CameraState'.
+	GCameraStreamStatusCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.CameraStreamStatus"),
+		TEXT("Diagnose why the portal isn't receiving CameraState. Logs whether the "
+			 "visualiser subsystem is alive, whether the cine pawn has been spawned by "
+			 "TryPositionPlayerView, and (if it has) what state would ship on the next "
+			 "broadcast. Pair with the data-channel 'Sending CameraState (Response, N "
+			 "players)' log -- if that line says players=0, the issue is no connected "
+			 "viewer, not the broadcast layer."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleCameraStreamStatusCommand),
+		ECVF_Default);
+
+	GSendCameraStateCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.SendCameraState"),
+		TEXT("Force one CameraState onto the data channel right now (synthesises a portal-"
+			 "side RequestCameraState). Use to test the wire end-to-end without portal "
+			 "cooperation: if you see 'Sending CameraState (Response, N players)' in the "
+			 "log but the portal doesn't render the update, the failure is at the portal's "
+			 "event listener (event name mismatch, frontend not subscribed), not in UE."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleSendCameraStateCommand),
+		ECVF_Default);
 }
 
 void FRebusVisualiserModule::ShutdownModule()
@@ -972,6 +1068,16 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GCameraResetCommand);
 		GCameraResetCommand = nullptr;
+	}
+	if (GCameraStreamStatusCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GCameraStreamStatusCommand);
+		GCameraStreamStatusCommand = nullptr;
+	}
+	if (GSendCameraStateCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GSendCameraStateCommand);
+		GSendCameraStateCommand = nullptr;
 	}
 	// v1.0.73 / v1.0.78: restore both CVar packs to their snapshotted values so a hot-reload
 	// of the module doesn't leak a permanent override into the engine session.

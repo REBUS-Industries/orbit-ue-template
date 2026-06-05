@@ -1215,6 +1215,16 @@ bool URebusVisualiserSubsystem::TryPositionPlayerView()
 		}
 		CineCameraPawn = NewPawn;
 		UE_LOG(LogRebusVisualiser, Log, TEXT("RebusCineCameraPawn spawned + possessed (replacing default pawn)."));
+
+		// v1.0.82: TrySendReady doesn't gate on bViewPositioned, so the cine pawn can spawn
+		// AFTER bReadySent flipped (handshake fired with a null pawn -> no initial CameraState
+		// went out). Force-push now that the pawn is finally alive so the portal receives the
+		// initial snapshot without having to send a RequestCameraState or wiggle the camera.
+		if (bReadySent && Channel.IsValid())
+		{
+			UE_LOG(LogRebusVisualiser, Log, TEXT("RebusCineCameraPawn first-spawn after Ready -> forcing initial CameraState broadcast."));
+			BroadcastCameraStateIfChanged(/*bForce*/ true);
+		}
 	}
 
 	if (ARebusCineCameraPawn* Cam = CineCameraPawn.Get())
@@ -1231,6 +1241,27 @@ bool URebusVisualiserSubsystem::HandleCameraDescriptor(const FString& Type, cons
 {
 	if (!Msg.IsValid()) return false;
 
+	// v1.0.82: trace EVERY camera descriptor + the pawn-availability state. Diagnoses the
+	// "I sent SetCameraTransform but nothing happened / no CameraState came back" symptom by
+	// proving (a) the descriptor reached the camera handler, (b) the cine pawn was alive at
+	// the moment of dispatch, and (c) a force-push was scheduled. Cheap (one log line per
+	// inbound command -- portals send these at <30Hz).
+	const bool bIsCamera =
+		Type == TEXT("RequestCameraState") || Type == TEXT("SetCameraTransform") ||
+		Type == TEXT("SetCameraFocalLength") || Type == TEXT("SetCameraAperture") ||
+		Type == TEXT("SetCameraFocusDistance") || Type == TEXT("SetCameraExposure") ||
+		Type == TEXT("SetCameraSensor");
+	if (bIsCamera)
+	{
+		ARebusCineCameraPawn* CamLog = CineCameraPawn.Get();
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("HandleCameraDescriptor: type='%s' pawn=%s readySent=%d channel=%d"),
+			*Type,
+			CamLog ? *CamLog->GetName() : TEXT("NULL"),
+			(int32)bReadySent,
+			(int32)Channel.IsValid());
+	}
+
 	// RequestCameraState is handled even if the pawn isn't ready yet -- we just answer with
 	// a zero snapshot so the portal's UI doesn't freeze waiting for a response that depends
 	// on a still-pending world spawn.
@@ -1246,6 +1277,12 @@ bool URebusVisualiserSubsystem::HandleCameraDescriptor(const FString& Type, cons
 
 	// Everything else needs a live pawn.
 	ARebusCineCameraPawn* Cam = CineCameraPawn.Get();
+	if (bIsCamera && !Cam)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("HandleCameraDescriptor '%s': cine pawn not spawned yet -- descriptor accepted but no effect. Pawn spawns in TryPositionPlayerView once the PlayerController + world exist; retry after stream start, or send RequestCameraState to confirm streaming is live."),
+			*Type);
+	}
 	if (Type == TEXT("SetCameraTransform"))
 	{
 		const TArray<TSharedPtr<FJsonValue>>* LocArr = nullptr;
@@ -1462,9 +1499,18 @@ void URebusVisualiserSubsystem::BroadcastFixtureStatesIfChanged(bool bForce)
 
 void URebusVisualiserSubsystem::BroadcastCameraStateIfChanged(bool bForce)
 {
-	if (!Channel.IsValid()) return;
+	if (!Channel.IsValid())
+	{
+		// Only log on bForce to avoid 30Hz spam when the streamer detaches mid-session.
+		if (bForce) UE_LOG(LogRebusVisualiser, Warning, TEXT("BroadcastCameraStateIfChanged(force=1): Channel not valid -- nothing to send."));
+		return;
+	}
 	ARebusCineCameraPawn* Cam = CineCameraPawn.Get();
-	if (!Cam) return;
+	if (!Cam)
+	{
+		if (bForce) UE_LOG(LogRebusVisualiser, Warning, TEXT("BroadcastCameraStateIfChanged(force=1): cine pawn null -- portal will see zero state. Wait for TryPositionPlayerView to spawn it."));
+		return;
+	}
 
 	const FRebusCameraState S = Cam->GetCameraState();
 
@@ -1481,6 +1527,15 @@ void URebusVisualiserSubsystem::BroadcastCameraStateIfChanged(bool bForce)
 		(S.bManualFocus != LastSentCameraState.bManualFocus);
 
 	if (!bForce && !bMoved) return;
+
+	// v1.0.82: log every actual send (force OR delta). The data channel layer already logs
+	// "Sending 'CameraState' (Response, N players)" with the connected-player count, so this
+	// pair-of-logs lets the operator follow the chain end-to-end: source -> wire -> portal.
+	UE_LOG(LogRebusVisualiser, Verbose,
+		TEXT("BroadcastCameraStateIfChanged: force=%d moved=%d -> SendCameraState (loc=%s rot=%s focal=%.1fmm fStop=%.2f focus=%.0fcm ev=%.2f)"),
+		(int32)bForce, (int32)bMoved,
+		*S.Location.ToString(), *S.Rotation.ToString(),
+		S.FocalLengthMm, S.Aperture, S.FocusDistanceCm, S.ExposureBiasEv);
 
 	Channel->SendCameraState(S);
 	LastSentCameraState.Location     = S.Location;
