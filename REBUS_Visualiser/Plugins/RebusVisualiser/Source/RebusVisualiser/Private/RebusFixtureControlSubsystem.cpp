@@ -495,20 +495,52 @@ void URebusFixtureControlSubsystem::RebindOrbitModels()
 	}
 
 	int32 Matched = 0, Unmatched = 0;
+	int32 SubstringMatched = 0; // v1.0.66: tolerant matches via "tag contains FixtureId"
 	TArray<FString> UnmatchedIds;
+	TArray<FString> SubstringHits; // "fixtureId<-orbitTag" pairs that fired the fallback
 	for (const TPair<FString, TObjectPtr<ARebusFixtureActor>>& Pair : Fixtures)
 	{
 		ARebusFixtureActor* Actor = Pair.Value.Get();
 		if (!Actor) continue;
 		const FString& FixtureId = Pair.Key;
 
-		if (TArray<USceneComponent*>* Found = OrbitIndex.Find(FixtureId))
+		// First try the canonical match (Orbit tag == FixtureId exactly).
+		TArray<USceneComponent*>* Found = OrbitIndex.Find(FixtureId);
+		FString MatchedKey = FixtureId;
+
+		// v1.0.66: fallback -- some glb exports tag components with a PATH or PREFIXED string
+		// that embeds the Speckle node id (e.g. "Light_001/090be834..." or
+		// "MovingHead.090be834..."), so exact equality misses but the fixture id still appears
+		// as a substring of one of the tag strings. We accept the FIRST tag containing it,
+		// preferring exact when both exist (handled by the Find above). Matching is case-
+		// sensitive on purpose -- Speckle node ids are hex digests, so casing is stable; only
+		// surrounding wrapper characters vary across exports.
+		if (!Found && FixtureId.Len() >= 8) // 8-char floor avoids accidental matches on short ids
 		{
-			// (Re)bind only when not already bound to this id with live components -- re-binding
-			// would otherwise re-capture the currently-driven pose as the new "rest" and drift.
-			if (Actor->GetBoundOrbitObjectId() != FixtureId || !Actor->HasOrbitBinding())
+			for (TPair<FString, TArray<USceneComponent*>>& OPair : OrbitIndex)
 			{
-				Actor->BindOrbitComponents(*Found, FixtureId);
+				if (OPair.Key.Contains(FixtureId, ESearchCase::CaseSensitive))
+				{
+					Found = &OPair.Value;
+					MatchedKey = OPair.Key;
+					++SubstringMatched;
+					if (SubstringHits.Num() < 4)
+					{
+						SubstringHits.Add(FString::Printf(TEXT("%s<-'%s'"), *FixtureId, *MatchedKey));
+					}
+					break;
+				}
+			}
+		}
+
+		if (Found)
+		{
+			// (Re)bind only when not already bound to this MATCHED KEY (canonical or substring)
+			// with live components -- re-binding would otherwise re-capture the currently-driven
+			// pose as the new "rest" and drift.
+			if (Actor->GetBoundOrbitObjectId() != MatchedKey || !Actor->HasOrbitBinding())
+			{
+				Actor->BindOrbitComponents(*Found, MatchedKey);
 			}
 			Actor->SetDriveOrbitModel(bDriveOrbitModels);
 			++Matched;
@@ -526,9 +558,33 @@ void URebusFixtureControlSubsystem::RebindOrbitModels()
 	{
 		LastOrbitMatchLogged = Matched;
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("Orbit bind: roots=%d taggedComps=%d distinctObjectIds=%d | fixtures matched=%d unmatched=%d%s%s"),
-			RootCount, TaggedComps, OrbitIndex.Num(), Matched, Unmatched,
+			TEXT("Orbit bind: roots=%d taggedComps=%d distinctObjectIds=%d | fixtures matched=%d (substring=%d) unmatched=%d%s%s"),
+			RootCount, TaggedComps, OrbitIndex.Num(), Matched, SubstringMatched, Unmatched,
 			UnmatchedIds.Num() > 0 ? TEXT(" unmatchedFixtureIds=") : TEXT(""),
 			UnmatchedIds.Num() > 0 ? *FString::Join(UnmatchedIds, TEXT(",")) : TEXT(""));
+
+		// v1.0.66: when at least one fixture is unmatched, dump a sample of the Orbit-side ids
+		// so the user can see WHY exact + substring both missed (likely an id-shape mismatch the
+		// data-pipeline emits -- hashing, base64-vs-hex, completely different namespace, etc.).
+		// Kept on a separate line so the throttled summary above stays grep-friendly.
+		if (Unmatched > 0 && OrbitIndex.Num() > 0)
+		{
+			TArray<FString> Keys; Keys.Reserve(OrbitIndex.Num());
+			for (const TPair<FString, TArray<USceneComponent*>>& OPair : OrbitIndex) { Keys.Add(OPair.Key); }
+			Keys.Sort();
+			const int32 SampleN = FMath::Min(Keys.Num(), 12);
+			TArray<FString> Sample;
+			Sample.Reserve(SampleN);
+			for (int32 i = 0; i < SampleN; ++i) { Sample.Add(Keys[i]); }
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Orbit bind sample orbit-side ids (first %d/%d, lexical): %s"),
+				SampleN, Keys.Num(), *FString::Join(Sample, TEXT(" | ")));
+		}
+		if (SubstringHits.Num() > 0)
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Orbit bind substring-fallback hits (first %d): %s"),
+				SubstringHits.Num(), *FString::Join(SubstringHits, TEXT(" ; ")));
+		}
 	}
 }

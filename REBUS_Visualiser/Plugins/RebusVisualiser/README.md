@@ -593,6 +593,64 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Orbit id-shape diagnostic + substring fallback (v1.0.66).** First v1.0.65 boot in the
+> field surfaced the next-layer-down issue: the matching plumbing works, but the IDs on the two
+> sides don't line up. Log line from the test scene with 4 control-channel fixtures + a populated
+> Orbit import:
+>
+> ```
+> Orbit bind: roots=1 taggedComps=23 distinctObjectIds=25 | fixtures matched=0 unmatched=4
+>   unmatchedFixtureIds=090be834b3d5ddc368799972e799e570,981d1fadb2846bac4555ff9a0b6bacbc,
+>                       9900f25ec38772e1b609351b76fd128f,0bfe4640283e3a8c7f3f94e7878a4b2c
+> ```
+>
+> 23 Orbit components forming 25 distinct tag strings, none of which equal any of the 4 Speckle
+> node ids the portal registered. So `OrbitIndex.Find(FixtureId)` returned null every time. The
+> previous diagnostic told us "they don't match" without telling us what the OTHER side actually
+> looks like, so we couldn't diagnose whether it was a path wrapper, a hash, a totally different
+> namespace, or a casing issue.
+>
+> **What v1.0.66 changes in `RebindOrbitModels`.**
+>
+> 1. **Substring-fallback match.** When exact `OrbitIndex.Find(FixtureId)` misses, we now scan
+>    the Orbit tag strings and accept the first one that CONTAINS the fixture id as a case-
+>    sensitive substring (with an 8-char floor on the fixture id so accidental short-string
+>    matches can't fire). This catches the most common glb-export wrappers we expect: tag of
+>    the form `Light_001/090be834...`, `MovingHead.090be834...`, `/scene/fixtures/090be834...`,
+>    `prefix-090be834...-suffix`, etc. Speckle node ids are hex digests so casing is stable;
+>    only the surrounding decoration varies across exports. When the substring match fires, the
+>    fixture is bound to the components under that *full Orbit tag* (not the bare fixture id),
+>    so subsequent rebinds correctly notice "already bound to this key" and skip rebinding.
+> 2. **Orbit-id sample dump.** When the summary log fires AND any fixture is still unmatched
+>    after the fallback, a second log line dumps the first 12 (lexically sorted) Orbit-side ids
+>    so the actual format mismatch is visible -- no more guessing what the importer wrote:
+>
+>    ```
+>    Orbit bind sample orbit-side ids (first 12/25, lexical): <id-1> | <id-2> | ...
+>    ```
+> 3. **Substring-hit log.** When the fallback DOES match, a third log line names which fixtures
+>    matched which Orbit tag (truncated to the first 4 hits) so you can see at a glance what
+>    wrapper shape the importer is using:
+>
+>    ```
+>    Orbit bind substring-fallback hits (first N): 090be834...<-'Light_001/090be834...' ; ...
+>    ```
+> 4. **Summary line now reports substring count.** `matched=N (substring=M)` so a glance tells
+>    you whether your scene relies on the fallback or the canonical exact-equality match.
+>
+> Why substring rather than a heuristic strip (e.g. split on `/`, take the last token): substring
+> match is the smallest viable change that covers ALL the wrapper shapes we've seen, with zero
+> false positives at 8+ chars of hex (32-char Speckle ids have ~10^38 distinct values; the
+> chance of one accidentally appearing as a substring of an unrelated tag is ~0). If the actual
+> mismatch turns out to be a transformation (base64-vs-hex, or a hash of the Speckle id), the
+> sample-id log dumped in step 2 gives us the evidence to add a targeted normalisation pass.
+>
+> **No portal-contract change.** The portal still sends Speckle node ids; OrbitConnector still
+> tags components however it tags them; v1.0.66 just bridges the two when the importer's tag
+> wraps the id in extra characters. Field test with the existing scene should jump straight from
+> `matched=0` to `matched=N (substring=N)` and the per-update `drove Orbit model ...` log line
+> starts firing for each fixture.
+
 > **Orbit-imported fixtures now move in lockstep with the control channel by default (v1.0.65).**
 > User question after the v1.0.64 focus fix: *"the fixtures that are imported via orbit and not
 > over the control channel. Do these have the same IDs now as the control channel fixtures? if
