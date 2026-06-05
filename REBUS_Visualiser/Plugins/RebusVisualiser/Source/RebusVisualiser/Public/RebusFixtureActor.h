@@ -9,6 +9,23 @@
 //   * a selection highlight via custom-depth stencil (§5.3).
 //
 // The actor is registered under its Speckle node id in URebusFixtureControlSubsystem.
+//
+// v1.0.94 -- LEGACY-PATH-ALWAYS POLICY (`Rebus.AllowMegaLights = 0` by default).
+// Every Rebus SpotLight is opted out of MegaLights at construction (`bAllowMegaLights = 0`)
+// regardless of mode (Epic-beam OR InternalBeam) and regardless of gobo state, so dynamic
+// occluders ALWAYS cast hard shadows in the floor footprint. This was the v1.0.94 fix for
+// "we are not seeing the shadow of an object in the [Epic-beam] footprint" -- MegaLights'
+// tile-clustered shadow path silently drops dynamic occluders below its shadow-fidelity
+// floor on low-end tiers, so a hanging truss / a person / a prop between the fixture and
+// the floor lit up but cast no silhouette. Trade-off: every Rebus SpotLight loses
+// MegaLights' clustering perf -- in show-context rigs (tens-to-hundreds of fixtures) this
+// is the right default because shadow fidelity is non-negotiable for stage visualisation.
+// `SpotLight->CastShadows` is also now ALWAYS asserted true in BuildSpotLight + every
+// RefreshBeamShadowMode call (the pre-v1.0.94 logic cleared it on non-hero non-gobo
+// fixtures as a perf opt -- a SpotLight with CastShadows=false casts NO shadows from any
+// occluder even with MegaLights opted out). Operators can flip `Rebus.AllowMegaLights 1`
+// at runtime to swap perf for fidelity (the CVar refresh sink walks every Rebus fixture
+// and re-resolves the per-light flag through `RefreshAllowMegaLightsFromCVar`).
 #pragma once
 
 #include "CoreMinimal.h"
@@ -211,6 +228,19 @@ public:
 	// because the engine reads `bAllowMegaLights` at proxy creation time (FLightSceneInfo, see
 	// the v1.0.51 comment on the same flag near ApplyCurrentGoboToLightFn).
 	void PushInternalBeamMegaLightsOptOut();
+
+	// v1.0.94 -- single chokepoint that re-resolves `SpotLight->bAllowMegaLights` from the
+	// CURRENT global gate `Rebus.AllowMegaLights` AND the per-fixture state (gobo cookie
+	// active / InternalBeam mode + `Rebus.InternalBeamForceLegacy = 1`). Called from the
+	// `Rebus.AllowMegaLights` CVar refresh sink for EVERY Rebus fixture (not just InternalBeam
+	// ones, unlike the v1.0.92 sink); also safe to call directly when per-fixture state
+	// changes. Idempotent / cheap when nothing transitioned -- ReregisterComponent is gated on
+	// a value change. Resolves the desired value as: 0 when the global gate is 0 (the v1.0.94
+	// HARD FLOOR -- legacy path always so dynamic occluders cast hard shadows in the floor
+	// footprint); else 0 when a gobo is active OR InternalBeam mode is on with
+	// `Rebus.InternalBeamForceLegacy = 1`; else 1 (MegaLights routing permitted).
+	void RefreshAllowMegaLightsFromCVar();
+
 	// v1.0.92: restore the cached `bAllowMegaLights` (push the ORIGINAL value back). Called from
 	// `RestoreInternalBeamPose` on the InternalBeam OFF edge AND from the
 	// `Rebus.InternalBeamForceLegacy` CVar refresh sink (when the CVar flips 1 -> 0 while

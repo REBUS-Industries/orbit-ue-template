@@ -258,6 +258,46 @@ FAutoConsoleVariableRef CVarRebusInternalBeamScatter(
 	}),
 	ECVF_Default);
 
+// v1.0.94 -- HARD FLOOR for MegaLights routing on every Rebus SpotLight. Default 0 (legacy
+// clustered/deferred path forced on every fixture, regardless of mode -- InternalBeam OR Epic-beam,
+// regardless of gobo state). The user reported (against v1.0.93) that "with the Epic beam system
+// we have, we are not seeing the shadow of an object in the footprint": objects placed between a
+// fixture and the floor were NOT casting shadow into the lit pool when the fixture was running in
+// the v1.0.x DEFAULT (Epic DMX-Fixtures beam) mode. Root cause: UE 5.5+ MegaLights routes
+// per-light shadow casting through the tile-clustered sampling path, which on the user's
+// hardware/quality tier silently drops dynamic occluders below MegaLights' shadow-fidelity floor
+// -- so a hanging truss / a person / a prop between the fixture and the floor lit up but cast no
+// silhouette. v1.0.92's per-fixture opt-out was scoped to InternalBeam-mode fixtures only; v1.0.94
+// extends the opt-out to ALL Rebus SpotLights so dynamic occluders ALWAYS cast hard shadows in
+// the floor footprint of EVERY Rebus fixture, in EVERY mode.
+//
+// Trade-off: every Rebus fixture loses MegaLights' clustering perf -- in show-context rigs (tens to
+// hundreds of fixtures) this is the right default because shadow fidelity is non-negotiable for
+// stage visualisation. Deployments that prioritise MegaLights' clustering over per-fixture shadow
+// fidelity can flip the gate to 1 (`Rebus.AllowMegaLights 1`); the CVar refresh sink walks every
+// Rebus fixture and re-resolves bAllowMegaLights based on the new value AND the fixture's current
+// gobo / InternalBeam state.
+//
+// Precedence vs the v1.0.92 `Rebus.InternalBeamForceLegacy` CVar: `Rebus.AllowMegaLights = 0` is
+// the HARD FLOOR -- ALL Rebus SpotLights run on the legacy path; the v1.0.92 CVar is then
+// redundant (every InternalBeam fixture is already off MegaLights). When `Rebus.AllowMegaLights =
+// 1`, the v1.0.92 CVar becomes effective again: it ONLY adds the InternalBeam-mode reassertion
+// (so an InternalBeam fixture with `Rebus.InternalBeamForceLegacy = 1` still goes legacy for the
+// volumetric LF/IES shaping reason documented in the v1.0.92 block, while non-InternalBeam
+// fixtures stay on MegaLights for perf). Both CVars live; new releases prefer
+// `Rebus.AllowMegaLights` because it is the more fundamental gate.
+int32 GRebusAllowMegaLights = 0;
+
+// Resolve the desired `bAllowMegaLights` value for a Rebus SpotLight given a per-call requested
+// value (typically 1 for "MegaLights-on" / 0 for "explicitly opt-out for gobo/InternalBeam"). The
+// `Rebus.AllowMegaLights` CVar is the hard floor: when 0, ALWAYS return 0; when 1, pass the
+// requested value through unchanged. Used at every assignment site of `SpotLight->bAllowMegaLights`
+// so every code path agrees on the policy. v1.0.94 introduced.
+static FORCEINLINE uint32 ResolveAllowMegaLights(uint32 RequestedAllow)
+{
+	return (GRebusAllowMegaLights == 0) ? 0u : (RequestedAllow ? 1u : 0u);
+}
+
 // v1.0.92 -- gate for the InternalBeam-mode `bAllowMegaLights = 0` push. Default 1 (force the
 // legacy clustered/deferred path, so the SpotLight's IES profile AND its LightFunctionMaterial
 // modulate the volumetric beam shaft). The user reported (against v1.0.90) that gobo and IES
@@ -276,6 +316,13 @@ FAutoConsoleVariableRef CVarRebusInternalBeamScatter(
 // it to. The CVar refresh sink walks every fixture currently in InternalBeam mode and toggles
 // the flag in-place: ON re-applies the opt-out (re-caching the current value), OFF restores the
 // cached value (so a deployment can A/B at runtime without a full Rebus.InternalBeam 0/1 cycle).
+//
+// v1.0.94 -- this CVar is now SUBORDINATE to `Rebus.AllowMegaLights`. When `Rebus.AllowMegaLights
+// = 0` (the v1.0.94 default) every Rebus SpotLight is already on the legacy path; the
+// InternalBeam-specific push is then redundant but harmless. When `Rebus.AllowMegaLights = 1`,
+// flipping `Rebus.InternalBeamForceLegacy` to 1 still adds the InternalBeam-mode reassertion as
+// the sole way to keep the volumetric LF/IES shaping for hero beams while non-InternalBeam
+// fixtures stay on MegaLights for perf.
 int32 GRebusInternalBeamForceLegacy = 1;
 
 // v1.0.89 -- live-toggleable sign for the InternalBeam back-offset application. See the comment
@@ -313,6 +360,54 @@ FAutoConsoleVariableRef CVarRebusInternalBeamOffsetSign(
 	}),
 	ECVF_Default);
 
+// v1.0.94 -- live-toggleable HARD FLOOR for MegaLights routing on every Rebus SpotLight. See
+// the comment on `GRebusAllowMegaLights` above for the rationale. Default 0 (every Rebus
+// SpotLight uses the legacy clustered/deferred path so dynamic occluders ALWAYS cast hard
+// shadows in the floor footprint, regardless of mode). Refresh sink walks EVERY Rebus fixture
+// (not just InternalBeam ones, unlike the v1.0.92 `Rebus.InternalBeamForceLegacy` sink) and
+// re-resolves `bAllowMegaLights` per the new value via `RefreshAllowMegaLightsFromCVar`,
+// re-registering the SpotLight component when the value transitions so the FLightSceneInfo
+// proxy is rebuilt with the new value on the next frame.
+FAutoConsoleVariableRef CVarRebusAllowMegaLights(
+	TEXT("Rebus.AllowMegaLights"),
+	GRebusAllowMegaLights,
+	TEXT("0|1 -- when 0 (default since v1.0.94), every Rebus SpotLight is forced off MegaLights "
+		 "(`bAllowMegaLights = 0`) so the legacy clustered/deferred path renders shadow casting "
+		 "for dynamic occluders -- the v1.0.94 fix for 'we are not seeing the shadow of an object "
+		 "in the [Epic-beam] footprint'. When 1, MegaLights routing is allowed: per-fixture state "
+		 "(gobo cookie active / InternalBeam mode + `Rebus.InternalBeamForceLegacy = 1`) can still "
+		 "force the legacy path on a per-fixture basis, but non-special fixtures get MegaLights' "
+		 "clustering perf back -- at the cost of dropping dynamic-occluder shadows in their "
+		 "footprint on low-fidelity tiers. Live -- changing this re-pushes / restores on every "
+		 "Rebus fixture in every loaded world. PRECEDENCE: this is the hard floor; "
+		 "`Rebus.InternalBeamForceLegacy` only adds InternalBeam-mode reassertion ON TOP and is "
+		 "redundant while `Rebus.AllowMegaLights = 0`."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		if (!GEngine) return;
+		int32 Refreshed = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					F->RefreshAllowMegaLightsFromCVar();
+					++Refreshed;
+				}
+			}
+		}
+		const bool bAllow = (CVar->GetInt() != 0);
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.AllowMegaLights -> %d, refreshed %d fixture(s) (%s)."),
+			CVar->GetInt(), Refreshed,
+			bAllow ? TEXT("MegaLights routing now permitted -- per-fixture gobo/InternalBeam paths still force legacy when active; non-special fixtures get clustering perf back")
+			       : TEXT("HARD FLOOR -- every Rebus SpotLight forced off MegaLights so dynamic occluders cast hard shadows in the footprint (Epic-beam mode AND InternalBeam mode)"));
+	}),
+	ECVF_Default);
+
 // v1.0.92 -- live-toggleable gate for the InternalBeam-mode `bAllowMegaLights=0` push. See the
 // comment on `GRebusInternalBeamForceLegacy` above for the rationale. The refresh sink walks
 // every InternalBeam fixture and either re-applies the opt-out (CVar -> 1) or restores the
@@ -320,6 +415,10 @@ FAutoConsoleVariableRef CVarRebusInternalBeamOffsetSign(
 // actor (PushInternalBeamMegaLightsOptOut + RestoreInternalBeamMegaLights) so the cache state
 // stays consistent regardless of how many times the operator toggles the CVar -- a 0->1->0
 // sequence on a fixture that started with bAllowMegaLights=1 always lands back on 1.
+//
+// v1.0.94 -- when `Rebus.AllowMegaLights = 0` is in force this CVar is redundant (the hard
+// floor already opted every Rebus fixture out of MegaLights). The refresh sink still runs and
+// is harmless -- the `RefreshAllowMegaLightsFromCVar` chokepoint resolves the same final value.
 FAutoConsoleVariableRef CVarRebusInternalBeamForceLegacy(
 	TEXT("Rebus.InternalBeamForceLegacy"),
 	GRebusInternalBeamForceLegacy,
@@ -1363,16 +1462,34 @@ void ARebusFixtureActor::BuildSpotLight()
 	// native VSM path that produces light-blocking truss gaps on runtime meshes). Default => 0.
 	SpotLight->SetVolumetricScatteringIntensity(bMeshBeamEnabled ? 0.f : FogScatteringIntensity);
 
-	// Opt this fixture light into MegaLights. bAllowMegaLights is the public uint32:1 per-light
-	// flag on ULightComponent (UE 5.7.4 has no Set* accessor for it) and defaults to true, but
-	// we assert it explicitly so EVERY imported fixture light is a MegaLight regardless of any
-	// future engine default change. The project-level r.MegaLights.Allow=1 ([SystemSettings])
-	// then governs the whole rig. The spotlight is the only emissive light the plugin spawns.
-	SpotLight->bAllowMegaLights = 1;
+	// v1.0.94 -- resolve `bAllowMegaLights` through the `Rebus.AllowMegaLights` HARD FLOOR
+	// (default 0 -> every Rebus SpotLight opts out of MegaLights at construction so dynamic
+	// occluders cast hard shadows in the floor footprint of EVERY fixture, in EVERY mode). When
+	// the CVar is 1 we pass through the engine's pre-v1.0.94 default (1 -- MegaLights on per
+	// fixture). bAllowMegaLights is the public uint32:1 per-light flag on ULightComponent (UE
+	// 5.7.4 has no Set* accessor for it) so we write it directly; a `ReregisterComponent` is NOT
+	// required at construction because the FLightSceneInfo proxy is created LATER (on first
+	// register, AFTER this assignment).
+	SpotLight->bAllowMegaLights = ResolveAllowMegaLights(1);
+
+	// v1.0.94 -- ALWAYS assert per-light shadow casting at construction. UE's
+	// USpotLightComponent::CastShadows defaults true, but the v1.0.x `RefreshBeamShadowMode`
+	// path used to clear it on non-hero non-gobo fixtures (a perf opt to skip the per-light
+	// shadow map when neither volumetric shadows nor a cookie LF needed it). That clear was
+	// the actual root cause for "Epic-beam fixtures don't show object shadows in the footprint"
+	// -- a SpotLight with `CastShadows = false` produces NO shadows from any occluder, even
+	// with MegaLights opted out. v1.0.94 keeps `CastShadows = true` always (shadow cost is
+	// comparable to lit-pool cost; the floor footprint must always show silhouettes of trusses
+	// / props / people standing between the fixture and the floor). RefreshBeamShadowMode also
+	// forces it true on every refresh to defeat any pathway that would clear it later.
+	SpotLight->SetCastShadows(true);
 
 	// Hero-beam cap: volumetric shadows are costly, so only the first N spotlights of the spawn
 	// batch cast them; the rest still scatter but skip the volumetric shadow pass. The session
-	// subsystem resets the budget (ResetVolumetricShadowBudget) before each (re)spawn.
+	// subsystem resets the budget (ResetVolumetricShadowBudget) before each (re)spawn. Note:
+	// CastVolumetricShadow is the FOG-volume-shadow flag (truss gaps in the volumetric beam),
+	// SEPARATE from CastShadows above which controls SOLID shadow casting onto surfaces -- the
+	// floor footprint shadow only depends on CastShadows, not CastVolumetricShadow.
 	const bool bHeroBeam = (VolumetricShadowBeamCount < RebusMaxVolumetricShadowBeams);
 	SpotLight->SetCastVolumetricShadow(bHeroBeam);
 	if (bHeroBeam)
@@ -2700,19 +2817,25 @@ void ARebusFixtureActor::RefreshBeamShadowMode()
 		// distance fields) carves real truss gaps into the volume. Non-hero beams stay mesh-only
 		// (scattering 0) so there's no competing froxel noise.
 		SpotLight->SetVolumetricScatteringIntensity(bShadowActive ? GRebusHeroShadowScatter : 0.f);
-		// Cast Volumetric Shadow only meaningfully carves the fog when the SpotLight is also casting
-		// regular shadows -- VSM needs the per-light shadow data to derive the volumetric shadow.
-		// v1.0.49: also enable CastShadows when a gobo is active -- a SpotLight LightFunctionMaterial
-		// only projects when the light is also casting shadows (the function is sampled via the
-		// shadow render target). Without this, the cookie wouldn't render on non-hero fixtures.
-		SpotLight->SetCastShadows(bShadowActive || bGoboActive);
+		// v1.0.94 -- ALWAYS keep per-light shadow casting ON. The pre-v1.0.94 logic
+		// (`bShadowActive || bGoboActive`) cleared `CastShadows` on every non-hero non-gobo fixture
+		// as a perf opt; combined with MegaLights routing on the same fixtures, this is what
+		// produced the user-reported "Epic-beam mode shows no object shadows in the footprint"
+		// (root cause C of the v1.0.94 audit -- a SpotLight with CastShadows=false casts NO
+		// shadows from any occluder, regardless of the MegaLights opt-out). The VSM volumetric-
+		// shadow path (CastVolumetricShadow below) and the v1.0.49 cookie LF path BOTH need
+		// CastShadows on, and so does the user-visible solid-shadow path that motivated this
+		// release; setting it true unconditionally is the simplest correct policy.
+		SpotLight->SetCastShadows(true);
 		SpotLight->SetCastVolumetricShadow(bShadowActive);
 	}
 	else
 	{
 		// Fog-beam A/B mode: restore the froxel beam; hero beams still cast volumetric shadow.
 		SpotLight->SetVolumetricScatteringIntensity(FogScatteringIntensity);
-		SpotLight->SetCastShadows(bShadowActive || bGoboActive);
+		// v1.0.94 -- same policy as the mesh-beam path above (always on -- see the comment there
+		// for the root-cause discussion).
+		SpotLight->SetCastShadows(true);
 		SpotLight->SetCastVolumetricShadow(bShadowActive);
 	}
 	SpotLight->MarkRenderStateDirty();
@@ -2997,7 +3120,12 @@ void ARebusFixtureActor::PushInternalBeamMegaLightsOptOut()
 		return;
 	}
 
-	SpotLight->bAllowMegaLights = 0;
+	// v1.0.94 -- always force 0 (the InternalBeam-specific opt-out reason, ungated by
+	// `Rebus.AllowMegaLights`: the volumetric LF/IES-on-shaft path needs the legacy clustered
+	// path even when the global gate would otherwise allow MegaLights). Routed through
+	// `ResolveAllowMegaLights(0)` for consistency with every other assignment site -- always
+	// returns 0 here.
+	SpotLight->bAllowMegaLights = ResolveAllowMegaLights(0);
 	// `bAllowMegaLights` is read at FLightSceneInfo proxy creation (LightSceneInfo.cpp ->
 	// Proxy->AllowMegaLights()), so the value MUST be present on a freshly-created proxy to
 	// take effect. MarkRenderStateDirty alone schedules a deferred recreate that has proven
@@ -3029,7 +3157,12 @@ void ARebusFixtureActor::RestoreInternalBeamMegaLights()
 	}
 
 	const bool bIsMega = (SpotLight->bAllowMegaLights != 0);
-	const bool bWantMega = bInternalBeamAllowMegaLightsOrig;
+	// v1.0.94 -- route through `ResolveAllowMegaLights` so `Rebus.AllowMegaLights = 0` (the
+	// hard floor) clamps the restore to 0 even if the originally-cached value was 1. The cache
+	// is still cleared (so a later InternalBeam ON/OFF cycle re-snapshots the live value) and
+	// the hard floor wins regardless of the InternalBeam-specific cache state.
+	const uint32 WantValue = ResolveAllowMegaLights(bInternalBeamAllowMegaLightsOrig ? 1u : 0u);
+	const bool bWantMega = (WantValue != 0);
 	bInternalBeamMegaLightsOrigCached = false;
 	bInternalBeamAllowMegaLightsOrig = true; // back to the field's struct default
 
@@ -3041,11 +3174,58 @@ void ARebusFixtureActor::RestoreInternalBeamMegaLights()
 		return;
 	}
 
-	SpotLight->bAllowMegaLights = bWantMega ? 1 : 0;
+	SpotLight->bAllowMegaLights = WantValue;
 	SpotLight->ReregisterComponent();
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s InternalBeam MegaLights restore: bAllowMegaLights %d -> %d (cached orig)."),
-		*FixtureId, bIsMega ? 1 : 0, bWantMega ? 1 : 0);
+		TEXT("Fixture %s InternalBeam MegaLights restore: bAllowMegaLights %d -> %d (cached orig, clamped by Rebus.AllowMegaLights=%d)."),
+		*FixtureId, bIsMega ? 1 : 0, bWantMega ? 1 : 0, GRebusAllowMegaLights);
+}
+
+void ARebusFixtureActor::RefreshAllowMegaLightsFromCVar()
+{
+	if (!SpotLight) return;
+
+	// v1.0.94 -- single chokepoint for resolving the desired `bAllowMegaLights` per the live
+	// global gate AND the per-fixture state (gobo cookie active / InternalBeam mode +
+	// `Rebus.InternalBeamForceLegacy = 1`). When `Rebus.AllowMegaLights = 0` (the v1.0.94
+	// default), every Rebus SpotLight runs on the legacy path -- the hard floor for shadow
+	// casting in the floor footprint. When `Rebus.AllowMegaLights = 1`, MegaLights is permitted
+	// EXCEPT where the per-fixture state explicitly opts out:
+	//   * `bGoboActive` -- the v1.0.50 cookie LF path needs the legacy deferred renderer
+	//     (M_Light_Master's MF_DMXGobo is not LightFunctionAtlas-compatible).
+	//   * `bInternalBeamEnabled && GRebusInternalBeamForceLegacy != 0` -- the v1.0.92
+	//     volumetric-LF/IES-on-shaft path needs the legacy clustered path.
+	// Called from the `Rebus.AllowMegaLights` CVar refresh sink for every Rebus fixture; safe
+	// to call directly when the gobo / InternalBeam state changes (idempotent / cheap when
+	// nothing transitioned -- ReregisterComponent is gated on a value change).
+	uint32 Desired = ResolveAllowMegaLights(1u);
+	if (Desired != 0)
+	{
+		if (bGoboActive) Desired = 0;
+		if (bInternalBeamEnabled && GRebusInternalBeamForceLegacy != 0) Desired = 0;
+	}
+
+	const uint32 IsValue = SpotLight->bAllowMegaLights ? 1u : 0u;
+	if (IsValue == Desired)
+	{
+		UE_LOG(LogRebusVisualiser, Verbose,
+			TEXT("Fixture %s Rebus.AllowMegaLights refresh: already at %d (gobo=%d internalBeam=%d forceLegacy=%d), no proxy rebuild."),
+			*FixtureId, Desired, bGoboActive ? 1 : 0,
+			bInternalBeamEnabled ? 1 : 0, GRebusInternalBeamForceLegacy);
+		return;
+	}
+
+	SpotLight->bAllowMegaLights = Desired;
+	// `bAllowMegaLights` is read at FLightSceneInfo proxy creation; a full ReregisterComponent
+	// guarantees the proxy is rebuilt on the next frame with the new value. Cost: brief one-frame
+	// blackout on the toggle, identical to the v1.0.92 path.
+	SpotLight->ReregisterComponent();
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s Rebus.AllowMegaLights refresh: bAllowMegaLights %d -> %d (CVar=%d gobo=%d internalBeam=%d forceLegacy=%d)."),
+		*FixtureId, IsValue, Desired,
+		GRebusAllowMegaLights, bGoboActive ? 1 : 0,
+		bInternalBeamEnabled ? 1 : 0, GRebusInternalBeamForceLegacy);
 }
 
 void ARebusFixtureActor::RestoreInternalBeamPose()
@@ -4813,7 +4993,11 @@ void ARebusFixtureActor::ApplyCurrentGoboToLightFn()
 		// Cost: this light loses MegaLights' clustering perf while a gobo is up -- acceptable;
 		// fixtures with gobos are typically hero lights.
 		const bool bPrevMegaLights = SpotLight->bAllowMegaLights != 0;
-		SpotLight->bAllowMegaLights = 0;
+		// v1.0.94 -- gobo-active branch ALWAYS forces 0 (independent of `Rebus.AllowMegaLights`):
+		// the cookie LF path needs the legacy deferred renderer regardless of the global gate.
+		// `ResolveAllowMegaLights(0)` returns 0 in either CVar state, so this is identity here
+		// but routing through the helper keeps every assignment site consistent.
+		SpotLight->bAllowMegaLights = ResolveAllowMegaLights(0);
 		// Push the same single-cell atlas params as the cone. The MF_DMXGobo inside M_Light_Master
 		// reads the texture identically; "Num Mask = 1, Index = 0" sweeps the entire texture.
 		// v1.0.52: as on EpicBeamMID, pin "DMX Gobo Disk Rotation Speed" to 0 -- it's a U-scroll
@@ -4915,8 +5099,13 @@ void ARebusFixtureActor::ApplyCurrentGoboToLightFn()
 		// MI default here because for a LightFunction material the default would project a frosted
 		// disc onto the entire lit cone, dimming it noticeably -- null is the true "no gobo".)
 		// v1.0.50: also re-enable MegaLights so this light goes back to the perf-optimised path.
+		// v1.0.94: route through `ResolveAllowMegaLights` so `Rebus.AllowMegaLights = 0` (the
+		// default) keeps the SpotLight on the legacy path even after the cookie clears -- the
+		// hard floor wins (dynamic occluders cast shadows in the footprint regardless of gobo
+		// state). When `Rebus.AllowMegaLights = 1` the pre-v1.0.94 behaviour is preserved (back
+		// to MegaLights perf when no gobo is active).
 		const bool bPrevMegaLights = SpotLight->bAllowMegaLights != 0;
-		SpotLight->bAllowMegaLights = 1;
+		SpotLight->bAllowMegaLights = ResolveAllowMegaLights(1);
 		SpotLight->SetLightFunctionMaterial(nullptr);
 		// v1.0.51: ReregisterComponent on the OFF->ON transition for the same proxy-baked reason.
 		if (!bPrevMegaLights)

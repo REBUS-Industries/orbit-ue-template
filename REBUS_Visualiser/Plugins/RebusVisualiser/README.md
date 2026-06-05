@@ -594,6 +594,138 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Dynamic shadows in the Epic-beam footprint -- force-disable MegaLights on every Rebus SpotLight (v1.0.94).**
+> User report (verbatim, against v1.0.93):
+>
+> > "with the Epic beam system we have, we are not seeing the shadow of an object in the
+> > footprint can you fix this"
+>
+> "Epic beam system" = the v1.0.x DEFAULT mode (`bInternalBeam = false`), where the Epic
+> DMX-Fixtures plugin's beam canvas + cone components are the visible shaft. The SpotLight
+> still lights the floor footprint -- but objects placed between the fixture and the floor
+> (a hanging truss / a person / a prop) lit up but cast NO silhouette into the lit pool.
+> The operator expects to see a clear silhouette in the floor footprint of every fixture in
+> every mode.
+>
+> ---
+>
+> **Investigation findings -- TWO independent gates were dropping dynamic-occluder shadows
+> in the Epic-beam-mode footprint.**
+>
+> **(A) MegaLights routing dropped dynamic occluders below the shadow-fidelity floor.** UE
+> 5.5+ MegaLights routes per-light shadow casting through a tile-clustered sampling pipeline
+> (`MegaLightsRendering.cpp` -> `MegaLightsShadows.cpp`). On the user's hardware/quality tier
+> the clustered shadow pass silently dropped dynamic occluders -- the lit pool rendered
+> correctly but no silhouette appeared. v1.0.92 had already opted InternalBeam-mode SpotLights
+> off MegaLights (for an unrelated volumetric LF/IES reason), but Epic-beam-mode fixtures
+> stayed on `bAllowMegaLights = 1` (the v1.0.x BuildSpotLight default), inheriting the
+> shadow-fidelity floor.
+>
+> **(B) `RefreshBeamShadowMode` cleared `SpotLight->CastShadows` on non-hero non-gobo
+> fixtures.** The pre-v1.0.94 RefreshBeamShadowMode logic was
+> `SpotLight->SetCastShadows(bShadowActive || bGoboActive)` -- a perf opt that disabled the
+> per-light shadow map when neither the volumetric-shadow path (hero beams only, capped at
+> 6 per spawn batch by `RebusMaxShadowFogBeams`) nor the cookie LF (a SpotLight LF only
+> projects when the light is also casting shadows) needed it. A SpotLight with
+> `CastShadows = false` produces NO shadows from any occluder, regardless of the MegaLights
+> opt-out -- this gate alone would have produced the same symptom even if (A) had been
+> fixed in isolation.
+>
+> **Both gates are now closed.** v1.0.94 forces `bAllowMegaLights = 0` on EVERY Rebus
+> SpotLight at construction (gate A) AND keeps `CastShadows = true` always in BuildSpotLight
+> + every RefreshBeamShadowMode call (gate B). Either one alone would not have fixed the
+> reported symptom.
+>
+> Other root causes investigated and ruled out: D (volumetric vs solid shadow conflation --
+> `bCastVolumetricShadow` is the FOG-volume-shadow flag, separate from `CastShadows` which
+> controls solid shadow casting onto surfaces; both are now correctly scoped), E (cascaded
+> shadow distance / `r.Shadow.*` -- the project ships defaults; nothing was clipping the
+> ~10 m fixture-to-floor span), F (floor receives shadows -- the `RebusFloor`
+> `StaticMeshActor` from `build_rebus_base_level.py` uses `/Engine/BasicShapes/Plane` which
+> receives dynamic shadows by default; no override touches it).
+>
+> **The v1.0.87 shadow cache (`SetBodyMeshesCastShadow` / `OptPrimitiveOutOfInternalBeam
+> Shadow`) was also audited.** The cache stores bit-packed `Entry.bCastShadow : 1` from
+> `Comp->CastShadow ? 1 : 0`, restores via `Entry.bCastShadow != 0`, and the on/off paths
+> are byte-exact symmetric. Weak-ptr staleness is handled by an `if (!Comp) continue;`
+> guard. No restore-symmetry bug -- v1.0.94 leaves the v1.0.87 helper untouched.
+>
+> ---
+>
+> **New CVar -- `Rebus.AllowMegaLights [0|1]`** (default `0`).
+>
+> The HARD FLOOR for MegaLights routing on every Rebus SpotLight. Default `0` (every Rebus
+> fixture forced off MegaLights, regardless of mode -- legacy clustered/deferred path always,
+> dynamic-occluder shadows in the footprint always). Refresh sink walks every Rebus fixture
+> in every loaded world and re-resolves `bAllowMegaLights` per the new value via
+> `RefreshAllowMegaLightsFromCVar`, re-registering the SpotLight component when the value
+> transitions. Live -- changing this re-pushes / restores immediately.
+>
+> ```
+> Rebus.AllowMegaLights 0   # default (v1.0.94) -- legacy path always; dynamic shadows in every footprint; lose MegaLights' clustering perf
+> Rebus.AllowMegaLights 1   # opt back in to MegaLights routing (per-fixture gobo / InternalBeam paths still force legacy when active)
+> ```
+>
+> **Precedence vs `Rebus.InternalBeamForceLegacy` (v1.0.92).**
+>
+> | `Rebus.AllowMegaLights` | `Rebus.InternalBeamForceLegacy` | Effective per-fixture path                                              |
+> |-------------------------|---------------------------------|-------------------------------------------------------------------------|
+> | `0` (v1.0.94 default)   | any                             | EVERY Rebus SpotLight on legacy path. v1.0.92 CVar redundant but harmless. |
+> | `1`                     | `1` (v1.0.92 default)           | Non-special fixtures: MegaLights on (perf). Gobo-active or InternalBeam fixtures: legacy. |
+> | `1`                     | `0`                             | Non-special fixtures: MegaLights on (perf). Gobo-active fixtures: legacy. InternalBeam fixtures stay on MegaLights -- volumetric LF/IES on shaft NOT guaranteed (the v1.0.92 trade-off). |
+>
+> `Rebus.AllowMegaLights = 0` is the hard floor: ALL Rebus SpotLights run on the legacy path
+> regardless of `Rebus.InternalBeamForceLegacy`. Both CVars live; new releases prefer
+> `Rebus.AllowMegaLights` because it is the more fundamental gate.
+>
+> **Operator checklist after rebuilding to v1.0.94.**
+>
+> 1. Confirm `Rebus.AllowMegaLights` is at its default `0` (no operator action needed; the
+>    CVar is registered in `RebusFixtureActor.cpp` with default `0`).
+> 2. Spawn or re-spawn a fixture in the Epic-beam mode (`bInternalBeam = false`) -- the
+>    BuildSpotLight log line should now read `allowMegaLights=0` (pre-v1.0.94 read
+>    `allowMegaLights=1` in this mode).
+> 3. Place a static occluder (a hanging truss / a `BP_StagePerformer` / a prop cube) BETWEEN
+>    the fixture's lens plane and its lit floor pool. From a top-down camera the lit pool
+>    should now show a CLEAR silhouette of the occluder -- the v1.0.94 fix.
+> 4. Sweep pan/tilt: the silhouette should track the occluder's position relative to the
+>    aim, dynamically (no shadow-map staleness on a Movable spotlight + Movable occluder).
+> 5. Toggle `Rebus.AllowMegaLights 1` at runtime -- the silhouette should disappear (the
+>    refresh sink switches every fixture back to MegaLights routing on this hardware/tier).
+>    Toggle back to `0` -- the silhouette should reappear within one frame (the
+>    ReregisterComponent transition rebuilds the FLightSceneInfo proxy with the new value).
+> 6. (Optional) Run `Rebus.DumpFixtureLights` to confirm the per-fixture state matches:
+>    `castShadows=1 bAllowMegaLights=0 LightFn=...`.
+>
+> **Perf trade-off.** Every Rebus SpotLight now loses MegaLights' clustering perf -- in a
+> rig with hundreds of fixtures the per-frame lighting cost is higher than v1.0.93 by
+> roughly the cost of one regular SpotLight per fixture (vs. the amortised clustered cost
+> on the MegaLights path). In show-context rigs (tens of hero fixtures + a few dozen
+> wash/PAR cans) this is the right default because shadow fidelity is non-negotiable for
+> stage visualisation. Deployments hitting frame-budget limits with the new default can
+> flip `Rebus.AllowMegaLights 1` and accept the loss of dynamic-occluder shadows in the
+> footprint of non-special fixtures (gobo-active fixtures and `InternalBeam +
+> InternalBeamForceLegacy = 1` fixtures still get the legacy path on a per-fixture basis).
+>
+> No subsystem-side `r.MegaLights.*` push was added -- the per-light `bAllowMegaLights = 0`
+> already routes every Rebus fixture out of the MegaLights shadow path; touching the
+> project-wide `r.MegaLights.Allow` would also affect any non-Rebus light spawned by the
+> game (e.g. an Orbit-imported KHR_lights_punctual light), which is out of scope.
+>
+> **Files touched (v1.0.94).**
+>
+> - `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Public/RebusFixture
+>   Actor.h` -- header-block legacy-path-policy comment + `RefreshAllowMegaLightsFromCVar`
+>   declaration.
+> - `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusFixture
+>   Actor.cpp` -- `Rebus.AllowMegaLights` CVar + `ResolveAllowMegaLights` helper +
+>   `RefreshAllowMegaLightsFromCVar` method; BuildSpotLight now resolves `bAllowMegaLights`
+>   through the helper AND asserts `CastShadows = true`; RefreshBeamShadowMode now keeps
+>   `CastShadows = true` always (was `bShadowActive || bGoboActive`); ApplyCurrentGobo
+>   ToLightFn (clear branch) + PushInternalBeamMegaLightsOptOut + RestoreInternalBeamMega
+>   Lights now route through the helper for consistency.
+> - `README.md` / this file -- v1.0.94 release block (this one).
+
 > **Cone-mesh InternalBeam shaft + Python-baked LF (`bUsedWithVolumetricFog=true`) + chrome lens (v1.0.93).**
 > User report (verbatim, against v1.0.92):
 >
