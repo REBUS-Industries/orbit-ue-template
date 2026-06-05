@@ -593,6 +593,23 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Build hotfix: bShouldClearRenderTargetOnReceiveUpdate is protected in UE 5.7 (v1.0.76).**
+> v1.0.74 / v1.0.75 wrote `GoboRT->bShouldClearRenderTargetOnReceiveUpdate = true` directly,
+> which failed to compile in UE 5.7 with `C2248: cannot access protected member` -- the
+> field is `protected` on `UCanvasRenderTarget2D` in 5.7 (it's still UPROPERTY-exposed via
+> `meta=(AllowPrivateAccess="true")` for Blueprint, but C++ outside the class is blocked).
+>
+> v1.0.76 routes through `FProperty` reflection (two tiny helpers,
+> `SetGoboRTClearOnUpdate` + `ReadGoboRTClearOnUpdate`, in the anonymous namespace next to
+> the canvas-RT code). Reflection-based writes bypass C++ access control because
+> `FBoolProperty::SetPropertyValue_InContainer` operates on the UPROPERTY through the
+> reflection system, not through a C++ member access. Semantics are unchanged:
+> v1.0.74's defensive assertion still runs at every `EnsureGoboRT` and
+> `RebuildGoboRTAtSize`, the `Rebus.DumpGoboState` line still reports the live flag value,
+> and the engine-default `true` provides the no-op fallback if `FindPropertyByName` ever
+> returns null (a future engine rename). No behavioural change vs. v1.0.74/75 -- this is
+> the build fix only.
+
 > **Gobo resolution 512 -> 1024 + mipmaps + DLSS scaffolding (v1.0.75).** User asked
 > *"can we increase the resolution of the gobos, they look pixelated. Can we enable NVIDIA
 > DLSS"*. Two unrelated requests, both addressed here.

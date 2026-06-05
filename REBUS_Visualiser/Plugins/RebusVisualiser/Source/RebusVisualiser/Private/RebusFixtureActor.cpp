@@ -318,7 +318,7 @@ void ARebusFixtureActor::DumpGoboStateForDebug() const
 		CurrentGoboTexture ? *CurrentGoboTexture->GetName() : TEXT("<null>"), SrcW, SrcH,
 		GoboRT.Get(),
 		GoboRT ? GoboRT->SizeX : 0, GoboRT ? GoboRT->SizeY : 0,
-		GoboRT ? (GoboRT->bShouldClearRenderTargetOnReceiveUpdate ? 1 : 0) : -1,
+		ReadGoboRTClearOnUpdate(GoboRT), // v1.0.76: protected field, reflection reader.
 		GoboRT ? (GoboRT->bAutoGenerateMips ? 1 : 0) : -1,
 		GoboRT ? (int32)GoboRT->Filter : -1,
 		GoboAngle,
@@ -2780,6 +2780,39 @@ bool ARebusFixtureActor::ApplyGoboTextureFromBytes(const TArray<uint8>& Bytes)
 	return true;
 }
 
+// v1.0.76 reflection helpers for UCanvasRenderTarget2D::bShouldClearRenderTargetOnReceiveUpdate.
+//
+// The field is declared `protected` on UCanvasRenderTarget2D in UE 5.7 (it's a UPROPERTY for
+// Blueprint access via meta=(AllowPrivateAccess="true"), but C++ outside the class can't read
+// or write it directly -- which broke the v1.0.74 explicit-set with C2248). Defaults to true
+// in 5.7 (verified in CanvasRenderTarget2D.h), so a no-op fallback is fine for the writer.
+// We go through FProperty reflection so the v1.0.74 defensive assertion semantics survive
+// (set is provable from the dump, write succeeds even though the field is protected). If the
+// engine ever renames the property the FindPropertyByName returns null and we silently fall
+// back to the documented default behaviour -- no crash, no regression vs. omitting the call.
+namespace
+{
+	FBoolProperty* FindClearOnUpdateProperty(UCanvasRenderTarget2D* RT)
+	{
+		if (!RT) return nullptr;
+		return CastField<FBoolProperty>(
+			RT->GetClass()->FindPropertyByName(TEXT("bShouldClearRenderTargetOnReceiveUpdate")));
+	}
+	void SetGoboRTClearOnUpdate(UCanvasRenderTarget2D* RT, bool bValue)
+	{
+		if (FBoolProperty* Prop = FindClearOnUpdateProperty(RT))
+		{
+			Prop->SetPropertyValue_InContainer(RT, bValue);
+		}
+	}
+	int32 ReadGoboRTClearOnUpdate(UCanvasRenderTarget2D* RT) // -1 = couldn't read, 0/1 = value
+	{
+		FBoolProperty* Prop = FindClearOnUpdateProperty(RT);
+		if (!Prop) return -1;
+		return Prop->GetPropertyValue_InContainer(RT) ? 1 : 0;
+	}
+}
+
 // v1.0.75: configurable per-actor gobo RT resolution.
 //   * Pre-v1.0.75 default was 512 (a balance for cost vs. cookie clarity). User reported the
 //     projected pattern looks pixelated -- expected, because 512 across a typical 60-degree
@@ -2826,9 +2859,10 @@ void ARebusFixtureActor::EnsureGoboRT()
 	// editor utility callbacks does set it false on some assets) would silently turn the RT
 	// into an accumulator -- successive K2_DrawTexture calls with BLEND_Translucent on top of
 	// the unCLEARED prior frame would build up a smear of every recent gobo orientation,
-	// looking exactly like ghosting on the floor projection. Setting explicit removes that
-	// failure mode.
-	GoboRT->bShouldClearRenderTargetOnReceiveUpdate = true;
+	// looking exactly like ghosting on the floor projection. v1.0.76: the field is `protected`
+	// in 5.7 so direct assignment was C2248; we go through FProperty reflection (see
+	// SetGoboRTClearOnUpdate above) which writes the UPROPERTY regardless of C++ access.
+	SetGoboRTClearOnUpdate(GoboRT, true);
 	// v1.0.75: mipmap chain + trilinear filtering. Without these the LF sampler reads a single
 	// LOD regardless of screen footprint, so a 1024 RT projected onto a tiny floor patch alias
 	// hard (every other texel skipped). bAutoGenerateMips defers chain generation to the GPU
@@ -2888,7 +2922,7 @@ int32 ARebusFixtureActor::RebuildGoboRTAtSize(int32 RequestedSizePixels)
 		return 0;
 	}
 	GoboRT->ClearColor = FLinearColor::Transparent;
-	GoboRT->bShouldClearRenderTargetOnReceiveUpdate = true;
+	SetGoboRTClearOnUpdate(GoboRT, true); // v1.0.76: protected field, reflection writer.
 	GoboRT->bAutoGenerateMips = true;
 	GoboRT->Filter = TF_Trilinear;
 	GoboRT->OnCanvasRenderTargetUpdate.AddDynamic(this, &ARebusFixtureActor::OnGoboRTUpdate);
