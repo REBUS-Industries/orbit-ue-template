@@ -329,6 +329,31 @@ ARebusFixtureActor::ARebusFixtureActor()
 	if (EpicBeamMatFinder.Succeeded()) EpicBeamMaterial = EpicBeamMatFinder.Object;
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> EpicBeamMeshFinder(TEXT("/DMXFixtures/LightFixtures/Meshes/SM_Beam_RM.SM_Beam_RM"));
 	if (EpicBeamMeshFinder.Succeeded()) EpicBeamMesh = EpicBeamMeshFinder.Object;
+
+	// v1.0.71 fixture body/lens material override -- cook-safe hard refs.
+	//
+	// FixtureMatParent (default parametric parent): /Engine/BasicShapes/BasicShapeMaterial.
+	// This material ships with every UE install (no new content required to make v1.0.71 work
+	// out-of-the-box) AND exposes the standard PBR parameter names Color (vector), Metallic
+	// (scalar), Roughness (scalar) that EnsureFixtureMIDs writes. If the parameter names ever
+	// change in a future engine version the SetVectorParameterValue / SetScalarParameterValue
+	// calls become benign no-ops and the MID renders as the parent's default look -- not ideal
+	// but never crashes / never breaks the build.
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> FixtureMatParentFinder(
+		TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
+	if (FixtureMatParentFinder.Succeeded()) FixtureMatParent = FixtureMatParentFinder.Object;
+	// Optional user-override assets at /Game paths. If present these take precedence over the
+	// runtime MIDs (the override IS the user's material verbatim, no parameter mangling). Both
+	// are optional -- missing path just leaves the ref null and EnsureFixtureMIDs falls back to
+	// the BasicShapeMaterial MID. To create them: in the editor, right-click /Game/REBUS/
+	// Materials, New -> Material, save as M_RebusFixtureBody (or M_RebusFixtureLens), configure
+	// any PBR shading you want, no parameter naming requirement.
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> UserBodyMatFinder(
+		TEXT("/Game/REBUS/Materials/M_RebusFixtureBody.M_RebusFixtureBody"));
+	if (UserBodyMatFinder.Succeeded()) FixtureBodyMaterialOverride = UserBodyMatFinder.Object;
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> UserLensMatFinder(
+		TEXT("/Game/REBUS/Materials/M_RebusFixtureLens.M_RebusFixtureLens"));
+	if (UserLensMatFinder.Succeeded()) FixtureLensMaterialOverride = UserLensMatFinder.Object;
 }
 
 void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
@@ -486,6 +511,173 @@ void ARebusFixtureActor::ResolveHeadAxisFromMeshes()
 	}
 }
 
+// ---- v1.0.71 fixture body/lens material override ----------------------------------------
+
+bool ARebusFixtureActor::IsLensToken(const FString& Token)
+{
+	// Case-insensitive substring scan for the common front-optic naming conventions across
+	// GDTF (Lens / Front Lens / Optic), glb importers (lens, glass), and decorative meshes
+	// (crystal-style PAR lenses). Kept loose on purpose -- a false positive at worst slaps a
+	// mirrored material on a small accent, which the user can disable per-fixture via the
+	// SetFixtureMaterialOverrideEnabled hook.
+	if (Token.IsEmpty()) return false;
+	const FString T = Token.ToLower();
+	return T.Contains(TEXT("lens"))
+		|| T.Contains(TEXT("glass"))
+		|| T.Contains(TEXT("crystal"))
+		|| T.Contains(TEXT("optic"))
+		|| T.Contains(TEXT("front"));
+}
+
+void ARebusFixtureActor::EnsureFixtureMIDs()
+{
+	// Lazy build, called from ApplyFixtureMaterialTo. We do NOTHING if user-override .uassets
+	// were found in the constructor (FixtureBodyMaterialOverride / LensOverride non-null) --
+	// those take precedence and we apply them verbatim. Otherwise we create the parametric MIDs
+	// off BasicShapeMaterial once per actor.
+	if (!FixtureMatParent) return;
+
+	if (!FixtureBodyMaterialOverride && !FixtureBodyMID)
+	{
+		FixtureBodyMID = UMaterialInstanceDynamic::Create(FixtureMatParent, this);
+		if (FixtureBodyMID)
+		{
+			// Black satin plastic: near-black diffuse + dielectric + medium-low roughness for
+			// the soft sheen highlight you get on injection-moulded fixture housings. NOT pure
+			// black (0,0,0) -- that crushes contrast under stage lights so it never reads as
+			// "satin"; #050505 gives just enough surface to catch the sheen.
+			FixtureBodyMID->SetVectorParameterValue(TEXT("Color"), FLinearColor(0.02f, 0.02f, 0.02f, 1.f));
+			FixtureBodyMID->SetScalarParameterValue(TEXT("Metallic"), 0.0f);
+			FixtureBodyMID->SetScalarParameterValue(TEXT("Roughness"), 0.35f);
+		}
+	}
+	if (!FixtureLensMaterialOverride && !FixtureLensMID)
+	{
+		FixtureLensMID = UMaterialInstanceDynamic::Create(FixtureMatParent, this);
+		if (FixtureLensMID)
+		{
+			// Mirrored glass: near-white "polished chrome" colour + fully metallic + very low
+			// roughness for a tight mirror highlight. True dielectric glass needs translucent
+			// shading which BasicShapeMaterial doesn't support -- but a fixture LENS in a
+			// venue reads visually as a chrome mirror under stage light (because the dark
+			// interior absorbs the back), so metallic-mirror is the right approximation here.
+			FixtureLensMID->SetVectorParameterValue(TEXT("Color"), FLinearColor(0.95f, 0.95f, 0.95f, 1.f));
+			FixtureLensMID->SetScalarParameterValue(TEXT("Metallic"), 1.0f);
+			FixtureLensMID->SetScalarParameterValue(TEXT("Roughness"), 0.05f);
+		}
+	}
+}
+
+bool ARebusFixtureActor::ApplyFixtureMaterialTo(UPrimitiveComponent* Comp, const FString& MeshName,
+	const FString& GeomName, bool bIsOrbitComp)
+{
+	if (!bOverrideFixtureMaterials || !Comp) return false;
+	EnsureFixtureMIDs();
+
+	const bool bLens = IsLensToken(MeshName) || IsLensToken(GeomName);
+	UMaterialInterface* Mat = bLens
+		? (FixtureLensMaterialOverride ? FixtureLensMaterialOverride.Get() : Cast<UMaterialInterface>(FixtureLensMID))
+		: (FixtureBodyMaterialOverride ? FixtureBodyMaterialOverride.Get() : Cast<UMaterialInterface>(FixtureBodyMID));
+	if (!Mat) return false;
+
+	// Cache the original material slot 0 the FIRST time we override this component, so
+	// SetFixtureMaterialOverrideEnabled(false) can restore it byte-exact. For control-channel
+	// meshes the cache is index-aligned to MeshComponents; for Orbit comps it's a per-weak-ptr
+	// map keyed off the component pointer.
+	if (bIsOrbitComp)
+	{
+		TWeakObjectPtr<USceneComponent> Key(Cast<USceneComponent>(Comp));
+		if (!OriginalOrbitMaterials.Contains(Key))
+		{
+			OriginalOrbitMaterials.Add(Key, TWeakObjectPtr<UMaterialInterface>(Comp->GetMaterial(0)));
+		}
+	}
+	else
+	{
+		const int32 Idx = MeshComponents.IndexOfByKey(Cast<UProceduralMeshComponent>(Comp));
+		if (Idx != INDEX_NONE)
+		{
+			if (!OriginalMeshMaterials.IsValidIndex(Idx))
+			{
+				OriginalMeshMaterials.SetNum(MeshComponents.Num());
+			}
+			if (!OriginalMeshMaterials[Idx])
+			{
+				OriginalMeshMaterials[Idx] = Comp->GetMaterial(0);
+			}
+		}
+	}
+
+	Comp->SetMaterial(0, Mat);
+	return true;
+}
+
+ARebusFixtureActor::FFixtureMaterialApplyCount ARebusFixtureActor::SetFixtureMaterialOverrideEnabled(bool bEnabled)
+{
+	FFixtureMaterialApplyCount Count;
+	bOverrideFixtureMaterials = bEnabled;
+
+	if (bEnabled)
+	{
+		// Re-apply across all owned meshes + Orbit comps. The classifier (lens vs body) repeats
+		// because MeshName/GeomName aren't cached per-component -- but the control-channel
+		// meshes carry the GDTF name in MeshComponents' parallel arrays only at build time, so
+		// we re-derive from the procedural mesh's Outer/Name (best-effort) which is enough for
+		// the "lens" keyword scan. Orbit comps use their tags + name as before.
+		for (int32 i = 0; i < MeshComponents.Num(); ++i)
+		{
+			UProceduralMeshComponent* PMC = MeshComponents[i];
+			if (!PMC) continue;
+			const FString Nm = PMC->GetName(); // generic if the build path didn't set one
+			if (ApplyFixtureMaterialTo(PMC, Nm, FString(), /*bIsOrbitComp*/ false))
+			{
+				if (IsLensToken(Nm)) ++Count.Lens; else ++Count.Body;
+			}
+		}
+		for (const TWeakObjectPtr<USceneComponent>& Weak : OrbitComponents)
+		{
+			USceneComponent* SC = Weak.Get();
+			UPrimitiveComponent* Prim = Cast<UPrimitiveComponent>(SC);
+			if (!Prim) continue;
+			// Concatenate every tag into the geom-name slot so IsLensToken sees them all.
+			FString TagStr;
+			for (const FName& Tag : SC->ComponentTags) { TagStr += Tag.ToString(); TagStr += TEXT(" "); }
+			if (ApplyFixtureMaterialTo(Prim, SC->GetName(), TagStr, /*bIsOrbitComp*/ true))
+			{
+				if (IsLensToken(SC->GetName()) || IsLensToken(TagStr)) ++Count.Lens; else ++Count.Body;
+			}
+		}
+	}
+	else
+	{
+		// Restore originals from the caches.
+		for (int32 i = 0; i < MeshComponents.Num(); ++i)
+		{
+			UProceduralMeshComponent* PMC = MeshComponents[i];
+			if (!PMC || !OriginalMeshMaterials.IsValidIndex(i)) continue;
+			if (UMaterialInterface* Orig = OriginalMeshMaterials[i])
+			{
+				PMC->SetMaterial(0, Orig);
+				++Count.Restored;
+			}
+			else
+			{
+				// No cache (never overridden) -- nothing to restore; leave whatever's there.
+			}
+		}
+		for (const TPair<TWeakObjectPtr<USceneComponent>, TWeakObjectPtr<UMaterialInterface>>& Pair : OriginalOrbitMaterials)
+		{
+			USceneComponent* SC = Pair.Key.Get();
+			UPrimitiveComponent* Prim = Cast<UPrimitiveComponent>(SC);
+			if (!Prim) continue;
+			Prim->SetMaterial(0, Pair.Value.Get()); // may be null = engine default; weak miss is benign
+			++Count.Restored;
+		}
+	}
+
+	return Count;
+}
+
 void ARebusFixtureActor::BuildMeshes(const FRebusMeshBundle& Meshes)
 {
 	for (const FRebusMesh& Mesh : Meshes.Meshes)
@@ -565,6 +757,13 @@ void ARebusFixtureActor::BuildMeshes(const FRebusMeshBundle& Meshes)
 		const int32 Axis = RebusMotion::ResolveAxisForMesh(Profile.MotionRig, Mesh.GeometryName, Mesh.ModelName);
 		MeshAxisBucket.SetNum(MeshComponents.Num());
 		MeshAxisBucket[ComponentIndex] = Axis;
+
+		// v1.0.71: black satin body / mirrored glass lens override. Uses Mesh.Name + Mesh.
+		// GeometryName as the lens-keyword source (the real GDTF naming, not the generic
+		// procedural-mesh comp name we'd have in SetFixtureMaterialOverrideEnabled's re-apply
+		// path). ApplyFixtureMaterialTo is a no-op when bOverrideFixtureMaterials is false,
+		// so opting out via the console command leaves the procedural-mesh default in place.
+		ApplyFixtureMaterialTo(PMC, Mesh.Name, Mesh.GeometryName, /*bIsOrbitComp*/ false);
 
 		// Per-mesh diagnostics: which motion axis (if any) this proxy bucketed onto, so the
 		// portal team can verify a pushed mesh actually attached to its pan/tilt group.
@@ -1795,6 +1994,17 @@ void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Com
 		// The bound Orbit model sits right on top of this fixture's light source, so exclude it from
 		// its own beam's volumetric-fog shadow (it would otherwise double-occlude with the body).
 		DisableSelfBeamVolumetricShadow(Cast<UPrimitiveComponent>(Comp));
+
+		// v1.0.71: apply the body/lens material override to the bound Orbit component too. Uses
+		// the comp's own name + concatenated ComponentTags as the lens-keyword source -- catches
+		// MVR/glb importers that surface the GDTF geometry name on either field. No-op when
+		// bOverrideFixtureMaterials is off.
+		if (UPrimitiveComponent* Prim = Cast<UPrimitiveComponent>(Comp))
+		{
+			FString TagStr;
+			for (const FName& Tag : Comp->ComponentTags) { TagStr += Tag.ToString(); TagStr += TEXT(" "); }
+			ApplyFixtureMaterialTo(Prim, Comp->GetName(), TagStr, /*bIsOrbitComp*/ true);
+		}
 	}
 
 	UE_LOG(LogRebusVisualiser, Log,
@@ -1838,6 +2048,11 @@ void ARebusFixtureActor::ClearOrbitBinding()
 	OrbitBindBase.Reset();
 	OrbitAxisBucket.Reset();
 	BoundOrbitObjectId.Reset();
+	// v1.0.71: drop the cached "original material per Orbit comp" map too. After ClearOrbit-
+	// Binding the comps we tracked may be destroyed (re-import) -- their weak entries become
+	// stale, and a subsequent ApplyFixtureMaterialTo on a freshly bound comp must re-capture
+	// the now-current original (not the dead one from the previous import).
+	OriginalOrbitMaterials.Reset();
 }
 
 int32 ARebusFixtureActor::SetOrbitVisibility(bool bVisible)

@@ -27,6 +27,7 @@ namespace
 	IConsoleCommand* GDumpFixtureLightsCommand = nullptr;
 	IConsoleCommand* GShowOrbitFixturesCommand = nullptr;
 	IConsoleCommand* GShowOrbitCommand = nullptr;
+	IConsoleCommand* GOverrideFixtureMaterialsCommand = nullptr;
 
 	// v1.0.55: Pixel Streaming console-command gate. v1.0.54 set only the PS1 CVar
 	// ("PixelStreaming.AllowPixelStreamingCommands") and had no effect because this project enables
@@ -250,6 +251,42 @@ namespace
 			bShow ? 1 : 0, RootsAffected, bShow ? TEXT("shown") : TEXT("hidden"));
 	}
 
+	// v1.0.71: `Rebus.OverrideFixtureMaterials [0|1]` -- enable / disable the body+lens material
+	// override on every ARebusFixtureActor in every Game/PIE world. ON applies the black satin
+	// plastic body material to every non-lens mesh (control-channel procedural meshes +
+	// Orbit-imported components bound to the fixture) and the mirrored-glass lens material to
+	// every mesh whose name/tag contains a lens keyword ("lens"/"glass"/"crystal"/"optic"/
+	// "front"). OFF restores each component's pre-override material from the per-actor cache
+	// captured the first time the override was applied. Default ON since v1.0.71 (the
+	// override fires automatically at fixture build time + Orbit bind time).
+	void HandleOverrideFixtureMaterialsCommand(const TArray<FString>& Args)
+	{
+		const bool bEnable = ParseBoolArg(Args, true);
+		if (!GEngine) return;
+		int32 TotalFixtures = 0;
+		int32 TotalBody = 0, TotalLens = 0, TotalRestored = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+			for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					const ARebusFixtureActor::FFixtureMaterialApplyCount C = F->SetFixtureMaterialOverrideEnabled(bEnable);
+					TotalBody += C.Body; TotalLens += C.Lens; TotalRestored += C.Restored;
+					++TotalFixtures;
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.OverrideFixtureMaterials %d: %d fixture(s) -- %s."),
+			bEnable ? 1 : 0, TotalFixtures,
+			bEnable
+				? *FString::Printf(TEXT("body=%d lens=%d meshes overridden"), TotalBody, TotalLens)
+				: *FString::Printf(TEXT("restored=%d original material(s)"), TotalRestored));
+	}
+
 	// `Rebus.DriveOrbitModels [0|1]` -- live toggle for the Phase-1 Orbit-model sync test (mirrors
 	// the bDriveOrbitModels scene property). No arg / "1"/"on"/"true" enables; "0"/"off"/"false"
 	// disables. Routes to the fixture control subsystem of each running Game/PIE world.
@@ -339,6 +376,19 @@ void FRebusVisualiserModule::StartupModule()
 			 "Usage: Rebus.ShowOrbit [0|1]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleShowOrbitCommand),
 		ECVF_Default);
+
+	// v1.0.71 fixture material override toggle.
+	GOverrideFixtureMaterialsCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.OverrideFixtureMaterials"),
+		TEXT("Apply / restore the v1.0.71 fixture material override on every fixture's body "
+			 "meshes (control-channel + Orbit). ON = black satin plastic body + mirrored glass "
+			 "lens (lens detection by name/tag: lens/glass/crystal/optic/front). OFF restores "
+			 "each mesh's original material from the per-actor cache. Drop a /Game/REBUS/"
+			 "Materials/M_RebusFixtureBody.uasset (and/or M_RebusFixtureLens.uasset) to use "
+			 "your own materials instead of the runtime BasicShapeMaterial MIDs. "
+			 "Usage: Rebus.OverrideFixtureMaterials [0|1]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleOverrideFixtureMaterialsCommand),
+		ECVF_Default);
 }
 
 void FRebusVisualiserModule::ShutdownModule()
@@ -367,6 +417,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GShowOrbitCommand);
 		GShowOrbitCommand = nullptr;
+	}
+	if (GOverrideFixtureMaterialsCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GOverrideFixtureMaterialsCommand);
+		GOverrideFixtureMaterialsCommand = nullptr;
 	}
 
 	UE_LOG(LogRebusVisualiser, Log, TEXT("RebusVisualiser module shut down."));

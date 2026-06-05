@@ -160,6 +160,17 @@ public:
 	// instead of a stale one.
 	int32 SetOrbitVisibility(bool bVisible);
 
+	// v1.0.71: enable/disable the body+lens material override on every mesh owned by this
+	// fixture (control-channel UProceduralMeshComponent body meshes AND the Orbit-imported
+	// components that were bound by RebindOrbitModels). When enabled, every non-lens mesh gets
+	// the cached body MID (black satin plastic) and every mesh whose name/tag matches a "lens"
+	// keyword gets the cached lens MID (mirrored glass). When disabled, the procedural meshes
+	// drop back to their saved original materials (cached at first override) and the Orbit
+	// components drop back to their pre-override materials. Returns (bodyApplied, lensApplied).
+	struct FFixtureMaterialApplyCount { int32 Body = 0; int32 Lens = 0; int32 Restored = 0; };
+	FFixtureMaterialApplyCount SetFixtureMaterialOverrideEnabled(bool bEnabled);
+	bool IsFixtureMaterialOverrideEnabled() const { return bOverrideFixtureMaterials; }
+
 	// REST client used to lazily fetch gobo wheel images / IES bytes.
 	void SetRestClient(TSharedPtr<FRebusRestClient> InClient) { RestClient = InClient; }
 
@@ -419,6 +430,51 @@ private:
 	// falls back to a runtime load and logs which asset failed.
 	UPROPERTY() TObjectPtr<UStaticMesh> LensPlaneMesh = nullptr;
 	UPROPERTY() TObjectPtr<UMaterialInterface> LensMaterial = nullptr;
+
+	// v1.0.71 fixture body/lens material override -- the user-facing "make every fixture look
+	// like a black satin plastic moving head, with mirrored-glass lenses" pass.
+	//
+	// FixtureMatParent: parametric PBR parent for the runtime-built MIDs. Defaults to
+	//   `/Engine/BasicShapes/BasicShapeMaterial` (exposes Color + Metallic + Roughness as
+	//   parameters, ships with every UE install, no new content required). The constructor also
+	//   probes `/Game/REBUS/Materials/M_RebusFixtureBody`/`M_RebusFixtureLens` -- if the user
+	//   drops their own .uasset materials at those paths, they take precedence and the MIDs
+	//   are not built (the override is the user's material verbatim).
+	// FixtureBodyMaterialOverride / FixtureLensMaterialOverride: optional user overrides
+	//   loaded via ConstructorHelpers from /Game (so cook captures them when present).
+	// FixtureBodyMID / FixtureLensMID: lazy per-actor MIDs built off FixtureMatParent in
+	//   EnsureFixtureMIDs the first time a mesh asks for them. Body MID is configured for
+	//   black satin plastic (Color=#050505, Metallic=0, Roughness=0.35); Lens MID for mirrored
+	//   glass (Color=#F2F2F2, Metallic=1, Roughness=0.05).
+	// OriginalMeshMaterials / OriginalOrbitMaterials: cached slot-0 materials captured the
+	//   first time the override is applied to each component, so SetFixtureMaterialOverride
+	//   Enabled(false) can restore the pre-override look exactly.
+	UPROPERTY() TObjectPtr<UMaterialInterface> FixtureMatParent = nullptr;
+	UPROPERTY() TObjectPtr<UMaterialInterface> FixtureBodyMaterialOverride = nullptr;
+	UPROPERTY() TObjectPtr<UMaterialInterface> FixtureLensMaterialOverride = nullptr;
+	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> FixtureBodyMID = nullptr;
+	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> FixtureLensMID = nullptr;
+	UPROPERTY() TArray<TObjectPtr<UMaterialInterface>> OriginalMeshMaterials; // index-aligned to MeshComponents
+	// Non-UPROPERTY because TMap with TWeakObjectPtr key is not reliably UHT-supported; value is
+	// weak too so a GC'd material (or destroyed comp on re-import) makes the restore a no-op
+	// rather than crashing. The original materials we cache for Orbit comps are GLB-imported
+	// assets owned by the OrbitConnector plugin's import root, so in practice they outlive the
+	// override -- the weak-weak storage is purely defensive.
+	TMap<TWeakObjectPtr<USceneComponent>, TWeakObjectPtr<UMaterialInterface>> OriginalOrbitMaterials;
+	bool bOverrideFixtureMaterials = true; // default on; flippable via the console command
+
+	// Build (once) the per-actor body + lens MIDs from FixtureMatParent. No-op if the parent is
+	// missing OR the user-override variants are present (in which case we use those verbatim).
+	void EnsureFixtureMIDs();
+	// Apply the override to a single mesh component. Captures the original material into
+	// OutOriginal* the first time, so the override can be reverted cleanly. bIsOrbitComp picks
+	// which cache to use. Returns true when a material was applied.
+	bool ApplyFixtureMaterialTo(class UPrimitiveComponent* Comp, const FString& MeshName,
+		const FString& GeomName, bool bIsOrbitComp);
+	// True when any of the supplied tokens (case-insensitive) contains a lens-shaped substring
+	// -- "lens" / "glass" / "crystal" / "optic" / "front" (last covers many GDTF naming
+	// conventions for the front optic).
+	static bool IsLensToken(const FString& Token);
 
 	// Hybrid volumetric beam (Phase 1, §8.4a): a procedural TRUNCATED-CONE (frustum) mesh + an
 	// additive faux-volumetric MID (M_RebusBeam), sized to the IES distribution (base = the lens

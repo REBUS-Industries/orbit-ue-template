@@ -593,6 +593,74 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Fixture body + lens material override: black satin plastic + mirrored glass (v1.0.71).**
+> User asked *"can all fixtures have their texture/material overridden and can UE make a
+> Fixture Material that we use. This will be a black satin plastic material. If there is a
+> lens material, this can be swapped for a mirrored glass material."* -- pre-v1.0.71 the
+> control-channel procedural body meshes shipped with whatever default `UProceduralMeshComponent`
+> renders (the engine WorldGridMaterial checkerboard in most cases), and the Orbit-imported
+> bodies kept whatever the glb shipped, which is usually nothing -- so the show looked like
+> a pile of grey debug meshes instead of real fixtures.
+>
+> **What v1.0.71 changes.** Every fixture's body meshes (control-channel `UProceduralMeshComponent`
+> *and* Orbit-imported components bound by `RebindOrbitModels`) now get a slot-0 material
+> override at build/bind time. Two material variants, picked per mesh by a name/tag keyword
+> scan:
+>
+> - **Body** (black satin plastic) -- applied to any mesh whose name/tag does NOT match a lens
+>   keyword. `Color = #050505`, `Metallic = 0`, `Roughness = 0.35`. Near-black diffuse + a
+>   soft sheen highlight -- reads as injection-moulded fixture housing under stage lights.
+>   (Pure black crushes contrast and reads as "flat black" rather than "satin"; the slight
+>   colour catches the sheen.)
+> - **Lens** (mirrored glass) -- applied to any mesh whose name OR any of its ComponentTags
+>   contains the substring `lens` / `glass` / `crystal` / `optic` / `front` (case-insensitive,
+>   covers GDTF "Lens"/"Front Lens"/"Optic", glb "lens"/"glass", and decorative-crystal naming).
+>   `Color = #F2F2F2`, `Metallic = 1`, `Roughness = 0.05` -- a polished chrome mirror. True
+>   dielectric glass needs translucent shading which the runtime parent doesn't support; in a
+>   venue under stage light a fixture lens reads visually as a chrome mirror anyway (because
+>   the dark interior absorbs the back), so metallic-mirror is the right approximation.
+>
+> **How the materials get built (no new assets required by default).** The two MIDs are
+> created lazily per fixture from `/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial`
+> -- an engine-shipped parametric PBR parent that exposes `Color` (vector), `Metallic`
+> (scalar), `Roughness` (scalar) as parameters. Ships with every UE install so there are no
+> new content additions; the cooker captures it via the constructor `ConstructorHelpers::
+> FObjectFinder` hard ref (cook-safe -- a runtime LoadObject is *not* a cook dependency).
+> If the engine ever renames those parameters the `SetVectorParameterValue`/
+> `SetScalarParameterValue` calls become benign no-ops and the MID renders as the parent's
+> default look -- never crashes, never breaks the build.
+>
+> **User-overridable assets (optional, drop-in).** The constructor also probes
+> `/Game/REBUS/Materials/M_RebusFixtureBody.M_RebusFixtureBody` and
+> `M_RebusFixtureLens.M_RebusFixtureLens`. If you create either asset in the editor it takes
+> precedence over the runtime MID -- the override uses your material verbatim, no parameter
+> mangling, no naming requirements on the parameters. To author them: right-click
+> `/Game/REBUS/Materials` -> New -> Material, save as `M_RebusFixtureBody`/`M_RebusFixtureLens`,
+> author whatever PBR shading you want (anisotropic satin, translucent glass with proper
+> IOR, painted texture maps, anything). Restart the editor or PIE and the new asset will be
+> picked up by the next fixture spawn.
+>
+> **Live toggle: `Rebus.OverrideFixtureMaterials [0|1]`.** Default ON. OFF restores each
+> mesh's pre-override material from a per-actor cache captured the first time the override
+> was applied -- byte-exact restore. The summary log reports the per-fixture body/lens
+> apply or restore count:
+>
+> ```
+> Rebus.OverrideFixtureMaterials 1: 4 fixture(s) -- body=18 lens=6 meshes overridden.
+> Rebus.OverrideFixtureMaterials 0: 4 fixture(s) -- restored=24 original material(s).
+> ```
+>
+> Per-actor API (for portal-side fine-grain control later):
+> `ARebusFixtureActor::SetFixtureMaterialOverrideEnabled(bool)` returns
+> `FFixtureMaterialApplyCount{Body, Lens, Restored}`.
+>
+> **Scope notes.** Only slot 0 of each mesh is overridden -- multi-material meshes keep
+> slots 1+ on their original materials. The emissive lens-flare disc (`LensDisc`,
+> `M_RebusLensFlare`) is untouched -- that's an additive glow disc, not body geometry; the
+> "lens material" the user asked to swap is a body-mesh lens (the front optic / decorative
+> glass), distinct from the flare. The beam canvas (Epic `MI_Beam`/REBUS `M_RebusBeam`) is
+> also untouched -- it's the volumetric shaft, not body.
+
 > **Hide-Orbit console commands (v1.0.70).** User asked *"how do I hide the orbit lights on
 > cmd"* -- there was no console toggle for this. v1.0.65's `Rebus.DriveOrbitModels 0` only stops
 > driving (the orbit fixtures freeze at their imported pose but stay visible). Added two
