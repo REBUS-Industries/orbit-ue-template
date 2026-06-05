@@ -8,10 +8,12 @@
 
 #include "Components/SpotLightComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Components/SceneCaptureComponent2D.h"
 #include "ProceduralMeshComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/TextureLightProfile.h"
 #include "Engine/Texture2D.h"
+#include "Engine/TextureRenderTarget2D.h"
 #include "Engine/Canvas.h"
 #include "Engine/CanvasRenderTarget2D.h"
 #include "Materials/MaterialInterface.h"
@@ -213,7 +215,191 @@ float GRebusSpotLightScatter = 0.5f;
 // `RefreshBeamShadowMode` (driven by `Rebus.HeroShadowScatter` / `bWantsVolumetricShadow`)
 // is a DIFFERENT system -- Unreal's native VSM fog volumetric-shadow path for hero fixtures
 // -- and is unchanged. See the README v1.0.110 release block for the open architectural
-// question for v1.0.111+.
+// question the v1.0.111 light-space depth-mask shadow path answers.
+
+// v1.0.111 -- LIGHT-SPACE DEPTH-MASK BEAM OCCLUSION. The architecturally correct
+// replacement for the v1.0.96..v1.0.109 screen-space trace. Each fixture owns its own
+// USceneCaptureComponent2D parented to the SpotLight (so it auto-tracks the live aim
+// via the existing component hierarchy -- pan / tilt / head motion all propagate for
+// free, NEVER attach to FixtureRoot because that doesn't track the head). The capture
+// renders depth-only (`SCS_SceneDepth`, linear cm) into a per-fixture
+// UTextureRenderTarget2D (default 256x256 R16f); the M_RebusBeam Custom HLSL samples
+// that texture per raymarch step, projects the sample's world position into the
+// SpotLight's local frame using the SpotLight's world right / up / forward axes (cached
+// each refresh into BeamLightRight / BeamLightUp / BeamShadowMaskTanHalfFov scalar
+// inputs), reads the blocker depth, and attenuates the per-step density when the
+// shaft sample is FURTHER from the lens than the blocker. The light-view frustum is
+// fixed by the aim and not by the camera, so the failure modes that killed the
+// screen-space trace -- off-screen occluders silently fail, pan-edge false occlusion,
+// reverse-Z precision crash beyond ~500 m -- ALL go away: samples outside the
+// SceneCapture's frustum are exactly the samples where the light geometrically does
+// not reach, so "no occlusion change" there is semantically correct.
+//
+// Five operator knobs all share `RefreshBeamShadowMaskParamsOnEveryFixture` which
+// walks every Rebus fixture and re-pushes the new scalar / texture state through
+// `RefreshBeamShadowMaskParams`. The MASTER TOGGLE `Rebus.BeamShadowMask 0|1` is a
+// proper int CVar (not a console-command save/restore like the deleted v1.0.96
+// `Rebus.BeamShadow`) -- the refresh sink flips BOTH the SceneCapture's
+// `bCaptureEveryFrame` AND the MID's `BeamShadowMaskEnabled` scalar so a disabled
+// mask costs no GPU time at all (the depth capture stops firing, AND the shader's
+// `[branch]` gate takes the per-sample fetch out of the per-pixel cost). The
+// per-fixture seed in `BuildBeamCone` reads the CURRENT live values so fresh-spawn
+// fixtures inherit the operator's chosen tuning.
+//
+// Defaults:
+//   * BeamShadowMask        = 1   (ON -- the v1.0.111 fix is the new default)
+//   * BeamShadowMaskRes     = 256 (px; square R16f; ~128 KB / fixture; recommended
+//     buckets: 128 / 256 / 512 / 1024 -- doubling res quadruples memory)
+//   * BeamShadowMaskBiasCm  = 5.0 (cm; constant offset added to blocker depth so a
+//     sample at the lens plane can't self-occlude against the lens disc's own depth)
+//   * BeamShadowMaskFadeCm  = 20.0 (cm; SOFT fade range -- the beam doesn't binary
+//     clip at the blocker, it fades over a few cm so the discontinuity softens against
+//     aliasing in the 256x256 capture)
+//   * BeamShadowMaskFovMargin = 2.0 (deg; added to the SpotLight outer cone full-angle
+//     before feeding the SceneCapture's `FOVAngle` -- so the beam's outermost raymarch
+//     samples don't read undefined pixels at the capture-render edge)
+//   * BeamShadowMaskDebug   = 0 (off; 1 = paint occluded samples RED inside the shaft
+//     so the operator can visually verify the projection math)
+int32 GRebusBeamShadowMask         = 1;
+int32 GRebusBeamShadowMaskRes      = 256;
+float GRebusBeamShadowMaskBiasCm   = 5.f;
+float GRebusBeamShadowMaskFadeCm   = 20.f;
+float GRebusBeamShadowMaskFovMargin = 2.f;
+int32 GRebusBeamShadowMaskDebug    = 0;
+
+static void RefreshBeamShadowMaskParamsOnEveryFixture(const TCHAR* CVarLabel, const FString& NewValStr)
+{
+	if (!GEngine) return;
+	int32 Refreshed = 0;
+	for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+	{
+		UWorld* W = Ctx.World();
+		if (!W) continue;
+		for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+		{
+			if (ARebusFixtureActor* F = *It)
+			{
+				F->RefreshBeamShadowMaskParams();
+				++Refreshed;
+			}
+		}
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("%s -> %s, refreshed %d fixture(s) (M_RebusBeam light-space depth-mask scalar / texture / FOV / axes re-pushed; SceneCapture FOV resynced)."),
+		CVarLabel, *NewValStr, Refreshed);
+}
+
+FAutoConsoleVariableRef CVarRebusBeamShadowMask(
+	TEXT("Rebus.BeamShadowMask"),
+	GRebusBeamShadowMask,
+	TEXT("v1.0.111 -- master toggle for the light-space depth-mask beam-occlusion path "
+		 "(default 1 = ON). When 0 every Rebus fixture's per-fixture SceneCapture2D stops "
+		 "capturing (`bCaptureEveryFrame = false` -- the depth render is skipped entirely, "
+		 "saving ~0.05-0.15 ms / fixture on the GPU) AND the BeamMID's `BeamShadowMask"
+		 "Enabled` scalar is forced to 0 (the shader's `[branch] if (BeamShadowMaskEnabled > "
+		 "0.5)` gate takes the per-step Texture2DSample fetch out of the per-pixel cost). "
+		 "When 1, both are re-enabled and the cone-mesh shaft is carved against ANY scene "
+		 "geometry standing between the fixture lens and the lit footprint (the v1.0.111 "
+		 "user-design verbatim: 'a small SceneCapture2D at the moving light lens, FOV "
+		 "matched to the spotlight cone angle, depth-only mask, compare pixel-distance-"
+		 "from-light to captured blocker-depth'). Live -- changing this walks every Rebus "
+		 "fixture and re-pushes both states through `RefreshBeamShadowMaskParams`. Pair "
+		 "with `Rebus.DumpBeamShadowMask` to verify per fixture."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamShadowMaskParamsOnEveryFixture(TEXT("Rebus.BeamShadowMask"), FString::FromInt(CVar->GetInt()));
+	}),
+	ECVF_Default);
+
+FAutoConsoleVariableRef CVarRebusBeamShadowMaskRes(
+	TEXT("Rebus.BeamShadowMaskRes"),
+	GRebusBeamShadowMaskRes,
+	TEXT("v1.0.111 -- light-space depth-mask render-target square pixel size for every "
+		 "Rebus fixture's SceneCapture2D (default 256). Recommended buckets: 128 (~32 KB / "
+		 "fixture, blocky at near edges), 256 (~128 KB / fixture, the v1.0.111 default -- "
+		 "good balance for typical 30-fixture shows), 512 (~512 KB / fixture, smooth "
+		 "edges, fine for hero rigs), 1024 (~2 MB / fixture, photographic; reserve for "
+		 "1-3 hero fixtures with `Rebus.BeamShadowMaskFadeCm 5.0` for sharp shadow "
+		 "geometry). Doubling res quadruples memory + roughly doubles the per-fixture "
+		 "GPU capture cost. Live -- the refresh sink re-creates every fixture's RT at "
+		 "the new size, including the format / sampler-state / generate-mips state "
+		 "(disabled -- the SceneCapture writes mip 0 every frame). Pair with `Rebus."
+		 "DumpBeamShadowMask` to confirm every fixture landed the new size."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamShadowMaskParamsOnEveryFixture(TEXT("Rebus.BeamShadowMaskRes"), FString::FromInt(CVar->GetInt()));
+	}),
+	ECVF_Default);
+
+FAutoConsoleVariableRef CVarRebusBeamShadowMaskBiasCm(
+	TEXT("Rebus.BeamShadowMaskBiasCm"),
+	GRebusBeamShadowMaskBiasCm,
+	TEXT("v1.0.111 -- light-space depth-mask comparison bias in cm (default 5.0). Each "
+		 "shaft sample compares `sampleDistFromLight > blockerDepth + Bias` to decide "
+		 "whether to attenuate. The bias prevents self-occlusion against geometry that "
+		 "sits exactly at the lens plane (the lens disc itself, the fixture body when "
+		 "the SceneCapture wasn't hidden against it, or thin geometry whose depth "
+		 "quantises to the same R16f bucket as the sample). Raise to 50+ if the operator "
+		 "reports the beam reads as 'shadowed at the very start' against props placed "
+		 "right at the lens; lower to 1.0 for tight rigs where 5 cm visibly delays the "
+		 "shadow entrance. Live."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamShadowMaskParamsOnEveryFixture(TEXT("Rebus.BeamShadowMaskBiasCm"), FString::SanitizeFloat(CVar->GetFloat()));
+	}),
+	ECVF_Default);
+
+FAutoConsoleVariableRef CVarRebusBeamShadowMaskFadeCm(
+	TEXT("Rebus.BeamShadowMaskFadeCm"),
+	GRebusBeamShadowMaskFadeCm,
+	TEXT("v1.0.111 -- light-space depth-mask soft-fade range in cm (default 20.0). The "
+		 "shaft doesn't binary clip at the blocker; per-step visibility = "
+		 "saturate(1 - (sampleDist - (blockerDepth + Bias)) / Fade). 0 = HARD clip (every "
+		 "sample farther than blocker reads 0 density -- crisp shadow edges, severe "
+		 "aliasing against the 256x256 R16f mask); higher = softer fade that hides the "
+		 "discrete-pixel mask aliasing AND gives the shadow a natural penumbra feel. "
+		 "Recommended: 5 cm for hero rigs at `BeamShadowMaskRes 512` or higher; 20 cm "
+		 "(v1.0.111 default) for the 256 res; 50 cm if you LIKE the soft look. Live."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamShadowMaskParamsOnEveryFixture(TEXT("Rebus.BeamShadowMaskFadeCm"), FString::SanitizeFloat(CVar->GetFloat()));
+	}),
+	ECVF_Default);
+
+FAutoConsoleVariableRef CVarRebusBeamShadowMaskFovMargin(
+	TEXT("Rebus.BeamShadowMaskFovMargin"),
+	GRebusBeamShadowMaskFovMargin,
+	TEXT("v1.0.111 -- safety margin in degrees added to the SpotLight outer-cone FULL "
+		 "angle before feeding the per-fixture SceneCapture2D's `FOVAngle` (default 2.0). "
+		 "The raymarch's outermost samples sit at the procedural cone-mesh edge "
+		 "(`OuterHalf * 2`); rendering the SceneCapture at EXACTLY that FOV puts those "
+		 "samples on the texture's outermost row of pixels, where bilinear filtering "
+		 "reads partly from outside the rendered region (undefined). 2 deg of margin "
+		 "moves the cone-edge samples one row inward. Raise if the operator reports "
+		 "the visible shadow stops short of the cone edge (the v1.0.111 mode-1 debug "
+		 "view will show the cone-edge samples as RED if this is the cause); lower to "
+		 "0 to confirm the diagnosis. Live."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamShadowMaskParamsOnEveryFixture(TEXT("Rebus.BeamShadowMaskFovMargin"), FString::SanitizeFloat(CVar->GetFloat()));
+	}),
+	ECVF_Default);
+
+FAutoConsoleVariableRef CVarRebusBeamShadowMaskDebug(
+	TEXT("Rebus.BeamShadowMaskDebug"),
+	GRebusBeamShadowMaskDebug,
+	TEXT("v1.0.111 -- light-space depth-mask debug visualisation (default 0 = off). 1 = "
+		 "paint OCCLUDED raymarch samples RED inside the shaft (the equivalent of "
+		 "v1.0.99's `Rebus.BeamShadowDebug 1` for the new path; lets the operator "
+		 "visually verify that the SceneCapture's projection lines up with the visible "
+		 "cone -- place a cube between the fixture and the floor, expect a RED carved "
+		 "channel that tracks the cube through pan / tilt). 0 = ship the regular "
+		 "composed beam. Live."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamShadowMaskParamsOnEveryFixture(TEXT("Rebus.BeamShadowMaskDebug"), FString::FromInt(CVar->GetInt()));
+	}),
+	ECVF_Default);
 
 // v1.0.101 -- per-fixture cone-mesh visible far-radius scale, applied identically to the
 // procedural M_RebusBeam cone (UpdateBeamConeGeometry) AND the Epic-beam canvas
@@ -2624,6 +2810,18 @@ void ARebusFixtureActor::BuildBeamCone()
 	RefreshBeamEmissive();
 	RefreshBeamSpatialParams();   // seed world BeamOrigin/BeamDir (RefreshMotion re-pushes per frame)
 
+	// v1.0.111 -- light-space depth-mask shadow path. Spawn the per-fixture
+	// SceneCapture2D + RT pair AFTER BeamMID has been created (so the new helper can
+	// wire the `BeamShadowMaskRT` texture param immediately) and AFTER SpotLight has
+	// been parented (the helper attaches to SpotLight so the capture rides the live
+	// aim through pan / tilt). Then push the initial scalar / axis / FOV state from
+	// the live CVars so the mask is operationally correct on the very first frame --
+	// the per-tick refresh through DriveBeamConeFromSpotLight handles updates from
+	// here on. Skip the entire path on the rare BeamMID-load-failed branch above
+	// (the early `return` after the M_RebusBeam null-load already covers it).
+	BuildBeamShadowMaskCapture();
+	RefreshBeamShadowMaskParams();
+
 	const float OuterHalf = ResolveOuterHalfDeg();
 	const float CurIntensity = RebusMeshBeamMaxIntensity * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * MeshBeamUserScale;
 	// Report the cone forward vs the spotlight forward so a residual flip is provable from logs:
@@ -2853,6 +3051,296 @@ void ARebusFixtureActor::RefreshBeamRadialParams()
 		FMath::Clamp(GRebusBeamFalloff, 0.f, 32.f));
 }
 
+void ARebusFixtureActor::BuildBeamShadowMaskCapture()
+{
+	// v1.0.111 -- one-time creation of the per-fixture SceneCapture2D + its depth-only
+	// UTextureRenderTarget2D. Idempotent: safe to call twice (the per-fixture
+	// `BeamShadowMaskCapture != nullptr` early-return below means a re-call -- e.g. a
+	// future hot-reload path -- becomes a no-op without leaking components). Skips when
+	// SpotLight is null (caller already checks this; defensive double-check is cheap).
+	if (BeamShadowMaskCapture || !SpotLight)
+	{
+		return;
+	}
+
+	// Render target: per-fixture R16f square. R16f gives ~10 bits of mantissa (0..2048
+	// exactly representable, then 1-cm steps to 4096 cm, 2-cm to 8192 cm, ...). At the
+	// 6000 cm default AttenuationRadius the worst-case quantisation is ~2 cm at the far
+	// throw -- well below the v1.0.111 default `BeamShadowMaskFadeCm = 20.0` so the
+	// soft-fade hides any quantisation step. The size is seeded from the live CVar so
+	// fresh-spawn fixtures pick up the operator's chosen res; `RefreshBeamShadowMaskParams`
+	// re-sizes the RT in place when the operator pushes a new `Rebus.BeamShadowMaskRes`.
+	const int32 SeedRes = FMath::Clamp(GRebusBeamShadowMaskRes, 64, 4096);
+	BeamShadowMaskRT = NewObject<UTextureRenderTarget2D>(this, TEXT("BeamShadowMaskRT"));
+	BeamShadowMaskRT->RenderTargetFormat = ETextureRenderTargetFormat::RTF_R16f;
+	BeamShadowMaskRT->ClearColor = FLinearColor(1e6f, 0.f, 0.f, 0.f); // initial = "infinitely far"
+	BeamShadowMaskRT->bAutoGenerateMips = false;
+	BeamShadowMaskRT->InitAutoFormat(SeedRes, SeedRes);
+	BeamShadowMaskRT->UpdateResourceImmediate(true);
+
+	// SceneCapture2D parented to the SpotLight so the capture transform auto-tracks the
+	// live aim via the existing component hierarchy (BeamRestTransform * Head). Attaching
+	// to FixtureRoot would NOT track pan/tilt -- the SpotLight's relative transform is
+	// where the head motion lives. Mobility must be Movable so the auto-tracked transform
+	// updates cleanly.
+	BeamShadowMaskCapture = NewObject<USceneCaptureComponent2D>(this, TEXT("BeamShadowMaskCapture"));
+	BeamShadowMaskCapture->SetupAttachment(SpotLight);
+	BeamShadowMaskCapture->SetRelativeTransform(FTransform::Identity);
+	BeamShadowMaskCapture->RegisterComponent();
+	BeamShadowMaskCapture->SetMobility(EComponentMobility::Movable);
+
+	// Depth-only capture; SCS_SceneDepth writes camera-Z in cm directly into R channel.
+	BeamShadowMaskCapture->TextureTarget = BeamShadowMaskRT;
+	BeamShadowMaskCapture->CaptureSource = ESceneCaptureSource::SCS_SceneDepth;
+	BeamShadowMaskCapture->ProjectionType = ECameraProjectionMode::Perspective;
+	BeamShadowMaskCapture->FOVAngle = 60.f; // placeholder; resynced by RefreshBeamShadowMaskParams
+	BeamShadowMaskCapture->MaxViewDistanceOverride = SpotLight->AttenuationRadius * 1.05f;
+	BeamShadowMaskCapture->bCaptureEveryFrame = (GRebusBeamShadowMask != 0);
+	BeamShadowMaskCapture->bCaptureOnMovement = false; // we own the trigger via bCaptureEveryFrame
+	BeamShadowMaskCapture->bAlwaysPersistRenderingState = true;
+
+	// Strip every expensive feature -- this is a depth-only "shadow map" pass and we want
+	// the cheapest possible capture per fixture. Per the v1.0.111 GPU budget: a 256x256
+	// depth-only capture with these flags costs ~0.05-0.15 ms each on modern hardware.
+	FEngineShowFlags& Flags = BeamShadowMaskCapture->ShowFlags;
+	Flags.SetAntiAliasing(false);
+	Flags.SetTemporalAA(false);
+	Flags.SetMotionBlur(false);
+	Flags.SetBloom(false);
+	Flags.SetEyeAdaptation(false);
+	Flags.SetAtmosphere(false);
+	Flags.SetFog(false);
+	Flags.SetVolumetricFog(false);
+	Flags.SetLighting(false);
+	Flags.SetDynamicShadows(false);
+	Flags.SetGlobalIllumination(false);
+	Flags.SetLumenGlobalIllumination(false);
+	Flags.SetLumenReflections(false);
+	Flags.SetReflectionEnvironment(false);
+	Flags.SetScreenSpaceReflections(false);
+	Flags.SetAmbientOcclusion(false);
+	Flags.SetScreenSpaceAO(false);
+	Flags.SetPostProcessing(false);
+	Flags.SetBSP(false);
+	Flags.SetDecals(false);
+	Flags.SetParticles(false);
+	Flags.SetTranslucency(false);
+	Flags.SetSeparateTranslucency(false);
+	Flags.SetSkeletalMeshes(true);      // dancers / performers DO occlude
+	Flags.SetStaticMeshes(true);        // trusses / set pieces DO occlude
+	Flags.SetLandscape(true);           // floors DO occlude
+	Flags.SetInstancedStaticMeshes(true);
+
+	// Hide our OWN visible-beam components on this fixture: the cone-mesh BeamCone (the
+	// procedural M_RebusBeam shaft we're trying to carve), the Epic-beam canvas
+	// (EpicBeamComp -- the alternate visible shaft, even though it's hidden when
+	// bPreferProceduralBeam=true), the LensDisc (the lens-flare disc co-located at the
+	// SpotLight origin), and every `IsBeamLensComponents` PMC (real-geometry lens panes
+	// for MAC-Aura-style fixtures). Without these hides the SceneCapture would shadow the
+	// beam against itself -- the lens disc sitting right at the SpotLight origin would
+	// register as a depth-1cm blocker that occludes everything behind it. `HiddenComponents`
+	// is a per-capture allowlist of components to skip rendering for THIS capture only;
+	// the SpotLight's per-light shadow casting + the main scene render are unaffected.
+	if (BeamCone)
+	{
+		BeamShadowMaskCapture->HiddenComponents.AddUnique(BeamCone);
+	}
+	if (EpicBeamComp)
+	{
+		BeamShadowMaskCapture->HiddenComponents.AddUnique(EpicBeamComp);
+	}
+	if (LensDisc)
+	{
+		BeamShadowMaskCapture->HiddenComponents.AddUnique(LensDisc);
+	}
+	for (const TWeakObjectPtr<UPrimitiveComponent>& WeakLens : IsBeamLensComponents)
+	{
+		if (UPrimitiveComponent* P = WeakLens.Get())
+		{
+			BeamShadowMaskCapture->HiddenComponents.AddUnique(P);
+		}
+	}
+	for (TObjectPtr<UStaticMeshComponent>& Flare : IsBeamFlareDiscs)
+	{
+		if (Flare)
+		{
+			BeamShadowMaskCapture->HiddenComponents.AddUnique(Flare);
+		}
+	}
+
+	// Bind the RT as the BeamMID's shadow-mask texture param. The BeamMID master must
+	// declare `BeamShadowMaskRT` (Texture2DObject param) for this push to land --
+	// `SetTextureParameterValue` is a silent no-op on a stale pre-v1.0.111 master, which
+	// is the case the Python self-heal probe `_beam_master_has_shadow_mask` covers on
+	// editor regen + the per-fixture `Rebus.DumpBeamShadowMask` EXISTS / MISSING flags
+	// surface to the operator at runtime.
+	if (BeamMID)
+	{
+		BeamMID->SetTextureParameterValue(TEXT("BeamShadowMaskRT"), BeamShadowMaskRT);
+	}
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s beam shadow mask: SPAWNED rt=%dx%d format=R16f attachedTo=SpotLight maxView=%.0fcm captureEveryFrame=%d hiddenComponents=%d"),
+		*FixtureId, SeedRes, SeedRes, BeamShadowMaskCapture->MaxViewDistanceOverride,
+		BeamShadowMaskCapture->bCaptureEveryFrame ? 1 : 0, BeamShadowMaskCapture->HiddenComponents.Num());
+}
+
+void ARebusFixtureActor::RefreshBeamShadowMaskParams()
+{
+	// v1.0.111 -- push the light-space depth-mask scalar / axis / RT state onto the
+	// BeamMID + resync the SceneCapture's FOV / capture-every-frame / RT size. Safe to
+	// call when BeamMID is null (M_RebusBeam load failed -- the early return matches
+	// the rest of the MID-push helpers) or when BeamShadowMaskCapture is null (no
+	// SceneCapture got built, e.g. a fixture spawned before SpotLight was ready).
+	if (!BeamMID) return;
+
+	const bool bMasterOn = (GRebusBeamShadowMask != 0);
+
+	// Scalars first -- always pushed so a master-toggle flip lands even if the capture
+	// got torn down somehow. The shader's `[branch] if (BeamShadowMaskEnabled > 0.5)`
+	// gate takes the per-step Texture2DSample fetch OUT of the per-pixel cost when 0.
+	BeamMID->SetScalarParameterValue(TEXT("BeamShadowMaskEnabled"), bMasterOn ? 1.f : 0.f);
+	BeamMID->SetScalarParameterValue(TEXT("BeamShadowMaskBiasCm"),
+		FMath::Clamp(GRebusBeamShadowMaskBiasCm, 0.f, 1000.f));
+	BeamMID->SetScalarParameterValue(TEXT("BeamShadowMaskFadeCm"),
+		FMath::Max(GRebusBeamShadowMaskFadeCm, 0.01f));
+	const float FarCm = SpotLight ? FMath::Max(SpotLight->AttenuationRadius, 100.f) : 6000.f;
+	BeamMID->SetScalarParameterValue(TEXT("BeamShadowMaskFarCm"), FarCm);
+	BeamMID->SetScalarParameterValue(TEXT("BeamShadowMaskDebug"),
+		(float)FMath::Clamp(GRebusBeamShadowMaskDebug, 0, 1));
+
+	// Light axes -- the SpotLight's world right / up / forward as the shader's basis
+	// for projecting `wp - BeamOrigin` into the per-fixture SceneCapture's local frame.
+	// Read live so pan / tilt updates are picked up each call (the per-tick refresh path
+	// goes through DriveBeamConeFromSpotLight -> RefreshBeamShadowMaskParams).
+	const FVector LightFwd   = SpotLight ? SpotLight->GetForwardVector().GetSafeNormal() : FVector::ForwardVector;
+	const FVector LightRight = SpotLight ? SpotLight->GetRightVector().GetSafeNormal()   : FVector::RightVector;
+	const FVector LightUp    = SpotLight ? SpotLight->GetUpVector().GetSafeNormal()      : FVector::UpVector;
+	BeamMID->SetVectorParameterValue(TEXT("BeamLightFwd"),
+		FLinearColor((float)LightFwd.X, (float)LightFwd.Y, (float)LightFwd.Z, 0.f));
+	BeamMID->SetVectorParameterValue(TEXT("BeamLightRight"),
+		FLinearColor((float)LightRight.X, (float)LightRight.Y, (float)LightRight.Z, 0.f));
+	BeamMID->SetVectorParameterValue(TEXT("BeamLightUp"),
+		FLinearColor((float)LightUp.X, (float)LightUp.Y, (float)LightUp.Z, 0.f));
+
+	// Tan(half-FOV) -- derived from the SceneCapture's live FOV (full angle in deg).
+	// Pushed as a SCALAR so the shader's per-step UV math is one mul + one add instead
+	// of resolving from a 4x4 view-projection. The capture's FOV is itself derived from
+	// the SpotLight outer cone + safety margin (see below) so this scalar tracks pan/tilt
+	// AND zoom changes for free.
+	float FovFull = 60.f;
+	if (BeamShadowMaskCapture)
+	{
+		FovFull = BeamShadowMaskCapture->FOVAngle;
+	}
+	const float TanHalfFov = FMath::Tan(FMath::DegreesToRadians(FMath::Clamp(FovFull, 1.f, 170.f) * 0.5f));
+	BeamMID->SetScalarParameterValue(TEXT("BeamShadowMaskTanHalfFov"), FMath::Max(TanHalfFov, 0.001f));
+
+	// SceneCapture-side state -- resync FOV from the SpotLight outer cone + margin,
+	// MaxViewDistanceOverride from AttenuationRadius (the same FarCm the shader sees),
+	// and bCaptureEveryFrame from the master toggle. ALL the SceneCapture state changes
+	// are gated on the capture existing so a hot-reload / pre-v1.0.111 fixture without
+	// the capture pair stays a clean no-op.
+	if (BeamShadowMaskCapture)
+	{
+		// Full angle = 2 * outer half deg, with a small safety margin so the cone-edge
+		// samples don't read undefined pixels at the capture-render edge.
+		const float OuterHalfDeg = ResolveOuterHalfDeg();
+		const float MarginDeg = FMath::Clamp(GRebusBeamShadowMaskFovMargin, 0.f, 30.f);
+		const float NewFov = FMath::Clamp(2.f * OuterHalfDeg + MarginDeg, 1.f, 170.f);
+		BeamShadowMaskCapture->FOVAngle = NewFov;
+		BeamShadowMaskCapture->MaxViewDistanceOverride = FarCm * 1.05f;
+		BeamShadowMaskCapture->bCaptureEveryFrame = bMasterOn;
+
+		// Resize the RT if the operator pushed a new `Rebus.BeamShadowMaskRes`.
+		const int32 WantRes = FMath::Clamp(GRebusBeamShadowMaskRes, 64, 4096);
+		if (BeamShadowMaskRT && (BeamShadowMaskRT->SizeX != WantRes || BeamShadowMaskRT->SizeY != WantRes))
+		{
+			BeamShadowMaskRT->ResizeTarget(WantRes, WantRes);
+		}
+
+		// Refresh the tan(halfFov) scalar to reflect the just-set FOV (the placeholder
+		// above used the PRE-resync value; this overwrite lands the live one).
+		const float TanHalfFovLive = FMath::Tan(FMath::DegreesToRadians(NewFov * 0.5f));
+		BeamMID->SetScalarParameterValue(TEXT("BeamShadowMaskTanHalfFov"), FMath::Max(TanHalfFovLive, 0.001f));
+	}
+}
+
+void ARebusFixtureActor::DumpBeamShadowMaskStateForDebug() const
+{
+	// v1.0.111 -- per-fixture light-space depth-mask diagnostic. Mirrors
+	// `DumpFixtureZoomStateForDebug` shape: one paste-friendly line per fixture with the
+	// SceneCapture state, the BeamMID scalar values (read back via GetScalarParameterValue
+	// so the EXISTS / MISSING flag surfaces a stale pre-v1.0.111 master), the projection
+	// sanity check (project BeamOrigin + BeamDir * AttenuationRadius * 0.5 into the
+	// SceneCapture's local frame -- expect (u, v) ~ (0, 0) which means the SceneCapture
+	// sits at the lens and aims down the beam, the v1.0.111 design point), and the global
+	// CVar values for diff against any portal / scene-property override.
+
+	auto MidScalar = [this](const TCHAR* Name, float& Out) -> bool
+	{
+		if (!BeamMID) { Out = 0.f; return false; }
+		FMaterialParameterInfo Info(Name);
+		return BeamMID->GetScalarParameterValue(Info, Out);
+	};
+
+	float MidEnabled = 0.f, MidBias = 0.f, MidFade = 0.f, MidFar = 0.f, MidDebug = 0.f, MidTan = 0.f;
+	const bool bHasEnabled = MidScalar(TEXT("BeamShadowMaskEnabled"), MidEnabled);
+	const bool bHasBias    = MidScalar(TEXT("BeamShadowMaskBiasCm"), MidBias);
+	const bool bHasFade    = MidScalar(TEXT("BeamShadowMaskFadeCm"), MidFade);
+	const bool bHasFar     = MidScalar(TEXT("BeamShadowMaskFarCm"), MidFar);
+	const bool bHasDebug   = MidScalar(TEXT("BeamShadowMaskDebug"), MidDebug);
+	const bool bHasTan     = MidScalar(TEXT("BeamShadowMaskTanHalfFov"), MidTan);
+	const bool bMasterShape = bHasEnabled && bHasBias && bHasFade && bHasFar && bHasDebug && bHasTan;
+
+	const FVector LightFwd   = SpotLight ? SpotLight->GetForwardVector().GetSafeNormal() : FVector::ForwardVector;
+	const FVector LightRight = SpotLight ? SpotLight->GetRightVector().GetSafeNormal()   : FVector::RightVector;
+	const FVector LightUp    = SpotLight ? SpotLight->GetUpVector().GetSafeNormal()      : FVector::UpVector;
+	const FVector LightOrigin = SpotLight ? SpotLight->GetComponentLocation() : FVector::ZeroVector;
+
+	// Projection sanity check: a point sitting in the middle of the beam should project
+	// to NDC ~ (0, 0). Anything outside ~|0.1| means BuildBeamShadowMaskCapture is
+	// attached / oriented wrong (the SceneCapture is NOT riding the SpotLight aim).
+	const float FarRadius = SpotLight ? SpotLight->AttenuationRadius : 6000.f;
+	const FVector MidPoint = LightOrigin + LightFwd * (FarRadius * 0.5f);
+	const FVector Local = MidPoint - LightOrigin;
+	const float AxialDist = (float)FVector::DotProduct(Local, LightFwd);
+	const float HorizDist = (float)FVector::DotProduct(Local, LightRight);
+	const float VertDist  = (float)FVector::DotProduct(Local, LightUp);
+	const float TanHalfFov = bHasTan ? FMath::Max(MidTan, 0.001f) : 0.001f;
+	const float UCoord = (AxialDist > 0.01f) ? (HorizDist / AxialDist / TanHalfFov) : 0.f;
+	const float VCoord = (AxialDist > 0.01f) ? (VertDist  / AxialDist / TanHalfFov) : 0.f;
+
+	const FString CaptureLine = BeamShadowMaskCapture
+		? FString::Printf(TEXT("Capture=ON fov=%.1fdeg rt=%dx%d format=R16f maxView=%.0fcm captureEveryFrame=%d hidden=%d"),
+			BeamShadowMaskCapture->FOVAngle,
+			BeamShadowMaskRT ? BeamShadowMaskRT->SizeX : -1,
+			BeamShadowMaskRT ? BeamShadowMaskRT->SizeY : -1,
+			BeamShadowMaskCapture->MaxViewDistanceOverride,
+			BeamShadowMaskCapture->bCaptureEveryFrame ? 1 : 0,
+			BeamShadowMaskCapture->HiddenComponents.Num())
+		: FString(TEXT("Capture=OFF (BeamShadowMaskCapture==null -- either pre-v1.0.111 fixture or BuildBeamShadowMaskCapture failed)"));
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("DumpBeamShadowMask Fixture %s [%s]: BeamMID.Enabled=%s BeamMID.BiasCm=%s BeamMID.FadeCm=%s BeamMID.FarCm=%s BeamMID.Debug=%s BeamMID.TanHalfFov=%s (masterShape=%s) %s sanity_uv_at_beam_midpoint=(%.3f,%.3f) [near-(0,0) means capture rides SpotLight aim correctly] LightOrigin=(%.0f,%.0f,%.0f) LightFwd=(%.3f,%.3f,%.3f) AttenuationRadius=%.0fcm CVars[Rebus.BeamShadowMask=%d Rebus.BeamShadowMaskRes=%d Rebus.BeamShadowMaskBiasCm=%.2f Rebus.BeamShadowMaskFadeCm=%.2f Rebus.BeamShadowMaskFovMargin=%.2f Rebus.BeamShadowMaskDebug=%d]"),
+		*FixtureId, *DisplayName,
+		bHasEnabled ? *FString::Printf(TEXT("%.2f"), MidEnabled) : TEXT("MISSING"),
+		bHasBias    ? *FString::Printf(TEXT("%.2f"), MidBias)    : TEXT("MISSING"),
+		bHasFade    ? *FString::Printf(TEXT("%.2f"), MidFade)    : TEXT("MISSING"),
+		bHasFar     ? *FString::Printf(TEXT("%.0f"), MidFar)     : TEXT("MISSING"),
+		bHasDebug   ? *FString::Printf(TEXT("%.0f"), MidDebug)   : TEXT("MISSING"),
+		bHasTan     ? *FString::Printf(TEXT("%.4f"), MidTan)     : TEXT("MISSING"),
+		bMasterShape ? TEXT("OK") : TEXT("STALE_MASTER -- run `Rebus.RebuildBeamMaterial` + ClearScene/LoadScene"),
+		*CaptureLine,
+		UCoord, VCoord,
+		LightOrigin.X, LightOrigin.Y, LightOrigin.Z,
+		LightFwd.X, LightFwd.Y, LightFwd.Z,
+		FarRadius,
+		GRebusBeamShadowMask, GRebusBeamShadowMaskRes,
+		GRebusBeamShadowMaskBiasCm, GRebusBeamShadowMaskFadeCm,
+		GRebusBeamShadowMaskFovMargin, GRebusBeamShadowMaskDebug);
+}
+
 void ARebusFixtureActor::RefreshBeamEmissive()
 {
 	if (!BeamMID) return;
@@ -2927,6 +3415,15 @@ void ARebusFixtureActor::DriveBeamConeFromSpotLight()
 	const FVector SpotLoc = SpotLight->GetComponentLocation();
 	BeamCone->SetWorldLocationAndRotation(SpotLoc, FRotationMatrix::MakeFromX(SpotFwd).ToQuat());
 	RefreshBeamSpatialParams(); // push the (now spotlight-aligned) world origin/dir to the raymarch MID
+
+	// v1.0.111 -- re-push the light-space depth-mask axis basis (BeamLightFwd / Right /
+	// Up) onto the BeamMID so the shader's per-step `wp - BeamOrigin` -> light-local
+	// projection tracks the live SpotLight aim. The SceneCapture is parented to the
+	// SpotLight so its transform auto-tracks via the component hierarchy; we just need
+	// to re-push the basis scalars + the FOV scalar so the shader's UV math stays in
+	// sync. RefreshBeamShadowMaskParams is the SAME helper the global CVar refresh
+	// sinks call, so the per-tick path and the operator-push path share one chokepoint.
+	RefreshBeamShadowMaskParams();
 
 	// v1.0.43: ride the Epic DMX beam canvas off the same ground-truth spotlight transform.
 	if (bUsingEpicBeam)

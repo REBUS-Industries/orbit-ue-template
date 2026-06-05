@@ -52,6 +52,8 @@ namespace
 	IConsoleCommand* GDumpOrbitNaniteCommand = nullptr;    // v1.0.105 -- per-mesh Nanite diagnostic dump
 	// v1.0.101 -- per-fixture zoom / cone-mesh / SpotLight outer-cone runtime dump.
 	IConsoleCommand* GDumpFixtureZoomCommand = nullptr;
+	// v1.0.111 -- per-fixture light-space depth-mask beam-occlusion state dump.
+	IConsoleCommand* GDumpBeamShadowMaskCommand = nullptr;
 	// v1.0.107 -- top-centre version watermark overlay (UDebugDrawService("Foreground")
 	// canvas draw). Two commands: the visibility toggle (with a `status` arg that
 	// prints the live state + cached version string + Y-margin) and the top-edge
@@ -389,6 +391,75 @@ namespace
 		{
 			UE_LOG(LogRebusVisualiser, Log,
 				TEXT("Rebus.DumpFixtureZoom '%s': dumped %d matching fixture(s)."), *Filter, Matched);
+		}
+	}
+
+	// v1.0.111: `Rebus.DumpBeamShadowMask [fixtureId]` -- per-fixture light-space depth-mask
+	// state dump. Mirrors `Rebus.DumpFixtureZoom`'s shape:
+	//   * No arg -> dumps every Rebus fixture in every Game/PIE/Editor world.
+	//   * Optional fixtureId arg (Speckle node id, same key SetFixture* uses) ->
+	//     dumps just that one; logs a warning if not found.
+	// Each line carries the SceneCapture2D's live FOVAngle + MaxViewDistanceOverride +
+	// bCaptureEveryFrame, the per-fixture render target's pixel size + format, the
+	// BeamMID's live BeamShadowMask*Cm / BeamShadowMaskTanHalfFov / BeamShadowMaskDebug /
+	// BeamShadowMaskEnabled scalars read back via `GetScalarParameterValue` (so an
+	// EXISTS/MISSING flag surfaces a stale master that pre-dates v1.0.111 --
+	// `_beam_master_has_shadow_mask` Python self-heal catches that on the editor regen
+	// path, this catches it from the runtime side), the projection sanity check (does
+	// projecting `BeamOrigin + BeamDir * AttenuationRadius * 0.5f` into the SceneCapture's
+	// view land at NDC ~ (0,0)?), and the live `Rebus.BeamShadowMask*` CVar values for
+	// diff against the per-fixture state.
+	void HandleDumpBeamShadowMaskCommand(const TArray<FString>& Args)
+	{
+		if (!GEngine) return;
+		const FString Filter = (Args.Num() > 0) ? Args[0] : FString();
+
+		// One-line CVar header so the operator has the six global values alongside the
+		// per-fixture lines for diff. Same shape as `Rebus.DumpFixtureZoom`'s header.
+		const auto FmtCVar = [](const TCHAR* Name) -> FString
+		{
+			IConsoleVariable* CV = IConsoleManager::Get().FindConsoleVariable(Name);
+			return CV ? CV->GetString() : FString(TEXT("<unregistered>"));
+		};
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("DumpBeamShadowMask CVars: Rebus.BeamShadowMask=%s, Res=%s, BiasCm=%s, FadeCm=%s, FovMargin=%s, Debug=%s"),
+			*FmtCVar(TEXT("Rebus.BeamShadowMask")),
+			*FmtCVar(TEXT("Rebus.BeamShadowMaskRes")),
+			*FmtCVar(TEXT("Rebus.BeamShadowMaskBiasCm")),
+			*FmtCVar(TEXT("Rebus.BeamShadowMaskFadeCm")),
+			*FmtCVar(TEXT("Rebus.BeamShadowMaskFovMargin")),
+			*FmtCVar(TEXT("Rebus.BeamShadowMaskDebug")));
+
+		int32 Total = 0, Matched = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE && Ctx.WorldType != EWorldType::Editor)) continue;
+			for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+			{
+				const ARebusFixtureActor* F = *It;
+				if (!F) continue;
+				++Total;
+				if (!Filter.IsEmpty() && !F->GetFixtureId().Equals(Filter, ESearchCase::IgnoreCase)) continue;
+				F->DumpBeamShadowMaskStateForDebug();
+				++Matched;
+			}
+		}
+		if (Filter.IsEmpty())
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.DumpBeamShadowMask: dumped %d fixture(s) (no filter)."), Matched);
+		}
+		else if (Matched == 0)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.DumpBeamShadowMask '%s': NOT FOUND (scanned %d fixture(s) -- check the Speckle node id, same key SetFixture* uses)."),
+				*Filter, Total);
+		}
+		else
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.DumpBeamShadowMask '%s': dumped %d matching fixture(s)."), *Filter, Matched);
 		}
 	}
 
@@ -1821,6 +1892,27 @@ void FRebusVisualiserModule::StartupModule()
 			 "Usage: Rebus.DumpFixtureZoom [fixtureId]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpFixtureZoomCommand),
 		ECVF_Default);
+
+	GDumpBeamShadowMaskCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.DumpBeamShadowMask"),
+		TEXT("v1.0.111 -- dump per-fixture light-space depth-mask beam-occlusion state in one "
+			 "line: SceneCapture2D live FOVAngle + MaxViewDistanceOverride + bCaptureEveryFrame, "
+			 "per-fixture render target's pixel size + format + memory cost, BeamMID's live "
+			 "BeamShadowMask*Cm / BeamShadowMaskEnabled / BeamShadowMaskTanHalfFov / "
+			 "BeamShadowMaskDebug scalar values read back via GetScalarParameterValue (the "
+			 "EXISTS/MISSING flag surfaces a stale M_RebusBeam master that pre-dates v1.0.111 "
+			 "-- `_beam_master_has_shadow_mask` Python self-heal catches it on the editor "
+			 "regen path; THIS catches it from the runtime side after a packaged build skipped "
+			 "the regen), projection sanity check (projects `BeamOrigin + BeamDir * "
+			 "AttenuationRadius * 0.5f` into the SceneCapture's view via the same axis math "
+			 "the shader uses, expects a near-(0,0) sample-plane offset -- proves the "
+			 "SceneCapture sits at the lens and aims down the beam), and live "
+			 "`Rebus.BeamShadowMask*` CVar values for diff. With no arg dumps every fixture; "
+			 "with a fixtureId (Speckle node id, same key SetFixture* uses) dumps just that "
+			 "one. Mirrors `Rebus.DumpFixtureZoom`'s shape. Usage: Rebus.DumpBeamShadowMask "
+			 "[fixtureId]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpBeamShadowMaskCommand),
+		ECVF_Default);
 }
 
 void FRebusVisualiserModule::ShutdownModule()
@@ -1949,6 +2041,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GDumpFixtureZoomCommand);
 		GDumpFixtureZoomCommand = nullptr;
+	}
+	if (GDumpBeamShadowMaskCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GDumpBeamShadowMaskCommand);
+		GDumpBeamShadowMaskCommand = nullptr;
 	}
 	if (GShowVersionCommand)
 	{

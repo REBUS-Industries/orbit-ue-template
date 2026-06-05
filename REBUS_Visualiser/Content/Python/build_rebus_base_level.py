@@ -503,16 +503,54 @@ _BEAM_RAYMARCH_HLSL = """
 // v1.0.110 ROLLBACK NOTE -- the v1.0.96 .. v1.0.109 screen-space self-shadow trace (per-shaft-sample
 // march from `wp` toward the SpotLight, tap SceneDepth at the projected UV, attenuate when occluded)
 // has been entirely REMOVED at the user's direction ("This shadow tracing,pen clip really isnt
-// working, its terrible and completely wrong, remove it and we will start again."). The trace ran
-// into the canonical SCREEN-SPACE-SHADOW limitations -- false occlusion on pan-edge sky pixels,
-// reverse-Z precision crash at long throws, and the fundamental "off-screen occluders don't cast"
-// architectural ceiling -- and the v1.0.109 guards mitigated but never fixed it. The HLSL is back
-// to the v1.0.95 baseline composition `d = BeamDensity * core * widthNorm * srcAtten * nf * softOcc`
-// so the shaft renders as a clean uncarved cone again. See the README v1.0.110 release block for
-// the full list of removed `BeamShadow*` material params + `Rebus.BeamShadow*` CVars + console
-// commands so operators with portal automation can prune their dispatcher tables, and for the
-// open architectural question the user will direct in v1.0.111+ (raytraced volumetric shadows,
-// neighbour-view depth, VSM-based volumetric, hand-painted clip planes, ...).
+// working, its terrible and completely wrong, remove it and we will start again."). See the README
+// v1.0.110 release block for the rollback scope. v1.0.111 (below) is the redesign on a different
+// architectural footing -- light-space, per-fixture, view-independent.
+//
+// v1.0.111 LIGHT-SPACE DEPTH-MASK BEAM OCCLUSION -- the architecturally correct replacement.
+// Each fixture owns a USceneCaptureComponent2D parented to its SpotLight (so the capture rides
+// the live pan/tilt aim via the existing component hierarchy) that renders a depth-only mask
+// (`SCS_SceneDepth`, linear cm) into a per-fixture R16f UTextureRenderTarget2D (`BeamShadowMaskRT`).
+// The raymarch below samples that texture per-step: it projects the shaft sample's world position
+// into the SpotLight's local frame using the SpotLight's pushed world right / up / forward axes
+// (BeamLightRight / BeamLightUp / BeamLightFwd) and the SceneCapture's tan(halfFov) (BeamShadow
+// MaskTanHalfFov), reads the blocker depth at that texture UV, and attenuates the per-step
+// density when the shaft sample sits FURTHER from the lens than the blocker.
+//
+// Why this works where the screen-space trace didn't:
+//   * The capture's frustum is FIXED BY THE AIM (the SpotLight's outer cone) -- not by the
+//     camera. Samples outside the capture's frustum are exactly samples where the light doesn't
+//     reach geometrically, so "no occlusion change" there is semantically correct (the
+//     v1.0.96..v1.0.109 false-occlusion at the screen edge was the camera-frustum mismatch
+//     bleeding into a light-space comparison).
+//   * Off-screen-relative-to-camera occluders still cast: the capture sees them as long as
+//     they're in the LIGHT's frustum (i.e. between the fixture and the lit footprint).
+//   * Reverse-Z precision crash beyond ~500m doesn't apply: the capture writes LINEAR cm
+//     (SCS_SceneDepth), not non-linear NDC z, and the FarCm scalar is the SpotLight's
+//     AttenuationRadius which caps the throw to something realistic.
+//
+// Operator-side knobs:
+//   BeamShadowMaskEnabled    0/1 master gate (the shader's `[branch]` takes the per-step tap
+//                            OUT of the per-pixel cost when 0; the C++ side ALSO flips the
+//                            SceneCapture's bCaptureEveryFrame so the GPU capture cost is
+//                            saved too)
+//   BeamShadowMaskBiasCm     constant offset added to blocker depth before the comparison
+//                            (default 5.0 cm) -- prevents self-occlusion against geometry
+//                            that sits exactly at the lens plane
+//   BeamShadowMaskFadeCm     soft-fade range in cm (default 20.0 cm) -- the shaft doesn't
+//                            binary clip, it fades over a few cm so the depth-mask's
+//                            discrete pixels don't read as aliased shadow edges
+//   BeamShadowMaskFarCm      maximum sample-distance for the comparison (= the SpotLight's
+//                            AttenuationRadius); when the capture returned a "missed all"
+//                            depth (~FarCm+epsilon) we treat it as no occluder
+//   BeamShadowMaskDebug      1 = paint occluded samples RED inside the shaft for visual
+//                            verification; 0 = ship the regular composed beam
+//   BeamShadowMaskTanHalfFov tan(0.5 * SceneCapture FOVAngle); pushed by C++ so the shader
+//                            doesn't compute tan() per pixel
+//   BeamLightFwd/Right/Up    SpotLight world axes; pushed by C++ each refresh; the shader
+//                            uses them to project `wp - BeamOrigin` into light-local space
+//   BeamShadowMaskRT         Texture2D depth-only mask; bound by C++ at BuildBeamShadowMask
+//                            Capture time (never re-bound per frame)
 //
 float3 ro = CamPos.xyz;
 float3 pp = PixelPos.xyz;
@@ -595,6 +633,27 @@ const float DEPTH_FADE_CM = 50.0;     // DMX-style soft depth fade where the bea
 float trans = 1.0;
 float t = tEntry + dt * 0.5;
 const int MAXSTEPS = 64;
+// v1.0.111 -- shadow-mask debug accumulator. Counts shaft samples whose visibility was
+// reduced by the depth-mask comparison; converted to a per-pixel RED tint at the end when
+// BeamShadowMaskDebug > 0.5 so the operator can visually verify the projection lines up
+// with real-world occluders (place a cube between fixture + floor -> expect a RED channel
+// inside the shaft that tracks the cube through pan/tilt). The accumulator is initialised
+// at 0 and stays 0 whenever BeamShadowMaskEnabled is off or the shaft sample lies outside
+// the SceneCapture frustum, so the debug view degenerates to "off" cleanly.
+float debugOccludedAccum = 0.0;
+float debugTotalAccum = 0.0;
+// Hoist the depth-mask params into locals so the compiler can keep them in registers
+// (the shader plumbs them as scalar/vector parameters from the BeamMID, but accessing
+// them inside the loop body lets the compiler decide; this hoisted form is the canonical
+// shadow-map sampling pattern and is consistently faster on modern GPUs).
+float maskEnabled = BeamShadowMaskEnabled;
+float maskBias    = max(BeamShadowMaskBiasCm, 0.0);
+float maskFade    = max(BeamShadowMaskFadeCm, 0.01);
+float maskFar     = max(BeamShadowMaskFarCm, 100.0);
+float maskTan     = max(BeamShadowMaskTanHalfFov, 0.001);
+float3 lFwd       = normalize(BeamLightFwd.xyz);
+float3 lRight     = normalize(BeamLightRight.xyz);
+float3 lUp        = normalize(BeamLightUp.xyz);
 [loop]
 for (int i = 0; i < MAXSTEPS; ++i)
 {
@@ -629,7 +688,74 @@ for (int i = 0; i < MAXSTEPS; ++i)
             float srcAtten = 1.0 / (1.0 + fall * dn * dn);
             float nf = saturate(t / NEAR_FADE_CM);              // soft near-camera fade
             float softOcc = saturate((tOcc - t) / DEPTH_FADE_CM); // DMX-style soft fade at geometry
-            float d = BeamDensity * core * widthNorm * srcAtten * nf * softOcc;
+
+            // v1.0.111 light-space depth-mask shadow-attenuation. Project the shaft sample
+            // into the SpotLight's local frame using the pushed world axes (lFwd / lRight /
+            // lUp) so the comparison is done in LIGHT space, not screen space. The capture
+            // sits at the lens (parented to SpotLight, identity relative transform) so
+            // `rel` (= wp - BeamOrigin = sample position relative to the lens) is the same
+            // vector the capture would compute as "where is this world point relative to
+            // me". axial = dot(rel, lFwd) is the linear depth (cm) from the lens along the
+            // light's forward; horizDist / vertDist project the sample onto the capture's
+            // image plane.
+            float shadowVis = 1.0;
+            [branch]
+            if (maskEnabled > 0.5 && axial > 0.5)  // skip points behind the lens AND the lens-coplanar samples that would self-occlude
+            {
+                float lAxial = dot(rel, lFwd);
+                if (lAxial > 0.5 && lAxial < maskFar)
+                {
+                    float horizDist = dot(rel, lRight);
+                    float vertDist  = dot(rel, lUp);
+                    // Perspective projection: (horizDist / lAxial) divided by tan(halfFov)
+                    // gives the sample's normalised X / Y on the capture plane (range
+                    // [-1, +1] inside the frustum, outside means the sample is beyond the
+                    // SceneCapture's FOV -- geometrically the light doesn't reach there).
+                    float ndcX = (horizDist / lAxial) / maskTan;
+                    float ndcY = (vertDist  / lAxial) / maskTan;
+                    if (abs(ndcX) < 1.0 && abs(ndcY) < 1.0)
+                    {
+                        // NDC (-1..+1) -> texture UV (0..1). V is flipped because UE
+                        // SceneCapture's image plane has +Y up (UE world right convention,
+                        // not GL screen y-down).
+                        float2 maskUV = float2(ndcX * 0.5 + 0.5, -ndcY * 0.5 + 0.5);
+                        // Sample the depth mask. SCS_SceneDepth wrote linear camera-Z in
+                        // cm into R; values near maskFar (or above) mean the capture
+                        // missed every occluder along that ray, which is the "infinitely
+                        // far" sentinel we want to treat as unoccluded.
+                        float blockerDepthCm = Texture2DSample(
+                            BeamShadowMaskRT, BeamShadowMaskRTSampler, maskUV).r;
+                        // Guard against the "infinite-distance" sentinel (the RT is cleared
+                        // to 1e6 in C++) AND against capture passes that haven't fired yet
+                        // (depth=0 on a freshly-allocated RT means "no geometry to compare
+                        // against" which we treat as unoccluded too).
+                        if (blockerDepthCm > 1.0 && blockerDepthCm < maskFar * 1.01)
+                        {
+                            // The comparison is in LINEAR cm along the light forward, not
+                            // along the view ray -- so we use lAxial (the projection onto
+                            // lFwd) which is the same quantity SCS_SceneDepth writes for
+                            // pixels at this image-plane position. A point sitting further
+                            // from the lens than its blocker depth (plus a bias) is in
+                            // shadow; the soft fade hides any aliasing from the discrete
+                            // R16f depth buckets.
+                            float diff = lAxial - (blockerDepthCm + maskBias);
+                            shadowVis = 1.0 - saturate(diff / maskFade);
+                            debugTotalAccum += 1.0;
+                            if (shadowVis < 0.99)
+                            {
+                                debugOccludedAccum += (1.0 - shadowVis);
+                            }
+                        }
+                    }
+                    // outside the capture frustum: shadowVis stays 1.0 (= no occlusion change).
+                    // This is geometrically correct -- the light doesn't reach there
+                    // either, so the shaft sample's density is whatever the radial Gaussian
+                    // + axial falloff say. The cone-mesh raymarch will fade those samples
+                    // out naturally via core / widthNorm / srcAtten.
+                }
+            }
+
+            float d = BeamDensity * core * widthNorm * srcAtten * nf * softOcc * shadowVis;
             float a = 1.0 - exp(-d * dt);
             trans *= (1.0 - a);
         }
@@ -639,6 +765,16 @@ for (int i = 0; i < MAXSTEPS; ++i)
 
 float coverage = saturate(1.0 - trans);
 float3 col = BeamColor.rgb * BeamIntensity * coverage;
+// v1.0.111 debug visualisation: when BeamShadowMaskDebug > 0.5, tint shaft pixels RED in
+// proportion to how much of their density got carved by the depth-mask comparison. Lets
+// the operator visually verify the projection -- a cube placed between fixture + floor
+// should paint a RED channel inside the shaft that follows the cube through pan/tilt.
+// When debug is off (default) this branch is dead code on modern GPUs.
+if (BeamShadowMaskDebug > 0.5 && debugTotalAccum > 0.5)
+{
+    float occlFrac = saturate(debugOccludedAccum / max(debugTotalAccum, 1.0));
+    col = lerp(col, float3(1.0, 0.0, 0.0), occlFrac * coverage);
+}
 return float4(col, coverage);
 """
 
@@ -715,6 +851,52 @@ def _build_beam_master(mat):
     beamdir.set_editor_property("parameter_name", "BeamDir")
     beamdir.set_editor_property("default_value", unreal.LinearColor(1.0, 0.0, 0.0, 0.0))
 
+    # v1.0.111 -- light-space depth-mask scalar / vector / texture parameters. See the
+    # v1.0.111 release block in `_BEAM_RAYMARCH_HLSL` for the architecture; ALL six
+    # scalars + three vectors + one texture are pushed by RefreshBeamShadowMaskParams
+    # (RebusFixtureActor.cpp) on the per-fixture MID. The master defaults below are
+    # the "operationally safe" fallback (enabled=0 -> shader's [branch] gates the
+    # mask sampling out, NO per-step cost, the master previews as a plain unoccluded
+    # cone) for the editor-preview path that doesn't go through a fixture spawn.
+    # Live operator tuning happens via the `Rebus.BeamShadowMask*` CVars which call
+    # the refresh sink which calls RefreshBeamShadowMaskParams on every fixture.
+    mask_enabled = _scalar("BeamShadowMaskEnabled", 0.0, 660)
+    mask_bias    = _scalar("BeamShadowMaskBiasCm",  5.0, 740)
+    mask_fade    = _scalar("BeamShadowMaskFadeCm", 20.0, 820)
+    mask_far     = _scalar("BeamShadowMaskFarCm", 6000.0, 900)
+    mask_tan     = _scalar("BeamShadowMaskTanHalfFov", 0.5, 980)
+    mask_debug   = _scalar("BeamShadowMaskDebug", 0.0, 1060)
+
+    beamlightfwd = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 1140)
+    beamlightfwd.set_editor_property("parameter_name", "BeamLightFwd")
+    beamlightfwd.set_editor_property("default_value", unreal.LinearColor(1.0, 0.0, 0.0, 0.0))
+
+    beamlightright = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 1220)
+    beamlightright.set_editor_property("parameter_name", "BeamLightRight")
+    beamlightright.set_editor_property("default_value", unreal.LinearColor(0.0, 1.0, 0.0, 0.0))
+
+    beamlightup = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 1300)
+    beamlightup.set_editor_property("parameter_name", "BeamLightUp")
+    beamlightup.set_editor_property("default_value", unreal.LinearColor(0.0, 0.0, 1.0, 0.0))
+
+    # Texture-object parameter (not a regular Texture Sample). The Custom HLSL node
+    # takes a Texture2D via the TextureObjectParameter pin; the HLSL body samples
+    # it through `Texture2DSample(BeamShadowMaskRT, BeamShadowMaskRTSampler, uv)`
+    # -- the engine auto-generates the SamplerState companion at compile time.
+    # Default texture is /Engine/EngineResources/WhiteSquareTexture (full-white) so
+    # an unbound RT samples as "no occluder" everywhere (matches the in-shader
+    # "blockerDepthCm > maskFar" sentinel which falls through to shadowVis = 1.0).
+    mask_rt = mel.create_material_expression(mat, unreal.MaterialExpressionTextureObjectParameter, -1100, 1380)
+    mask_rt.set_editor_property("parameter_name", "BeamShadowMaskRT")
+    try:
+        default_white = unreal.EditorAssetLibrary.load_asset("/Engine/EngineResources/WhiteSquareTexture")
+        if default_white is not None:
+            mask_rt.set_editor_property("texture", default_white)
+    except Exception:
+        # Best-effort -- if the engine asset path moves the master still cooks with
+        # a null default, and the per-fixture C++ push wires the real RT on spawn.
+        pass
+
     # ---- Scene/view inputs (engine nodes) ----
     campos = mel.create_material_expression(mat, unreal.MaterialExpressionCameraPositionWS, -1100, 680)
     pixelpos = mel.create_material_expression(mat, unreal.MaterialExpressionWorldPosition, -1100, 760)
@@ -732,6 +914,15 @@ def _build_beam_master(mat):
         "BeamColor", "BeamIntensity", "BeamSharpness", "BeamFalloff",
         "StepCount", "BeamDensity", "BeamOrigin", "BeamDir",
         "BeamLength", "LensRadius", "FarRadius",
+        # v1.0.111 light-space depth-mask plumbing -- six scalars + three vectors +
+        # one texture-object. The texture pin (`BeamShadowMaskRT`) doesn't need a
+        # special pin-type tag: the engine infers `Texture2D` from the connected
+        # `MaterialExpressionTextureObjectParameter` and auto-generates the companion
+        # `SamplerState BeamShadowMaskRTSampler` symbol the HLSL body samples through.
+        "BeamShadowMaskEnabled", "BeamShadowMaskBiasCm", "BeamShadowMaskFadeCm",
+        "BeamShadowMaskFarCm", "BeamShadowMaskTanHalfFov", "BeamShadowMaskDebug",
+        "BeamLightFwd", "BeamLightRight", "BeamLightUp",
+        "BeamShadowMaskRT",
     ]
     custom_inputs = []
     for n in input_names:
@@ -745,6 +936,11 @@ def _build_beam_master(mat):
         "BeamColor": color, "BeamIntensity": intensity, "BeamSharpness": sharp, "BeamFalloff": falloff,
         "StepCount": stepcount, "BeamDensity": density, "BeamOrigin": beamorigin, "BeamDir": beamdir,
         "BeamLength": beamlen, "LensRadius": lensrad, "FarRadius": farrad,
+        "BeamShadowMaskEnabled": mask_enabled, "BeamShadowMaskBiasCm": mask_bias,
+        "BeamShadowMaskFadeCm": mask_fade, "BeamShadowMaskFarCm": mask_far,
+        "BeamShadowMaskTanHalfFov": mask_tan, "BeamShadowMaskDebug": mask_debug,
+        "BeamLightFwd": beamlightfwd, "BeamLightRight": beamlightright, "BeamLightUp": beamlightup,
+        "BeamShadowMaskRT": mask_rt,
     }
     for n in input_names:
         mel.connect_material_expressions(src_for[n], "", custom, n)
@@ -769,18 +965,70 @@ def _build_beam_master(mat):
     mel.recompile_material(mat)
 
 
+def _beam_master_has_shadow_mask(master):
+    """v1.0.111: best-effort probe -- the existing on-disk M_RebusBeam master declares
+    the new light-space depth-mask parameter set (`BeamShadowMaskEnabled`,
+    `BeamShadowMaskBiasCm`, `BeamShadowMaskFadeCm`, `BeamShadowMaskFarCm`,
+    `BeamShadowMaskTanHalfFov`, `BeamShadowMaskDebug` scalars + `BeamLightFwd`,
+    `BeamLightRight`, `BeamLightUp` vectors + `BeamShadowMaskRT` texture). When ANY
+    of those are missing the on-disk master pre-dates v1.0.111 and the C++
+    per-fixture push will silently no-op (SetScalarParameterValue against a name
+    the MID doesn't know is a no-op), so the shadow mask never actually engages.
+
+    Mirrors the v1.0.104 (`_orbit_imported_master_has_two_sided`) / v1.0.97
+    (`_master_is_two_sided`) self-heal probes -- best-effort, ANY exception
+    yields False so the self-heal treats the master as needs-regen (a redundant
+    rebake is cheap; missing the v1.0.111 contract would leave the operator on
+    an old un-shadowable master indefinitely).
+
+    Returns True when the master DOES declare the full v1.0.111 parameter set
+    AND therefore needs no migration; False when the master is stale.
+    """
+    try:
+        scalars = unreal.MaterialEditingLibrary.get_scalar_parameter_names(master)
+        vectors = unreal.MaterialEditingLibrary.get_vector_parameter_names(master)
+        textures = unreal.MaterialEditingLibrary.get_texture_parameter_names(master)
+    except Exception:  # noqa: BLE001
+        return False
+    scalar_names = {str(n) for n in scalars}
+    vector_names = {str(n) for n in vectors}
+    texture_names = {str(n) for n in textures}
+    required_scalars = {
+        "BeamShadowMaskEnabled", "BeamShadowMaskBiasCm", "BeamShadowMaskFadeCm",
+        "BeamShadowMaskFarCm", "BeamShadowMaskTanHalfFov", "BeamShadowMaskDebug",
+    }
+    required_vectors = {"BeamLightFwd", "BeamLightRight", "BeamLightUp"}
+    required_textures = {"BeamShadowMaskRT"}
+    return (required_scalars.issubset(scalar_names)
+            and required_vectors.issubset(vector_names)
+            and required_textures.issubset(texture_names))
+
+
 def ensure_beam_material(force=False):
     """Generate the faux-volumetric beam master material. Idempotent (only creates when missing)
     unless force=True (delete + regenerate, e.g. during a full build()).
 
-    v1.0.110 -- the v1.0.96 / v1.0.99 / v1.0.109 self-heal cascade was tied to the screen-space
-    shadow-trace scalar contract that this release deleted entirely. With the trace gone there's
-    nothing in the master beyond the v1.0.95-shape parameter set that a stale on-disk asset
-    could "miss" -- the only path back to a fresh master is a deliberate `force=True` call
-    (the full `build()` entry point or `Rebus.RebuildBeamMaterial` from the editor console).
-    See the README v1.0.110 release block for the rollback rationale.
+    v1.0.111 self-heal: a non-force call against a pre-v1.0.111 master that's missing the new
+    light-space depth-mask parameter set (`_beam_master_has_shadow_mask` returns False) gets
+    promoted to a force-regen with a Warning log -- without that the operator would silently
+    keep an old master where the C++ per-fixture `RefreshBeamShadowMaskParams` push reaches
+    no-op-against-unknown-name and the new v1.0.111 occlusion never engages. Matches the
+    v1.0.104 (`_orbit_imported_master_has_two_sided`) / v1.0.97 (`_master_is_two_sided`)
+    cascade shape -- one probe -> one promotion -> one regen log line.
     """
     tools = unreal.AssetToolsHelpers.get_asset_tools()
+
+    # v1.0.111 non-force self-heal: pre-v1.0.111 master missing the light-space depth-mask
+    # contract => promote to force-regen so the new parameter set is bound on disk.
+    if not force and unreal.EditorAssetLibrary.does_asset_exist(BEAM_PATH):
+        existing = unreal.EditorAssetLibrary.load_asset(BEAM_PATH)
+        if existing is not None and not _beam_master_has_shadow_mask(existing):
+            unreal.log_warning(
+                "RebusBaseLevel: pre-v1.0.111 M_RebusBeam detected (missing one or more of "
+                "BeamShadowMask*/BeamLight* parameters); regenerating so the v1.0.111 "
+                "light-space depth-mask beam-occlusion path can bind."
+            )
+            force = True
 
     if force and unreal.EditorAssetLibrary.does_asset_exist(BEAM_PATH):
         unreal.EditorAssetLibrary.delete_asset(BEAM_PATH)

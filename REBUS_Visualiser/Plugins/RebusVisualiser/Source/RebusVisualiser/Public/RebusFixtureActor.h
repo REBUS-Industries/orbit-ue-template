@@ -54,6 +54,8 @@ class UProceduralMeshComponent;
 class UTextureLightProfile;
 class UCanvas;
 class UCanvasRenderTarget2D;
+class USceneCaptureComponent2D;
+class UTextureRenderTarget2D;
 class FRebusRestClient;
 
 UENUM()
@@ -303,6 +305,19 @@ private:
 	void BuildMeshes(const FRebusMeshBundle& Meshes);
 	void ResolveHeadAxisFromMeshes(); // refine HeadAxisIndex to the deepest axis driving a head mesh
 	void BuildSpotLight();
+	// v1.0.111 -- one-time creation + parenting of the per-fixture SceneCapture2D + its
+	// depth-only UTextureRenderTarget2D that drive the light-space depth-mask shadow path.
+	// Attached to `SpotLight` (NOT FixtureRoot) so the capture auto-tracks the live aim --
+	// pan / tilt / head motion all propagate via the component hierarchy. The render target
+	// is a square R16f at `Rebus.BeamShadowMaskRes` (default 256) so the depth values are
+	// linear cm directly readable by the raymarch in HLSL. `CaptureSource = SCS_SceneDepth`
+	// (linear-cm depth, single-channel). Self-shadowing of the visible beam is avoided by
+	// adding `BeamCone`, `EpicBeamComp`, `LensDisc`, and every `IsBeamLensComponents` entry
+	// to `HiddenComponents` BEFORE the first capture fires. Called from `BuildBeamCone` at
+	// the end (after SpotLight is parented + the BeamMID is created), so the
+	// `BeamShadowMaskRT` texture param can be wired immediately. Idempotent / safe when
+	// SpotLight is null (early-spawn race -- the caller skips the call).
+	void BuildBeamShadowMaskCapture();
 	void BuildLensDisc();         // emissive "glowing lens" flare disc at the beam origin (§8.3a)
 	void RefreshLensDisc();       // drive disc emissive from live dimmer x colour x shutter-gate
 	// Resolve the lens-opening diameter (metres) shared by the lens disc + SpotLight SourceRadius,
@@ -349,6 +364,20 @@ public:
 	// NOT touched -- these knobs only reshape the radial Gaussian / axial falloff inside the
 	// existing cone volume.
 	void RefreshBeamRadialParams();
+	// v1.0.111 -- push the light-space depth-mask scalars + axis params + render-target
+	// reference onto this fixture's BeamMID so the M_RebusBeam Custom HLSL shadow-mask
+	// sampling block reads the operator's current `Rebus.BeamShadowMask*` CVar values AND
+	// the live SpotLight axis basis (forward / right / up) used to project sample positions
+	// into the per-fixture SceneCapture's view. Also re-pushes the BeamShadowMaskFarCm from
+	// the SpotLight's live `AttenuationRadius`, and resyncs the SceneCapture's FOV to the
+	// SpotLight's current outer cone via `ResolveZoomHalfDeg(...)` + the FOV margin CVar.
+	// Called from `BuildBeamCone` (after `BuildBeamShadowMaskCapture` seeds the components),
+	// from `DriveBeamConeFromSpotLight` per tick (so the axes track pan/tilt), AND from the
+	// `Rebus.BeamShadowMask*` CVar refresh sinks. Silently no-ops when BeamMID is null OR
+	// the SceneCapture pair has not been built (e.g. fixtures that pre-date v1.0.111 in a
+	// hot-reload scenario, or fixtures whose `M_RebusBeam` failed to load and so have no
+	// BeamMID). Idempotent / cheap (six scalar sets + three vector sets + one texture set).
+	void RefreshBeamShadowMaskParams();
 private:
 	// v1.0.101 -- single-source-of-truth canonical zoom half-angle (degrees) for both the
 	// SpotLight outer-cone AND the procedural cone-mesh far-radius (and the Epic-beam DMX
@@ -505,6 +534,21 @@ public:
 	// the push race against any portal override). Mirrors `Rebus.DumpFixtureIes`'s shape.
 	// Called by `Rebus.DumpFixtureZoom [fixtureId]`.
 	void DumpFixtureZoomStateForDebug() const;
+
+	// v1.0.111 -- dump THIS fixture's light-space depth-mask state in one line: whether
+	// the SceneCapture + RT pair is built, the capture's live FOVAngle + RT size + render
+	// target format / max-view-distance, the live BeamShadowMask*Cm scalar values on the
+	// BeamMID (read back via `GetScalarParameterValue` so the EXISTS / MISSING flag
+	// surfaces a stale master that pre-dates the v1.0.111 parameter set -- the
+	// `_beam_master_has_shadow_mask` Python self-heal probe in build_rebus_base_level.py
+	// catches this on the editor regen path; the per-fixture dump catches it from the
+	// runtime side), and the live `Rebus.BeamShadowMask*` global CVar values for diff.
+	// Also validates the projection by transforming `BeamOrigin + BeamDir * AttenuationRadius
+	// * 0.5f` into the SceneCapture's view via the same axis math the shader uses, expecting
+	// a near-(0, 0) sample-plane offset (proves the SceneCapture sits at the lens and aims
+	// down the beam). Mirrors `Rebus.DumpFixtureZoom`'s shape. Called by
+	// `Rebus.DumpBeamShadowMask`.
+	void DumpBeamShadowMaskStateForDebug() const;
 
 	// v1.0.101: assign the per-fixture cone-mesh radius scale + re-push the cone geometry
 	// + Epic-beam DMX Zoom param so a live `Rebus.BeamConeRadiusScale` change picks up
@@ -803,6 +847,20 @@ private:
 	UPROPERTY() TObjectPtr<UProceduralMeshComponent> BeamCone = nullptr;
 	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> BeamMID = nullptr;
 	UPROPERTY() TObjectPtr<UMaterialInterface> BeamMaterial = nullptr;
+
+	// v1.0.111 -- per-fixture light-space depth-mask pair (the "shadow map for the beam").
+	// SceneCapture2D is attached to `SpotLight` so its world transform auto-tracks the
+	// pan/tilt/head motion the SpotLight already rides; the RT is a depth-only square
+	// (R16f, default 256x256) the M_RebusBeam Custom HLSL samples per raymarch step to
+	// decide whether each shaft sample is occluded by geometry between the lens and the
+	// floor footprint. Both null until `BuildBeamShadowMaskCapture()` succeeds (skipped
+	// when SpotLight failed to build, when the BeamMID is null, or when the operator has
+	// flipped `Rebus.BeamShadowMask 0` for the whole show); the `Rebus.BeamShadowMask`
+	// master toggle flips both `bCaptureEveryFrame` AND the BeamMID's
+	// `BeamShadowMaskEnabled` scalar so a disabled mask costs no GPU time. See
+	// `BuildBeamShadowMaskCapture` / `RefreshBeamShadowMaskParams` doc-comments.
+	UPROPERTY() TObjectPtr<USceneCaptureComponent2D> BeamShadowMaskCapture = nullptr;
+	UPROPERTY() TObjectPtr<UTextureRenderTarget2D> BeamShadowMaskRT = nullptr;
 
 	// Epic DMX official beam (v1.0.43). Hard CDO refs (so the cooker packages them) to Epic's REAL
 	// beam canvas mesh (SM_Beam_RM) + beam material (MI_Beam / M_Beam_Master) from the installed DMX

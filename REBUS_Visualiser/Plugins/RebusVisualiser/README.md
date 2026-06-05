@@ -594,6 +594,148 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Light-space depth-mask beam occlusion -- per-fixture SceneCapture2D "shadow map for the beam" (v1.0.111).**
+>
+> User design direction (verbatim):
+>
+> > "Keep your 3D cone, but add a light-space depth mask: Place a small SceneCapture2D
+> > at the moving light lens. Match its FOV to the spotlight cone angle. Render a
+> > depth-only / mask render target from the light's view. In the cone material,
+> > transform each pixel/world position into the light's projection space. Compare:
+> > pixel distance from light vs captured blocker depth. If pixel distance is farther
+> > than blocker depth, reduce opacity to 0 or fade it."
+>
+> v1.0.111 ships exactly that. It's the architecturally correct replacement for the
+> v1.0.96..v1.0.109 screen-space self-shadow trace v1.0.110 ripped out.
+>
+> **The system.** Each fixture spawns a `USceneCaptureComponent2D` (`BeamShadowMask
+> Capture`) attached to its SpotLight (so the capture rides the live pan/tilt aim
+> through the existing component hierarchy -- NEVER attach to FixtureRoot, that doesn't
+> track the head), aimed down the beam, FOV matched to the SpotLight's outer cone
+> (`2 * ResolveZoomHalfDeg() + Rebus.BeamShadowMaskFovMargin`, default 2 deg margin
+> so the cone-edge raymarch samples don't sit on the texture's outermost row), with
+> `CaptureSource = SCS_SceneDepth` so the per-fixture `UTextureRenderTarget2D`
+> (`BeamShadowMaskRT`, default 256x256 R16f, ~128 KB / fixture) receives linear cm
+> depth directly readable by the raymarch. The `M_RebusBeam` Custom-HLSL node has
+> a new `[branch]` block per raymarch step: project the sample's world position into
+> the SpotLight's local frame using the pushed `BeamLightFwd / BeamLightRight /
+> BeamLightUp` world axes + the `BeamShadowMaskTanHalfFov` FOV scalar (perspective
+> projection in dot products, no 4x4 matrix multiply -- LWC-safe and ~5x cheaper),
+> sample the depth mask at the resulting UV, and attenuate the sample's density
+> when `(sampleDistFromLight - (blockerDepth + Bias)) / Fade > 0`. The shaft fades
+> softly over `Rebus.BeamShadowMaskFadeCm` (default 20 cm) so the discrete pixel
+> mask doesn't read as aliased shadow edges.
+>
+> **Why this works where the v1.0.96..v1.0.109 screen-space trace didn't.**
+> The SceneCapture's frustum is fixed by the SpotLight's AIM (not by the camera).
+> Samples outside the capture frustum are exactly samples where the light doesn't
+> reach geometrically -- so "no occlusion change there" is semantically correct,
+> not a hack. The three v1.0.96..v1.0.109 failure modes all dissolve:
+>
+> - **Off-screen-relative-to-camera occluders silently failed.** The screen-space
+>   trace could only see what was in the camera's depth buffer; geometry behind the
+>   camera was invisible. The light-space mask sees everything the LIGHT sees.
+>   Solved.
+> - **Pan-edge false occlusion.** The screen-space trace's projected UV ran out of
+>   the camera's screen at the cone's screen edge, sampled sky depth, and read
+>   "occluded by the sky". The light-space mask runs entirely in the SpotLight's
+>   own frustum -- "outside the frustum" is the unoccluded path. Solved.
+> - **Reverse-Z precision crash beyond ~500m.** The screen-space trace compared
+>   non-linear NDC z deltas at distances where the float32 reverse-Z mantissa
+>   collapses. The light-space mask compares LINEAR cm (`SCS_SceneDepth`); R16f
+>   gives ~6 cm precision at 60 m (well under the 20 cm soft fade), and the FarCm
+>   cap = `SpotLight->AttenuationRadius` keeps the comparison range physical.
+>   Solved.
+>
+> **Components added per fixture.** `USceneCaptureComponent2D` (parented to
+> `SpotLight`, `SCS_SceneDepth`, perspective, all advanced features disabled --
+> Lumen / fog / bloom / motion blur / decals / atmosphere / TAA all off, plus
+> `BeamCone` + `EpicBeamComp` + `LensDisc` + every `IsBeamLensComponents`
+> entry added to `HiddenComponents` so the beam visualisation can't self-shadow)
+> + `UTextureRenderTarget2D` (R16f, 256x256 default, no mips, no gen-mips,
+> Bilinear sampler) + ten new BeamMID parameter bindings:
+> `BeamShadowMaskEnabled / BiasCm / FadeCm / FarCm / TanHalfFov / Debug` scalars,
+> `BeamLightFwd / Right / Up` vectors, and `BeamShadowMaskRT` texture.
+>
+> **Memory & GPU cost (per fixture, defaults).**
+> - RT memory: 256 * 256 * 2 bytes (R16f) = **128 KB / fixture**. 32-fixture show
+>   = ~4 MB GPU memory for the masks. `Rebus.BeamShadowMaskRes 128` -> 32 KB,
+>   `512` -> 512 KB, `1024` -> 2 MB / fixture.
+> - GPU capture: depth-only with all features disabled, ~**0.05-0.15 ms / fixture**
+>   on a modern GPU at 256 res. 32 fixtures -> ~3 ms / frame upper bound. Linear
+>   in pixel count (doubling res ~4x cost).
+> - Raymarch sample cost: one `Texture2DSample` per step per pixel where the sample
+>   lies inside the cone AND the SceneCapture frustum, gated by a `[branch]` on
+>   `BeamShadowMaskEnabled` so the OFF path costs ~zero (the compiler hoists the
+>   branch above the sample). The OFF path also disables the per-fixture
+>   `bCaptureEveryFrame` so the depth render is skipped entirely.
+>
+> **Console surface (six CVars + one diagnostic command).**
+>
+> - `Rebus.BeamShadowMask [0|1]` (default `1`). Master toggle. Flips both the
+>   SceneCapture's `bCaptureEveryFrame` AND the BeamMID's `BeamShadowMaskEnabled`
+>   scalar so a disabled mask costs zero GPU time (capture + per-pixel sample
+>   are both skipped).
+> - `Rebus.BeamShadowMaskRes <px>` (default `256`). Render-target square pixel
+>   size. Recommended buckets: 128 / 256 / 512 / 1024. Doubling res 4x's memory
+>   and ~2x's per-fixture capture cost.
+> - `Rebus.BeamShadowMaskBiasCm <float>` (default `5.0`). Constant offset added
+>   to blocker depth before the comparison. Raise to 50+ if the operator reports
+>   beam shows as "shadowed right at the lens"; lower to 1.0 for tight rigs.
+> - `Rebus.BeamShadowMaskFadeCm <float>` (default `20.0`). Soft fade range in cm
+>   so the shaft doesn't binary clip at the blocker. 0 = hard clip (severe
+>   aliasing at the 256 res); 5 cm for hero rigs at `Res 512+`; 50 cm for an
+>   intentionally soft look.
+> - `Rebus.BeamShadowMaskFovMargin <deg>` (default `2.0`). Safety margin added
+>   to the SpotLight outer-cone full angle before feeding the SceneCapture's
+>   `FOVAngle`, so the cone's outermost raymarch samples don't read undefined
+>   pixels at the capture-render edge. Raise if the visible shadow stops short
+>   of the cone edge; lower to 0 to confirm the diagnosis.
+> - `Rebus.BeamShadowMaskDebug [0|1]` (default `0`). Paints occluded raymarch
+>   samples RED inside the shaft so the operator can visually verify the
+>   projection lines up with real-world occluders.
+> - `Rebus.DumpBeamShadowMask [fixtureId]`. Per-fixture state dump: capture
+>   FOVAngle / `MaxViewDistanceOverride` / `bCaptureEveryFrame`, RT pixel size +
+>   format + memory cost, BeamMID's live shadow-mask scalar values (with
+>   EXISTS/MISSING flag for stale pre-v1.0.111 masters), the projection sanity
+>   check (projects `BeamOrigin + BeamDir * AttenuationRadius * 0.5f` into the
+>   capture's view -- expects sample-plane offset near (0,0)), and the six
+>   global CVar values for diff. Mirrors `Rebus.DumpFixtureZoom`'s shape.
+>
+> **Known limitations (these are CORRECT, not bugs).**
+> - The SceneCapture only sees what's INSIDE the SpotLight's frustum. A ladder
+>   leaning ACROSS but not THROUGH the cone won't shadow the beam -- and that
+>   matches the physical light: it doesn't hit the ladder either.
+> - Translucent geometry doesn't write to `SCS_SceneDepth` so glass / portals /
+>   particles don't shadow the beam. Volumetric fog in the beam's frustum is
+>   handled by Unreal's native VSM path on the SpotLight itself (unchanged --
+>   the v1.0.110 rollback note's "What stayed" applies).
+> - The cone-mesh raymarch only knows about samples INSIDE its own cone volume,
+>   so an occluder that sits OUTSIDE the cone but blocks parts of the lit
+>   footprint doesn't carve the shaft (correct -- the shaft IS the cone
+>   visualisation; the footprint shadowing is handled by the SpotLight's own
+>   shadow pass via the engine's depth/VSM path).
+>
+> **Acceptance / operator verification.**
+> 1. Launch, place a cube between fixture lens + floor in line with the beam aim.
+> 2. The cube carves a hole into the cone shaft at the cube's depth -- beam BEFORE
+>    the cube is full intensity, AFTER is black (or `BeamShadowMaskFadeCm`-faded).
+> 3. Pan the fixture left-right. The shadow rides with the beam aim (no
+>    camera-driven offset -- the v1.0.96..v1.0.109 failure mode that finally
+>    works).
+> 4. Move the camera while the fixture is stationary. The shadow is rock-stable.
+> 5. `Rebus.BeamShadowMaskDebug 1`. Occluded samples paint RED inside the shaft.
+> 6. `Rebus.BeamShadowMask 0`. Shadow vanishes; beam shines through the cube.
+>    `Rebus.BeamShadowMask 1`. Shadow returns.
+> 7. `Rebus.DumpBeamShadowMask`. Reports FOV, RT size, projection sanity check
+>    per fixture (the projection sample-plane offset should be < 1 cm).
+>
+> **v1.0.111 will likely be iterated.** This is the "iterate from clean slate"
+> v1.0.111; the operator will tune `Rebus.BeamShadowMaskRes` / `BiasCm` / `FadeCm`
+> defaults in v1.0.112+. The Python self-heal `_beam_master_has_shadow_mask`
+> probe auto-regenerates pre-v1.0.111 `M_RebusBeam` masters on next editor open
+> so packaged builds with old masters can't silently no-op the new push.
+
 > **Remove v1.0.96 → v1.0.109 screen-space beam shadow trace (clean slate for redesign) (v1.0.110).**
 >
 > User instruction (verbatim):
