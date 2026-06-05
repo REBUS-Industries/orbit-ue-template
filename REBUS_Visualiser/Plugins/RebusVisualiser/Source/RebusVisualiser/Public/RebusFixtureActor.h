@@ -181,6 +181,15 @@ public:
 	// restored, the SpotLight relative location + volumetric flags go back to construction
 	// defaults, and every cached primitive's CastShadow flags are restored from the per-comp
 	// cache captured the first time the mode was enabled.
+	//
+	// v1.0.92 ALSO forces `SpotLight->bAllowMegaLights = 0` on the ON transition (regardless of
+	// gobo state) so the legacy clustered/deferred light path renders the IES profile AND the
+	// LightFunctionMaterial through the volumetric scattering integrator -- MegaLights bypasses
+	// BOTH on the shaft, which was the v1.0.92 root-cause for "gobo + IES on the floor footprint
+	// but not on the visible volumetric beam". The pre-toggle value is cached into
+	// `bInternalBeamAllowMegaLightsOrig` and restored on the OFF transition. Gated by the new
+	// `Rebus.InternalBeamForceLegacy` CVar (default 1; flip to 0 to leave MegaLights alone if a
+	// deployment prefers MegaLights perf and doesn't need volumetric gobo/IES shaping).
 	void SetInternalBeamModeEnabled(bool bEnabled);
 	bool IsInternalBeamModeEnabled() const { return bInternalBeamEnabled; }
 
@@ -190,6 +199,26 @@ public:
 	// sign onto every fixture currently in InternalBeam mode without forcing a full pose-rebuild
 	// (volumetric / cast-shadow state is independent of the sign and stays untouched).
 	void RefreshInternalBeamOffset();
+
+	// v1.0.92: force `SpotLight->bAllowMegaLights = 0` on this fixture (idempotent), caching the
+	// pre-push value into `bInternalBeamAllowMegaLightsOrig` the FIRST time the push lands so a
+	// subsequent OFF transition can restore byte-exact. Called from `ApplyInternalBeamPose` on
+	// the InternalBeam ON edge AND from the `Rebus.InternalBeamForceLegacy` CVar refresh sink
+	// (when the CVar flips 0 -> 1 while fixtures are already in InternalBeam mode). No-op when
+	// the SpotLight is already opted out (e.g. ApplyCurrentGoboToLightFn already pushed
+	// bAllowMegaLights=0 because a gobo is active) -- the cache is still primed so the OFF
+	// path knows what to restore. Triggers a `ReregisterComponent()` when the value transitions
+	// because the engine reads `bAllowMegaLights` at proxy creation time (FLightSceneInfo, see
+	// the v1.0.51 comment on the same flag near ApplyCurrentGoboToLightFn).
+	void PushInternalBeamMegaLightsOptOut();
+	// v1.0.92: restore the cached `bAllowMegaLights` (push the ORIGINAL value back). Called from
+	// `RestoreInternalBeamPose` on the InternalBeam OFF edge AND from the
+	// `Rebus.InternalBeamForceLegacy` CVar refresh sink (when the CVar flips 1 -> 0 while
+	// fixtures are still in InternalBeam mode). When a gobo is currently active the
+	// ApplyCurrentGoboToLightFn path will re-assert bAllowMegaLights=0 on its next call (gobo
+	// cookies still need the legacy LF path), so the restore reverts to whatever the gobo path
+	// chooses -- which is the correct end state.
+	void RestoreInternalBeamMegaLights();
 
 	// v1.0.88 -- operator-flippable A/B toggle for the new <Beam> (isBeam) lens path.
 	//
@@ -728,6 +757,23 @@ private:
 	bool bInternalBeamEpicCompVisOrig = true;
 	bool bInternalBeamConeVisOrig = true;
 	bool bInternalBeamPoseCached = false;
+	// v1.0.92 -- cached per-fixture `bAllowMegaLights` from BEFORE the InternalBeam push so the
+	// OFF transition restores it byte-exact. v1.0.92 forces `bAllowMegaLights = 0` on every
+	// fixture in InternalBeam mode (regardless of gobo-active state) so the SpotLight's
+	// `IESTexture` AND `LightFunctionMaterial` BOTH modulate the volumetric beam shaft. UE 5.7
+	// MegaLights bypasses both the IES + light-function paths in the volumetric integrator (the
+	// many-lights-per-pixel sampling path doesn't sample either), so a MegaLight spotlight has
+	// a uniformly-bright cone in fog regardless of its IES profile or its cookie. Routing the
+	// SpotLight through the legacy clustered/deferred path on InternalBeam ON means it loses
+	// MegaLights' clustering perf for the duration -- documented perf trade-off (README v1.0.92).
+	// The opt-out is gated by the `Rebus.InternalBeamForceLegacy` CVar (default 1); when 0 the
+	// legacy MegaLights value is left untouched so deployments that don't need volumetric LF/IES
+	// on the shaft can keep MegaLights' efficiency. `bInternalBeamMegaLightsOrigCached` latches
+	// the snapshot so a 0->1->0->1 toggle of `Rebus.InternalBeamForceLegacy` (re-entrant push)
+	// can't overwrite the cached value with the value we just installed (mirrors the
+	// PushLightFunctionAtlasForInternalBeam idempotency latch on the subsystem).
+	bool bInternalBeamAllowMegaLightsOrig = true;
+	bool bInternalBeamMegaLightsOrigCached = false;
 
 	// Per-primitive shadow cache captured the first time InternalBeam is enabled on this actor.
 	// Each entry holds a weak ref + the original CastShadow flag set so RestoreInternalBeamPose

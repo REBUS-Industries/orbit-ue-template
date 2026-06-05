@@ -258,6 +258,26 @@ FAutoConsoleVariableRef CVarRebusInternalBeamScatter(
 	}),
 	ECVF_Default);
 
+// v1.0.92 -- gate for the InternalBeam-mode `bAllowMegaLights = 0` push. Default 1 (force the
+// legacy clustered/deferred path, so the SpotLight's IES profile AND its LightFunctionMaterial
+// modulate the volumetric beam shaft). The user reported (against v1.0.90) that gobo and IES
+// shape the lit floor footprint correctly but DON'T reach the visible volumetric cone, even
+// after the v1.0.89 `r.LightFunctionAtlas.Enabled 1` push. Root cause: UE 5.7 MegaLights bypasses
+// the IES texture AND the LightFunctionMaterial when computing volumetric scattering -- the
+// many-lights-per-pixel sampling pipeline doesn't sample either. So on every InternalBeam-enabled
+// fixture v1.0.92 forces `bAllowMegaLights = 0` (cached prior value, restored byte-exact on
+// disable) so the spotlight goes through the legacy path that DOES route both onto the
+// volumetric integrator. Cost: this fixture loses MegaLights' clustering perf for the duration
+// of the mode -- acceptable, the InternalBeam mode is itself a high-fidelity hero-beam choice.
+//
+// Operators on deployments that prefer MegaLights' efficiency over volumetric LF/IES shaping can
+// flip the gate to 0 (`Rebus.InternalBeamForceLegacy 0`) -- the per-fixture push is then skipped
+// and `bAllowMegaLights` is left at whatever BuildSpotLight + the gobo-active path already set
+// it to. The CVar refresh sink walks every fixture currently in InternalBeam mode and toggles
+// the flag in-place: ON re-applies the opt-out (re-caching the current value), OFF restores the
+// cached value (so a deployment can A/B at runtime without a full Rebus.InternalBeam 0/1 cycle).
+int32 GRebusInternalBeamForceLegacy = 1;
+
 // v1.0.89 -- live-toggleable sign for the InternalBeam back-offset application. See the comment
 // on `GRebusInternalBeamOffsetSign` above for the rationale. On change, every fixture currently
 // in InternalBeam mode re-runs RefreshMotion so the offset re-applies in-place; this is the only
@@ -290,6 +310,58 @@ FAutoConsoleVariableRef CVarRebusInternalBeamOffsetSign(
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("Rebus.InternalBeamOffsetSign -> %+.0f, refreshed %d InternalBeam fixture(s)."),
 			CVar->GetFloat(), Refreshed);
+	}),
+	ECVF_Default);
+
+// v1.0.92 -- live-toggleable gate for the InternalBeam-mode `bAllowMegaLights=0` push. See the
+// comment on `GRebusInternalBeamForceLegacy` above for the rationale. The refresh sink walks
+// every InternalBeam fixture and either re-applies the opt-out (CVar -> 1) or restores the
+// cached prior value (CVar -> 0). The two transitions go through dedicated helpers on the
+// actor (PushInternalBeamMegaLightsOptOut + RestoreInternalBeamMegaLights) so the cache state
+// stays consistent regardless of how many times the operator toggles the CVar -- a 0->1->0
+// sequence on a fixture that started with bAllowMegaLights=1 always lands back on 1.
+FAutoConsoleVariableRef CVarRebusInternalBeamForceLegacy(
+	TEXT("Rebus.InternalBeamForceLegacy"),
+	GRebusInternalBeamForceLegacy,
+	TEXT("0|1 -- when 1 (default since v1.0.92), every fixture in InternalBeam mode (v1.0.87+) has "
+		 "`bAllowMegaLights=0` forced on its SpotLight so the legacy clustered/deferred path renders "
+		 "the IES profile AND the LightFunctionMaterial through the volumetric scattering integrator. "
+		 "Without this push, UE 5.7 MegaLights bypasses both on the volumetric beam shaft (the "
+		 "many-lights-per-pixel pipeline doesn't sample either), so a gobo cookie + IES profile are "
+		 "visible on the lit floor footprint but the visible volumetric cone reads as a uniform "
+		 "untextured beam. Cost: the spotlight loses MegaLights' clustering perf for the duration of "
+		 "InternalBeam mode (the floor lighting falls back to the legacy path). When 0, "
+		 "`bAllowMegaLights` is left at whatever BuildSpotLight + the gobo-active path set it to "
+		 "(MegaLights stays on except where ApplyCurrentGoboToLightFn explicitly turns it off for "
+		 "the cookie). Live -- changing this re-pushes / restores on every fixture currently in "
+		 "InternalBeam mode."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		if (!GEngine) return;
+		const bool bForce = (CVar->GetInt() != 0);
+		int32 Refreshed = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					if (F->IsInternalBeamModeEnabled())
+					{
+						if (bForce) F->PushInternalBeamMegaLightsOptOut();
+						else        F->RestoreInternalBeamMegaLights();
+						++Refreshed;
+					}
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.InternalBeamForceLegacy -> %d, refreshed %d InternalBeam fixture(s) (%s)."),
+			CVar->GetInt(), Refreshed,
+			bForce ? TEXT("forced bAllowMegaLights=0 -- IES + light function modulate the volumetric shaft via the legacy path")
+			       : TEXT("restored cached bAllowMegaLights -- MegaLights perf back, volumetric IES/LF on the shaft NOT guaranteed"));
 	}),
 	ECVF_Default);
 
@@ -2417,17 +2489,110 @@ void ARebusFixtureActor::ApplyInternalBeamPose()
 	//    the now-internal spotlight (would otherwise extinguish the entire beam).
 	SetBodyMeshesCastShadow(/*bRestoreOriginal*/ false);
 
-	// 3) Push the spatial back-offset onto the SpotLight RIGHT NOW. RefreshMotion's post-step
+	// 3) v1.0.92 -- force the SpotLight off the MegaLights path so the IES profile AND the
+	//    LightFunctionMaterial both modulate the volumetric beam shaft. v1.0.89's
+	//    `r.LightFunctionAtlas.Enabled 1` push was necessary but not sufficient: UE 5.7
+	//    MegaLights bypasses both IES + LF in the volumetric integrator (the many-lights-per-
+	//    pixel sample pipeline doesn't sample either, see the engine
+	//    MegaLightsRendering.cpp / VolumetricFog.cpp for the gating logic), so a MegaLight
+	//    spotlight reads as a uniform untextured cone in fog regardless of its IES file or its
+	//    cookie. Gated by `Rebus.InternalBeamForceLegacy` (default 1); when 0 the push is
+	//    skipped and `bAllowMegaLights` is left at whatever BuildSpotLight + the gobo path set
+	//    it to, so a deployment that prefers MegaLights' clustering perf can opt out.
+	if (GRebusInternalBeamForceLegacy != 0)
+	{
+		PushInternalBeamMegaLightsOptOut();
+	}
+
+	// 4) Push the spatial back-offset onto the SpotLight RIGHT NOW. RefreshMotion's post-step
 	//    will re-apply this every subsequent frame, but the operator toggled the mode in this
 	//    frame and we want the visible change immediately rather than waiting for the next
 	//    motion tick. RefreshMotion is idempotent so this redundant call is cheap (cone
 	//    geometry only rebuilds when zoom changes, etc.).
 	RefreshMotion();
 
-	// 4) Push the volumetric beam state onto the SpotLight (RefreshBeamShadowMode honors
+	// 5) Push the volumetric beam state onto the SpotLight (RefreshBeamShadowMode honors
 	//    bInternalBeamEnabled when true and forces the volumetric scatter + cast volumetric shadow
 	//    regardless of the hero-budget / mesh-beam paths).
 	RefreshBeamShadowMode();
+}
+
+void ARebusFixtureActor::PushInternalBeamMegaLightsOptOut()
+{
+	if (!SpotLight) return;
+
+	// Cache the prior value the FIRST time we push, mirroring `bInternalBeamPoseCached` for
+	// the rest of the InternalBeam pose state. A second push in the same InternalBeam session
+	// (e.g. ApplyCurrentGoboToLightFn already toggled the flag because a gobo went active and
+	// then we re-entered the push via the CVar refresh sink) must NOT re-snapshot the value
+	// we just installed -- the prior value the OFF transition needs is the construction-time
+	// value, not "0".
+	if (!bInternalBeamMegaLightsOrigCached)
+	{
+		bInternalBeamAllowMegaLightsOrig = (SpotLight->bAllowMegaLights != 0);
+		bInternalBeamMegaLightsOrigCached = true;
+	}
+
+	const bool bWasMega = (SpotLight->bAllowMegaLights != 0);
+	if (!bWasMega)
+	{
+		// Already opted out (the gobo-active path beat us to it). The cache is primed, so the
+		// OFF restore will still push the byte-exact original value back. No render-state churn.
+		UE_LOG(LogRebusVisualiser, Verbose,
+			TEXT("Fixture %s InternalBeam MegaLights opt-out: already 0 (gobo-active path?); cache primed (orig=%d)."),
+			*FixtureId, bInternalBeamAllowMegaLightsOrig ? 1 : 0);
+		return;
+	}
+
+	SpotLight->bAllowMegaLights = 0;
+	// `bAllowMegaLights` is read at FLightSceneInfo proxy creation (LightSceneInfo.cpp ->
+	// Proxy->AllowMegaLights()), so the value MUST be present on a freshly-created proxy to
+	// take effect. MarkRenderStateDirty alone schedules a deferred recreate that has proven
+	// unreliable in v1.0.50 -- a full ReregisterComponent on the transition guarantees the
+	// proxy is rebuilt with bAllowMegaLights=0 on the next frame. Cost: brief one-frame
+	// blackout on the toggle.
+	SpotLight->ReregisterComponent();
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s InternalBeam MegaLights opt-out: bAllowMegaLights 1 -> 0 (orig=%d cached). "
+			 "Volumetric scattering integrator now samples IES + LightFunction; perf trade-off: this fixture loses MegaLights' clustering."),
+		*FixtureId, bInternalBeamAllowMegaLightsOrig ? 1 : 0);
+}
+
+void ARebusFixtureActor::RestoreInternalBeamMegaLights()
+{
+	if (!SpotLight) return;
+
+	// Symmetric with PushInternalBeamMegaLightsOptOut. When the cache was never primed (the ON
+	// edge skipped the push because Rebus.InternalBeamForceLegacy was 0), there's nothing to
+	// restore -- the bAllowMegaLights value is whatever BuildSpotLight + the gobo path set it
+	// to, which is exactly what the operator wanted in that mode.
+	if (!bInternalBeamMegaLightsOrigCached)
+	{
+		UE_LOG(LogRebusVisualiser, Verbose,
+			TEXT("Fixture %s InternalBeam MegaLights restore: no cached value (push never ran), no-op."),
+			*FixtureId);
+		return;
+	}
+
+	const bool bIsMega = (SpotLight->bAllowMegaLights != 0);
+	const bool bWantMega = bInternalBeamAllowMegaLightsOrig;
+	bInternalBeamMegaLightsOrigCached = false;
+	bInternalBeamAllowMegaLightsOrig = true; // back to the field's struct default
+
+	if (bIsMega == bWantMega)
+	{
+		UE_LOG(LogRebusVisualiser, Verbose,
+			TEXT("Fixture %s InternalBeam MegaLights restore: already at orig=%d, no proxy rebuild."),
+			*FixtureId, bWantMega ? 1 : 0);
+		return;
+	}
+
+	SpotLight->bAllowMegaLights = bWantMega ? 1 : 0;
+	SpotLight->ReregisterComponent();
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s InternalBeam MegaLights restore: bAllowMegaLights %d -> %d (cached orig)."),
+		*FixtureId, bIsMega ? 1 : 0, bWantMega ? 1 : 0);
 }
 
 void ARebusFixtureActor::RestoreInternalBeamPose()
@@ -2458,13 +2623,21 @@ void ARebusFixtureActor::RestoreInternalBeamPose()
 	//    (Apply was never run).
 	SetBodyMeshesCastShadow(/*bRestoreOriginal*/ true);
 
-	// 3) Re-push motion so the spotlight returns to its un-offset position byte-exact (Refresh
+	// 3) v1.0.92: restore the cached `bAllowMegaLights` byte-exact (no-op if the push never
+	//    ran -- e.g. Rebus.InternalBeamForceLegacy was 0 on the ON edge). When a gobo is still
+	//    active the very next ApplyCurrentGoboToLightFn call will re-assert
+	//    `bAllowMegaLights = 0` (the legacy LF path is required for the cookie even outside
+	//    InternalBeam mode), so the restore lands the spotlight exactly where it would be in
+	//    the non-InternalBeam-with-gobo state -- which is the correct end state.
+	RestoreInternalBeamMegaLights();
+
+	// 4) Re-push motion so the spotlight returns to its un-offset position byte-exact (Refresh
 	//    Motion's offset post-step skips when bInternalBeamEnabled is now false, and the prior
 	//    SetRelativeTransform(BeamRestTransform * Head) re-puts the spotlight at the
 	//    construction-time recipe).
 	RefreshMotion();
 
-	// 4) Final volumetric refresh.
+	// 5) Final volumetric refresh.
 	RefreshBeamShadowMode();
 }
 
@@ -2486,14 +2659,17 @@ void ARebusFixtureActor::SetInternalBeamModeEnabled(bool bEnabled)
 		RestoreInternalBeamPose();
 	}
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s InternalBeam mode %s (backOffset=%.1fcm sign=%+.0f maxZoomFullDeg=%.1f scatter=%.2f bodyPrimsOptedOut=%d)."),
+		TEXT("Fixture %s InternalBeam mode %s (backOffset=%.1fcm sign=%+.0f maxZoomFullDeg=%.1f scatter=%.2f bodyPrimsOptedOut=%d forceLegacy=%d allowMegaLights=%d cachedOrig=%d)."),
 		*FixtureId,
 		bEnabled ? TEXT("ENABLED") : TEXT("DISABLED -> Epic beam restored"),
 		bEnabled ? (GRebusInternalBeamOffsetSign * ComputeInternalBeamBackOffsetCm()) : 0.f,
 		GRebusInternalBeamOffsetSign,
 		(Profile.Zoom.bValid && Profile.Zoom.MaxDeg > 0.0) ? (float)Profile.Zoom.MaxDeg : InternalBeamMaxZoomFullDeg,
 		GRebusInternalBeamScatter,
-		InternalBeamShadowCache.Num());
+		InternalBeamShadowCache.Num(),
+		GRebusInternalBeamForceLegacy,
+		SpotLight ? (SpotLight->bAllowMegaLights ? 1 : 0) : -1,
+		bInternalBeamMegaLightsOrigCached ? (bInternalBeamAllowMegaLightsOrig ? 1 : 0) : -1);
 
 	// v1.0.89: lock-in diagnostic so the user can confirm volumetric shadow + light function
 	// state landed as intended on every InternalBeam toggle. CastShadows must be ON (the

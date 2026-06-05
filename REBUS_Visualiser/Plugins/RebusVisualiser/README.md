@@ -594,6 +594,213 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Gobo + IES modulate the volumetric beam shaft -- force legacy path, push volumetric LF CVars (v1.0.92).**
+> User report (verbatim, against v1.0.90):
+> *"gobo or IES is not being applied to the volumetric beam of the spotlight"*.
+>
+> The operator is in InternalBeam mode (v1.0.87+) with a gobo loaded and a per-fixture IES
+> profile bound (the v1.0.91 candela-max chain landed both on every fixture's SpotLight).
+> Symptoms confirmed: the gobo IS visible in the lit floor footprint (the cookie projects
+> through the SpotLight's `LightFunctionMaterial`), the IES IS shaping the floor footprint
+> (the v1.0.91 candela-max -> Intensity wiring works), but NEITHER reaches the visible
+> volumetric beam shaft -- the cone in fog reads as a uniformly-bright untextured cone
+> regardless of the gobo cookie or the IES profile.
+>
+> The v1.0.89 `r.LightFunctionAtlas.Enabled = 1` push was a necessary first step (caveat
+> documented at the time: "the atlas push has now proven insufficient -- pursue the
+> documented fallback only if it is"). v1.0.92 finds and fixes the actual root cause.
+>
+> ---
+>
+> **Root cause -- TWO independent gates were silently dropping LF + IES on the volumetric
+> shaft.**
+>
+> **(A) MegaLights bypasses BOTH `IESTexture` and `LightFunctionMaterial` on the
+> volumetric integrator.** UE 5.5+ MegaLights routes per-light volumetric scattering through
+> the many-lights-per-pixel sampling pipeline (`MegaLightsRendering.cpp`), which does NOT
+> sample either the IES texture OR the light function when computing the per-froxel
+> contribution -- the IES + LF terms are evaluated only on the per-pixel surface lighting
+> pass. Net effect: a SpotLight with `bAllowMegaLights = 1` (the v1.0.x default) reads as
+> a uniform untextured cone in fog regardless of what its IES profile or its gobo cookie say.
+>
+> Pre-v1.0.92 we ONLY opted out of MegaLights when a gobo was active (the v1.0.50
+> `ApplyCurrentGoboToLightFn` opt-out, so the legacy deferred path could project the
+> cookie at all). With NO gobo, the SpotLight stayed on the MegaLights path and the IES
+> profile silently lost its volumetric effect. With a gobo, the cookie now reached the
+> *floor* via the deferred path but the volumetric integrator still didn't sample it (a
+> separate engine-side gate, see (B)).
+>
+> **(B) `r.VolumetricFog.LightFunction` AND `r.LightFunctionQuality` gate volumetric LF
+> integration.** Even on the legacy deferred path, two engine CVars determine whether a
+> SpotLight's `LightFunctionMaterial` is folded into the volumetric scattering integrator:
+>
+> * `r.VolumetricFog.LightFunction` (default 1 in UE 5.5+) -- the actual gate. 0 = LFs
+>   never modulate volumetric fog regardless of any other setting. The v1.0.x DefaultEngine
+>   .ini doesn't touch it, but a prior `Rebus.GoboAntiGhost`-style scalability pack (or a
+>   future portal-side push) can drive it to 0 silently.
+> * `r.LightFunctionQuality` -- 0 disables LFs entirely (no floor footprint, no shaft).
+>   The v1.0.74 anti-ghost pack pushes this to 2 (high), but v1.0.83 made that pack
+>   default-OFF, so a deployment that hasn't enabled it can be running at the engine
+>   default (1 = default), at which the volumetric LF samples are noticeably softer than
+>   the floor-footprint samples.
+>
+> ---
+>
+> **Fix (per-fixture).** `ApplyInternalBeamPose` now calls
+> `PushInternalBeamMegaLightsOptOut()` on the InternalBeam ON edge -- caches
+> `SpotLight->bAllowMegaLights` into `bInternalBeamAllowMegaLightsOrig` (latched via
+> `bInternalBeamMegaLightsOrigCached`), forces the flag to 0, and triggers a
+> `ReregisterComponent()` because `bAllowMegaLights` is read at proxy creation time
+> (`FLightSceneInfo` -> `Proxy->AllowMegaLights()`, see the v1.0.51 comment on the same
+> flag near `ApplyCurrentGoboToLightFn`). `RestoreInternalBeamPose` calls the symmetric
+> `RestoreInternalBeamMegaLights()` which pushes the cached value back byte-exact.
+>
+> Idempotency: a re-entrant call (e.g. ApplyCurrentGoboToLightFn already opted out because
+> a gobo went active before InternalBeam was enabled) re-uses the existing cache and just
+> short-circuits the proxy rebuild -- the OFF restore still lands the construction-time
+> value, NOT the value the gobo path installed.
+>
+> Gated by a new operator-flippable CVar:
+>
+> ```
+> Rebus.InternalBeamForceLegacy 1   # default (v1.0.92) -- volumetric LF + IES on, MegaLights off for InternalBeam fixtures
+> Rebus.InternalBeamForceLegacy 0   # leaves bAllowMegaLights at whatever BuildSpotLight + the gobo path set it to
+> ```
+>
+> The CVar refresh sink walks every fixture currently in InternalBeam mode and toggles the
+> opt-out in-place: ON re-applies the push (re-priming the cache), OFF restores the cached
+> value (so a deployment can A/B at runtime without a full `Rebus.InternalBeam 0/1` cycle).
+>
+> **Fix (engine CVars).** `URebusSceneSettingsSubsystem::SetInternalBeamEnabled(true)` now
+> ALSO calls `PushVolumetricFogLightFunctionForInternalBeam(true)` (paired with the v1.0.89
+> `PushLightFunctionAtlasForInternalBeam`) so the engine-side gates are forced ON for the
+> duration of InternalBeam mode:
+>
+> | CVar                                | v1.0.92 push value | Restore               |
+> | ----------------------------------- | ------------------ | --------------------- |
+> | `r.LightFunctionAtlas.Enabled`      | `1` (v1.0.89)      | cached prior int      |
+> | `r.VolumetricFog.LightFunction`     | `1` (v1.0.92)      | cached prior int      |
+> | `r.LightFunctionQuality`            | `2` (v1.0.92, high)| cached prior int      |
+>
+> Each CVar's prior value is cached at the OFF -> ON edge into a private member of the
+> subsystem (`VolumetricFogLightFunctionPriorValue`, `LightFunctionQualityPriorValue`,
+> latched by `bVolumetricFogLightFunctionPushActive`). The OFF transition restores the
+> cached value byte-exact via `IConsoleVariable::Set(value, ECVF_SetByGameOverride)` --
+> sentinel `-1` ("no snapshot") falls back to `1` (the engine default in UE 5.5+), safer
+> than `0` because any other gobo wiring on a stage scene expects volumetric LF live.
+>
+> Defensive against the CVars being unregistered (renderer module not loaded yet, or the
+> engine drop renamed them): the helper logs a warning per missing CVar and SKIPS the
+> latch flip when BOTH are missing, so a later call after the renderer module loads can
+> still install the push.
+>
+> ---
+>
+> **Operator-visible logs.** Both transitions emit one line each so the operator can grep
+> for the live state in one place:
+>
+> ```
+> v1.0.92 InternalBeam: r.VolumetricFog.LightFunction was=1 now=1, r.LightFunctionQuality was=1 now=2 (push so SpotLight LightFunctionMaterial + IESTexture modulate the volumetric beam shaft).
+> Fixture <id> InternalBeam MegaLights opt-out: bAllowMegaLights 1 -> 0 (orig=1 cached). Volumetric scattering integrator now samples IES + LightFunction; perf trade-off: this fixture loses MegaLights' clustering.
+> ...
+> Fixture <id> InternalBeam MegaLights restore: bAllowMegaLights 0 -> 1 (cached orig).
+> v1.0.92 InternalBeam: r.VolumetricFog.LightFunction was=1 restored=1, r.LightFunctionQuality was=2 restored=1 (InternalBeam OFF -> released the v1.0.92 force pushes).
+> ```
+>
+> The `SetInternalBeamModeEnabled` per-fixture summary log gains three new fields so a
+> single line proves the chain landed:
+>
+> ```
+> Fixture <id> InternalBeam mode ENABLED (... forceLegacy=1 allowMegaLights=0 cachedOrig=1).
+> ```
+>
+> `forceLegacy` is the live CVar; `allowMegaLights` is the post-push value on the
+> SpotLight; `cachedOrig` is what the OFF transition will restore (or `-1` when the cache
+> wasn't primed because the operator had `Rebus.InternalBeamForceLegacy 0`).
+>
+> ---
+>
+> **Operator checklist after rebuilding to v1.0.92.**
+>
+> 1. Toggle InternalBeam ON via the portal (`SetSceneProperty bInternalBeam true`) or
+>    console (`Rebus.InternalBeam 1`).
+> 2. Send a fixture a gobo: `SetFixtureGobo` with a non-zero `goboIndex`.
+> 3. Verify the gobo pattern carves through the visible volumetric beam shaft (not just
+>    the floor footprint). The cookie's bright/dark areas should be visible inside the cone
+>    of light through fog.
+> 4. Sweep the fixture pan/tilt and confirm the shaft KEEPS the cookie pattern -- the
+>    pattern should track the head, not stay screen-locked.
+> 5. Verify the IES profile shapes the volumetric shaft (the shaft has the IES profile's
+>    directional intensity falloff, not a uniform cone).
+> 6. Send `SetFixtureZoom` with a few different zoom values and confirm the IES re-binds
+>    (the v1.0.91 zoom-keyed selection re-runs `SelectIesForZoom`, which re-applies the
+>    new candela max + the new `IESTexture` -- if the shaft shape doesn't change with
+>    zoom, the IES re-bind isn't running).
+> 7. Toggle InternalBeam OFF and confirm the Epic beam returns intact AND the SpotLight's
+>    `bAllowMegaLights` flag returns to its v1.0.92 cached value (1 by default; 0 if a gobo
+>    is still active, in which case the gobo path will keep MegaLights off).
+> 8. (Optional) Flip `Rebus.InternalBeamForceLegacy 0` while in InternalBeam mode and
+>    verify the SpotLight goes back onto the MegaLights path (uniformly-bright cone in fog
+>    again -- expected for that mode). Flip back to 1 to re-shape the shaft.
+>
+> Diagnostic console commands (already in the codebase):
+>
+> * `Rebus.DumpFixtureLights` -- prints `bAllowMegaLights`, `LightFunctionMaterial`,
+>   `IESTexture` per fixture (so the operator can confirm the per-fixture flags landed).
+> * `Rebus.DumpFixtureIes` (v1.0.91) -- prints the active IES profile + parsed candela max
+>   + the live `SpotLight->Intensity` formula breakdown.
+> * `Rebus.DumpGoboState` -- prints `bGoboActive`, the GoboRT pointer, and confirms the
+>   cookie material is bound.
+>
+> ---
+>
+> **Perf trade-off.** Forcing `bAllowMegaLights = 0` removes this fixture from MegaLights'
+> tile-based clustering for the duration of InternalBeam mode -- the floor footprint and
+> the volumetric shaft both render via the legacy deferred / clustered path. For a stage
+> show with 4-32 fixtures (a typical InternalBeam-mode session), the cost is acceptable
+> (the InternalBeam mode is itself a high-fidelity hero-beam choice; operators ship it
+> when "looks photographic" matters more than "lights N+1"). For deployments where
+> MegaLights' clustering is what makes the scene tractable (hundreds of fixtures simultaneously
+> in InternalBeam mode), flip `Rebus.InternalBeamForceLegacy 0` to keep MegaLights on -- the
+> floor footprint still shows the gobo + IES correctly (those paths don't depend on the
+> per-fixture MegaLights flag), only the volumetric shaft loses LF/IES shaping.
+>
+> ---
+>
+> **Documented escalation path (NOT implemented in v1.0.92, only documented).** If a future
+> engine drop changes the volumetric LF/IES routing again and the v1.0.92 push proves
+> insufficient on someone's deployment (the gobo + IES still don't reach the shaft after
+> a clean rebuild + a verified `Rebus.DumpFixtureIes` + `Rebus.DumpFixtureLights` pass), the
+> next step is the **translucent additive cone-mesh fallback**: author a translucent
+> additive cone mesh wrapped around the SpotLight that samples the cookie texture (and the
+> IES profile if practical) via a Custom HLSL node, multiplied by `BeamColor * Intensity`
+> and a soft Gaussian falloff. The existing `M_RebusBeam` raymarch material in
+> `Content/Python/build_rebus_base_level.py` (`_BEAM_RAYMARCH_HLSL`) is a complete reference
+> for the cone-mesh structure -- a v1.0.93+ would gate the new path behind a new
+> `Rebus.InternalBeamCookieCone [0|1]` CVar (default OFF) so the operator can A/B against
+> the engine-native v1.0.92 path without disturbing it. **DO NOT implement this fallback
+> without first confirming v1.0.92 is genuinely insufficient on the user's hardware** --
+> the cone-mesh path adds a per-fixture translucent draw call and another texture sample
+> chain (cookie + IES + Gaussian) that the engine-native v1.0.92 path doesn't pay for.
+>
+> ---
+>
+> **Files touched.**
+>
+> ```
+> REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Public/RebusFixtureActor.h
+> REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusFixtureActor.cpp
+> REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Public/RebusSceneSettingsSubsystem.h
+> REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusSceneSettingsSubsystem.cpp
+> REBUS_Visualiser/Plugins/RebusVisualiser/README.md
+> ```
+>
+> No changes to `RebusVisualiser.cpp` -- the `Rebus.InternalBeamForceLegacy` CVar is
+> registered via `FAutoConsoleVariableRef` (mirroring the v1.0.87 `Rebus.InternalBeamScatter`
+> + v1.0.89 `Rebus.InternalBeamOffsetSign` registrations in `RebusFixtureActor.cpp`), so
+> it auto-registers at module load and auto-unregisters at shutdown without a separate
+> `IConsoleManager::RegisterConsoleCommand` / `UnregisterConsoleObject` plumbing block.
+
 > **IES profile + IES candela max drive the SpotLight (v1.0.91).**
 > User: *"can we make sure we use the IES profile and IES intensity for the beam/spotlight"*.
 >
