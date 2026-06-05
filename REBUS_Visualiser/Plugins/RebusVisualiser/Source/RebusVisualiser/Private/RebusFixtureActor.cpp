@@ -540,6 +540,136 @@ FAutoConsoleVariableRef CVarRebusForceSyntheticLensFallback(
 	}),
 	ECVF_Default);
 
+// v1.0.106 -- HARD FLOOR: prefer the procedural `M_RebusBeam` cone (which carries the
+// v1.0.96 / v1.0.99 screen-space self-shadow trace) over Epic's `MI_Beam` canvas as the
+// visible beam shaft. Default 1 (procedural wins). The user reported across v1.0.96,
+// v1.0.99, v1.0.103 that "the beam mesh / beam cone is not stopping when it hits an
+// object" -- every iteration of the shadow-trace work has been on `M_RebusBeam` (the
+// procedural cone), but `TryBuildEpicBeam()` (v1.0.43) succeeds whenever the DMX
+// Fixtures plugin content is installed at `/DMXFixtures/...`, sets `bUsingEpicBeam=true`,
+// and HIDES the procedural cone (`BeamCone->SetVisibility(false)`). The visible shaft
+// then becomes `EpicBeamMID` (`M_Beam_Master`), onto which `RefreshBeamShadowParams`
+// has NEVER pushed any of the `BeamShadow*` scalars -- so every iteration of the v1.0.96+
+// work has been editing a hidden material. The truth table:
+//
+//   bUsingEpicBeam | visible-shaft material | carries v1.0.99 shadow trace?
+//   ---------------|------------------------|------------------------------
+//   true           | Epic MI_Beam           | NO -- our shadow params are ignored
+//   false          | M_RebusBeam MID        | YES (when master regen has run)
+//
+// v1.0.106 flips the default so `bUsingEpicBeam` is forced false in `BuildBeamCone()`
+// (`TryBuildEpicBeam()` is skipped entirely). The procedural cone is unhidden and
+// `RefreshBeamShadowParams` re-pushes the trace scalars onto its MID -- the v1.0.99
+// shadow trace now actually renders. Operators preferring Epic's beam fidelity (its
+// lens-flare integration + smarter zoom-normalised distribution) can flip back with
+// `Rebus.PreferProceduralBeam 0`; the next v1.0.107 release will port the screen-
+// space trace to Epic's MI_Beam too so both paths get the self-shadow correctness.
+//
+// Per-fixture override: `ARebusFixtureActor::bPreferProceduralBeam` (Details panel,
+// `EditAnywhere` only -- private UPROPERTY, no `BlueprintReadWrite`, matches the
+// v1.0.101 -> v1.0.102 fix on `BeamConeRadiusScale`). The CVar refresh sink walks
+// every fixture; the per-fixture knob is the post-spawn editor-instance override
+// (a hero fixture can keep Epic-beam while the rest of the rig flips procedural).
+//
+// Refresh sink (below) ALSO performs a one-shot probe of the on-disk M_RebusBeam
+// master on every flip-to-1 transition: if `BeamShadowStrength` / `BeamShadowDebug`
+// scalars are missing the master predates v1.0.99 and the trace will SILENTLY
+// NO-OP. The Warning names `Rebus.RebuildBeamMaterial` (the v1.0.103 runtime regen
+// command) so the operator-recovery action is on the same log line as the flip
+// (catches the v1.0.103 operator-action-required case at exactly the moment it
+// becomes relevant -- before the operator looks at the now-visible cone-mesh and
+// wrongly concludes "still broken").
+int32 GRebusPreferProceduralBeam = 1;
+FAutoConsoleVariableRef CVarRebusPreferProceduralBeam(
+	TEXT("Rebus.PreferProceduralBeam"),
+	GRebusPreferProceduralBeam,
+	TEXT("v1.0.106 -- 0|1 (default 1). When 1 (default since v1.0.106), every Rebus fixture's "
+		 "visible beam shaft is the procedural `M_RebusBeam` cone -- which carries the v1.0.96 / "
+		 "v1.0.99 screen-space self-shadow trace -- and `TryBuildEpicBeam()` is skipped at "
+		 "spawn (Epic's `MI_Beam` canvas is not built). When 0, Epic's `MI_Beam` canvas IS the "
+		 "visible shaft (the pre-v1.0.106 default since v1.0.43), and the screen-space self-"
+		 "shadow trace is BYPASSED (it lives on `M_RebusBeam`, not on `M_Beam_Master`); "
+		 "v1.0.107 will port the trace to Epic's beam too. Live -- changing this walks every "
+		 "Rebus fixture and flips the visible shaft without a respawn (the procedural cone + "
+		 "Epic canvas both stay alive in the scene -- visibility-only toggle). On flip to 1 "
+		 "the on-disk M_RebusBeam master is probed for the v1.0.99 parameter contract; a "
+		 "stale master logs a Warning naming `Rebus.RebuildBeamMaterial` (the v1.0.103 "
+		 "runtime regen). Pair with `Rebus.DumpBeamShadow` -- the per-fixture `Beam=Epic|"
+		 "Procedural` field reports which path is live. See the v1.0.106 README release "
+		 "block for the diagnosis chain that motivated the default flip."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		if (!GEngine) return;
+		const bool bPrefer = (CVar->GetInt() != 0);
+
+		// v1.0.106 stale-master probe on flip-to-1: a fresh-pull operator who never ran
+		// `build_rebus_base_level.py` keeps the v1.0.96 cooked master with the LWC
+		// projection bug -- the screen-space trace then silently no-ops on every step.
+		// Catch this at the moment the flip becomes operator-visible so the recovery
+		// action is on the same log line as the flip itself. Re-uses the same scalar
+		// contract `URebusVisualiserSubsystem::ProbeBeamMasterAtStartup` checks at
+		// session boot (BeamShadowStrength + BeamShadowDebug -- the two scalars added
+		// post-v1.0.96 that prove the master is on or after v1.0.99).
+		if (bPrefer)
+		{
+			if (UMaterialInterface* BeamMaster = LoadObject<UMaterialInterface>(nullptr,
+				TEXT("/Game/REBUS/Materials/M_RebusBeam.M_RebusBeam")))
+			{
+				float V = 0.f;
+				const bool bHasStrength = BeamMaster->GetScalarParameterValue(
+					FMaterialParameterInfo(TEXT("BeamShadowStrength")), V);
+				const bool bHasDebug = BeamMaster->GetScalarParameterValue(
+					FMaterialParameterInfo(TEXT("BeamShadowDebug")), V);
+				if (!bHasStrength || !bHasDebug)
+				{
+					UE_LOG(LogRebusVisualiser, Warning,
+						TEXT("Rebus.PreferProceduralBeam 1: STALE BEAM MASTER detected -- "
+							 "M_RebusBeam is missing the v1.0.99 parameter contract "
+							 "(BeamShadowStrength=%d BeamShadowDebug=%d). The procedural "
+							 "cone is now the visible shaft, but the screen-space shadow "
+							 "trace will SILENTLY NO-OP against this master -- the cone "
+							 "will read additive but UNSHADOWED (cubes between fixture + "
+							 "floor will appear to let the beam pass through). Operator "
+							 "recovery: run `Rebus.RebuildBeamMaterial` (editor-only "
+							 "v1.0.103 runtime regen), then ClearScene+LoadScene from the "
+							 "portal (or restart the editor) so each fixture respawns + "
+							 "rebuilds its BeamMID off the freshly-regenerated master. "
+							 "Verify with `Rebus.DumpBeamShadow` (every MID scalar should "
+							 "show EXISTS) and `Rebus.BeamShadowDebug 1` (a cube should "
+							 "appear RED inside the beam region behind it)."),
+						bHasStrength ? 1 : 0, bHasDebug ? 1 : 0);
+				}
+			}
+		}
+
+		int32 Flipped = 0;
+		int32 Total = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					if (F->RefreshPreferProceduralBeamFromCVar(bPrefer))
+					{
+						++Flipped;
+					}
+					++Total;
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.PreferProceduralBeam -> %d, walked %d fixture(s) (%d visible-shaft transitions). "
+				 "%s"),
+			bPrefer ? 1 : 0, Total, Flipped,
+			bPrefer
+				? TEXT("Procedural M_RebusBeam cone is the live shaft (v1.0.96 / v1.0.99 screen-space self-shadow trace is now bound to the visible MID).")
+				: TEXT("Epic MI_Beam canvas is the live shaft (v1.0.99 trace is BYPASSED until v1.0.107 ports it to Epic's beam too; use `Rebus.DumpBeamShadow` to confirm `Beam=Epic` per fixture)."));
+	}),
+	ECVF_Default);
+
 // v1.0.102 -- live A/B multiplier on the LENS-MATERIAL emissive intensity, independent
 // of the actual SpotLight intensity. Default 1.0 (no scaling). Operators tweak when the
 // lens reads too bright/dim relative to the lit floor pool -- "the lens is blowing out
@@ -861,17 +991,41 @@ void ARebusFixtureActor::DumpBeamShadowStateForDebug() const
 		? TEXT(" -- STALE MASTER (one or more MID scalars MISSING; the master predates v1.0.99 and the LWC projection fix DID NOT LAND -- the trace runs the broken v1.0.96 shader). Operator action: run `Rebus.RebuildBeamMaterial` (editor only) then ClearScene+LoadScene OR restart the editor")
 		: TEXT("");
 
+	// v1.0.106 -- report which beam path is currently rendering on this fixture so the
+	// operator can tell at a glance whether the v1.0.96 / v1.0.99 shadow trace is even
+	// LIVE on the visible MID:
+	//   * Beam=Procedural -- M_RebusBeam is the visible shaft (the MID column above IS the
+	//     material the per-pixel shader is reading; shadow scalars actually matter).
+	//   * Beam=Epic       -- Epic's MI_Beam is the visible shaft; the MID column above
+	//     describes the HIDDEN procedural cone (the v1.0.96..v1.0.103 shadow trace work
+	//     has been editing a hidden material -- the v1.0.106 diagnosis). The trace
+	//     SCALARS are still pushed onto the procedural BeamMID for parity, but they have
+	//     no on-screen effect until the operator flips `Rebus.PreferProceduralBeam 1`
+	//     (default since v1.0.106) OR the v1.0.107 follow-up ports the trace to Epic's
+	//     beam too.
+	// `Prefer=N/Y` also reported so the operator can confirm the per-fixture override
+	// flag matches the live visible path (a mismatch indicates the operator pushed the
+	// CVar but a sibling editor pin holds an instance override -- mirrors the
+	// `BeamConeRadiusScale` per-fixture override pattern in `DumpFixtureZoom`).
+	const TCHAR* BeamPath = bUsingEpicBeam ? TEXT("Epic") : TEXT("Procedural");
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("DumpBeamShadow '%s': MID(Steps=%.1f/%s Strength=%.3f/%s Bias=%.2f/%s Debug=%d/%s) "
-			 "CVars(Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d) -- shadowing %s, debug mode %d%s."),
-		*FixtureId,
+		TEXT("DumpBeamShadow '%s' Beam=%s Prefer=%s MID(Steps=%.1f/%s Strength=%.3f/%s Bias=%.2f/%s Debug=%d/%s) "
+			 "CVars(Steps=%.1f Strength=%.3f Bias=%.2f Debug=%d) -- shadowing %s, debug mode %d%s%s."),
+		*FixtureId, BeamPath, bPreferProceduralBeam ? TEXT("Y") : TEXT("N"),
 		MidSteps, Tag(bStepsOk),
 		MidStrength, Tag(bStrengthOk),
 		MidBias, Tag(bBiasOk),
 		(int32)MidDebug, Tag(bDebugOk),
 		GRebusBeamShadowSteps, GRebusBeamShadowStrength, GRebusBeamShadowBias, GRebusBeamShadowDebug,
 		bShadowEnabled ? TEXT("ENABLED") : TEXT("DISABLED"),
-		DebugMode, MasterStaleNote);
+		DebugMode, MasterStaleNote,
+		bUsingEpicBeam
+			? TEXT(" -- WARNING: Beam=Epic means the v1.0.96 / v1.0.99 shadow trace is BYPASSED "
+				   "on this fixture (the trace lives on M_RebusBeam, not on M_Beam_Master). The "
+				   "MID column above describes the HIDDEN procedural cone. To make the trace render, "
+				   "flip `Rebus.PreferProceduralBeam 1` (default since v1.0.106) -- the procedural "
+				   "cone becomes the visible shaft. Epic-beam parity for the trace is queued for v1.0.107.")
+			: TEXT(""));
 }
 
 void ARebusFixtureActor::DumpIesStateForDebug() const
@@ -1019,6 +1173,90 @@ void ARebusFixtureActor::RefreshBeamConeRadiusScaleFromCVar(float NewScale)
 	{
 		UpdateEpicBeamParams();
 	}
+}
+
+bool ARebusFixtureActor::RefreshPreferProceduralBeamFromCVar(bool bNewPrefer)
+{
+	// v1.0.106 -- pick up a live `Rebus.PreferProceduralBeam` change without a respawn.
+	// Assigns the per-fixture UPROPERTY first so a subsequent BuildBeamCone (e.g. on
+	// re-spawn from ClearScene+LoadScene) inherits the new value at seed time. The
+	// visible-shaft flip below is a pure SetVisibility toggle on `EpicBeamComp` +
+	// `BeamCone` -- the components stay alive in the scene either way, so re-toggling is
+	// cheap and idempotent. Returns true when the visible shaft actually transitioned
+	// (so the CVar refresh sink can count + log how many fixtures changed paths).
+	//
+	// Idempotence: the no-op early-return checks BOTH the cached preference flag AND the
+	// live `bUsingEpicBeam` -- so a fixture whose preference matches but whose visible
+	// path got out of sync (e.g. the very first `Rebus.PreferProceduralBeam 0` push after
+	// boot where `bPreferProceduralBeam` defaulted true but `EpicBeamComp` was never
+	// built) still re-runs the build/show path.
+	const bool bWantEpicVisible = !bNewPrefer;
+	if (bPreferProceduralBeam == bNewPrefer && bUsingEpicBeam == bWantEpicVisible)
+	{
+		return false;
+	}
+	bPreferProceduralBeam = bNewPrefer;
+
+	if (bNewPrefer)
+	{
+		// Switch TO procedural: hide Epic canvas (kept alive so future flip-back is cheap);
+		// unhide the procedural cone if the operator hasn't explicitly disabled mesh beams.
+		// Re-push the screen-space shadow trace scalars so the v1.0.96 / v1.0.99 BeamShadow*
+		// parameters land on the now-visible procedural BeamMID -- the whole point of the
+		// v1.0.106 flip is that the trace ACTUALLY renders, which requires the scalars on
+		// the visible MID. `RefreshBeamShadowParams` is silently no-op when BeamMID is null
+		// (the M_RebusBeam load failed in BuildBeamCone -- the cone-mesh build path errors
+		// loudly there; this flip is a benign no-op in that degenerate case).
+		if (EpicBeamComp)
+		{
+			EpicBeamComp->SetVisibility(false);
+			EpicBeamComp->SetHiddenInGame(true);
+		}
+		bUsingEpicBeam = false;
+		if (BeamCone)
+		{
+			BeamCone->SetVisibility(bMeshBeamEnabled);
+		}
+		RefreshBeamShadowParams();
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s beam: PreferProceduralBeam 1 -- Epic canvas hidden, procedural "
+				 "M_RebusBeam visible (v1.0.96 / v1.0.99 self-shadow trace scalars re-pushed "
+				 "onto BeamMID)."), *FixtureId);
+		return true;
+	}
+
+	// Switch TO Epic: unhide existing canvas if we built one earlier; else build it lazily.
+	// `TryBuildEpicBeam` returns false (with a logged Warning naming the missing asset path)
+	// when the DMX Fixtures plugin content isn't installed -- we then stay on the procedural
+	// cone and surface that fact in the log so the operator knows the toggle had no effect.
+	bool bEpicReady = false;
+	if (EpicBeamComp)
+	{
+		EpicBeamComp->SetVisibility(bMeshBeamEnabled);
+		EpicBeamComp->SetHiddenInGame(false);
+		bEpicReady = true;
+	}
+	else
+	{
+		bEpicReady = TryBuildEpicBeam();
+	}
+	bUsingEpicBeam = bEpicReady;
+	if (BeamCone)
+	{
+		// Hide the procedural cone only when Epic's canvas is actually visible -- if the DMX
+		// content is missing we MUST keep the procedural shaft visible (otherwise the fixture
+		// loses its beam entirely).
+		BeamCone->SetVisibility(bMeshBeamEnabled && !bUsingEpicBeam);
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s beam: PreferProceduralBeam 0 -- %s."),
+		*FixtureId,
+		bUsingEpicBeam
+			? TEXT("Epic MI_Beam canvas visible (v1.0.96 / v1.0.99 self-shadow trace is BYPASSED "
+				   "until the v1.0.107 follow-up ports the trace to Epic's beam too)")
+			: TEXT("Epic DMX Fixtures content NOT installed -- procedural cone remains the "
+				   "visible shaft (toggle had no effect on this fixture's visible beam)"));
+	return true;
 }
 
 ARebusFixtureActor::ARebusFixtureActor()
@@ -2513,14 +2751,47 @@ void ARebusFixtureActor::BuildBeamCone()
 		CurIntensity, bMeshBeamEnabled ? 1 : 0, DiamSrc,
 		ConeFwd.X, ConeFwd.Y, ConeFwd.Z, SpotFwd.X, SpotFwd.Y, SpotFwd.Z);
 
-	// v1.0.43: prefer Epic's REAL DMX beam (SM_Beam_RM + MI_Beam) when the DMX Fixtures content is
-	// installed. On success the procedural cone above becomes the hidden fallback (it stays built so
-	// the integration is fully reversible / robust to the content being removed). On failure we keep
-	// the M_RebusBeam cone as the visible beam.
-	bUsingEpicBeam = TryBuildEpicBeam();
-	if (bUsingEpicBeam && BeamCone)
+	// v1.0.106 -- seed the per-fixture preference from the live CVar so a fresh-spawn fixture
+	// inherits the operator's current `Rebus.PreferProceduralBeam` choice (default 1 = prefer
+	// procedural; the CVar refresh sink only walks already-spawned fixtures, so a fixture
+	// spawned AFTER an operator pushed `Rebus.PreferProceduralBeam 0` would default-construct
+	// to 1 and the operator would see a mid-batch flicker between paths without this seed).
+	// Same shape as the BeamConeRadiusScale seed above -- consistent seed point for every
+	// per-fixture beam scalar/flag that has a global CVar pair.
+	if (IConsoleVariable* PrefCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.PreferProceduralBeam")))
 	{
-		BeamCone->SetVisibility(false);
+		bPreferProceduralBeam = (PrefCVar->GetInt() != 0);
+	}
+
+	// v1.0.43 introduced / v1.0.106 GATED: prefer Epic's REAL DMX beam (SM_Beam_RM + MI_Beam)
+	// when the DMX Fixtures content is installed AND the operator has not opted into the
+	// procedural cone (the default). On success the procedural cone above becomes the hidden
+	// fallback (it stays built so the integration is fully reversible / robust to the content
+	// being removed). On failure we keep the M_RebusBeam cone as the visible beam.
+	//
+	// v1.0.106 -- when `bPreferProceduralBeam` is true (the new default) `TryBuildEpicBeam()`
+	// is SKIPPED entirely: the procedural cone is the visible shaft and the v1.0.96 / v1.0.99
+	// screen-space self-shadow trace (seeded via `RefreshBeamShadowParams` above) actually
+	// renders. EpicBeamComp / EpicBeamMID stay null until the operator flips the toggle off,
+	// at which point `RefreshPreferProceduralBeamFromCVar` builds them lazily.
+	if (!bPreferProceduralBeam)
+	{
+		bUsingEpicBeam = TryBuildEpicBeam();
+		if (bUsingEpicBeam && BeamCone)
+		{
+			BeamCone->SetVisibility(false);
+		}
+	}
+	else
+	{
+		bUsingEpicBeam = false;
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s beam: PreferProceduralBeam=1 (v1.0.106 default) -- skipping "
+				 "TryBuildEpicBeam(); M_RebusBeam procedural cone IS the visible shaft so the "
+				 "v1.0.96 / v1.0.99 screen-space self-shadow trace actually renders. Flip with "
+				 "`Rebus.PreferProceduralBeam 0` to restore Epic's MI_Beam canvas (the v1.0.107 "
+				 "follow-up will port the trace to Epic's beam too)."),
+			*FixtureId);
 	}
 }
 

@@ -503,6 +503,26 @@ public:
 	void RefreshBeamConeRadiusScaleFromCVar(float NewScale);
 	float GetBeamConeRadiusScale() const { return BeamConeRadiusScale; }
 
+	// v1.0.106 -- prefer the procedural `M_RebusBeam` cone (which carries the v1.0.96 / v1.0.99
+	// screen-space self-shadow trace) over Epic's `MI_Beam` canvas. Mirror the per-fixture-knob
+	// shape of `RefreshBeamConeRadiusScaleFromCVar`: the CVar `Rebus.PreferProceduralBeam`
+	// refresh sink walks every Rebus fixture and forwards the new value here; the call also
+	// performs a live no-respawn flip on the visible shaft (hide the Epic canvas, unhide the
+	// procedural cone, re-push `RefreshBeamShadowParams` so the trace scalars are bound to
+	// the now-visible MID -- and vice versa on flip to 0). On flip to 0 ("prefer Epic"), if
+	// the per-fixture EpicBeamComp was never built (the original Path the v1.0.43 wiring took
+	// when DMX content loaded), `TryBuildEpicBeam` is invoked lazily so the same toggle that
+	// hid the canvas earlier can re-show it later. Returns true when the visible beam path
+	// changed (so a caller can throttle re-logs); the per-fixture `bPreferProceduralBeam`
+	// UPROPERTY mirrors the resolved state for the Details panel + the next `BuildBeamCone`.
+	//
+	// The v1.0.106 stale-master Warning that pairs with the master toggle lives in the CVar
+	// refresh sink itself (RebusFixtureActor.cpp), not here -- per-fixture this call is
+	// idempotent and silent when nothing transitioned.
+	bool RefreshPreferProceduralBeamFromCVar(bool bNewPrefer);
+	bool IsPreferringProceduralBeam() const { return bPreferProceduralBeam; }
+	bool IsUsingEpicBeam() const { return bUsingEpicBeam; }
+
 	// v1.0.75: rebuild the gobo render target at a new square pixel size + re-bind it on the
 	// cookie/light-function MIDs. Called by Rebus.GoboRTSize. Size is clamped to [128, 8192]
 	// and rounded up to a power of two (mipmap generation requires it for tight LOD chains).
@@ -820,6 +840,28 @@ private:
 	// the editor-property exposure is purely for per-instance overrides in the Details panel.
 	UPROPERTY(EditAnywhere, Category = "Rebus|Beam")
 	float BeamConeRadiusScale = 1.0f;
+
+	// v1.0.106 -- per-fixture preference for the procedural `M_RebusBeam` cone over Epic's
+	// `MI_Beam` canvas. Default true so a fresh-spawn fixture inherits the v1.0.106
+	// "M_RebusBeam is the visible shaft" policy (the v1.0.96 / v1.0.99 screen-space
+	// self-shadow trace then renders because it lives on `BeamMID` -- our procedural cone --
+	// not on `EpicBeamMID`). When false, `BuildBeamCone` calls `TryBuildEpicBeam()` and Epic's
+	// canvas becomes the visible shaft (the pre-v1.0.106 default since v1.0.43); the
+	// procedural cone stays hidden in the scene as the fallback.
+	//
+	// Live operator-tweakable via `Rebus.PreferProceduralBeam <0|1>` (default 1); the CVar
+	// refresh sink walks every fixture and routes the new value through
+	// `RefreshPreferProceduralBeamFromCVar`, which flips the visible shaft without a respawn
+	// (`EpicBeamComp` is built lazily on first flip-to-0 if it wasn't built at spawn -- the
+	// component + MID stay alive after that for cheap subsequent toggles). The Details panel
+	// exposure is intentionally per-fixture so a single hero fixture can override the global
+	// gate (e.g. show-context wants Epic's lens-flare math on the front-of-house mover only).
+	//
+	// NOTE: kept `EditAnywhere` only (no `BlueprintReadWrite`) because this UPROPERTY lives
+	// in the `private:` block -- UHT rejects BP-write on private members (same constraint
+	// the v1.0.101 -> v1.0.102 fix on `BeamConeRadiusScale` documented).
+	UPROPERTY(EditAnywhere, Category = "Rebus|Beam")
+	bool bPreferProceduralBeam = true;
 
 	// bMeshBeams runtime toggle (default true = mesh beam on, fog scattering suppressed). When the
 	// portal pushes bMeshBeams=false the cone hides and FogScatteringIntensity is restored on the

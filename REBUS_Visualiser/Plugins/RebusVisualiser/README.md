@@ -594,6 +594,138 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Prefer the procedural `M_RebusBeam` cone over Epic's `MI_Beam` so the v1.0.96 / v1.0.99 screen-space self-shadow trace actually renders -- Epic-beam parity queued for v1.0.107 (v1.0.106).**
+>
+> User report (verbatim):
+>
+> > "The beam mesh, beam cone is not stopping when it hits an object. Can we check if this is EpicBeam or Beamcone we need to edit to fix this but we want the shaft of light to stop as it hits objects but only the part of the beam thats touching the object, the rest can pass through around the object if clear."
+>
+> **Diagnosis -- the v1.0.96 / v1.0.99 / v1.0.103 work has been on a hidden material.**
+> The user explicitly named both `BeamMesh / BeamCone` AND `EpicBeam` in this latest
+> report, which was the missing puzzle piece. v1.0.96 introduced the screen-space
+> self-shadow trace in `M_RebusBeam` (the procedural cone master) + the matching
+> `Rebus.BeamShadow*` CVars + `RefreshBeamShadowParams` push path. v1.0.99 fixed an
+> LWC projection bug + a first-step self-occlusion bias in the same `M_RebusBeam`
+> trace. v1.0.103 shipped diagnostics (`Rebus.DumpBeamShadow` EXISTS/MISSING per
+> scalar + `URebusVisualiserSubsystem::ProbeBeamMasterAtStartup` + the
+> `Rebus.RebuildBeamMaterial` runtime regen) on the H1 (stale on-disk master)
+> hypothesis. The user reported across v1.0.99 / v1.0.102 / v1.0.103 that "the beam
+> mesh / beam cone is not stopping when it hits an object" -- every iteration of the
+> shadow-trace work appeared to do NOTHING from the operator's perspective.
+>
+> The v1.0.106 audit uncovered the real cause: `ARebusFixtureActor::TryBuildEpicBeam()`
+> (introduced in v1.0.43) loads Epic's `MI_Beam` / `M_Beam_Master` from
+> `/DMXFixtures/LightFixtures/...` whenever the DMX Fixtures plugin content is
+> installed, sets `bUsingEpicBeam = true`, and HIDES the procedural cone
+> (`BeamCone->SetVisibility(false)` at line 2523 of v1.0.105 `RebusFixtureActor.cpp`).
+> The visible shaft then becomes `EpicBeamMID` (a per-fixture MID off `M_Beam_Master`)
+> onto which `RefreshBeamShadowParams` HAS NEVER PUSHED any of the `BeamShadow*`
+> scalars. The truth table:
+>
+> | `bUsingEpicBeam` | visible-shaft material | carries v1.0.99 shadow trace? |
+> | --- | --- | --- |
+> | `true` (DMX content installed) | Epic `MI_Beam` (`M_Beam_Master`) | **NO** -- our shadow params are ignored |
+> | `false` (no DMX content) | `M_RebusBeam` MID | YES (when master regen has run) |
+>
+> So on the user's install -- which DOES have the DMX Fixtures plugin content -- the
+> visible shaft has been Epic's `MI_Beam` since v1.0.43, and every iteration of the
+> shadow-trace work (v1.0.96 introduction, v1.0.99 LWC fix, v1.0.103 self-heal +
+> diagnostics) edited a material that wasn't rendering. The v1.0.103 stale-master
+> probe + Warning (`URebusVisualiserSubsystem::ProbeBeamMasterAtStartup`) was
+> investigating the right symptom on the wrong material. We've burned three release
+> cycles on a misdiagnosis -- the user has been patient.
+>
+> **What lands in v1.0.106.**
+>
+> | Surface | Behaviour |
+> | --- | --- |
+> | `Rebus.PreferProceduralBeam [0\|1]` CVar (NEW, default `1`) | When `1` (default since v1.0.106), every Rebus fixture's visible beam shaft is the procedural `M_RebusBeam` cone -- which carries the v1.0.96 / v1.0.99 screen-space self-shadow trace -- and `TryBuildEpicBeam()` is SKIPPED at spawn (Epic's `MI_Beam` canvas is not built; `EpicBeamComp` / `EpicBeamMID` stay null until the toggle flips). When `0`, Epic's `MI_Beam` canvas IS the visible shaft (the pre-v1.0.106 default since v1.0.43), and the screen-space self-shadow trace is BYPASSED (it lives on `M_RebusBeam`, not on `M_Beam_Master`). Refresh sink walks every fixture and flips the visible shaft WITHOUT a respawn -- the procedural cone + Epic canvas both stay alive in the scene (visibility-only toggle), so subsequent toggles are cheap. |
+> | Stale-master probe on flip-to-`1` | The CVar refresh sink re-loads `/Game/REBUS/Materials/M_RebusBeam` and checks for the v1.0.99 parameter contract (`BeamShadowStrength` + `BeamShadowDebug` scalars). Missing -> Warning naming `Rebus.RebuildBeamMaterial` (the v1.0.103 runtime regen) on the SAME log line as the flip -- catches the v1.0.103 operator-action-required case at exactly the moment it becomes relevant (the operator who flips the toggle to make the trace render needs to know in the same log line that the master is stale and the trace will silently no-op). |
+> | `bPreferProceduralBeam` per-fixture UPROPERTY (NEW) | `EditAnywhere` only (no `BlueprintReadWrite` -- private member, matches the v1.0.101 -> v1.0.102 `BeamConeRadiusScale` UHT fix). Default `true`. Mirror the per-fixture override pattern of `BeamConeRadiusScale`: the CVar refresh sink overwrites the per-fixture value on every push, but the Details panel exposes the knob so a single hero fixture can keep Epic-beam fidelity (lens-flare math + smarter zoom-normalised distribution) while the rest of the rig flips procedural. |
+> | `ARebusFixtureActor::RefreshPreferProceduralBeamFromCVar(bool)` (NEW) | The single chokepoint that flips the visible shaft. Idempotent: no-op when the cached preference + the live `bUsingEpicBeam` already match the target. Flip-to-procedural: hides the Epic canvas (`SetVisibility(false) + SetHiddenInGame(true)`), unhides the procedural cone (gated on `bMeshBeamEnabled`), and re-pushes `RefreshBeamShadowParams` so the trace scalars land on the now-visible BeamMID. Flip-to-Epic: unhides the Epic canvas if present, else lazily calls `TryBuildEpicBeam()` (which logs a Warning when the DMX content is missing and stays on the procedural cone -- the toggle then has no visible effect on that fixture, but the operator sees that explicitly in the per-fixture log line). |
+> | `BuildBeamCone()` gate | `TryBuildEpicBeam()` is now wrapped in `if (!bPreferProceduralBeam)`. The per-fixture flag is seeded from the live CVar at the top of `BuildBeamCone` so a fresh-spawn fixture inherits the operator's current choice (the CVar refresh sink only walks already-spawned fixtures; without this seed a fixture spawned AFTER an operator pushed `Rebus.PreferProceduralBeam 0` would default to `1` and operators would see a mid-batch flicker between paths). |
+> | `Rebus.DumpBeamShadow` extension | Per-fixture line now reports `Beam=Procedural\|Epic` + `Prefer=Y\|N`. When `Beam=Epic` an additional WARNING tail is appended naming the bypass + the v1.0.107 follow-up promise. So the dump now distinguishes "shadow trace is wired correctly but the visible material doesn't carry it" from the pre-v1.0.106 conflated state. |
+>
+> **Why a default flip (1) rather than a Path A port to Epic's master?** Path C
+> (v1.0.106): ship today, get the user a visible self-shadow shaft IMMEDIATELY on
+> their install, reversible per-fixture per-show via the CVar. Path A
+> (v1.0.107-queued): port the same screen-space self-shadow trace to a Rebus-owned
+> override of Epic's `M_Beam_Master` (`M_RebusEpicBeamOverride`), faithfully
+> mirroring Epic's existing param vocabulary (`DMX Color`, `DMX Max Light Intensity`,
+> `DMX Dimmer`, `DMX Max Light Distance`, `DMX Lens Radius`, `DMX Zoom`, `DMX Zoom
+> Normalize`, `DMX Quality Level`, `DMX Gobo Disk Frosted`, `DMX Gobo Num Mask`, `DMX
+> Gobo Index`, `DMX Gobo Disk Rotation Speed`) so `UpdateEpicBeamParams()` /
+> `ApplyCurrentGoboToEpicBeam()` keep working unchanged. Path A is high-effort
+> high-payoff (Epic's beam material does sophisticated work -- cone-frustum SDF, lens-
+> flare integration, smarter zoom-normalised brightness -- that we'd need to
+> faithfully reproduce or wrap). The user has been complaining about Epic's beam
+> behaviour ALL ALONG (the v1.0.101 `BeamConeRadiusScale` knob was added because the
+> Epic beam read wider than the lit footprint; the v1.0.96..v1.0.103 work was about
+> shadows that have apparently never rendered on the Epic beam). v1.0.106 ships the
+> default flip TODAY so the user sees the v1.0.99 shadow trace immediately on their
+> install; v1.0.107 ports the trace to Epic's beam so operators preferring Epic
+> fidelity can flip the CVar back and still get self-shadowing.
+>
+> **Operator action path (v1.0.106+).**
+>
+> 1. **Default ON does the right thing.** Launch the editor / packaged build; the
+>    default `Rebus.PreferProceduralBeam = 1` means every spawned fixture's visible
+>    shaft is the procedural `M_RebusBeam` cone with the v1.0.99 trace active.
+>    Place a cube between a fixture and the floor; the cube should carve a black
+>    shadow into the beam shaft.
+> 2. **Verify with `Rebus.DumpBeamShadow`.** Every per-fixture line should now
+>    report `Beam=Procedural Prefer=Y` and `shadowing ENABLED, debug mode 0`. Any
+>    `Beam=Epic` entry means the per-fixture override flag is still set false on
+>    that fixture's editor instance (use the Details panel `Rebus|Beam ->
+>    bPreferProceduralBeam = true` to flip per-fixture, or push the CVar again).
+> 3. **Diagnose visually with `Rebus.BeamShadowDebug 1`.** Pixels behind the
+>    occluder cube should appear RED inside the beam region. Green = the trace
+>    found no occluders. If the cube is still green AFTER the `Beam=Procedural`
+>    confirmation, look for the `STALE BEAM MASTER` Warning emitted at the moment
+>    of the flip-to-1 (the CVar sink probes the master and warns if it predates
+>    v1.0.99); the recovery is `Rebus.RebuildBeamMaterial` (v1.0.103 runtime
+>    regen) + ClearScene+LoadScene OR an editor restart so each fixture
+>    respawns + rebuilds its `BeamMID` off the freshly-regenerated master.
+> 4. **A/B against the Epic-beam path.** Push `Rebus.PreferProceduralBeam 0`. The
+>    Epic `MI_Beam` canvas becomes visible per fixture (`TryBuildEpicBeam` is
+>    invoked lazily on first flip-to-0 if the canvas wasn't built at spawn).
+>    `Rebus.DumpBeamShadow` now reports `Beam=Epic Prefer=N` per fixture with the
+>    additional WARNING tail naming the bypass. The shadow trace will appear NOT
+>    to render -- expected; v1.0.107 will port it to Epic's beam.
+> 5. **Per-fixture override.** Open a single fixture in the Details panel,
+>    `Rebus|Beam -> bPreferProceduralBeam`, flip per-fixture for hero fixtures
+>    that need Epic's lens-flare math while the rest of the rig stays
+>    procedural. The CVar refresh sink will overwrite this on every global push;
+>    persist the per-fixture choice by sending the CVar BEFORE setting the
+>    instance overrides.
+>
+> **Files touched (v1.0.106).**
+>
+> | File | Change |
+> | --- | --- |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Public/RebusFixtureActor.h` | New `bPreferProceduralBeam` per-fixture UPROPERTY (private, `EditAnywhere` only, default `true`) + new public methods `RefreshPreferProceduralBeamFromCVar(bool)` + `IsPreferringProceduralBeam()` + `IsUsingEpicBeam()`. Mirrors the v1.0.101 `BeamConeRadiusScale` / `RefreshBeamConeRadiusScaleFromCVar` shape verbatim. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusFixtureActor.cpp` | New `Rebus.PreferProceduralBeam` CVar + refresh sink (stale-master probe on flip-to-1 mirrors `URebusVisualiserSubsystem::ProbeBeamMasterAtStartup`'s scalar check). `BuildBeamCone` now seeds the per-fixture flag from the CVar + gates `TryBuildEpicBeam()` on `!bPreferProceduralBeam`. New `RefreshPreferProceduralBeamFromCVar(bool)` impl (idempotent visibility-only flip; lazily builds `EpicBeamComp` on first flip-to-0). `DumpBeamShadowStateForDebug` extended to report `Beam=Procedural\|Epic` + `Prefer=Y\|N` + a WARNING tail when `Beam=Epic` (the v1.0.107 promise). |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/RebusVisualiser.uplugin` | `VersionName` bumped `1.0.105` -> `1.0.106`. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/README.md` | This release block. |
+>
+> No engine / `OrbitConnector` / `glTFRuntime` asset is touched -- v1.0.106 stays
+> inside `RebusVisualiser`. The v1.0.96 / v1.0.99 / v1.0.103 shadow-trace work is
+> preserved verbatim on the procedural cone (the v1.0.107 follow-up will REUSE the
+> same `_BEAM_RAYMARCH_HLSL` shadow loop on the Epic-beam master override). The
+> v1.0.104 double-sided + v1.0.105 Nanite walkers are untouched.
+>
+> **v1.0.107 follow-up (Epic-beam parity for the self-shadow trace).** Author
+> `M_RebusEpicBeamOverride` in `build_rebus_base_level.py` mirroring Epic's
+> `M_Beam_Master` parameter vocabulary verbatim (so `UpdateEpicBeamParams()` /
+> `ApplyCurrentGoboToEpicBeam()` continue to work unchanged), bake in the same
+> `BeamShadow*` scalars (Steps / Strength / Bias / Debug) and the same
+> `_BEAM_RAYMARCH_HLSL` shadow loop, then in `TryBuildEpicBeam()` prefer the
+> override material when present (falling back to Epic's `MI_Beam` when not).
+> Operators preferring Epic fidelity then flip `Rebus.PreferProceduralBeam 0` AND
+> get self-shadowing on the Epic beam too. v1.0.106 is the visible-shaft fix the
+> user needs today; v1.0.107 is the architectural fix that gives both paths the
+> trace.
+
 > **Nanite enable on every Orbit-imported `UStaticMesh` (operator-toggleable, editor-only conversion) (v1.0.105).**
 > User request (verbatim):
 >
