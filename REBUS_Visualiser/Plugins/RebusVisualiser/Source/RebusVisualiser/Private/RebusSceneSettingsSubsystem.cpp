@@ -266,6 +266,14 @@ void URebusSceneSettingsSubsystem::SetInternalBeamEnabled(bool bEnabled)
 	UWorld* World = GetWorld();
 	if (!World) return;
 
+	// v1.0.89: push `r.LightFunctionAtlas.Enabled 1` BEFORE walking the fixtures so the very
+	// first SpotLight->SetCastVolumetricShadow call inside ApplyInternalBeamPose sees the
+	// atlas path enabled when its render proxy is rebuilt. Symmetric on the OFF transition --
+	// restore is the LAST step (after every fixture's RestoreInternalBeamPose) so the atlas
+	// stays on for the duration of the byte-exact restore walk. Idempotent: the helper below
+	// short-circuits when the live latch already matches the requested state.
+	PushLightFunctionAtlasForInternalBeam(bEnabled);
+
 	int32 Count = 0;
 	for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
 	{
@@ -279,13 +287,16 @@ void URebusSceneSettingsSubsystem::SetInternalBeamEnabled(bool bEnabled)
 		TEXT("bInternalBeam=%d applied to %d fixture(s) (%s)."),
 		bEnabled ? 1 : 0, Count,
 		bEnabled
-			? TEXT("Epic beam hidden, SpotLight promoted to visible volumetric shaft + back-offset applied + body meshes opted out of shadow casting")
-			: TEXT("Epic beam restored, SpotLight pose + body shadow flags reverted byte-exact"));
+			? TEXT("Epic beam hidden, SpotLight promoted to visible volumetric shaft + back-offset applied + body meshes opted out of shadow casting + r.LightFunctionAtlas.Enabled forced to 1 so gobo cookies modulate the shaft")
+			: TEXT("Epic beam restored, SpotLight pose + body shadow flags reverted byte-exact + r.LightFunctionAtlas.Enabled restored to its pre-push value"));
 
-	// v1.0.87 visibility hint: the internal beam needs volumetric fog to be visible in the
-	// scene; surface it as a Verbose log so the operator can see why the toggle "did nothing"
-	// in a fog-off level (we deliberately do NOT force bVolumetricFog on -- that's a separate
-	// scene-property the operator owns).
+	// v1.0.89: promoted from Verbose to Warning. The user explicitly reported "Can we make sure
+	// volumetric shadows are on" -- if the scene has no active volumetric fog, NO amount of
+	// SpotLight->SetCastVolumetricShadow(true) inside the actor will make the shaft carve
+	// through anything (there is no scattering medium for the rays to be occluded against), so
+	// the operator gets ONE obvious warning per InternalBeam-on toggle when the prerequisite is
+	// missing. We deliberately do NOT force bVolumetricFog on -- that's a separate scene
+	// property the operator owns -- but the warning makes the failure mode self-diagnosing.
 	if (bEnabled)
 	{
 		if (AExponentialHeightFog* Fog = GetFog())
@@ -294,11 +305,58 @@ void URebusSceneSettingsSubsystem::SetInternalBeamEnabled(bool bEnabled)
 			{
 				if (!FogComp->bEnableVolumetricFog)
 				{
-					UE_LOG(LogRebusVisualiser, Verbose,
-						TEXT("bInternalBeam=1 but bVolumetricFog=0 on the scene fog -- the SpotLight's volumetric shaft will be invisible until you enable VolumetricFog (SetSceneProperty bVolumetricFog true)."));
+					UE_LOG(LogRebusVisualiser, Warning,
+						TEXT("bInternalBeam=1 but bVolumetricFog=0 on the scene fog -- the SpotLight's volumetric shaft will be invisible until you enable volumetric fog (SetSceneProperty bVolumetricFog true, or set r.VolumetricFog 1 in console). Cast-volumetric-shadow needs a scattering medium to render the carve."));
 				}
 			}
 		}
+		else
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("bInternalBeam=1 but no AExponentialHeightFog actor in the scene -- the SpotLight's volumetric shaft will be invisible until you spawn a fog actor with bVolumetricFog enabled (BaseLevel ships with one; check the scene was loaded from a v1.0.x BaseLevel preset)."));
+		}
+	}
+}
+
+void URebusSceneSettingsSubsystem::PushLightFunctionAtlasForInternalBeam(bool bOn)
+{
+	if (bOn == bLightFunctionAtlasPushActive)
+	{
+		// Idempotent: the wire path can re-enter (ReapplyAll, double-push of the same scene
+		// property) and we MUST NOT overwrite our cached prior value with the value we just
+		// installed. A second false after a single true would otherwise flip the engine to 0.
+		return;
+	}
+	IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.LightFunctionAtlas.Enabled"));
+	if (!CVar)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("v1.0.89 InternalBeam: r.LightFunctionAtlas.Enabled NOT REGISTERED -- the renderer module is not loaded or the CVar was renamed in this engine version. The gobo cookie may not modulate the volumetric shaft until this CVar is forced to 1."));
+		return;
+	}
+
+	if (bOn)
+	{
+		LightFunctionAtlasPriorValue = CVar->GetInt();
+		CVar->Set(1, ECVF_SetByGameOverride);
+		bLightFunctionAtlasPushActive = true;
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("v1.0.89 InternalBeam: r.LightFunctionAtlas.Enabled was=%d now=1 (push so SpotLight LightFunctionMaterial modulates the volumetric shaft, not just the lit floor)."),
+			LightFunctionAtlasPriorValue);
+	}
+	else
+	{
+		const FString Before = CVar->GetString();
+		// Restore to the prior int value byte-exact. If the snapshot was never taken (sentinel
+		// negative), fall back to 1 (the engine default in UE 5.5+; safer than 0 because any
+		// other gobo wiring expects the atlas path live).
+		const int32 Restore = (LightFunctionAtlasPriorValue >= 0) ? LightFunctionAtlasPriorValue : 1;
+		CVar->Set(Restore, ECVF_SetByGameOverride);
+		bLightFunctionAtlasPushActive = false;
+		LightFunctionAtlasPriorValue = -1;
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("v1.0.89 InternalBeam: r.LightFunctionAtlas.Enabled was=%s restored=%d (InternalBeam OFF -> released the v1.0.89 force-1 push)."),
+			*Before, Restore);
 	}
 }
 

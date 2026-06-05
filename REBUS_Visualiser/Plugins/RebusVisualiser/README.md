@@ -594,6 +594,258 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **InternalBeam fixes -- offset direction, gobo on shaft, volumetric shadows, lens shadow opt-out (v1.0.89).**
+> User report (verbatim, four issues in one message):
+> *"the beam offset is in the wrong direction. Its infront of the lens, not behind it.*
+> *No gobo is being passed to this spotlight beam even though its in the footprint.*
+> *Can we make sure volumetric shadows are on.*
+> *Can we make sure the fixture lens doenst shadow this light either."*
+>
+> All four are bugs in the v1.0.87 InternalBeam A/B mode (and the v1.0.88 isBeam lens path),
+> resolved per-issue below. The v1.0.87 + v1.0.88 contracts are unchanged at the surface --
+> `bInternalBeam` scene property + `Rebus.InternalBeam` console toggle still drive the same
+> per-fixture state machine, and the v1.0.88 `Rebus.ForceSyntheticLensFallback` lens A/B is
+> untouched.
+>
+> ---
+>
+> **(1) Back-offset sign was inverted on the user's GDTF profile.**
+>
+> Root cause. `BuildSpotLight` builds the SpotLight rest rotation with
+> `FRotationMatrix::MakeFromXZ(Forward, Up)`, where `Forward` is the GDTF `<Beam>` node's `+Y`
+> axis (or the explicit `beamDirectionWorld` when the portal sends one). After this rotation
+> the SpotLight's local `+X` is intended to point OUT of the lens (the emission direction).
+> v1.0.87 wrote `SpotLight->AddRelativeLocation(-offset * LiveFwd)` to push the spotlight
+> UP-stream (back into the head body) so the cone exits the lens at the lens diameter at
+> MaxZoom. That is the right math for a profile whose `+Y` matches the convention; the user
+> reported the spotlight ending up IN FRONT of the lens, proving the resolved `+X` axis on
+> their content is pointing INTO the head, not out of the lens. With the inverted axis,
+> `-offset * LiveFwd` pushed the spot DOWN-stream past the lens.
+>
+> Fix. The sign is now an operator-flippable global, default flipped to the corrected
+> direction:
+>
+> ```
+> Rebus.InternalBeamOffsetSign +1   # default (v1.0.89 corrected) -- adds +offset * LiveFwd
+> Rebus.InternalBeamOffsetSign -1   # legacy v1.0.87 behaviour, for diagnostics
+> ```
+>
+> The CVar refresh sink walks every fixture currently in InternalBeam mode and re-runs
+> `ARebusFixtureActor::RefreshInternalBeamOffset()` (a public thin-wrapper around
+> `RefreshMotion`) so the new sign re-applies in-place without a respawn or a full pose
+> rebuild. Both RefreshMotion branches (rig-attached `BeamRest * Head` and the
+> synthetic-pan/tilt fallback) read `GRebusInternalBeamOffsetSign` at the moment of
+> application, so the change lands in the same frame the CVar is set. A new Verbose log
+> ```
+> Fixture <id> InternalBeam offset: applied +<cm> along LiveFwd=(<x>,<y>,<z>) (sign=+1, restLoc=(...), spotLoc=(...))
+> ```
+> makes the resolved direction grep-visible the next time we revisit this. The per-toggle
+> `SetInternalBeamModeEnabled` summary log also surfaces the live sign + signed offset.
+>
+> ---
+>
+> **(2) Gobo cookie modulated the floor pool but not the volumetric shaft.**
+>
+> Root cause. UE 5.7 routes a SpotLight's `LightFunctionMaterial` onto the volumetric
+> scattering integrator ONLY when `r.LightFunctionAtlas.Enabled = 1`. With the atlas off,
+> the cookie still projects onto lit surfaces (the user saw the gobo on the floor) but the
+> volumetric shaft sees flat scattering (no cookie modulation). The v1.0.74 anti-ghost pack
+> deliberately pushes `r.LightFunctionAtlas.Enabled = 0` (defensive against stale-atlas
+> sample artefacts on a rotating cookie), and although v1.0.83 made that pack default-OFF,
+> the engine baseline of `1` still loses to any later push that drives it to `0`.
+>
+> Fix. `URebusSceneSettingsSubsystem::SetInternalBeamEnabled(true)` now FORCES
+> `r.LightFunctionAtlas.Enabled = 1` for the duration of the InternalBeam session. Cached
+> prior value + `ECVF_SetByGameOverride` write + restore-on-disable byte-exact, mirroring
+> the existing v1.0.74/78 CVar-pack pattern. The push is GLOBAL (one CVar, not per-fixture)
+> so a session with N fixtures in InternalBeam mode pushes the CVar exactly once;
+> idempotency latch prevents a double-true / double-false from flipping the CVar twice.
+>
+> Single helper: `URebusSceneSettingsSubsystem::PushLightFunctionAtlasForInternalBeam(bool)`
+> -- called from `SetInternalBeamEnabled` BEFORE the per-fixture walk on the ON transition,
+> AFTER the per-fixture walk on the OFF transition (so the atlas stays on for the entire
+> restore phase). Restore is symmetric: prior value cached on the OFF -> ON edge, restored
+> on the ON -> OFF edge; sentinel `-1` means "no snapshot" and the restore falls back to
+> the engine default `1` (safer than `0` because any other gobo wiring expects the atlas
+> path live). One-line log on each transition:
+>
+> ```
+> v1.0.89 InternalBeam: r.LightFunctionAtlas.Enabled was=0 now=1 (push so SpotLight LightFunctionMaterial modulates the volumetric shaft, not just the lit floor).
+> ...
+> v1.0.89 InternalBeam: r.LightFunctionAtlas.Enabled was=1 restored=0 (InternalBeam OFF -> released the v1.0.89 force-1 push).
+> ```
+>
+> Caveat (documented for the next round). Epic's `MI_Light` (`M_Light_Master`) is NOT
+> currently `MaterialIsLightFunctionAtlasCompatible` and our `ApplyCurrentGoboToLightFn`
+> sets `bAllowMegaLights = 0` on the SpotLight while a gobo is active (so the cookie
+> projects via the legacy deferred light-function path, which DOES modulate the volumetric
+> integrator when `r.LightFunctionAtlas.Enabled = 1`). If a future engine version changes
+> the volumetric LF routing again and the cookie still doesn't reach the shaft after the
+> v1.0.89 atlas push, the documented next step is a translucent additive cone mesh
+> wrapped around the spotlight that samples the same cookie texture (visible-shaft cookie
+> via geometry, not via light function). DO NOT pursue without first confirming the
+> v1.0.89 atlas push is insufficient on the user's deployment.
+>
+> ---
+>
+> **(3) Volumetric-shadow lock-in.**
+>
+> The v1.0.87 `RefreshBeamShadowMode` already calls `SpotLight->SetCastShadows(true)` and
+> `SpotLight->SetCastVolumetricShadow(true)` on the `bInternalBeamEnabled` branch (with
+> `MarkRenderStateDirty()` to propagate to the render thread). v1.0.89 adds:
+>
+> * A one-shot `Log`-level diagnostic emitted from `SetInternalBeamModeEnabled(true)` so the
+>   user can confirm the state landed without a debugger:
+>
+>   ```
+>   Fixture <id> InternalBeam: scatter=1.00 castShadows=1 volumetric-shadow=1 allowMegaLights=0 light-function=GoboLightFnMID gobo-active=1
+>   ```
+>
+>   `castShadows=0` here would catch a future regression where the SpotLight's CastShadows
+>   was suppressed by some other code path; `volumetric-shadow=0` would catch a regression
+>   on the VSM fog path; `light-function=<none>` while a gobo is selected is the diagnostic
+>   for "gobo on floor, not on shaft".
+>
+> * **Volumetric-fog warning promoted Verbose -> Warning.** v1.0.87 logged a Verbose hint
+>   when `bInternalBeam=1` was applied while the scene's `AExponentialHeightFog`
+>   `bEnableVolumetricFog` was off (the shaft has no scattering medium to render against).
+>   The user explicitly asked us to "make sure volumetric shadows are on" -- so the
+>   prerequisite warning is now `Warning`-level and self-diagnosing:
+>
+>   ```
+>   bInternalBeam=1 but bVolumetricFog=0 on the scene fog -- the SpotLight's volumetric shaft will be invisible until you enable volumetric fog (SetSceneProperty bVolumetricFog true, or set r.VolumetricFog 1 in console).
+>   ```
+>
+>   A second Warning fires if the scene has no `AExponentialHeightFog` actor at all
+>   (BaseLevel ships with one; if it's missing, something stripped the level). We
+>   deliberately do NOT force `bVolumetricFog` on -- that's still a separate scene property
+>   the operator owns -- but the operator now gets one obvious "do this to see the beam
+>   carve" warning per InternalBeam toggle.
+>
+> ---
+>
+> **(4) Lens shouldn't shadow the InternalBeam spotlight.**
+>
+> Root cause. The v1.0.87 `SetBodyMeshesCastShadow` walker forces
+> `CastShadow / bCastDynamicShadow / bCastHiddenShadow / bCastShadowAsTwoSided = false` on
+> every body primitive when the mode is enabled, EXCLUDING the SpotLight, the Epic beam
+> canvas, the procedural cone, and the synthetic LensDisc. v1.0.88 added a NEW class of
+> primitive -- the real `<Beam>` lens meshes (tagged `RebusIsBeamLens`, tracked in
+> `IsBeamLensComponents`) -- which the walker ALREADY includes today (they're not in the
+> skip list). So the v1.0.89 fix is sequencing-driven: when `BuildMeshes` lands AFTER
+> `SetInternalBeamModeEnabled(true)` has already walked the actor (e.g. a delayed
+> `/meshes` push, or a re-build path that re-creates the procedural meshes), the new
+> `RebusIsBeamLens` mesh keeps its default `CastShadow=true` and shadows the spotlight.
+>
+> Fix.
+>
+> 1. **Defensive single-primitive opt-out at BuildMeshes time.** New public method
+>    `ARebusFixtureActor::OptPrimitiveOutOfInternalBeamShadow(UPrimitiveComponent*)`. Called
+>    immediately after every freshly-created procedural mesh component in `BuildMeshes`.
+>    No-op when not in InternalBeam mode (the typical first-spawn flow); when in
+>    InternalBeam mode it caches the comp's original four shadow flags into the v1.0.87
+>    `InternalBeamShadowCache`, opts the comp out (CastShadow + bCastDynamicShadow +
+>    bCastHiddenShadow + bCastShadowAsTwoSided -> false), and `MarkRenderStateDirty()`s.
+>    Mirrors the per-actor walker's filter rules (skips BeamCone / EpicBeamComp /
+>    LensDisc / any ULightComponent) and re-entrancy-guards via a linear scan of the
+>    cache so a comp can't be opted out twice.
+>
+> 2. **Walker still INCLUDES `RebusIsBeamLens`.** No skip-list addition for the new tag --
+>    the body opt-out is for them too. Walker log message updated to make this explicit
+>    (`v1.0.89 INCLUDES RebusIsBeamLens-tagged real <Beam> lens meshes`). The synthetic
+>    LensDisc is still skipped because it's an emissive disc that was always non-shadowing;
+>    the per-beam `RebusIsBeamFlare` discs are also already non-shadowing by construction
+>    (`BuildIsBeamLensFlares` hard-sets CastShadow=false on every flare disc).
+>
+> 3. **Restore-on-disable still byte-exact.** `RestoreInternalBeamPose` -> `SetBodyMeshes
+>    CastShadow(true)` walks the cache (NOT the live primitive list) and restores each
+>    entry's original four flags. Because `OptPrimitiveOutOfInternalBeamShadow` adds to
+>    the SAME cache, late-arrival primitives are restored alongside walker-touched ones --
+>    no separate code path. After the cache replay the cache is `Reset()`'d so a
+>    subsequent ON transition rebuilds it from scratch (preventing dangling weak refs
+>    from a previous session).
+>
+> ---
+>
+> **C++ surface additions.**
+>
+> * `void ARebusFixtureActor::RefreshInternalBeamOffset()` (public). Re-runs `RefreshMotion`
+>   so the offset re-applies; called by the new `Rebus.InternalBeamOffsetSign` CVar refresh
+>   sink.
+> * `void ARebusFixtureActor::OptPrimitiveOutOfInternalBeamShadow(UPrimitiveComponent*)`
+>   (public). Single-primitive opt-out + cache for the BuildMeshes defensive path.
+> * `void URebusSceneSettingsSubsystem::PushLightFunctionAtlasForInternalBeam(bool)`
+>   (private). Cached + restored r.LightFunctionAtlas.Enabled push.
+>
+> **No new UPROPERTYs** (the offset-sign is a global CVar, not per-fixture; per-fixture
+> override would be over-engineering for a sign flip that depends on GDTF authoring
+> convention, which the operator can usually fix once at the portal level rather than
+> on each fixture). The existing `InternalBeamMaxZoomFullDeg` UPROPERTY (45 deg fallback)
+> is unchanged.
+>
+> **Console additions.**
+>
+> ```
+> Rebus.InternalBeamOffsetSign [+1|-1]   # v1.0.89 -- flip the InternalBeam back-offset
+>                                         # along the SpotLight local +X. Default +1
+>                                         # (v1.0.89 corrected); -1 = legacy v1.0.87.
+> ```
+>
+> Existing `Rebus.InternalBeam`, `Rebus.InternalBeamScatter` continue to work unchanged.
+>
+> **Operator checklist.**
+>
+> ```text
+> # 1. Toggle InternalBeam ON. Confirm both warnings fire OR the prerequisite is met.
+> Rebus.InternalBeam 1
+> #    Expected:
+> #    bInternalBeam=1 applied to N fixture(s) (Epic beam hidden ... + r.LightFunctionAtlas.Enabled forced to 1 ...).
+> #    v1.0.89 InternalBeam: r.LightFunctionAtlas.Enabled was=<prior> now=1 ...
+> #    Per fixture:
+> #    Fixture <id> InternalBeam mode ENABLED (backOffset=+<cm> sign=+1 ...).
+> #    Fixture <id> InternalBeam: scatter=1.00 castShadows=1 volumetric-shadow=1 allowMegaLights=<0 if gobo active, else 1> light-function=<MID name or <none>> gobo-active=<0|1>
+> #    If volumetric fog is OFF you also see (Warning):
+> #    bInternalBeam=1 but bVolumetricFog=0 on the scene fog -- ... enable volumetric fog ...
+> SetSceneProperty bVolumetricFog true   # via portal data channel, OR
+> r.VolumetricFog 1                       # console
+>
+> # 2. Verify the spotlight is BEHIND the lens. Look at the fixture from the side -- the
+> #    visible volumetric shaft should EXIT the lens at the lens diameter (max zoom) /
+> #    INSIDE the lens diameter (narrower zoom). If the shaft starts in mid-air past the
+> #    lens, the offset went the wrong way; flip the sign:
+> Rebus.InternalBeamOffsetSign -1
+> #    Per fixture:
+> #    Fixture <id> InternalBeam offset: applied -<cm> along LiveFwd=(...) (sign=-1, ...)
+>
+> # 3. Verify the gobo lands on the volumetric shaft (not just the floor).
+> #    Select a gobo with a clear pattern (e.g. break-up). With InternalBeam ON, the
+> #    pattern should ride the visible shaft. If it doesn't, dump the fixture state:
+> Rebus.DumpGoboState
+> #    Look for: SpotLight.LightFunctionMaterial bound + r.LightFunctionAtlas.Enabled=1.
+> #    If both are correct and the shaft still has no cookie, the next step is the
+> #    translucent-cone fallback (NOT in v1.0.89 -- documented as future work).
+>
+> # 4. Verify shadows carve through fog.
+> #    Put a truss in the beam path. The shaft should show a clean gap where the truss
+> #    occludes it. Confirm via:
+> Rebus.DumpFixtureLights
+> #    Look for: bCastShadows=1, bCastVolumetricShadow=1, on every InternalBeam fixture.
+>
+> # 5. Verify the lens does NOT shadow the spotlight. Look at the fixture from below
+> #    (along the beam axis). The shaft should be uniformly bright across the lens
+> #    aperture. A dark disc in the centre of the shaft would mean the v1.0.88 isBeam
+> #    lens mesh is still shadowing -- check that the per-fixture log includes the
+> #    isBeam mesh in the body-shadow opt-out:
+> #    Fixture <id> InternalBeam: opted N body primitive(s) out of shadow casting (...
+> #         v1.0.89 INCLUDES RebusIsBeamLens-tagged real <Beam> lens meshes ...).
+>
+> # 6. Toggle OFF cleanly. Every cached flag restored byte-exact.
+> Rebus.InternalBeam 0
+> #    Expected:
+> #    bInternalBeam=0 applied to N fixture(s) (Epic beam restored ... + r.LightFunctionAtlas.Enabled restored ...).
+> #    v1.0.89 InternalBeam: r.LightFunctionAtlas.Enabled was=1 restored=<prior> ...
+> ```
+
 > **Real `<Beam>` lens disc -- isBeam mesh flag + mirror/glass material (v1.0.88).**
 > User: *"We are now sending a beam object (Lens Disc) from our portal. This needs to be included
 > in the fixture and move with the head. It needs the lens mirror/glass material applied to it."*

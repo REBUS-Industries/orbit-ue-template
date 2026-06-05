@@ -184,6 +184,13 @@ public:
 	void SetInternalBeamModeEnabled(bool bEnabled);
 	bool IsInternalBeamModeEnabled() const { return bInternalBeamEnabled; }
 
+	// v1.0.89: re-apply the InternalBeam back-offset by re-running RefreshMotion (the offset is
+	// applied as the post-step there, both in the rig path and the synthetic-pan/tilt fallback).
+	// Public so the v1.0.89 `Rebus.InternalBeamOffsetSign` CVar refresh sink can re-push the new
+	// sign onto every fixture currently in InternalBeam mode without forcing a full pose-rebuild
+	// (volumetric / cast-shadow state is independent of the sign and stays untouched).
+	void RefreshInternalBeamOffset();
+
 	// v1.0.88 -- operator-flippable A/B toggle for the new <Beam> (isBeam) lens path.
 	//
 	// Default (bForceSynthetic=false): when /meshes carries at least one mesh flagged isBeam=true
@@ -742,7 +749,23 @@ private:
 	// the Epic beam canvas, the procedural cone, the lens disc and any other beam-functional comp)
 	// and force CastShadow + bCastDynamicShadow + bCastHiddenShadow + bCastShadowAsTwoSided to
 	// false, caching the original flags. When bRestoreOriginal=true, push the cached flags back.
+	//
+	// v1.0.89: the walker INCLUDES every component tagged `RebusIsBeamLens` (the v1.0.88 real
+	// `<Beam>` lens meshes) -- they are body geometry as far as the SpotLight is concerned, and
+	// must not shadow it. The synthetic LensDisc is still skipped (it is an emissive disc,
+	// already non-shadowing). The per-beam emissive flares (`RebusIsBeamFlare`) are also already
+	// non-shadowing by construction (BuildIsBeamLensFlares hard-sets CastShadow=false).
 	void SetBodyMeshesCastShadow(bool bRestoreOriginal);
+
+	// v1.0.89: opt a single freshly-created primitive out of shadow casting AND cache its
+	// original flags into the InternalBeamShadowCache so RestoreInternalBeamPose's restore-on-
+	// disable still pushes byte-exact. Defensive entry-point for BuildMeshes when a mesh-bundle
+	// lands AFTER `SetInternalBeamModeEnabled(true)` has already walked the actor (e.g. a
+	// delayed `/meshes` push -- rare, but the v1.0.88 isBeam lens components arrive in BuildMeshes
+	// and would otherwise default to CastShadow=true and shadow the spotlight). No-op when not
+	// in InternalBeam mode, when the comp is null, or when the comp is one of the beam-functional
+	// primitives that the walker normally skips.
+	void OptPrimitiveOutOfInternalBeamShadow(class UPrimitiveComponent* Comp);
 	// True once this fixture has been granted a hero volumetric-shadow slot (under the per-batch
 	// RebusMaxShadowFogBeams budget). Latched so toggling shadow on/off doesn't re-consume budget.
 	bool bGrantedShadowHero = false;

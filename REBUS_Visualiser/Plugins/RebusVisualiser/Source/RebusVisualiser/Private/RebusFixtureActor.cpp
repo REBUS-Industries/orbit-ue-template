@@ -185,6 +185,21 @@ float GRebusHeroShadowScatter = 4.0f;
 // blasting the lit pool. Live-tunable via `Rebus.InternalBeamScatter <float>`; on change every
 // fixture currently in InternalBeam mode re-pushes its volumetric state immediately.
 float GRebusInternalBeamScatter = 1.0f;
+
+// v1.0.89: sign multiplier applied to the InternalBeam back-offset. The offset itself is the
+// SCALAR `lensRadius / tan(maxZoomHalfAngle)` (always >= 0); whether we ADD it along the
+// SpotLight's local +X (the GDTF emission axis after MakeFromXZ) or SUBTRACT it depends on
+// which way that axis empirically resolves on the user's GDTF profile.
+//
+// v1.0.87 hard-coded the sign as `-LiveFwd` (subtract along emission, intending to push the
+// spotlight INTO the head body so the cone exits at the lens diameter). For the user's
+// observed GDTF the spotlight ended up IN FRONT of the lens instead, proving that on this
+// content the spotlight's local +X actually points INTO the head -- inverting the sign needed
+// to push the spot UP-stream from the lens. v1.0.89 default is `+1` (the corrected direction
+// for that report); the operator can flip to `-1` via `Rebus.InternalBeamOffsetSign -1` if a
+// different GDTF authoring convention emerges. The CVar's refresh sink walks every live
+// fixture and re-runs RefreshMotion so the offset re-applies in-place without a respawn.
+float GRebusInternalBeamOffsetSign = 1.0f;
 FAutoConsoleVariableRef CVarRebusHeroShadowScatter(
 	TEXT("Rebus.HeroShadowScatter"),
 	GRebusHeroShadowScatter,
@@ -239,6 +254,41 @@ FAutoConsoleVariableRef CVarRebusInternalBeamScatter(
 		}
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("Rebus.InternalBeamScatter -> %.2f, refreshed %d InternalBeam fixture(s)."),
+			CVar->GetFloat(), Refreshed);
+	}),
+	ECVF_Default);
+
+// v1.0.89 -- live-toggleable sign for the InternalBeam back-offset application. See the comment
+// on `GRebusInternalBeamOffsetSign` above for the rationale. On change, every fixture currently
+// in InternalBeam mode re-runs RefreshMotion so the offset re-applies in-place; this is the only
+// state that depends on the sign (volumetric scatter / cast-shadow / body-shadow walk are
+// independent), so RefreshMotion is sufficient -- ApplyInternalBeamPose is not required.
+FAutoConsoleVariableRef CVarRebusInternalBeamOffsetSign(
+	TEXT("Rebus.InternalBeamOffsetSign"),
+	GRebusInternalBeamOffsetSign,
+	TEXT("Sign multiplier (+1 default / -1 inverted) for the InternalBeam back-offset application. v1.0.87 hard-coded the sign as -1 along the SpotLight's local +X; v1.0.89 fixes the reported 'spotlight ended up in FRONT of the lens' regression by defaulting to +1 (the corrected direction for the observed GDTF convention). Operator flip-flop for fixture profiles that resolve the emission axis the other way: Rebus.InternalBeamOffsetSign -1."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		if (!GEngine) return;
+		int32 Refreshed = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					if (F->IsInternalBeamModeEnabled())
+					{
+						F->RefreshInternalBeamOffset();
+						++Refreshed;
+					}
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.InternalBeamOffsetSign -> %+.0f, refreshed %d InternalBeam fixture(s)."),
 			CVar->GetFloat(), Refreshed);
 	}),
 	ECVF_Default);
@@ -704,14 +754,17 @@ void ARebusFixtureActor::EnsureFixtureMIDs()
 		FixtureLensMID = UMaterialInstanceDynamic::Create(FixtureMatParent, this);
 		if (FixtureLensMID)
 		{
-			// Mirrored glass: near-white "polished chrome" colour + fully metallic + very low
-			// roughness for a tight mirror highlight. True dielectric glass needs translucent
-			// shading which BasicShapeMaterial doesn't support -- but a fixture LENS in a
-			// venue reads visually as a chrome mirror under stage light (because the dark
-			// interior absorbs the back), so metallic-mirror is the right approximation here.
+			// Mirrored glass: near-white "polished chrome" colour + fully metallic + ZERO
+			// roughness for a perfect mirror highlight (v1.0.89 -- user requested fully-
+			// reflective). True dielectric glass needs translucent shading which
+			// BasicShapeMaterial doesn't support -- but a fixture LENS in a venue reads
+			// visually as a chrome mirror under stage light (because the dark interior absorbs
+			// the back), so metallic-mirror is the right approximation here. Roughness=0 gives
+			// a razor-sharp specular response that picks up the surrounding rig and is the
+			// hallmark "polished optic" look the operator expects.
 			FixtureLensMID->SetVectorParameterValue(TEXT("Color"), FLinearColor(0.95f, 0.95f, 0.95f, 1.f));
 			FixtureLensMID->SetScalarParameterValue(TEXT("Metallic"), 1.0f);
-			FixtureLensMID->SetScalarParameterValue(TEXT("Roughness"), 0.05f);
+			FixtureLensMID->SetScalarParameterValue(TEXT("Roughness"), 0.0f);
 		}
 	}
 }
@@ -910,6 +963,16 @@ void ARebusFixtureActor::BuildMeshes(const FRebusMeshBundle& Meshes)
 		// the light source and otherwise mottles the beam base). Keeps contact/RT grounding.
 		DisableSelfBeamVolumetricShadow(PMC);
 
+		// v1.0.89: if this fixture is already in InternalBeam mode at the moment this mesh
+		// arrives (BuildMeshes typically runs once during Setup BEFORE the subsystem's
+		// ReapplyAll re-asserts bInternalBeam=true, but a delayed mesh-bundle push could
+		// land in BuildMeshes AFTER the per-actor SetBodyMeshesCastShadow walk has already
+		// run and would otherwise leave the new mesh at CastShadow=true -- which the user
+		// reported showing up specifically on the v1.0.88 isBeam lens disc), opt it out
+		// of shadow casting + cache its original flags so the OFF transition still restores
+		// byte-exact. The call is a no-op on first-spawn flow (bInternalBeamEnabled=false).
+		OptPrimitiveOutOfInternalBeamShadow(PMC);
+
 		const int32 ComponentIndex = MeshComponents.Add(PMC);
 		const int32 Axis = RebusMotion::ResolveAxisForMesh(Profile.MotionRig, Mesh.GeometryName, Mesh.ModelName);
 		MeshAxisBucket.SetNum(MeshComponents.Num());
@@ -933,7 +996,7 @@ void ARebusFixtureActor::BuildMeshes(const FRebusMeshBundle& Meshes)
 		//      flag landed. Helps the next portal-team debug round.
 		//   3. Force the mirror/glass FixtureLensMaterialOverride (.uasset, when the user
 		//      authored one at /Game/REBUS/Materials/M_RebusFixtureLens) or the runtime
-		//      FixtureLensMID (Metallic=1, Roughness=0.05) onto EVERY material slot the
+		//      FixtureLensMID (Metallic=1, Roughness=0 -- v1.0.89 fully-reflective) onto EVERY material slot the
 		//      procedural mesh exposes (GetNumMaterials() may be >1 for fan-triangulated
 		//      multi-section beams). When BOTH are null (the v1.0.71 mat-parent missed too)
 		//      we log a one-shot Warning and leave the mesh's default material -- so a
@@ -2218,8 +2281,52 @@ void ARebusFixtureActor::SetBodyMeshesCastShadow(bool bRestoreOriginal)
 		++Touched;
 	}
 	UE_LOG(LogRebusVisualiser, Verbose,
-		TEXT("Fixture %s InternalBeam: opted %d body primitive(s) out of shadow casting (skipped SpotLight + BeamCone + EpicBeam + LensDisc)."),
+		TEXT("Fixture %s InternalBeam: opted %d body primitive(s) out of shadow casting (skipped SpotLight + BeamCone + EpicBeam + LensDisc; v1.0.89 INCLUDES RebusIsBeamLens-tagged real <Beam> lens meshes -- they are body geometry as far as the spotlight is concerned)."),
 		*FixtureId, Touched);
+}
+
+// v1.0.89 -- defensive single-primitive entry-point for the shadow opt-out + cache. Used by
+// BuildMeshes when a freshly-created procedural mesh component arrives AFTER InternalBeam mode
+// is already ON (rare on first spawn, but a delayed /meshes push -- or a re-build in some future
+// reload path -- would otherwise leave the new comp at CastShadow=true). Symmetric with the
+// per-actor walker's filter rules so the cache stays consistent (RestoreInternalBeamPose must
+// still byte-exactly restore everything that was opted out).
+void ARebusFixtureActor::OptPrimitiveOutOfInternalBeamShadow(UPrimitiveComponent* Comp)
+{
+	if (!bInternalBeamEnabled || !Comp) return;
+	// Mirror the SetBodyMeshesCastShadow skip filter so we never opt out a beam-functional comp
+	// that the walker also skips (would corrupt the cache for the OFF restore).
+	if (Comp == (UPrimitiveComponent*)BeamCone.Get()) return;
+	if (Comp == (UPrimitiveComponent*)EpicBeamComp.Get()) return;
+	if (Comp == (UPrimitiveComponent*)LensDisc.Get()) return;
+	if (Comp->IsA<ULightComponent>()) return;
+	// Already in the cache (re-entrancy guard). Linear scan is cheap because this list is
+	// per-actor and bounded by the body-primitive count (~5-15 typical, ~30 for a pixel-LED
+	// matrix). Avoids restoring the SAME component twice on disable.
+	for (const FInternalBeamShadowEntry& Existing : InternalBeamShadowCache)
+	{
+		if (Existing.Comp.Get() == Comp) return;
+	}
+
+	FInternalBeamShadowEntry Entry;
+	Entry.Comp = Comp;
+	Entry.bCastShadow = Comp->CastShadow ? 1 : 0;
+	Entry.bCastDynamicShadow = Comp->bCastDynamicShadow ? 1 : 0;
+	Entry.bCastHiddenShadow = Comp->bCastHiddenShadow ? 1 : 0;
+	Entry.bCastShadowAsTwoSided = Comp->bCastShadowAsTwoSided ? 1 : 0;
+	InternalBeamShadowCache.Add(Entry);
+
+	Comp->SetCastShadow(false);
+	Comp->bCastDynamicShadow = false;
+	Comp->bCastHiddenShadow = false;
+	Comp->bCastShadowAsTwoSided = false;
+	Comp->MarkRenderStateDirty();
+
+	UE_LOG(LogRebusVisualiser, Verbose,
+		TEXT("Fixture %s InternalBeam: opted late-arrival primitive '%s' (tags: %s) out of shadow casting AND cached its original flags so the next OFF transition restores byte-exact."),
+		*FixtureId,
+		*Comp->GetName(),
+		Comp->ComponentTags.Num() > 0 ? *FString::JoinBy(Comp->ComponentTags, TEXT(","), [](const FName& T) { return T.ToString(); }) : TEXT("<none>"));
 }
 
 void ARebusFixtureActor::ApplyInternalBeamPose()
@@ -2324,13 +2431,42 @@ void ARebusFixtureActor::SetInternalBeamModeEnabled(bool bEnabled)
 		RestoreInternalBeamPose();
 	}
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s InternalBeam mode %s (backOffset=%.1fcm maxZoomFullDeg=%.1f scatter=%.2f bodyPrimsOptedOut=%d)."),
+		TEXT("Fixture %s InternalBeam mode %s (backOffset=%.1fcm sign=%+.0f maxZoomFullDeg=%.1f scatter=%.2f bodyPrimsOptedOut=%d)."),
 		*FixtureId,
 		bEnabled ? TEXT("ENABLED") : TEXT("DISABLED -> Epic beam restored"),
-		bEnabled ? ComputeInternalBeamBackOffsetCm() : 0.f,
+		bEnabled ? (GRebusInternalBeamOffsetSign * ComputeInternalBeamBackOffsetCm()) : 0.f,
+		GRebusInternalBeamOffsetSign,
 		(Profile.Zoom.bValid && Profile.Zoom.MaxDeg > 0.0) ? (float)Profile.Zoom.MaxDeg : InternalBeamMaxZoomFullDeg,
 		GRebusInternalBeamScatter,
 		InternalBeamShadowCache.Num());
+
+	// v1.0.89: lock-in diagnostic so the user can confirm volumetric shadow + light function
+	// state landed as intended on every InternalBeam toggle. CastShadows must be ON (the
+	// SpotLight light-function projection AND the volumetric shadow path both gate on it),
+	// CastVolumetricShadow must be ON (so the shaft carves through the fog), and the live
+	// LightFunctionMaterial pointer should match GoboLightFnMID when a gobo is bound -- a
+	// null here while a gobo is selected is the diagnostic for "gobo on floor, not on shaft".
+	if (bEnabled && SpotLight)
+	{
+		const UMaterialInterface* LF = SpotLight->LightFunctionMaterial;
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s InternalBeam: scatter=%.2f castShadows=%d volumetric-shadow=%d allowMegaLights=%d light-function=%s gobo-active=%d"),
+			*FixtureId,
+			SpotLight->VolumetricScatteringIntensity,
+			SpotLight->CastShadows ? 1 : 0,
+			SpotLight->bCastVolumetricShadow ? 1 : 0,
+			SpotLight->bAllowMegaLights ? 1 : 0,
+			LF ? *LF->GetName() : TEXT("<none>"),
+			bGoboActive ? 1 : 0);
+	}
+}
+
+void ARebusFixtureActor::RefreshInternalBeamOffset()
+{
+	// The offset is applied as the post-step at the bottom of RefreshMotion (both branches:
+	// rig-path and synthetic-pan/tilt fallback), reading the LIVE GRebusInternalBeamOffsetSign
+	// each call, so a CVar flip lands instantly without needing a per-actor cache invalidation.
+	RefreshMotion();
 }
 
 void ARebusFixtureActor::RefreshMotion()
@@ -2367,9 +2503,16 @@ void ARebusFixtureActor::RefreshMotion()
 			// the synthetic pan/tilt-rotated emission forward) so the cone exits the lens plane
 			// at the lens diameter at MAX zoom. Applied in the no-rig synthetic-aim path so the
 			// offset rotates with the synthetic aim instead of staying locked to the static rest.
+			//
+			// v1.0.89 -- the sign is now operator-flippable via `Rebus.InternalBeamOffsetSign`
+			// (default +1). v1.0.87 hard-coded `-Dir`, but the user reported the spotlight
+			// ending up IN FRONT of the lens on their GDTF profile (proving the GDTF +Y / beam
+			// direction resolved INTO the head, not out of the lens, so the legacy `-Dir` was
+			// pushing the spot DOWN-stream). The default `+1` direction matches the reported
+			// fix; toggling to `-1` restores the legacy v1.0.87 behaviour for diagnostics.
 			if (bInternalBeamEnabled)
 			{
-				SpotLight->AddRelativeLocation(-ComputeInternalBeamBackOffsetCm() * Dir);
+				SpotLight->AddRelativeLocation(GRebusInternalBeamOffsetSign * ComputeInternalBeamBackOffsetCm() * Dir);
 			}
 
 			// Lens disc tracks the same synthetic aim: plane normal along the beam Dir.
@@ -2430,10 +2573,24 @@ void ARebusFixtureActor::RefreshMotion()
 		// at MAX zoom and strictly inside the lens diameter at every narrower zoom. The offset
 		// rides through pan/tilt because we sample the LIVE relative rotation (set just above)
 		// instead of a static fixture-local axis.
+		//
+		// v1.0.89 -- the sign is now operator-flippable via `Rebus.InternalBeamOffsetSign`
+		// (default +1, the corrected direction for the user's reported GDTF profile). v1.0.87
+		// hard-coded `-LiveFwd` and the user observed the spotlight ending up IN FRONT of the
+		// lens, proving the spotlight's local +X resolved INTO the head on this content (so
+		// `-LiveFwd` pushed the spot DOWN-stream, not up). Toggle `-1` for legacy behaviour.
 		if (bInternalBeamEnabled)
 		{
 			const FVector LiveFwd = SpotLight->GetRelativeRotation().RotateVector(FVector::ForwardVector);
-			SpotLight->AddRelativeLocation(-ComputeInternalBeamBackOffsetCm() * LiveFwd);
+			SpotLight->AddRelativeLocation(GRebusInternalBeamOffsetSign * ComputeInternalBeamBackOffsetCm() * LiveFwd);
+			UE_LOG(LogRebusVisualiser, Verbose,
+				TEXT("Fixture %s InternalBeam offset: applied %+.2fcm along LiveFwd=(%.3f,%.3f,%.3f) (sign=%+.0f, restLoc=(%.1f,%.1f,%.1f), spotLoc=(%.1f,%.1f,%.1f))"),
+				*FixtureId,
+				GRebusInternalBeamOffsetSign * ComputeInternalBeamBackOffsetCm(),
+				LiveFwd.X, LiveFwd.Y, LiveFwd.Z,
+				GRebusInternalBeamOffsetSign,
+				BeamRestTransform.GetLocation().X, BeamRestTransform.GetLocation().Y, BeamRestTransform.GetLocation().Z,
+				SpotLight->GetRelativeLocation().X, SpotLight->GetRelativeLocation().Y, SpotLight->GetRelativeLocation().Z);
 		}
 
 		// Lens disc rides the SAME head transform (LensDiscRest * Head), so it stays co-located
