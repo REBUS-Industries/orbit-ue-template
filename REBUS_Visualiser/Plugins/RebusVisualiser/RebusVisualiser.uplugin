@@ -25,6 +25,10 @@
 		{
 			"Name": "PixelStreaming2",
 			"Enabled": true
+		},
+		{
+			"Name": "ProceduralMeshComponent",
+			"Enabled": true
 		}
 	]
 }

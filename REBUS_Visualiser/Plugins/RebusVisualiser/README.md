@@ -594,6 +594,155 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Double-sided shading on every Orbit-imported primitive (operator-toggleable) (v1.0.104).**
+> User request (verbatim):
+>
+> > "can you set all Orbit textures to be double sided on import"
+>
+> Operator context: v1.0.97 already flipped every Rebus-authored Python master material
+> to `two_sided = True` (`M_RebusGround`, `M_RebusBeam`, `M_RebusFixtureLens`,
+> `M_RebusFixtureBody`, `M_RebusTruss`, `M_RebusLensFlare`), so any geometry assigned a
+> Rebus-built MI / MID renders both sides correctly. The complaint that triggered
+> v1.0.104 is about the OTHER half of the pipeline: **Orbit-imported materials**
+> (`OrbitConnector` + `glTFRuntime`-baked) are still single-sided in many cases, so
+> thin geometry (truss cross-bars, banner cloth, sheet-metal flags, gobo flags) either
+> disappears or projects a flipped-winding shadow when viewed from the back. The v1.0.99
+> imported-primitive shadow-cast normalisation made the problem MORE visible because
+> single-sided thin geometry that previously didn't cast shadows at all now casts a
+> back-face-culled silhouette in the lit pool -- so the v1.0.104 work is partly a
+> follow-up to v1.0.99 even though the user-facing symptom is "Orbit textures aren't
+> double-sided".
+>
+> **Investigation -- can we just flip the imported materials at runtime? No.**
+>
+> | Investigation surface | Result |
+> | --- | --- |
+> | `FglTFRuntimeMaterialsConfig` (the per-import config struct `OrbitConnector` feeds `glTFRuntime`) | No `bForceTwoSided` / `bDisableTwoSided` flag exists. Two-sided is keyed off the source glTF's `doubleSided` field per-material -- `glTFRuntimeParserMaterials.cpp::ProcessMaterial` reads `doubleSided` into `RuntimeMaterial.bTwoSided`, then picks a `TwoSided` / `TwoSidedTranslucent` / `TwoSidedMasked` base material from `MetallicRoughnessMaterialsMap` / `UberMaterialsOverrideMap`. So flipping ON requires (a) the source glTF asserts `doubleSided=true` (which `OrbitConnector`'s mesh export does NOT today) OR (b) the consumer overrides the parent base material via the `MaterialsOverrideMap`. We don't own `OrbitConnector`'s call site (the plugin in this checkout is just `ThirdParty/Cli/win-x64/orbit-cli.exe` -- no UE source -- so this is fully external). |
+> | `UMaterialInstance::BasePropertyOverrides` (`bOverride_TwoSided` + `TwoSided` on an MID) | Editor-only API (`WITH_EDITORONLY_DATA` on the parent struct); even when used in PIE it triggers a fresh shader-permutation compile because top-level `two_sided` is part of the shader key. Not viable in a packaged PRISM build. |
+> | `UPrimitiveComponent::bCastShadowAsTwoSided` (component-level, shadow-side only) | ALWAYS settable at runtime, cheap. Walks both sides of every triangle when projecting shadow casters. Doesn't affect rendering visibility -- ONLY the shadow pass. |
+> | Per-slot MID parent-swap to a project-owned two-sided master (`M_RebusOrbitImported`) | Works in cooked builds (no permutation compile -- the new master is pre-cooked), but copying source textures / vertex-colour wiring across is high-risk and would visibly alter the look of any glTFRuntime asset whose param contract doesn't match our master. Documented as a **resource** the operator can opt into manually via `OrbitConnector`'s import-material override path; the C++ walker does NOT auto-swap (would clobber operator-tuned imports). |
+>
+> So the **rendering-side** win on glTFRuntime-baked imports requires either an upstream
+> `OrbitConnector` change (set `doubleSided=true` in the mesh exporter, or feed
+> `glTFRuntime` a two-sided `MaterialsOverrideMap`) OR an operator manually re-parenting
+> specific assets to the new `M_RebusOrbitImported` master. v1.0.104 covers what's
+> in-scope for this plugin: the **shadow-side** fix on every Orbit-imported primitive,
+> plus the resource + parameter contract operators need to opt into the render-side
+> when they care.
+>
+> **What lands in v1.0.104.**
+>
+> | Surface | Behaviour |
+> | --- | --- |
+> | `URebusVisualiserSubsystem::EnsureImportedDoubleSided()` | Walks every `OrbitImportRoot` actor (matched by class-name string -- zero compile dep on `OrbitConnector`, mirroring v1.0.85's truss-material pass and v1.0.99's shadow-cast pass) and per `UPrimitiveComponent`: (1) forces `bCastShadowAsTwoSided = true` (shadow-side fix, always-on, no permutation cost); (2) wraps every non-MID material slot in a `UMaterialInstanceDynamic` parented to the existing material so per-slot parameters can be pushed without persisting to disk; (3) pushes `bTwoSidedScalar = 1.0` onto every MID (silently no-ops on parents that don't declare the param -- i.e. glTFRuntime / engine masters; lands on every Rebus-authored master that does). Idempotent (per-comp early-out when flags match). Tracked comps go into `OrbitDoubleSidedTouched` so the OFF path can restore the single-sided baseline. |
+> | `URebusVisualiserSubsystem::SetOrbitDoubleSidedEnabled(bool)` | Single chokepoint shared by the console command and the scene-property handler. Walks `OrbitDoubleSidedTouched` to flip every prior comp + runs `EnsureImportedDoubleSided` to pick up newly-imported geometry, so a single toggle transition is consistent across the whole import on the same call. Mirrors v1.0.99 `SetOrbitCastShadowsEnabled` byte-for-byte. |
+> | `Rebus.OrbitDoubleSided [0|1]` console | New (default ON). Routes through `SetOrbitDoubleSidedEnabled` per Game/PIE world. |
+> | `bOrbitDoubleSided` scene property | New (default `true`, seeded in `URebusSceneSettingsSubsystem::Initialize`). Routes through the same chokepoint via `ApplySceneProperty`. SceneState round-trips it; `ReapplyAll` re-asserts on (re)spawn. |
+> | Tick hook | The visualiser subsystem's 1 Hz orbit-rebind tick now also calls `EnsureImportedDoubleSided()` so newly-imported Orbit geometry inherits the override on the next 1 s without an operator console call. Sits alongside the v1.0.99 `EnsureImportedShadowsCast()` call so the four imported-primitive normalisation passes (truss-material override, shadow-cast, double-sided, fixture-bind) all run on the same cadence. |
+> | New `M_RebusOrbitImported` master (Python-authored in `build_rebus_base_level.py`) | Two-sided opaque PBR master with `BaseColor` (vector) * `BaseColorTexture` (texture, defaults to engine WhiteSquareTexture so untextured MIs no-op), `Roughness` / `Metallic` scalars, optional emissive layer (default off), and a `bTwoSidedScalar` parameter marker (= the v1.0.104 contract -- queried by `_orbit_imported_master_has_two_sided` for self-heal). Top-level `two_sided = True` is hard-baked so an MI / MID parented to this master renders both sides regardless of the marker. Operators assign this to specific Orbit imports via `OrbitConnector`'s import-material override when they need genuine back-face rendering on glTFRuntime-baked thin geometry. |
+> | `_orbit_imported_master_has_two_sided` self-heal probe | Mirrors v1.0.97 `_master_is_two_sided` shape -- best-effort `get_scalar_parameter_names` query checks for `bTwoSidedScalar` on the existing on-disk master. `ensure_orbit_imported_material()` combines it with v1.0.97's `_master_is_two_sided` via OR so EITHER missing-marker OR accidentally-single-sided triggers a single force-regen with a Warning. So the first launch on v1.0.104 picks up the new master automatically with no operator action. |
+>
+> Why `bCastShadowAsTwoSided = false` regardless of the toggle is NOT the v1.0.104 ship:
+> a separate toggle here would conflict with v1.0.99's two-sided-shadow-cast semantics
+> on thin geometry. v1.0.104 flips both the component flag AND the MID `bTwoSidedScalar`
+> in lockstep -- single chokepoint, the operator can A/B the WHOLE double-sided pipeline
+> with one console command.
+>
+> **Why no parent-swap auto-walker.** Re-parenting every glTFRuntime MID to
+> `M_RebusOrbitImported` would visibly alter the look of any asset whose source material
+> doesn't match the new master's param contract (BaseColor / BaseColorTexture / Roughness
+> / Metallic / EmissiveColor / EmissiveStrength). The glTF spec uses `baseColorFactor` /
+> `baseColorTexture` / `metallicFactor` / `roughnessFactor` / `emissiveFactor` /
+> `emissiveTexture` and `glTFRuntime` exposes those as parameters with those exact
+> names -- but a flat "rename + copy" would still drop the normal-map term and any
+> Substrate / sheen / clearcoat layer the source declared. The conservative ship is
+> "expose the resource + the runtime toggle, let the operator opt in per-asset". A
+> future v1.0.10x with a richer M_RebusOrbitImported (normal + ARM) could safely
+> auto-swap, gated behind a separate `bOrbitForceRebusParent` scene property.
+>
+> **Perf caveat (operator-facing).** Two-sided opaque shading is ~5-15% more expensive
+> in the base pass than single-sided opaque (the pixel shader runs once per back face
+> too, and shadow-casting two-sided cone-mesh and ground-mesh writes ~2x the shadow-map
+> samples per draw). On the live previs surface this is well below the volumetric-fog
+> + Lumen budgets that dominate the frame, so the default ON is the right shipping
+> choice -- but a stage with hundreds of imported set-piece props can hit the cost
+> ceiling. The toggle exists for exactly that case: `Rebus.OrbitDoubleSided 0` from
+> the portal / in-editor console drops every tracked comp back to the single-sided
+> shadow baseline (the `bTwoSidedScalar` push reverts to 0 on every Rebus-authored MID
+> too, so re-parented assets revert in lockstep).
+>
+> **Per-fixture override path (operator-facing).** The v1.0.71 fixture-material override
+> walker (`Rebus.OverrideFixtureMaterials`) and the v1.0.85 truss-material pass
+> (`Rebus.OverrideTrussMaterial`) BOTH produce MIDs in their own pipelines, and BOTH
+> use Rebus-authored masters (`M_RebusFixtureBody`, `M_RebusFixtureLens`, `M_RebusTruss`)
+> that already expose `bTwoSidedScalar` (v1.0.104 retro-fits the marker on the Python
+> side alongside v1.0.97's hard-baked `two_sided = True`). So a Rebus-overridden
+> fixture body / lens / truss is double-sided on the same toggle without any extra
+> walker run. To force a specific Orbit-imported asset two-sided regardless of toggle:
+> re-parent its material to `/Game/REBUS/Materials/M_RebusOrbitImported` via the editor
+> Content Browser or `OrbitConnector`'s pre-import settings; v1.0.104's tick walker
+> will pick it up on the next 1 s.
+>
+> **Operator action path (v1.0.104+).**
+>
+> 1. **Rebuild + relaunch.** v1.0.104 ships a new master + a new console command + a
+>    new scene-property seed; an editor restart picks all three up. The Python self-
+>    heal (`ensure_orbit_imported_material`) bakes `M_RebusOrbitImported` on the next
+>    launch with no operator action.
+> 2. **Default ON: nothing to do.** Walk around the stage with the camera looking back
+>    at thin Orbit-imported geometry (truss cross-bars / banner cloth / metal flags).
+>    Pre-v1.0.104 the back face is invisible OR the cast shadow is missing / inverted;
+>    v1.0.104 the geometry casts a correct silhouette AND, for assets re-parented to
+>    `M_RebusOrbitImported`, the back face renders.
+> 3. **A/B against pre-v1.0.104.** Send `Rebus.OrbitDoubleSided 0` from the portal /
+>    in-editor console. The log line `Rebus.OrbitDoubleSided 0: prior-touched=N
+>    freshly-touched=M (of K Orbit primitive(s) walked, W MIDs wrapped, S
+>    bTwoSidedScalar pushes accepted)` confirms the walker ran. Toggle back ON with
+>    `Rebus.OrbitDoubleSided 1`.
+> 4. **Push from the portal.** `SetSceneProperty` `{"type":"SetSceneProperty","name":
+>    "bOrbitDoubleSided","value":false}` mirrors the console toggle and round-trips in
+>    `SceneState`, so a portal recycle re-asserts the operator's choice via
+>    `ReapplyAll`.
+> 5. **For genuine back-face rendering on a SPECIFIC Orbit-imported asset** (e.g. a
+>    GDTF fixture flag where the operator can see the v1.0.99 thin-geometry shadow
+>    win but the visual back-face is still missing): re-parent that asset's material
+>    to `/Game/REBUS/Materials/M_RebusOrbitImported` via the editor Content Browser
+>    (open the MID, drag the new parent into the parent slot), copy across the source
+>    `baseColorFactor` / `metallicFactor` / `roughnessFactor` to the matching params,
+>    then re-import OR `ClearScene + LoadScene` from the portal so the C++ walker
+>    re-binds the asset and the next 1 s tick pushes `bTwoSidedScalar=1.0` onto it.
+>    You should see the back face render on the next frame.
+> 6. **You may need `ClearScene + LoadScene` to re-import existing assets** with the
+>    new master if you're upgrading an existing PRISM session that loaded its scene
+>    before v1.0.104's tick walker registered. The handshake / re-import gives every
+>    `OrbitImportRoot` primitive a fresh visit from the v1.0.104 walker on the next
+>    1 s.
+>
+> **`.uplugin` `ProceduralMeshComponent` dependency now declared.** Silences a UHT
+> Warning that appeared during the v1.0.95 procedural-mesh refactor: the visualiser
+> module uses `UProceduralMeshComponent` (via `RebusFixtureActor`) but the
+> `RebusVisualiser.uplugin` `Plugins` array didn't list the `ProceduralMeshComponent`
+> plugin, so UBT emitted a `MissingPluginDependency` warning on every build. v1.0.104
+> adds the entry. No runtime change -- the dependency was always there via the
+> module's `Build.cs`; this just resolves the explicit `.uplugin`-level declaration
+> UHT wants.
+>
+> **Files touched (v1.0.104).**
+>
+> | File | Change |
+> | --- | --- |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp` + `Public/RebusVisualiserSubsystem.h` | New `EnsureImportedDoubleSided()` + `SetOrbitDoubleSidedEnabled(bool)` + `bOrbitDoubleSidedEnabled` flag + `OrbitDoubleSidedTouched` tracking set. `FOrbitDoubleSidedApplyCount` struct (Components / Touched / MIDsWrapped / SwitchesPushed). Tick hook adds `EnsureImportedDoubleSided()` to the 1 Hz rebind cadence (alongside v1.0.99's `EnsureImportedShadowsCast` + v1.0.85's `ApplyTrussMaterialPass`). |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusSceneSettingsSubsystem.cpp` | New `bOrbitDoubleSided` seed (default `true`) in `Initialize`; new `ApplySceneProperty` branch routing through `URebusVisualiserSubsystem::SetOrbitDoubleSidedEnabled`. Mirrors v1.0.99's `bOrbitCastShadows` byte-for-byte. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusVisualiser.cpp` | New `Rebus.OrbitDoubleSided` console command (registered alongside `Rebus.OrbitCastShadows`, cleaned up in `ShutdownModule`). Mirrors v1.0.99's `Rebus.OrbitCastShadows` lambda body byte-for-byte. |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/RebusVisualiser.uplugin` | New `ProceduralMeshComponent` entry in `Plugins` -- silences the UHT `MissingPluginDependency` warning (the runtime dep was always declared in the module's `Build.cs`; this is the explicit plugin-manifest mirror UHT wants). |
+> | `REBUS_Visualiser/Content/Python/build_rebus_base_level.py` | New `M_RebusOrbitImported` master (`_build_orbit_imported_master`) -- two-sided opaque PBR (`BaseColor` * `BaseColorTexture` -> BaseColor, `Roughness` / `Metallic` scalars, optional emissive layer default off, `bTwoSidedScalar` parameter marker default 1.0). New `_orbit_imported_master_has_two_sided` self-heal probe + `ensure_orbit_imported_material()` helper. Wired into `build()` (force=True) AND `ensure_base_level()` (idempotent self-heal). |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/README.md` | This release block. |
+>
+> No engine / `OrbitConnector` / `glTFRuntime` asset is touched -- v1.0.104 stays inside
+> the RebusVisualiser plugin + the Python build script. The v1.0.99 shadow-cast pipeline
+> + v1.0.97 master-side `two_sided = True` bakes are preserved verbatim (v1.0.104 is
+> strictly additive). The v1.0.103 beam-shadow diagnostic surfaces are untouched.
+
 > **Beam-shadow trace diagnostics + stale-master detection + runtime regen (v1.0.103).**
 > User report (verbatim, against v1.0.102):
 >

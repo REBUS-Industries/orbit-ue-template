@@ -72,6 +72,24 @@ LENS_FLARE_PATH = MATERIALS_DIR + "/M_RebusLensFlare"
 # + light-blocking volumetric shadows.
 BEAM_PATH = MATERIALS_DIR + "/M_RebusBeam"
 
+# v1.0.104 -- two-sided opaque master operators can re-parent Orbit-imported (glTFRuntime
+# baked) materials to so thin geometry (truss cross-bars, banner cloth, sheet-metal flags)
+# renders from BOTH sides. Authored alongside M_RebusGround / M_RebusBeam etc. because
+# glTFRuntime's default materials are hard-baked single-sided at cook time and the engine
+# offers no MID-level runtime override for the top-level Material `two_sided` flag (it's
+# part of the shader-permutation key), so the only way to truly draw back faces on
+# imported assets is to swap the parent for a master authored two-sided. The C++ post-
+# import walker (URebusVisualiserSubsystem::EnsureImportedDoubleSided) does NOT auto-swap
+# parents on glTFRuntime imports -- doing so would lose the source's PBR textures /
+# vertex-colour wiring; the walker instead pushes the `bTwoSidedScalar` parameter (which
+# this master exposes alongside its hard-baked `two_sided = True` for forward-compat with
+# a future render-side toggle). This master is therefore a RESOURCE operators can manually
+# assign to specific Orbit assets via OrbitConnector's import-material override path when
+# they need genuine back-face rendering; the C++ shadow-side fix (bCastShadowAsTwoSided)
+# is the always-on path that covers the v1.0.99-introduced thin-geometry shadow-flip
+# regression without requiring any operator action. See the v1.0.104 README block.
+ORBIT_IMPORTED_PATH = MATERIALS_DIR + "/M_RebusOrbitImported"
+
 # Portal-controllable ground surface presets: name -> (ColorA, ColorB, Roughness).
 # These drive the procedural M_RebusGround master (no imported image textures needed);
 # the C++ scene-settings subsystem swaps between the generated instances on SetSceneProperty
@@ -301,6 +319,153 @@ def ensure_lens_material(force=False):
         mat = tools.create_asset("M_RebusLensFlare", MATERIALS_DIR, unreal.Material, unreal.MaterialFactoryNew())
         _build_lens_flare_master(mat)
         unreal.EditorAssetLibrary.save_loaded_asset(mat)
+
+
+def _build_orbit_imported_master(mat):
+    """Author the v1.0.104 two-sided opaque master operators can re-parent Orbit-imported
+    materials to.
+
+    The minimal PBR graph that gives glTFRuntime / OrbitConnector imports a viable
+    two-sided home without losing the source material's texture / colour data once an
+    operator has copied the relevant params across:
+
+        BaseColor   = BaseColor (vector) * BaseColorTexture.Sample(TexCoord)
+        Roughness   = Roughness (scalar)
+        Metallic    = Metallic  (scalar)
+        Emissive    = EmissiveColor * EmissiveStrength    (additive layer; default off)
+        Normal      = ditto-via-texture-sample-default-(0.5, 0.5, 1)  (skipped on v1.0.104
+                      -- glTFRuntime imports overwhelmingly publish baseColor + ARM /
+                      metallicRoughness + emissive; normal-map preservation is on the
+                      v1.0.105 roadmap so a future operator-driven swap can include it.)
+
+    `bTwoSidedScalar` (scalar param, default 1) is exposed so the v1.0.104 C++ walker
+    (URebusVisualiserSubsystem::EnsureImportedDoubleSided) can flip individual MID
+    instances at runtime; the top-level `two_sided` editor property is ALSO baked True
+    so a material assigned directly (no MID wrap) still renders both sides. Mirrors the
+    v1.0.97 double-sided contract on every other Rebus-authored master.
+
+    The texture sampler defaults to /Engine/EngineResources/WhiteSquareTexture so an MI
+    that doesn't bind a real texture multiplies by white (1,1,1) and the BaseColor vector
+    + Metallic / Roughness scalars carry the look untouched -- matches v1.0.86's
+    _build_ground_master texture-default convention.
+    """
+    mel = unreal.MaterialEditingLibrary
+
+    # v1.0.104: two-sided opaque -- the whole point of this master. Operators re-parent
+    # Orbit-imported single-sided MIDs to this so the engine renders the back face.
+    _set(mat, "two_sided", True)
+
+    # --- BaseColor: BaseColor (vector) * BaseColorTexture.Sample(TexCoord) ---
+    base_color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -800, -240)
+    base_color.set_editor_property("parameter_name", "BaseColor")
+    base_color.set_editor_property("default_value", unreal.LinearColor(0.5, 0.5, 0.5, 1.0))
+
+    base_tex = mel.create_material_expression(mat, unreal.MaterialExpressionTextureSampleParameter2D, -800, 0)
+    base_tex.set_editor_property("parameter_name", "BaseColorTexture")
+    _white = unreal.EditorAssetLibrary.load_asset("/Engine/EngineResources/WhiteSquareTexture")
+    if _white is not None:
+        _set(base_tex, "texture", _white)
+
+    base_mul = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -440, -120)
+    mel.connect_material_expressions(base_color, "", base_mul, "A")
+    mel.connect_material_expressions(base_tex, "", base_mul, "B")
+    mel.connect_material_property(base_mul, "", unreal.MaterialProperty.MP_BASE_COLOR)
+
+    # --- Roughness / Metallic (scalar params with PBR-typical defaults) ---
+    rough = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -440, 160)
+    rough.set_editor_property("parameter_name", "Roughness")
+    rough.set_editor_property("default_value", 0.7)
+    mel.connect_material_property(rough, "", unreal.MaterialProperty.MP_ROUGHNESS)
+
+    metallic = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -440, 300)
+    metallic.set_editor_property("parameter_name", "Metallic")
+    metallic.set_editor_property("default_value", 0.0)
+    mel.connect_material_property(metallic, "", unreal.MaterialProperty.MP_METALLIC)
+
+    # --- Optional emissive layer (additive on top; default OFF so re-parented MIDs that
+    # don't bind EmissiveStrength read identical to the unlit-on-emissive baseline). ---
+    em_color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -800, 460)
+    em_color.set_editor_property("parameter_name", "EmissiveColor")
+    em_color.set_editor_property("default_value", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
+
+    em_strength = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -800, 620)
+    em_strength.set_editor_property("parameter_name", "EmissiveStrength")
+    em_strength.set_editor_property("default_value", 0.0)
+
+    em_mul = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -440, 540)
+    mel.connect_material_expressions(em_color, "", em_mul, "A")
+    mel.connect_material_expressions(em_strength, "", em_mul, "B")
+    mel.connect_material_property(em_mul, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+
+    # --- v1.0.104 `bTwoSidedScalar` parameter (the C++ walker probe target). The master
+    # is already two_sided=True at the asset level; this scalar exists so the C++ walker
+    # can detect-this-is-a-Rebus-two-sided-aware-master via GetScalarParameterValue (the
+    # only runtime-safe MID parameter inspection path that doesn't load shader source).
+    # The value itself is not wired into the graph -- it's a marker. A future Rebus-
+    # authored master that supports BOTH single and double-sided rendering via a Static
+    # Switch could wire this scalar into a StaticSwitchParameter; on v1.0.104 the master
+    # is unconditionally two-sided so the marker just identifies it. ---
+    two_sided_marker = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -800, 780)
+    two_sided_marker.set_editor_property("parameter_name", "bTwoSidedScalar")
+    two_sided_marker.set_editor_property("default_value", 1.0)
+
+    mel.recompile_material(mat)
+
+
+def _orbit_imported_master_has_two_sided(master):
+    """v1.0.104: best-effort probe -- the existing on-disk M_RebusOrbitImported master
+    declares the `bTwoSidedScalar` parameter (= it was baked by v1.0.104+ and carries
+    the double-sided contract).
+
+    Mirrors v1.0.86 (`_master_has_tiling_meters`) / v1.0.93
+    (`_fixture_lens_master_is_current`) / v1.0.96 (`_beam_master_has_shadow_steps`) /
+    v1.0.97 (`_master_is_two_sided`): an `or` between this probe and the top-level
+    `two_sided` editor property catches BOTH "missing the scalar marker" and "master
+    accidentally got single-sided" as needs-regen. Best-effort: any exception (engine-
+    version rename, unfamiliar asset shape) yields False so the self-heal path treats
+    the master as "needs regen" -- a redundant rebake on next launch is cheap; a false
+    positive would leave the operator on an OLD single-sided master indefinitely.
+    """
+    try:
+        info = unreal.MaterialEditingLibrary.get_scalar_parameter_names(master)
+    except Exception:  # noqa: BLE001
+        return False
+    return any(str(n) == "bTwoSidedScalar" for n in info)
+
+
+def ensure_orbit_imported_material(force=False):
+    """Generate the v1.0.104 two-sided opaque master operators re-parent Orbit-imported
+    materials to.
+
+    Idempotent by default (only creates when missing); force=True deletes + regenerates
+    (used by build()). v1.0.104 self-heal: a non-force call against a pre-v1.0.104 master
+    -- either missing the `bTwoSidedScalar` marker or, defensively, top-level
+    `two_sided = False` -- gets promoted to a force-regen with a Warning log so the
+    operator can see the migration happen. Matches the v1.0.97 self-heal shape for
+    `_build_ground_master` + `_build_fixture_lens_master` (combined-OR over the two
+    probes triggers a single regen).
+    """
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+
+    # Non-force self-heal: pre-v1.0.104 master missing the bTwoSidedScalar marker OR
+    # accidentally single-sided => promote to force-regen.
+    if not force and unreal.EditorAssetLibrary.does_asset_exist(ORBIT_IMPORTED_PATH):
+        existing = unreal.EditorAssetLibrary.load_asset(ORBIT_IMPORTED_PATH)
+        if existing is not None and (not _orbit_imported_master_has_two_sided(existing)
+                                     or not _master_is_two_sided(existing)):
+            unreal.log_warning("RebusBaseLevel: pre-v1.0.104 M_RebusOrbitImported detected "
+                               "(missing bTwoSidedScalar marker or single-sided); regenerating.")
+            force = True
+
+    if force and unreal.EditorAssetLibrary.does_asset_exist(ORBIT_IMPORTED_PATH):
+        unreal.EditorAssetLibrary.delete_asset(ORBIT_IMPORTED_PATH)
+
+    if not unreal.EditorAssetLibrary.does_asset_exist(ORBIT_IMPORTED_PATH):
+        mat = tools.create_asset("M_RebusOrbitImported", MATERIALS_DIR, unreal.Material, unreal.MaterialFactoryNew())
+        _build_orbit_imported_master(mat)
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+
+    unreal.log("RebusBaseLevel: M_RebusOrbitImported ensured (v1.0.104, two-sided opaque).")
 
     unreal.log("RebusBaseLevel: lens-flare material ensured.")
 
@@ -1379,6 +1544,9 @@ def build():
 	ensure_beam_material(force=True)
 	# v1.0.93 mirror lens (drives every Epic-beam lens object).
 	ensure_fixture_lens_material(force=True)
+	# v1.0.104 two-sided opaque master operators can re-parent Orbit-imported materials
+	# to so thin geometry renders both sides (see ORBIT_IMPORTED_PATH doc + README v1.0.104).
+	ensure_orbit_imported_material(force=True)
 	# v1.0.95 migration -- see the helper docstring + README v1.0.95.
 	_cleanup_internal_beam_assets()
 
@@ -1407,6 +1575,8 @@ def ensure_base_level():
 	ensure_beam_material()
 	# v1.0.93 mirror lens self-heal (drives every Epic-beam lens object).
 	ensure_fixture_lens_material()
+	# v1.0.104 Orbit-imported two-sided opaque master self-heal.
+	ensure_orbit_imported_material()
 	# v1.0.95 migration -- see the helper docstring + README v1.0.95.
 	_cleanup_internal_beam_assets()
 

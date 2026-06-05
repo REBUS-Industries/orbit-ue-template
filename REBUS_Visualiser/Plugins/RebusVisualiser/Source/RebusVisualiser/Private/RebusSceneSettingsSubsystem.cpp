@@ -85,6 +85,28 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// See the v1.0.99 README release block for the full diagnosis.
 	Values.Add(TEXT("bOrbitCastShadows"), FRebusPropertyValue::MakeBool(true));
 
+	// v1.0.104 imported-primitive double-sided normalisation. Default ON: every
+	// OrbitImportRoot primitive component is forced to bCastShadowAsTwoSided=true (and a
+	// `bTwoSided` static-switch parameter is pushed onto every per-slot MID, no-op'ing
+	// silently when the parent master doesn't expose one) on the same 1Hz cadence as
+	// RebindOrbitModels / EnsureImportedShadowsCast (URebusVisualiserSubsystem::
+	// EnsureImportedDoubleSided). User report: "Orbit-imported materials are still
+	// single-sided in many cases, so thin geometry (truss cross-bars, banner cloth,
+	// sheet-metal flags) disappears when viewed from the back." Root cause: glTFRuntime
+	// honours the glTF `doubleSided` source flag verbatim and OrbitConnector's mesh export
+	// leaves that flag unset on most thin geometry -- so the imported MIs are baked
+	// single-sided regardless of what's visually intended. v1.0.104 normalises the
+	// shadow-side at the component level (catches the "thin geometry projects a missing /
+	// flipped shadow" failure mode the v1.0.99 force-cast-shadows pass introduced for thin
+	// geometry) AND pushes the bTwoSided switch onto every Rebus-authored MID (M_Rebus*
+	// masters expose it via v1.0.97 + v1.0.104's new M_RebusOrbitImported master, so
+	// re-parented operator assets switch immediately). The portal can override per-scene
+	// via SetSceneProperty bOrbitDoubleSided=false, mirrored by the `Rebus.OrbitDoubleSided
+	// 0` console command. See the v1.0.104 README release block for the full diagnosis +
+	// perf caveat (~5-15% extra base-pass cost for two-sided opaque on materials whose
+	// master we actually flipped).
+	Values.Add(TEXT("bOrbitDoubleSided"), FRebusPropertyValue::MakeBool(true));
+
 	// v1.0.90: post-process Bloom / Lens Flare / Vignette exposed as portal scene properties.
 	// Seeded so SceneState round-trips them before the portal pushes its first value, and the
 	// v1.0.89 ReapplyAll re-asserts the operator's live values on every (re)spawn of the
@@ -565,6 +587,27 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 				if (URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>())
 				{
 					Viz->SetOrbitCastShadowsEnabled(Value.bBool);
+				}
+			}
+		}
+	}
+	// v1.0.104 imported-primitive double-sided normalisation. Routes the portal scene-
+	// property push through the same GameInstance subsystem chokepoint as v1.0.99's
+	// bOrbitCastShadows so the toggle path AND the periodic tick agree on the desired
+	// state -- a portal recycle would otherwise quietly leave bOrbitDoubleSidedEnabled at
+	// its construction default and any operator override would be lost. The
+	// `Rebus.OrbitDoubleSided` console command lives in RebusVisualiser.cpp and routes
+	// through the SAME SetOrbitDoubleSidedEnabled so the console + scene-property paths
+	// can never diverge. Mirrors the v1.0.99 bOrbitCastShadows branch byte-for-byte.
+	else if (Name == TEXT("bOrbitDoubleSided"))
+	{
+		if (UWorld* World = GetWorld())
+		{
+			if (UGameInstance* GI = World->GetGameInstance())
+			{
+				if (URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>())
+				{
+					Viz->SetOrbitDoubleSidedEnabled(Value.bBool);
 				}
 			}
 		}

@@ -181,6 +181,64 @@ public:
 	void SetOrbitCastShadowsEnabled(bool bEnabled);
 	bool IsOrbitCastShadowsEnabled() const { return bOrbitCastShadowsEnabled; }
 
+	// v1.0.104 -- force every Orbit-imported primitive component (and its per-slot MIDs)
+	// to render double-sided where the engine allows it at runtime. User report (verbatim
+	// from the v1.0.104 brief): "Orbit-imported materials (glTFRuntime-baked + the
+	// OrbitConnector plugin's own pipeline) are still single-sided in many cases, so thin
+	// geometry (truss cross-bars, banner cloth, sheet-metal flags) disappears when viewed
+	// from the back." Mirrors the v1.0.99 EnsureImportedShadowsCast shape byte-for-byte:
+	// runs on the same 1Hz Tick cadence as RebindOrbitModels + ApplyTrussMaterialPass +
+	// EnsureImportedShadowsCast so newly-imported geometry inherits the override on the
+	// next second after import without an operator console call. Per-comp early-out keeps
+	// the steady-state walk cheap (Touched=0 when nothing changed).
+	//
+	// What the walker does, per component:
+	//   1. Force `bCastShadowAsTwoSided = true` on the UPrimitiveComponent. This is the
+	//      cheap, always-effective shadow-side fix: a single-sided opaque material that
+	//      casts a one-sided shadow flips its winding under a light catching the back
+	//      face and projects a missing / inverted silhouette on the floor pool -- v1.0.99
+	//      `bCastShadow = true` made the issue visible because thin Orbit geometry
+	//      started casting shadows at all (it was off pre-v1.0.99). Two-sided shadow
+	//      casting walks both sides of the triangle so the silhouette is geometrically
+	//      correct from any light angle, regardless of whether the material itself
+	//      renders two-sided.
+	//   2. For every material slot whose live material is NOT already a
+	//      UMaterialInstanceDynamic, wrap it in a MID parented to the existing material
+	//      (preserves all textures + scalar / vector params; cheap). This lets the v1.0.97
+	//      `bTwoSided` static switch on Rebus-authored masters (M_RebusGround,
+	//      M_RebusFixtureLens, M_RebusOrbitImported, etc.) be flipped per-MID at runtime.
+	//      v1.0.85's truss-material override + v1.0.71's fixture-material override
+	//      already produce MIDs in their pipelines, so this is mostly a no-op on already-
+	//      processed components.
+	//   3. Push a `bTwoSided` static switch parameter onto every MID. Silently no-ops
+	//      when the parent master doesn't expose the param (glTFRuntime masters don't --
+	//      see the v1.0.104 README block for why we can't force-flip those at runtime).
+	//
+	// `bCastShadowAsTwoSided = false` REGARDLESS of the toggle is NOT what v1.0.104 ships
+	// (a separate operator toggle would conflict with v1.0.99's two-sided-shadow-cast
+	// semantics on thin geometry). The toggle flips both the component flag AND the MID
+	// switch in lockstep -- single chokepoint.
+	//
+	// Operator overrides:
+	//   * `Rebus.OrbitDoubleSided [0|1]` flips bOrbitDoubleSidedEnabled. ON (default)
+	//     forces the two-sided state on every tracked + newly-encountered comp; OFF
+	//     walks the tracked set and restores `bCastShadowAsTwoSided = false` + clears
+	//     the bTwoSided switch (so the operator can A/B against the single-sided
+	//     baseline). The tick walk continues to enforce the chosen state on newly-
+	//     arrived geometry either way.
+	//   * `bOrbitDoubleSided` scene property mirrors the same flag through the portal /
+	//     SetSceneProperty wire path -- routes via SetOrbitDoubleSidedEnabled below.
+	struct FOrbitDoubleSidedApplyCount
+	{
+		int32 Components = 0; // total Orbit primitive components considered this pass
+		int32 Touched    = 0; // had a flag flipped this call (component OR any MID slot)
+		int32 MIDsWrapped = 0; // material slots wrapped in a fresh MID this call
+		int32 SwitchesPushed = 0; // MID slots that accepted the `bTwoSided` switch
+	};
+	FOrbitDoubleSidedApplyCount EnsureImportedDoubleSided();
+	void SetOrbitDoubleSidedEnabled(bool bEnabled);
+	bool IsOrbitDoubleSidedEnabled() const { return bOrbitDoubleSidedEnabled; }
+
 private:
 	// Config / launch tokens.
 	FString PortalUrl;
@@ -328,4 +386,14 @@ private:
 	// CastShadow=true). Weak so a destroyed comp on re-import is silently dropped on next
 	// pass instead of crashing.
 	TSet<TWeakObjectPtr<UPrimitiveComponent>> OrbitShadowTouched;
+
+	// v1.0.104 -- imported-primitive double-sided normalisation state. See the doc-comment
+	// on `EnsureImportedDoubleSided` above for the rationale + algorithm. Default ON
+	// matches the scene-property seed in URebusSceneSettingsSubsystem::Initialize so a
+	// fresh launch starts on the operator's reported failure mode resolved.
+	bool bOrbitDoubleSidedEnabled = true;
+	// Set of every primitive we've ever flipped to two-sided shadow casting; mirrors the
+	// v1.0.99 OrbitShadowTouched contract (the OFF path uses this to restore the prior
+	// single-sided baseline). Weak so a destroyed comp on re-import is silently dropped.
+	TSet<TWeakObjectPtr<UPrimitiveComponent>> OrbitDoubleSidedTouched;
 };

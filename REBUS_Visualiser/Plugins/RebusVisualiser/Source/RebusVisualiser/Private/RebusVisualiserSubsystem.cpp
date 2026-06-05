@@ -330,6 +330,14 @@ bool URebusVisualiserSubsystem::Tick(float DeltaSeconds)
 				// stable (per-comp early-out -- Touched=0 when nothing changed). See the
 				// EnsureImportedShadowsCast doc-comment in the header for the user report.
 				EnsureImportedShadowsCast();
+				// v1.0.104: piggyback the imported-double-sided pass on the same cadence
+				// so freshly-imported Orbit geometry inherits bCastShadowAsTwoSided=true +
+				// the `bTwoSided` MID switch on the next 1 Hz tick after import. Cheap
+				// when stable; addresses the user report that thin Orbit geometry (truss
+				// cross-bars, banner cloth, sheet-metal flags) disappears when viewed from
+				// the back. See EnsureImportedDoubleSided doc-comment in the header for
+				// the full algorithm + the perf caveat.
+				EnsureImportedDoubleSided();
 			}
 		}
 	}
@@ -1954,4 +1962,154 @@ void URebusVisualiserSubsystem::SetOrbitCastShadowsEnabled(bool bEnabled)
 	UE_LOG(LogRebusVisualiser, Log,
 		TEXT("Rebus.OrbitCastShadows %d: prior-touched=%d freshly-touched=%d (of %d Orbit primitive(s) walked)."),
 		bEnabled ? 1 : 0, Restored, Count.Touched, Count.Components);
+}
+
+// v1.0.104 imported-primitive double-sided normalisation. Mirrors the v1.0.99
+// EnsureImportedShadowsCast shape byte-for-byte: walks every OrbitImportRoot actor
+// (matched by class-name string so we keep zero compile dependency on the OrbitConnector
+// plugin, just like the v1.0.85 truss-material pass and the v1.0.99 shadow-cast pass) and
+// asserts bCastShadowAsTwoSided + the `bTwoSided` static switch on every per-slot MID. See
+// the EnsureImportedDoubleSided doc-comment in the header for the full algorithm + the
+// user report + the perf caveat.
+URebusVisualiserSubsystem::FOrbitDoubleSidedApplyCount URebusVisualiserSubsystem::EnsureImportedDoubleSided()
+{
+	FOrbitDoubleSidedApplyCount Count;
+	UWorld* World = GetActiveWorld();
+	if (!World) return Count;
+
+	const bool bWantOn = bOrbitDoubleSidedEnabled;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor || Actor->GetClass()->GetName() != TEXT("OrbitImportRoot")) continue;
+
+		TArray<UPrimitiveComponent*> Prims;
+		Actor->GetComponents<UPrimitiveComponent>(Prims);
+		for (UPrimitiveComponent* Prim : Prims)
+		{
+			if (!Prim) continue;
+			++Count.Components;
+			OrbitDoubleSidedTouched.Add(Prim);
+
+			bool bTouched = false;
+
+			// (1) Component-level shadow-side fix: bCastShadowAsTwoSided walks both sides
+			// of every triangle when projecting shadow casters, so a single-sided opaque
+			// material whose winding faces away from the light still throws the correct
+			// silhouette in the lit pool. Cheap (one bool); no MarkRenderStateDirty
+			// required (UE updates the shadow proxy from the cached value on the next
+			// SceneRenderer draw). Per-comp early-out keeps the steady-state walk free.
+			if (Prim->bCastShadowAsTwoSided != bWantOn)
+			{
+				Prim->bCastShadowAsTwoSided = bWantOn;
+				bTouched = true;
+			}
+
+			// (2) Per-slot MID wrap + (3) `bTwoSided` static switch push. Wrapping
+			// non-MID materials in a MID is cheap (one allocation per slot the first
+			// time, byte-exact param inheritance on the parent) and lets the bTwoSided
+			// switch be set per-instance without touching the on-disk asset. The static
+			// switch silently no-ops on glTFRuntime / engine masters that don't expose it
+			// (the SwitchesPushed counter only increments when the push was accepted) --
+			// per the v1.0.104 README block, we cannot force-flip glTFRuntime's hard-baked
+			// single-sided materials at runtime without re-cooking shader permutations,
+			// so the operator-visible win on glTFRuntime imports is the (1) shadow-side
+			// fix; the (2)+(3) win lands on every Rebus-authored master (M_RebusGround,
+			// M_RebusFixtureLens, M_RebusOrbitImported, ...) that the operator has
+			// re-parented Orbit assets to.
+			const int32 NumSlots = Prim->GetNumMaterials();
+			for (int32 s = 0; s < NumSlots; ++s)
+			{
+				UMaterialInterface* Mat = Prim->GetMaterial(s);
+				if (!Mat) continue;
+
+				UMaterialInstanceDynamic* MID = Cast<UMaterialInstanceDynamic>(Mat);
+				if (!MID)
+				{
+					MID = UMaterialInstanceDynamic::Create(Mat, this);
+					if (!MID) continue;
+					Prim->SetMaterial(s, MID);
+					++Count.MIDsWrapped;
+					bTouched = true;
+				}
+
+				// SetStaticSwitchParameterValueEditorOnly is the editor-only path;
+				// SetScalarParameterValue/SetVectorParameterValue are the runtime-safe
+				// MID setters that silently no-op on a missing param. There is no
+				// public runtime setter for static switches on MIDs (static switches
+				// require shader permutations), so we route the toggle through a
+				// SCALAR named `bTwoSidedScalar` that the v1.0.104 M_RebusOrbitImported
+				// master + the existing v1.0.97 masters expose alongside their top-level
+				// two_sided=true bake. Setting a scalar that doesn't exist on the parent
+				// silently no-ops (UE's MaterialInstance setter compares the parameter
+				// name against the parent's parameter set first), so on glTFRuntime
+				// materials this is a free O(1) lookup.
+				//
+				// Naming note: the scalar is `bTwoSidedScalar` (not just `bTwoSided`)
+				// so it can't ever collide with a future glTFRuntime / Substrate param
+				// name; the leading `b` honours the v1.0.86 / v1.0.99 boolean-scalar
+				// naming convention in our masters.
+				const float Want = bWantOn ? 1.0f : 0.0f;
+				float Live = 0.0f;
+				const bool bHasParam = MID->GetScalarParameterValue(TEXT("bTwoSidedScalar"), Live);
+				if (bHasParam)
+				{
+					if (!FMath::IsNearlyEqual(Live, Want))
+					{
+						MID->SetScalarParameterValue(TEXT("bTwoSidedScalar"), Want);
+						bTouched = true;
+					}
+					++Count.SwitchesPushed;
+				}
+			}
+
+			if (bTouched) ++Count.Touched;
+		}
+	}
+	return Count;
+}
+
+void URebusVisualiserSubsystem::SetOrbitDoubleSidedEnabled(bool bEnabled)
+{
+	bOrbitDoubleSidedEnabled = bEnabled;
+
+	// First walk the previously-touched set so an OFF flips ALL prior comps off (and a
+	// re-toggle ON walks them back on). Then run the standard pass to pick up any newly-
+	// imported geometry that hasn't been visited yet on this cadence -- so a single
+	// toggle transition is fully consistent across the whole import on the same call.
+	// Mirrors v1.0.99 SetOrbitCastShadowsEnabled byte-for-byte.
+	int32 Restored = 0;
+	for (auto It = OrbitDoubleSidedTouched.CreateIterator(); It; ++It)
+	{
+		UPrimitiveComponent* Prim = It->Get();
+		if (!Prim)
+		{
+			It.RemoveCurrent();
+			continue;
+		}
+		Prim->bCastShadowAsTwoSided = bEnabled;
+
+		// Walk every slot MID and re-push the desired state. Skip non-MID materials
+		// (we never wrapped those into MIDs on the previous ON pass either; nothing to
+		// restore). MID slots not exposing `bTwoSidedScalar` silently no-op.
+		const int32 NumSlots = Prim->GetNumMaterials();
+		const float Want = bEnabled ? 1.0f : 0.0f;
+		for (int32 s = 0; s < NumSlots; ++s)
+		{
+			if (UMaterialInstanceDynamic* MID = Cast<UMaterialInstanceDynamic>(Prim->GetMaterial(s)))
+			{
+				float Live = 0.0f;
+				if (MID->GetScalarParameterValue(TEXT("bTwoSidedScalar"), Live)
+					&& !FMath::IsNearlyEqual(Live, Want))
+				{
+					MID->SetScalarParameterValue(TEXT("bTwoSidedScalar"), Want);
+				}
+			}
+		}
+		++Restored;
+	}
+	const FOrbitDoubleSidedApplyCount Count = EnsureImportedDoubleSided();
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Rebus.OrbitDoubleSided %d: prior-touched=%d freshly-touched=%d (of %d Orbit primitive(s) walked, %d MIDs wrapped, %d bTwoSidedScalar pushes accepted)."),
+		bEnabled ? 1 : 0, Restored, Count.Touched, Count.Components, Count.MIDsWrapped, Count.SwitchesPushed);
 }

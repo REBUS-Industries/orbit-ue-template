@@ -49,6 +49,7 @@ namespace
 	IConsoleCommand* GDumpBeamShadowCommand = nullptr;
 	IConsoleCommand* GRebuildBeamMaterialCommand = nullptr; // v1.0.103 -- editor-only runtime regen
 	IConsoleCommand* GOrbitCastShadowsCommand = nullptr;
+	IConsoleCommand* GOrbitDoubleSidedCommand = nullptr; // v1.0.104 -- imported-primitive double-sided normalisation
 	// v1.0.101 -- per-fixture zoom / cone-mesh / SpotLight outer-cone runtime dump.
 	IConsoleCommand* GDumpFixtureZoomCommand = nullptr;
 
@@ -1399,6 +1400,58 @@ void FRebusVisualiserModule::StartupModule()
 		}),
 		ECVF_Default);
 
+	// v1.0.104 imported-primitive double-sided normalisation toggle. Mirrors the v1.0.99
+	// Rebus.OrbitCastShadows shape byte-for-byte (same lambda body, same per-world Game/
+	// PIE walk, same GameInstance-subsystem chokepoint), just routed through the v1.0.104
+	// SetOrbitDoubleSidedEnabled chokepoint. The scene-property `bOrbitDoubleSided` mirror
+	// lives in URebusSceneSettingsSubsystem::ApplySceneProperty -- both paths drive the
+	// same chokepoint so console + portal can never diverge. See the v1.0.104 README
+	// release block for the user report ("Orbit-imported materials are still single-
+	// sided in many cases, so thin geometry disappears when viewed from the back").
+	GOrbitDoubleSidedCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.OrbitDoubleSided"),
+		TEXT("v1.0.104 -- toggle the imported-Orbit-primitive double-sided normalisation "
+			 "(default ON). When ON the visualiser subsystem walks every OrbitImportRoot's "
+			 "primitive components on the same 1 Hz cadence as RebindOrbitModels + "
+			 "EnsureImportedShadowsCast and forces bCastShadowAsTwoSided=true on each "
+			 "comp, wraps every non-MID material slot in a UMaterialInstanceDynamic, and "
+			 "pushes a `bTwoSidedScalar` (0/1) parameter onto every MID -- silently no-ops "
+			 "on the scalar push when the parent master doesn't expose the param (e.g. "
+			 "glTFRuntime / engine masters whose top-level two_sided flag is hard-baked "
+			 "at cook time and can't be flipped at runtime), so the operator-visible win "
+			 "on those imports is the shadow-side bCastShadowAsTwoSided fix; the full "
+			 "double-sided RENDER win lands on every Rebus-authored master (M_RebusGround, "
+			 "M_RebusFixtureLens, M_RebusOrbitImported, ...) that the operator has re-"
+			 "parented Orbit assets to. OFF walks the same tracked set and restores the "
+			 "single-sided baseline (so the operator can A/B against pre-v1.0.104 "
+			 "behaviour). Mirrors the `bOrbitDoubleSided` scene property -- both drive "
+			 "the same SetOrbitDoubleSidedEnabled chokepoint. See the v1.0.104 README "
+			 "release block for the full diagnosis + the ~5-15% base-pass perf caveat "
+			 "for two-sided opaque (user report: \"can you set all Orbit textures to be "
+			 "double sided on import\"). Usage: Rebus.OrbitDoubleSided [0|1]"),
+		FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
+		{
+			const bool bEnable = ParseBoolArg(Args, true);
+			if (!GEngine) return;
+			int32 Subsystems = 0;
+			for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+			{
+				UWorld* World = Ctx.World();
+				if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+				UGameInstance* GI = World->GetGameInstance();
+				if (!GI) continue;
+				if (URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>())
+				{
+					Viz->SetOrbitDoubleSidedEnabled(bEnable);
+					++Subsystems;
+				}
+			}
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.OrbitDoubleSided %d: applied to %d subsystem(s)."),
+				bEnable ? 1 : 0, Subsystems);
+		}),
+		ECVF_Default);
+
 	// v1.0.99 per-fixture screen-space-shadow-trace runtime dump.
 	// v1.0.103 -- the dump is now the primary diagnostic for "v1.0.99 fix didn't materialise"
 	// because the per-scalar MID column reports EXISTS/MISSING explicitly (was a -999
@@ -1794,6 +1847,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GOrbitCastShadowsCommand);
 		GOrbitCastShadowsCommand = nullptr;
+	}
+	if (GOrbitDoubleSidedCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GOrbitDoubleSidedCommand);
+		GOrbitDoubleSidedCommand = nullptr;
 	}
 	if (GDumpFixtureZoomCommand)
 	{
