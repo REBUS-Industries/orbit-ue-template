@@ -508,13 +508,17 @@ private:
 	// which simplifies (Cumulative=Identity at rest) to CompRest -- so an axis the user isn't
 	// driving still leaves the component on its imported pose.
 	TArray<FTransform> OrbitBindBase;
-	// v1.0.68: per-component motion-axis bucket, parallel to OrbitComponents. INDEX_NONE means
-	// "base" (never moves); otherwise an index into Profile.MotionRig.Axes that drives the
-	// component. Classified by BindOrbitComponents using a multi-strategy chain (tag-name match
-	// against AffectedGeometryNames -> comp-name match -> keyword scan -> attach-hierarchy depth
-	// -> nearest-pivot in world space -> default head). Pre-v1.0.68 every component effectively
-	// rode HeadAxisIndex, so the whole fixture tilted instead of just the head -- the user's
-	// report that "we are not seeing the orbit fixture being treated as base, yoke and head".
+	// v1.0.68 introduced, v1.0.69 ID-only: per-component motion-axis bucket, parallel to
+	// OrbitComponents. INDEX_NONE means "base" (never moves); otherwise an index into
+	// Profile.MotionRig.Axes that drives the component. Classified by BindOrbitComponents using
+	// an ID/name strategy chain: tag-name match against AffectedGeometryNames -> comp-name match
+	// -> keyword scan ('head'/'tilt' -> tilt, 'yoke'/'arm'/'pan' -> pan, 'base'/'body' ->
+	// static) -> attach-hierarchy depth. Components for which NO strategy fires bucket to
+	// INDEX_NONE (static rest) -- v1.0.69 removed v1.0.68's position fallback + default-head
+	// safety net because the position heuristic put every mesh on the deepest (tilt) axis for
+	// the user's GLBs (every component was geometrically near the head, so nearest-pivot ties
+	// went to tilt), fully defeating the per-part split. The classifier now logs a per-fixture
+	// warning naming exactly which conventions the importer can adopt to enable motion.
 	TArray<int32> OrbitAxisBucket;
 	// Head world transform at the rest (pan=tilt=0) pose, captured at bind time.
 	FTransform OrbitHeadWorldRest = FTransform::Identity;

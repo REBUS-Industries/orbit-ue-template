@@ -593,6 +593,86 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **ID-only axis classification, no bounding box (v1.0.69).** v1.0.68 added per-component
+> motion-axis bucketing but its position-fallback strategy misbehaved on the user's GLBs:
+>
+> ```
+> Fixture 54E648DF-...: BOUND 5 Orbit-imported component(s) (drive=ON)
+>   | axis-buckets: base=0 pan=0 tilt=5 other=0 default=0
+>   | sample: 'StaticMeshComponent_3'->position(a=1) | ...->position(a=1)
+>     | ...->position(a=1) | ...->position(a=1) | ...->position(a=1)
+> ```
+>
+> Every component went to the tilt axis. Cause: typical moving-head GLBs cluster every mesh
+> (base, yoke, head, sub-parts) within ~tens-of-cm of each other, all within the head volume.
+> The nearest-pivot heuristic puts a mesh on the closest rig pivot; with comps stacked near
+> the head, "nearest" was tilt for everyone, ties resolved deepest-first onto tilt. With the
+> whole fixture on `Cumulative[tilt] = TiltSelf * PanCumulative`, the user saw the body rotate
+> as one rigid lump driven by pan, while the *intended* per-part split was nowhere to be seen:
+> *"the tilt is no longer moving the orbit fixture but the entire orbit fixture is rotating
+> on pan. No individual yoke/head control. ... can we just use IDs and not location bounding
+> box."*
+>
+> **What v1.0.69 changes.** The classification chain is reduced to **ID/name strategies only**;
+> the position fallback and default-head safety net are removed.
+>
+>   1. **Tag-name** -- each `Comp->ComponentTags` entry tested against
+>      `Profile.MotionRig.Axes[i].AffectedGeometryNames` via the existing
+>      `ResolveAxisForMesh`. Picks the deepest matching axis.
+>   2. **Comp-name** -- `Comp->GetName()` tested the same way.
+>   3. **Keyword scan** -- name + tags lower-cased, then substring search:
+>      `head`/`tilt` -> tilt axis, `yoke`/`arm`/`pan` -> pan axis,
+>      `base`/`body` -> static (`INDEX_NONE`).
+>   4. **Attach-hierarchy depth** -- if the components form an attach-tree with varying
+>      `GetAttachParent` depths (importer preserved glTF node hierarchy), deepest = head,
+>      max-1 = yoke, root = base. Skipped when all components are at the same depth (typical
+>      for procedural importers that re-parent everything under one root).
+>   5. *(no position fallback)*
+>   6. *(no default head)*
+>
+> Components for which NO strategy fires bucket to **`INDEX_NONE` (static rest)**. "Nothing
+> moves" is preferable to "wrong thing moves" -- a static base mesh is correct on the body
+> and lets the user immediately see which meshes are unclassified.
+>
+> **New diagnostic warning.** When at least one component falls through to unclassified, the
+> classifier emits a one-shot warning per fixture spelling out exactly what naming the
+> orbit-cli / portal can adopt to enable motion:
+>
+> ```
+> Fixture 54E648DF-...: 5/5 Orbit component(s) UNCLASSIFIED (static rest). To enable per-part
+>   motion, the orbit-cli / portal should expose ONE of these per mesh component,
+>   case-insensitive:
+>   (1) a ComponentTag matching a GDTF AffectedGeometryNames entry on this fixture's rig,
+>   (2) the component name matching the same,
+>   (3) any tag OR name containing the substrings 'head'/'tilt' (-> tilt axis),
+>       'yoke'/'arm'/'pan' (-> pan axis), or 'base'/'body' (-> static),
+>   (4) a preserved glTF parent-child hierarchy under OrbitImportRoot (deepest = head,
+>       mid = yoke, root = base).
+>   Current component names are generic (e.g. 'StaticMeshComponent_3') -- recommend tagging
+>   each mesh with 'base' / 'yoke' / 'head' on the orbit-cli side.
+> ```
+>
+> **Recommended schema (easiest to adopt).** On the orbit-cli side, for each MVR fixture
+> instance's GLB, add one of these per mesh component before publishing to Unreal:
+> - **ComponentTag** = `base`, `yoke`, or `head` (lower-case, exact). Strategy 3 catches it.
+> - OR **component Name** containing one of those substrings (e.g. `MovingHead_Head_001`).
+>   Strategy 3 catches it.
+> - OR preserve the MVR symdef's parent-child hierarchy when building the GLB nodes
+>   (strategy 4 catches it).
+>
+> Tag-based is the simplest because it doesn't require renaming meshes -- one extra
+> `ComponentTags.Add(TEXT("head"))` per mesh in the orbit-cli emit step and the visualiser
+> immediately splits the fixture correctly.
+>
+> Healthy log result after orbit-cli adoption:
+>
+> ```
+> Fixture <id>: BOUND 5 Orbit-imported component(s) (drive=ON)
+>   | axis-buckets: base=1 pan=2 tilt=2 other=0 unclassified=0
+>   | sample: '...'->keyword-base(a=-1) | '...'->keyword-pan(a=0)
+>     | '...'->keyword-head(a=1) | ...
+> ```
+
 > **Per-component axis classification: base stays put, yoke pans, head pans+tilts (v1.0.68).**
 > v1.0.67 finally got the Orbit-imported mesh bound to the control-channel fixture, but the
 > user immediately reported: *"we now have control of the Orbit fixture mesh but it's treating

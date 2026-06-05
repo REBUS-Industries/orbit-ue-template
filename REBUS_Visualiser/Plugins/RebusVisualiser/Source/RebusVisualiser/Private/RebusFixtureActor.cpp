@@ -1623,43 +1623,41 @@ void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Com
 	const FTransform ActorWorldInv = ActorWorld.Inverse();
 	OrbitHeadWorldRest = ComputeHeadLocal(0.f, 0.f) * ActorWorld; // kept for diagnostic legacy
 
-	// v1.0.68: per-component axis classification. Pre-compute each rig axis' world-space pivot +
-	// depth so the position-fallback strategy can score components against the actual pan/tilt
-	// pivots in world space (not just along Z, so the heuristic works for hanging AND standing
-	// rigs without an orientation assumption). Sorted deepest-first so equidistant ties resolve
-	// onto head before yoke, matching how a real moving-head's pivots stack (tilt nested inside
-	// pan).
-	struct FAxisPivotWorld { int32 AxisIndex; FVector PivotWorld; int32 Depth; };
-	TArray<FAxisPivotWorld> AxisPivots;
+	// v1.0.69: ID-ONLY axis classification. v1.0.68's six-strategy chain (incl. nearest-pivot
+	// "position fallback" + default-head safety net) was misclassifying every component as TILT
+	// for the user's GLBs -- every mesh on a typical moving-head sits in/around the head volume,
+	// so the nearest-pivot heuristic put base, yoke and head ALL on the deepest (tilt) axis. The
+	// user's report: "the tilt is no longer moving the orbit fixture but the entire orbit fixture
+	// is rotating on pan. No individual yoke/head control. ... can we just use IDs and not
+	// location bounding box". Position-based bucketing dropped here; the only strategies left
+	// are the ones that read EXPLICIT identifying info off the components themselves
+	// (tag-name, comp-name, name-keyword scan, attach-hierarchy depth). When the importer hasn't
+	// surfaced any naming, components bucket to INDEX_NONE (static base) -- "nothing moves" is
+	// preferable to "wrong thing moves", and the per-fixture warning below tells the orbit-cli /
+	// portal team exactly what naming to add.
 	const FRebusMotionRig& Rig = Profile.MotionRig;
+	int32 DeepestPanAxis = INDEX_NONE;
+	int32 DeepestTiltAxis = INDEX_NONE;
 	if (Rig.bValid && Rig.Axes.Num() > 0)
 	{
-		AxisPivots.Reserve(Rig.Axes.Num());
+		int32 BestPanDepth = -1, BestTiltDepth = -1;
 		for (int32 i = 0; i < Rig.Axes.Num(); ++i)
 		{
-			const FRebusMotionAxis& A = Rig.Axes[i];
-			FVector PivotYUp = A.Pivot;
-			if (Rig.bHasPivotOffset) PivotYUp -= Rig.PivotOffset;
-			const FVector PivotLocal = RebusCoords::PointYUpMetersToUnreal(PivotYUp);
-			const FVector PivotWorld = ActorWorld.TransformPosition(PivotLocal);
 			int32 Depth = 0;
-			int32 P = A.ParentAxisIndex;
+			int32 P = Rig.Axes[i].ParentAxisIndex;
 			while (P != INDEX_NONE && Rig.Axes.IsValidIndex(P)) { ++Depth; P = Rig.Axes[P].ParentAxisIndex; }
-			AxisPivots.Add({ i, PivotWorld, Depth });
+			if (Rig.Axes[i].Kind == ERebusAxisKind::Pan && Depth > BestPanDepth)
+			{
+				BestPanDepth = Depth; DeepestPanAxis = i;
+			}
+			else if (Rig.Axes[i].Kind == ERebusAxisKind::Tilt && Depth > BestTiltDepth)
+			{
+				BestTiltDepth = Depth; DeepestTiltAxis = i;
+			}
 		}
-		AxisPivots.Sort([](const FAxisPivotWorld& A, const FAxisPivotWorld& B) { return A.Depth > B.Depth; });
 	}
 
-	auto AxisOfKindDeepest = [&](ERebusAxisKind Kind) -> int32
-	{
-		for (const FAxisPivotWorld& P : AxisPivots)
-		{
-			if (Rig.Axes.IsValidIndex(P.AxisIndex) && Rig.Axes[P.AxisIndex].Kind == Kind) return P.AxisIndex;
-		}
-		return INDEX_NONE;
-	};
-
-	int32 NBase = 0, NPan = 0, NTilt = 0, NOther = 0, NDefaulted = 0;
+	int32 NBase = 0, NPan = 0, NTilt = 0, NOther = 0, NUnclassified = 0;
 	TArray<FString> ClassifyDiag;
 	ClassifyDiag.Reserve(6);
 
@@ -1672,14 +1670,14 @@ void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Com
 		OrbitBindBase.Add(CompRest * ActorWorldInv);
 
 		int32 AxisBucket = INDEX_NONE;
-		const TCHAR* Strategy = TEXT("base"); // default when there's no rig
+		const TCHAR* Strategy = TEXT("base"); // when there's no rig OR nothing matched (static)
 
 		if (Rig.bValid && Rig.Axes.Num() > 0)
 		{
 			bool bMatched = false;
 
 			// Strategy 1: each tag (lowercased by ResolveAxisForMesh) against AffectedGeometryNames.
-			// Catches the easy case where the orbit-cli exposes GDTF geometry names on the
+			// Catches the case where the orbit-cli exposes GDTF geometry names on the
 			// components (e.g. tag = "yoke" / "head" / "movinghead_head").
 			for (const FName& Tag : Comp->ComponentTags)
 			{
@@ -1706,13 +1704,12 @@ void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Com
 				for (const FName& Tag : Comp->ComponentTags) { Hay += TEXT(" "); Hay += Tag.ToString().ToLower(); }
 				if (Hay.Contains(TEXT("head")) || Hay.Contains(TEXT("tilt")))
 				{
-					AxisBucket = AxisOfKindDeepest(ERebusAxisKind::Tilt);
-					if (AxisBucket == INDEX_NONE) AxisBucket = HeadAxisIndex; // fall through to deepest axis
+					AxisBucket = (DeepestTiltAxis != INDEX_NONE) ? DeepestTiltAxis : HeadAxisIndex;
 					if (AxisBucket != INDEX_NONE) { bMatched = true; Strategy = TEXT("keyword-head"); }
 				}
 				else if (Hay.Contains(TEXT("yoke")) || Hay.Contains(TEXT("arm")) || Hay.Contains(TEXT("pan")))
 				{
-					AxisBucket = AxisOfKindDeepest(ERebusAxisKind::Pan);
+					AxisBucket = DeepestPanAxis;
 					if (AxisBucket != INDEX_NONE) { bMatched = true; Strategy = TEXT("keyword-pan"); }
 				}
 				else if (Hay.Contains(TEXT("base")) || Hay.Contains(TEXT("body")))
@@ -1724,8 +1721,11 @@ void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Com
 			// Strategy 4: attach-hierarchy depth. If the import preserved a parent-child tree
 			// (Base -> Yoke -> Head), the deepest component (max GetAttachParent chain length
 			// among components in THIS bind) is the head, max-1 is the yoke, etc. Works for
-			// any GLB importer that respects glTF node hierarchy and skips intermediate transform
-			// nodes (we only look at the components we were handed -- mesh-bearing ones).
+			// any GLB importer that respects glTF node hierarchy. Skipped when all components
+			// are at the same depth (typical when the importer flattens everything under one
+			// root, which is exactly the case for the user's `StaticMeshComponent_N` set --
+			// they all sit at the same attach depth so the heuristic falls through to "static"
+			// instead of guessing).
 			if (!bMatched)
 			{
 				int32 MaxDepth = -1;
@@ -1745,13 +1745,12 @@ void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Com
 					for (USceneComponent* P = Comp->GetAttachParent(); P != nullptr; P = P->GetAttachParent()) ++MyDepth;
 					if (MyDepth == MaxDepth)
 					{
-						AxisBucket = AxisOfKindDeepest(ERebusAxisKind::Tilt);
-						if (AxisBucket == INDEX_NONE) AxisBucket = HeadAxisIndex;
+						AxisBucket = (DeepestTiltAxis != INDEX_NONE) ? DeepestTiltAxis : HeadAxisIndex;
 						if (AxisBucket != INDEX_NONE) { bMatched = true; Strategy = TEXT("depth-head"); }
 					}
 					else if (MyDepth > MinDepth)
 					{
-						AxisBucket = AxisOfKindDeepest(ERebusAxisKind::Pan);
+						AxisBucket = DeepestPanAxis;
 						if (AxisBucket != INDEX_NONE) { bMatched = true; Strategy = TEXT("depth-yoke"); }
 					}
 					else
@@ -1761,38 +1760,16 @@ void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Com
 				}
 			}
 
-			// Strategy 5: position-fallback. Distance from the component's world position to each
-			// rig pivot's world position; closest pivot wins (deepest axis breaks ties because
-			// AxisPivots is sorted deepest-first). For typical moving-heads this puts comps near
-			// the tilt pivot onto the head bucket and comps near the pan pivot onto the yoke
-			// bucket. Components far from BOTH pivots (i.e. anywhere outside ~1.5x the nearest
-			// pivot's distance) bucket to base -- catches the static body/base where the head
-			// hangs from when nothing else identified it.
-			if (!bMatched && AxisPivots.Num() > 0)
-			{
-				const FVector CompW = Comp->GetComponentLocation();
-				float NearestSq = FLT_MAX;
-				int32 NearestAxis = INDEX_NONE;
-				for (const FAxisPivotWorld& P : AxisPivots)
-				{
-					const float DSq = (float)FVector::DistSquared(CompW, P.PivotWorld);
-					if (DSq < NearestSq) { NearestSq = DSq; NearestAxis = P.AxisIndex; }
-				}
-				if (NearestAxis != INDEX_NONE)
-				{
-					AxisBucket = NearestAxis; bMatched = true; Strategy = TEXT("position");
-				}
-			}
-
-			// Strategy 6: default to HeadAxisIndex so the fixture still moves SOMEHOW (the
-			// pre-v1.0.68 behaviour). Better than leaving everything static if we genuinely
-			// couldn't classify a single component. Logged separately so the user sees we
-			// punted.
+			// v1.0.69: NO position fallback, NO default-head. If strategies 1-4 didn't fire,
+			// AxisBucket stays INDEX_NONE -> the component sits static at its imported rest pose.
+			// "Nothing moves" is preferable to "wrong thing moves" -- v1.0.68's position fallback
+			// put every component on the deepest (tilt) axis for the user's GLBs because all
+			// meshes were geometrically near the head, which fully defeated the per-part split.
 			if (!bMatched)
 			{
-				AxisBucket = HeadAxisIndex;
-				Strategy = (AxisBucket == INDEX_NONE) ? TEXT("default-static") : TEXT("default-head");
-				++NDefaulted;
+				AxisBucket = INDEX_NONE;
+				Strategy = TEXT("unclassified-static");
+				++NUnclassified;
 			}
 		}
 
@@ -1821,11 +1798,31 @@ void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Com
 	}
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s: BOUND %d Orbit-imported component(s) by objectId '%s' (drive=%s) | axis-buckets: base=%d pan=%d tilt=%d other=%d default=%d | sample: %s"),
+		TEXT("Fixture %s: BOUND %d Orbit-imported component(s) by objectId '%s' (drive=%s) | axis-buckets: base=%d pan=%d tilt=%d other=%d unclassified=%d | sample: %s"),
 		*FixtureId, OrbitComponents.Num(), *MatchedObjectId,
 		bDriveOrbitModel ? TEXT("ON") : TEXT("off"),
-		NBase, NPan, NTilt, NOther, NDefaulted,
+		NBase, NPan, NTilt, NOther, NUnclassified,
 		ClassifyDiag.Num() > 0 ? *FString::Join(ClassifyDiag, TEXT(" | ")) : TEXT("(none)"));
+
+	// v1.0.69: when EVERY component fell through to "unclassified-static" (none of the four
+	// ID/name-based strategies matched), surface a one-shot warning per fixture telling the
+	// orbit-cli / portal team exactly what naming the visualiser is looking for. Without this
+	// the user sees a silently-static Orbit fixture and no indication that the geometry needs
+	// labels. We log even when SOME comps classified (NUnclassified > 0 but < total) so a
+	// partial classification is visible too.
+	if (NUnclassified > 0 && Rig.bValid && Rig.Axes.Num() > 0)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s: %d/%d Orbit component(s) UNCLASSIFIED (static rest). To enable per-part motion, ")
+			TEXT("the orbit-cli / portal should expose ONE of these per mesh component, case-insensitive: ")
+			TEXT("(1) a ComponentTag matching a GDTF AffectedGeometryNames entry on this fixture's rig, ")
+			TEXT("(2) the component name matching the same, ")
+			TEXT("(3) any tag OR name containing the substrings 'head'/'tilt' (-> tilt axis), 'yoke'/'arm'/'pan' (-> pan axis), or 'base'/'body' (-> static), ")
+			TEXT("(4) a preserved glTF parent-child hierarchy under OrbitImportRoot (deepest = head, mid = yoke, root = base). ")
+			TEXT("Current component names are generic (e.g. '%s') -- recommend tagging each mesh with 'base' / 'yoke' / 'head' on the orbit-cli side."),
+			*FixtureId, NUnclassified, OrbitComponents.Num(),
+			Components.IsValidIndex(0) && Components[0] ? *Components[0]->GetName() : TEXT("?"));
+	}
 
 	// Snap the model to the fixture's current pose now, so a late bind doesn't pop on the next tick.
 	if (bDriveOrbitModel)
