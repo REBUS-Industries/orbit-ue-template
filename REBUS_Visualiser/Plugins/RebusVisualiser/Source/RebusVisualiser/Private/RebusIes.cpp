@@ -15,8 +15,11 @@
 
 namespace RebusIes
 {
-	UTextureLightProfile* BuildLightProfile(UObject* Outer, const TArray<uint8>& IesBytes)
+	UTextureLightProfile* BuildLightProfile(UObject* Outer, const TArray<uint8>& IesBytes,
+		float* OutCandelaMax)
 	{
+		if (OutCandelaMax) { *OutCandelaMax = -1.f; }
+
 		if (IesBytes.Num() == 0)
 		{
 			return nullptr;
@@ -33,6 +36,17 @@ namespace RebusIes
 		const int32 Width = Converter.GetWidth();
 		const int32 Height = Converter.GetHeight();
 		const TArray<uint8>& Raw = Converter.GetRawData(); // RGBA16F texels
+
+		// v1.0.91 -- peak candela the caller will multiply by the live dimmer + shutter-gate.
+		// `GetBrightness() * GetMultiplier()` mirrors the editor-import path's effective peak
+		// (the importer writes Brightness * Multiplier into UTextureLightProfile::Brightness),
+		// so the runtime and the cooked / WITH_EDITORONLY_DATA paths agree numerically.
+		if (OutCandelaMax)
+		{
+			const float Brightness = Converter.GetBrightness();
+			const float Multiplier = Converter.GetMultiplier();
+			*OutCandelaMax = FMath::Max(0.f, Brightness * Multiplier);
+		}
 
 		UTextureLightProfile* Profile = NewObject<UTextureLightProfile>(
 			Outer ? Outer : (UObject*)GetTransientPackage(), NAME_None, RF_Transient);

@@ -480,6 +480,61 @@ void ARebusFixtureActor::DumpGoboStateForDebug() const
 		EpicBeamMID.Get());
 }
 
+void ARebusFixtureActor::DumpIesStateForDebug() const
+{
+	// v1.0.91 per-fixture IES dump for `Rebus.DumpFixtureIes`. Surfaces the complete chain so
+	// the operator can confirm in ONE line:
+	//   * which IES profile is loaded (inline iesText vs URL, plus the source profileId),
+	//   * the zoomDmx that selected it (paired with the live zoom half-angle for cross-check),
+	//   * the IESTexture UObject name (proves SpotLight->SetIESTexture landed),
+	//   * the PEAK CANDELA parsed from the .ies file (drives Intensity, see RefreshIntensity),
+	//   * the SpotLight's IntensityUnits (must be `2` = Candelas for the cd values to be
+	//     physically meaningful -- BuildSpotLight sets this once at construction),
+	//   * the live Intensity that just landed, plus the formula breakdown so the operator
+	//     can see whether dimmer or shutter-gate are zeroing it out vs. the IES being missing.
+	// All fields read from the LIVE SpotLight state (no cached snapshot) so a value mid-fade
+	// is reported accurately. Counts of inline / URL IES entries are included so the operator
+	// can tell whether the portal ever pushed a profile in the first place.
+	if (!SpotLight)
+	{
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("DumpFixtureIes '%s': NO SpotLight component -- fixture not fully constructed."),
+			*FixtureId);
+		return;
+	}
+
+	float Gate = 1.f;
+	switch (ShutterMode)
+	{
+	case ERebusShutterMode::Closed: Gate = 0.f; break;
+	case ERebusShutterMode::Strobe: Gate = (ShutterPhase < 0.5f) ? 1.f : 0.f; break;
+	default: break;
+	}
+	const float Dim = FMath::Clamp(Dimmer.Current, 0.f, 1.f);
+	const float Cd  = (IesCandelaMax >= 0.f) ? IesCandelaMax : BaseCandela;
+	const float Expected = Cd * Dim * Gate;
+	const TCHAR* Src =
+		(!ActiveIesProfile)                  ? TEXT("none(synthetic-cone)") :
+		bActiveIesInline                     ? TEXT("inline") :
+		                                       TEXT("url");
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("DumpFixtureIes '%s' source=%s profileId='%s' zoomDmx=%d zoomHalfDeg=%.2f "
+			 "iesTexture=%s candelaMax=%.1f baseCandela(flux-derived)=%.1f -> activeBase=%.1f "
+			 "SpotLight intensityUnits=%d intensityLive=%.1f expected(=base*dim*gate)=%.1f "
+			 "dimmer=%.3f shutterMode=%d gate=%.2f inlineCount=%d urlCount=%d "
+			 "bUseIESBrightness=%d IESBrightnessScale=%.3f"),
+		*FixtureId, Src,
+		ActiveIesProfileId.IsEmpty() ? TEXT("<none>") : *ActiveIesProfileId,
+		CurrentIesZoomDmx, ZoomDeg.Current,
+		ActiveIesProfile ? *ActiveIesProfile->GetName() : TEXT("<null>"),
+		IesCandelaMax, BaseCandela, Cd,
+		(int32)SpotLight->IntensityUnits, SpotLight->Intensity, Expected,
+		Dim, (int32)ShutterMode, Gate,
+		InlineIes.Profiles.Num(), Profile.IesProfiles.Num(),
+		SpotLight->bUseIESBrightness ? 1 : 0, SpotLight->IESBrightnessScale);
+}
+
 ARebusFixtureActor::ARebusFixtureActor()
 {
 	PrimaryActorTick.bCanEverTick = true;
@@ -3112,7 +3167,24 @@ void ARebusFixtureActor::RefreshIntensity()
 	default: break;
 	}
 
-	SpotLight->SetIntensity(BaseCandela * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate);
+	// v1.0.91 -- the per-fixture .ies file's PEAK CANDELA is now the authoritative BASE
+	// intensity when an IES is loaded (`IesCandelaMax >= 0`). The pre-v1.0.91 fallback path
+	// derived BaseCandela from photometrics.LuminousFlux / FieldAngle (Setup, §8.1) -- that
+	// estimate is still the floor for fixtures that arrive without an .ies file at all, but
+	// when the .ies IS present its candela max wins because:
+	//   * the .ies file is the photometric authority (real measurement, not an estimate from
+	//     a single flux + full angle),
+	//   * IES units mode = Candelas was already set in BuildSpotLight, so the value is fed
+	//     directly to UE in physically-meaningful units (no unit conversion), and
+	//   * the existing dimmer + shutter-gate stay as linear MULTIPLIERS on top, so the
+	//     operator's wire surface (SetFixtureDimmer / shutter) and DMX intensity flow are
+	//     untouched -- this change is BASE only.
+	// `bUseIESBrightness` stays false so the IES texture only reshapes the spatial falloff
+	// (peak texel = 1.0 -> the SpotLight's Intensity acts as the per-fixture peak candela
+	// directly); flipping it true would also bake the candela max into the texture sample
+	// and double-up with this Intensity write.
+	const float Cd = (IesCandelaMax >= 0.f) ? IesCandelaMax : BaseCandela;
+	SpotLight->SetIntensity(Cd * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate);
 
 	const FLinearColor Linear(
 		FMath::Clamp(ColorR.Current, 0.f, 1.f),
@@ -3452,16 +3524,28 @@ void ARebusFixtureActor::SelectIesForZoom()
 		{
 			return; // this inline entry is already loaded
 		}
-		if (UTextureLightProfile* Prof = RebusIes::BuildLightProfile(this, Inline->Bytes))
+		float ParsedCandelaMax = -1.f;
+		if (UTextureLightProfile* Prof = RebusIes::BuildLightProfile(this, Inline->Bytes, &ParsedCandelaMax))
 		{
 			ActiveIesProfile = Prof;
 			SpotLight->SetIESTexture(Prof);
-			// Keep the portal's brightness authority (§8.2 step 4).
+			// Keep the portal's brightness authority for the SPATIAL distribution (§8.2 step 4).
+			// The PEAK CANDELA from the .ies file is folded into SpotLight->Intensity via
+			// IesCandelaMax + RefreshIntensity below (v1.0.91), so the user's request "use the
+			// IES profile + IES intensity" is satisfied without flipping bUseIESBrightness on
+			// (which would double-bake the candela max -- see RefreshIntensity comment).
 			SpotLight->bUseIESBrightness = false;
 			SpotLight->IESBrightnessScale = 1.f;
 			SpotLight->MarkRenderStateDirty();
 			bActiveIesInline = true;
 			CurrentIesZoomDmx = Inline->ZoomDmx;
+			IesCandelaMax = ParsedCandelaMax;
+			ActiveIesProfileId = Inline->ProfileId;
+			RefreshIntensity();
+			UE_LOG(LogRebusVisualiser, Verbose,
+				TEXT("Fixture %s IES applied: profile=%s zoomDmx=%d candelaMax=%.0f intensityUnits=Candelas finalIntensity=%.0f (source=inline)"),
+				*FixtureId, *Inline->ProfileId, Inline->ZoomDmx,
+				IesCandelaMax, SpotLight->Intensity);
 			return;
 		}
 		UE_LOG(LogRebusVisualiser, Warning,
@@ -3492,10 +3576,16 @@ void ARebusFixtureActor::SelectIesForZoom()
 	if (!PickProfileUrl(Url, Key))
 	{
 		// 3) No IES at all -> clear and keep the synthesized cone (§8.2 step 5).
+		// v1.0.91 -- also drop the IES candela max so RefreshIntensity falls back to the
+		// flux-derived BaseCandela on the next push (otherwise the SpotLight would keep
+		// shining at the prior IES's peak even after the .ies file was removed).
 		SpotLight->SetIESTexture(nullptr);
 		ActiveIesProfile = nullptr;
 		CurrentIesZoomDmx = -1;
 		bActiveIesInline = false;
+		IesCandelaMax = -1.f;
+		ActiveIesProfileId.Reset();
+		RefreshIntensity();
 		return;
 	}
 	if (!bActiveIesInline && Key == CurrentIesZoomDmx && ActiveIesProfile)
@@ -3511,20 +3601,32 @@ void ARebusFixtureActor::FetchAndAssignIes(const FString& IesUrl)
 {
 	if (!RestClient.IsValid() || IesUrl.IsEmpty()) return;
 
+	const int32 PendingZoomDmx = CurrentIesZoomDmx;
 	TWeakObjectPtr<ARebusFixtureActor> WeakThis(this);
 	RestClient->FetchBytes(IesUrl, FRebusBytesFetched::CreateLambda(
-		[WeakThis](bool bOk, const TArray<uint8>& Bytes)
+		[WeakThis, PendingZoomDmx](bool bOk, const TArray<uint8>& Bytes)
 		{
 			ARebusFixtureActor* Self = WeakThis.Get();
 			if (!Self || !bOk || !Self->SpotLight) return;
-			UTextureLightProfile* Prof = RebusIes::BuildLightProfile(Self, Bytes);
+			float ParsedCandelaMax = -1.f;
+			UTextureLightProfile* Prof = RebusIes::BuildLightProfile(Self, Bytes, &ParsedCandelaMax);
 			if (!Prof) return;
 			Self->ActiveIesProfile = Prof;
 			Self->SpotLight->SetIESTexture(Prof);
-			// Keep the portal's brightness authority (§8.2 step 4).
+			// Keep the portal's brightness authority for the SPATIAL distribution (§8.2 step 4).
+			// PEAK CANDELA is folded into SpotLight->Intensity below (v1.0.91, same path as the
+			// inline branch above) -- see RefreshIntensity comment for why bUseIESBrightness
+			// stays false.
 			Self->SpotLight->bUseIESBrightness = false;
 			Self->SpotLight->IESBrightnessScale = 1.f;
 			Self->SpotLight->MarkRenderStateDirty();
+			Self->IesCandelaMax = ParsedCandelaMax;
+			Self->ActiveIesProfileId = FString::Printf(TEXT("url:%d"), PendingZoomDmx);
+			Self->RefreshIntensity();
+			UE_LOG(LogRebusVisualiser, Verbose,
+				TEXT("Fixture %s IES applied: profile=%s zoomDmx=%d candelaMax=%.0f intensityUnits=Candelas finalIntensity=%.0f (source=url)"),
+				*Self->FixtureId, *Self->ActiveIesProfileId, PendingZoomDmx,
+				Self->IesCandelaMax, Self->SpotLight->Intensity);
 		}));
 }
 

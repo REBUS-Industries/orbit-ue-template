@@ -594,6 +594,231 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **IES profile + IES candela max drive the SpotLight (v1.0.91).**
+> User: *"can we make sure we use the IES profile and IES intensity for the beam/spotlight"*.
+>
+> The user is asking us to verify (and fix where missing) that the per-fixture `.ies` file
+> drives BOTH the spatial distribution AND the absolute brightness of the SpotLight that
+> v1.0.87's InternalBeam mode now promotes to the visible volumetric beam. The mode-of-the-
+> day for the operator is InternalBeam ON, so the IES chain must work in that path in
+> particular.
+>
+> ---
+>
+> **Audit findings (what already worked, what was missing).**
+>
+> Pre-v1.0.91 the SpotLight's `IESTexture` wiring was already in place end-to-end:
+>
+> 1. **Fetch.** `URebusVisualiserSubsystem` accepts both inline IESNA LM-63 text via the data-
+>    channel `RegisterFixtureIes` descriptor (one or more profiles per `libraryId`, indexed by
+>    `zoomDmx`) and signed `iesUrl` / `iesProfileUrl` URLs in the REST `/api/ue/fixtures/{id}`
+>    profile. The blobs reach `ARebusFixtureActor::Setup` as `FRebusInlineIes` /
+>    `FRebusFixtureProfile.IesProfiles` -- ALREADY WORKING.
+> 2. **Build.** `RebusIes::BuildLightProfile` runs the raw `.ies` text through the engine's
+>    `FIESConverter` (same path the editor importer uses) and returns a runtime
+>    `UTextureLightProfile` -- ALREADY WORKING.
+> 3. **Apply (spatial).** `ARebusFixtureActor::SelectIesForZoom` calls
+>    `SpotLight->SetIESTexture(Profile)` and sets `bUseIESBrightness=false` +
+>    `IESBrightnessScale=1.0` so the texture only reshapes the spatial falloff -- ALREADY
+>    WORKING.
+> 4. **Zoom-keyed selection.** `SelectIesForZoom` maps the live zoom half-angle to a 0..255
+>    `zoomDmx` key and picks the nearest inline profile (preferred) then the nearest URL
+>    profile. Called from `Setup`, from `ApplyZoom` (snap path), from `Tick` (fade path via
+>    `bConeAnim`), so a zoom step OR a fade re-selects the right `.ies` automatically --
+>    ALREADY WORKING.
+> 5. **IntensityUnits = Candelas.** `BuildSpotLight` calls
+>    `SpotLight->SetIntensityUnits(ELightUnits::Candelas)` once at construction -- ALREADY
+>    WORKING. UE's default is `Unitless`, which would make a candela-typed Intensity value
+>    physically meaningless.
+> 6. **InternalBeam interplay.** v1.0.87's `ApplyInternalBeamPose` / `RestoreInternalBeam
+>    Pose` touch volumetrics + visibility + per-primitive shadow flags, NOT the IES texture
+>    nor `IntensityUnits` nor `Intensity`. Verified by inspection: the IES chain survives
+>    `Rebus.InternalBeam 1` / `0` cycles unchanged.
+>
+> **What was MISSING.** The `.ies` file's **peak candela** (what the photometric file is
+> literally describing -- the brightest direction's luminous intensity, expressed in
+> candelas) was NEVER folded into `SpotLight->Intensity`. The intensity formula was:
+>
+> ```
+> SpotLight->Intensity = BaseCandela * Dimmer.Current * shutter-gate
+> ```
+>
+> where `BaseCandela` came from the JSON profile's `photometrics.luminousFlux /
+> photometrics.fieldAngle` via the spherical-cap solid-angle integral:
+>
+> ```
+> BaseCandela = LuminousFlux / (2 * PI * (1 - cos(fieldAngle / 2)))
+> ```
+>
+> That's a defensible flux-derived estimate (and remains the fallback when no `.ies` is
+> available), but it ignores the IES file's directly-measured peak candela. So a fixture
+> with a photometric profile claiming `60000 cd` peak would render at whatever cosmic
+> brightness the flux integral computed -- usually different. With `bUseIESBrightness=false`,
+> UE treats the IES texture as a peak-1 spatial distribution multiplied by
+> `SpotLight->Intensity`, so the candela max was getting silently lost.
+>
+> ---
+>
+> **Fix -- `IesCandelaMax` is now the BASE for `SpotLight->Intensity`.**
+>
+> ```
+> SpotLight->Intensity = ((IesCandelaMax >= 0) ? IesCandelaMax : BaseCandela)
+>                        * FMath::Clamp(Dimmer.Current, 0, 1)
+>                        * shutter-gate
+> ```
+>
+> `IesCandelaMax` is captured directly from `FIESConverter::GetBrightness() *
+> GetMultiplier()` -- exactly the value the editor importer would write into
+> `UTextureLightProfile::Brightness` for a cooked asset, so the runtime path is numerically
+> identical to the cooked / `WITH_EDITORONLY_DATA` path. The dimmer (operator + DMX
+> intensity multipliers fold into `Dimmer.Current`) and the shutter-gate (open/closed/strobe)
+> stay as linear multipliers on top, so the existing wire surface
+> (`SetFixtureDimmer` / `SetFixtureShutter`) and the v1.0.60 single-source-of-truth contract
+> for dimmer on the SpotLight Intensity are untouched. The flux-derived `BaseCandela` is
+> kept as the FALLBACK for fixtures that arrive with no inline IES + no `iesUrl` (e.g.
+> light-only data-channel pushes), so behaviour for profile-less fixtures is byte-exact to
+> pre-v1.0.91.
+>
+> Why NOT `bUseIESBrightness = true` (the "automatic" UE path). Flipping that flag tells UE
+> "use the IES brightness as the absolute candela for the light", ignoring
+> `SpotLight->Intensity`. But it also drives the per-sample intensity of the IES texture
+> directly off `Brightness * IESBrightnessScale`, which would mean folding the dimmer in via
+> `IESBrightnessScale` -- a different code path and a different multiplier semantic. The
+> explicit BASE-via-`SpotLight->Intensity` path keeps the existing dimmer chain authoritative
+> (one source of truth, see RefreshIntensity's v1.0.60 comment), keeps gate behaviour
+> consistent across the SpotLight + Epic beam + cone-mesh paths, and matches the
+> portal-keeps-brightness-authority contract in `RebusIes.h` step 4.
+>
+> ---
+>
+> **Where the candela max is captured + refreshed.**
+>
+> `RebusIes::BuildLightProfile(Outer, Bytes, float* OutCandelaMax)` is the single capture
+> point -- the existing `FIESConverter` instance already parses the brightness; v1.0.91
+> just surfaces it through a new out-parameter (defaults to `nullptr` so any
+> hypothetical other caller stays source-compatible). Both call sites in
+> `ARebusFixtureActor` -- the inline `iesText` path AND the URL-fetch async lambda -- now
+> read the parsed candela max, store it on the actor as `IesCandelaMax`, and call
+> `RefreshIntensity()` so the new BASE takes effect immediately (no waiting on the next
+> dimmer push). The clear path (no inline + no URL -> synthetic cone fallback) ALSO calls
+> `RefreshIntensity` so the actor falls back to `BaseCandela` cleanly instead of leaving
+> the SpotLight at the previous IES's peak.
+>
+> **Zoom-keyed refresh.** `SelectIesForZoom` is re-entered on every zoom step
+> (`ApplyZoom`'s snap path + the `Tick` fade path) and re-captures the candela max from
+> whichever `zoomDmx` profile is now nearest. So a zoom-keyed IES set (one `.ies` per
+> zoom step) drives a per-zoom intensity envelope naturally -- the spatial distribution
+> AND the peak both come from the right `.ies` file at every zoom point. No additional
+> `RefreshIesForZoom()` API was needed.
+>
+> **Verbose log on every IES apply.** Both call sites emit:
+>
+> ```
+> Fixture <id> IES applied: profile=<id> zoomDmx=<n> candelaMax=<cd> intensityUnits=Candelas finalIntensity=<cd> (source=inline|url)
+> ```
+>
+> Grep `IES applied:` to confirm a fresh IES landed AND that the resulting
+> `SpotLight->Intensity` is what you expect (= candela max * live dimmer * gate).
+>
+> ---
+>
+> **New diagnostic console command.**
+>
+> ```
+> Rebus.DumpFixtureIes [fixtureId]
+> ```
+>
+> Dumps THIS fixture's complete IES state in one line (LogRebusVisualiser Log):
+>
+> ```
+> DumpFixtureIes '<id>' source=inline|url|none(synthetic-cone) profileId='<id>' zoomDmx=<n>
+>     zoomHalfDeg=<deg> iesTexture=<UObject name> candelaMax=<cd> baseCandela(flux-derived)=<cd>
+>     -> activeBase=<cd> SpotLight intensityUnits=<n> intensityLive=<cd>
+>     expected(=base*dim*gate)=<cd> dimmer=<0..1> shutterMode=<0|1|2> gate=<0..1>
+>     inlineCount=<n> urlCount=<n> bUseIESBrightness=<0|1> IESBrightnessScale=<f>
+> ```
+>
+> With NO arg dumps every fixture in every Game/PIE/Editor world. With a `fixtureId` (the
+> Speckle node id -- same key `SetFixture*` uses) dumps only that one and logs a Warning if
+> not found. Use it to verify the chain landed at a glance: `source` tells you whether an
+> IES file is loaded at all, `candelaMax` is the parsed peak, `intensityUnits=2` confirms
+> Candelas, and `intensityLive vs expected` lets you spot a dimmer/gate that's secretly
+> zeroing the beam.
+>
+> ---
+>
+> **Files touched.**
+>
+> ```
+> REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Public/RebusIes.h
+> REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusIes.cpp
+> REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Public/RebusFixtureActor.h
+> REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusFixtureActor.cpp
+> REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusVisualiser.cpp
+> REBUS_Visualiser/Plugins/RebusVisualiser/README.md
+> ```
+>
+> No header changes to `RebusSceneSettingsSubsystem` (this is a per-fixture intensity-source
+> change, not a scene property) and no new UPROPERTYs (`IesCandelaMax` + `ActiveIesProfileId`
+> are plain `float` / `FString` members on the actor; the existing `ActiveIesProfile`
+> `UTextureLightProfile` UPROPERTY GC-roots the texture).
+>
+> **No regressions for InternalBeam, no regressions for the classic Epic-beam path.** The
+> SpotLight is the same component the v1.0.87 InternalBeam mode promotes to the visible
+> volumetric beam (`ApplyInternalBeamPose` only pushes volumetric flags + a back-offset onto
+> it, never touches `IESTexture` / `Intensity` / `IntensityUnits`), so the v1.0.91 candela-max
+> wiring lights up identically in both modes. The Epic-beam path's `M_Beam_Master` brightness
+> param is fed `RebusEpicBeamMaxIntensity * MeshBeamUserScale` (a separate constant for the
+> beam canvas raymarch), which intentionally does NOT track the SpotLight's candela value --
+> that path's brightness story is its own (v1.0.45 final), unchanged here.
+>
+> **Operator checklist.**
+>
+> ```text
+> # 1. Spawn a scene whose fixtures carry IES profiles (REST iesUrl OR data-channel
+> #    RegisterFixtureIes inline iesText). Confirm:
+> Rebus.DumpFixtureIes
+> #    Expected per fixture:
+> #    DumpFixtureIes '<id>' source=inline|url profileId='<id>' zoomDmx=<n> zoomHalfDeg=<deg>
+> #        iesTexture=TextureLightProfile_N candelaMax=<cd> baseCandela(flux-derived)=<cd>
+> #        -> activeBase=<cd>     <-- activeBase MUST equal candelaMax (proves IES won the BASE)
+> #        SpotLight intensityUnits=2  <-- 2 = Candelas (the only physically-meaningful value)
+> #        intensityLive=<cd> expected(=base*dim*gate)=<cd>  <-- live should equal expected
+> #        dimmer=<0..1> shutterMode=<0|1|2> gate=<0..1>
+>
+> # 2. Push a dimmer change and verify Intensity scales linearly with it.
+> SetFixtureDimmer <id> 0.5
+> Rebus.DumpFixtureIes <id>
+> #    intensityLive should be roughly candelaMax * 0.5 * (1 if shutter open else 0).
+>
+> # 3. Toggle InternalBeam ON. Confirm the candela max is preserved (the SpotLight is the
+> #    same component the v1.0.87 mode promotes to the visible shaft):
+> Rebus.InternalBeam 1
+> Rebus.DumpFixtureIes <id>
+> #    candelaMax, iesTexture, intensityUnits should be IDENTICAL pre/post toggle. The
+> #    intensityLive value should ALSO be identical (assuming dimmer/gate didn't change).
+>
+> # 4. Verify the IES SHAPE matches the .ies file. Visually -- the beam's
+> #    centre-vs-edge intensity falloff in the lit pool should match what the .ies file
+> #    plots (e.g. a tight ~5 deg IES centred on a 25 deg field shows a bright core with
+> #    a dim wash; a broad ~40 deg IES on the same field shows even illumination).
+> #    Grep `IES applied:` in the log to confirm the right profileId is loaded.
+>
+> # 5. Change zoom and re-dump. The selected zoomDmx should jump to the nearest profile
+> #    in a per-zoom set, and candelaMax usually changes between zoom steps (zoom-keyed
+> #    IES often have a different peak at narrow vs wide field).
+> SetFixtureZoom <id> 15
+> Rebus.DumpFixtureIes <id>
+> SetFixtureZoom <id> 35
+> Rebus.DumpFixtureIes <id>
+>
+> # 6. Light-only / profile-less fallback. A fixture pushed with no IES (no inline +
+> #    no iesUrl) should report:
+> #    source=none(synthetic-cone) candelaMax=-1.0 -> activeBase=<flux-derived BaseCandela>
+> #    intensityLive=<base*dim*gate>
+> #    -- proves the fallback path is intact (no regression vs pre-v1.0.91 behaviour).
+> ```
+
 > **Post-process Bloom / Lens Flare / Vignette exposed as portal scene properties (v1.0.90).**
 > User: *"can we expose post processing - Lens Flare, Bloom and Vignette so we can control these via the portal."*
 >

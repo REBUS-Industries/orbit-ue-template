@@ -442,6 +442,14 @@ public:
 	// anti-ghost diagnosis.
 	void DumpGoboStateForDebug() const;
 
+	// v1.0.91: dump THIS fixture's IES runtime state in one line -- which IES profile is
+	// loaded (inline iesText vs URL), the zoomDmx that selected it, the IESTexture object
+	// name, the parsed peak candela max, the SpotLight's live IntensityUnits + Intensity,
+	// and the breakdown of BaseCandela vs IesCandelaMax with the live dimmer/shutter-gate
+	// multipliers so the operator can confirm the candela-max -> SpotLight.Intensity chain
+	// landed. Called by `Rebus.DumpFixtureIes [fixtureId]`.
+	void DumpIesStateForDebug() const;
+
 	// v1.0.75: rebuild the gobo render target at a new square pixel size + re-bind it on the
 	// cookie/light-function MIDs. Called by Rebus.GoboRTSize. Size is clamped to [128, 8192]
 	// and rounded up to a power of two (mipmap generation requires it for tight LOD chains).
@@ -871,6 +879,20 @@ private:
 	FString CurrentGoboWheel;      // live wheel-name hint for the gobo selection (re-apply)
 	int32 CurrentIesZoomDmx = -1;  // which IES entry (inline or URL) is loaded, by zoomDmx
 	bool bActiveIesInline = false; // true when the loaded IES came from an inline iesText push
+
+	// v1.0.91 -- peak candela parsed from the active IES file (FIESConverter::GetBrightness() *
+	// GetMultiplier(), via RebusIes::BuildLightProfile's OutCandelaMax). Drives
+	// SpotLight->Intensity when >= 0 (with units = Candelas, see BuildSpotLight): the formula
+	// is `IesCandelaMax * Dimmer * Gate` -- so the .ies file's candela max is the BASE
+	// intensity, and the live operator dimmer + shutter-gate are linear multipliers on top.
+	// Sentinel < 0 (no IES, or IES build failed) falls back to the flux-derived BaseCandela.
+	// Reset to -1 by the clear path in SelectIesForZoom (no inline + no URL -> synthetic cone),
+	// re-captured on every successful BuildLightProfile (zoom-keyed selection refresh too).
+	// `ActiveIesProfileId` is informational (the inline profileId or "url:<zoomDmx>" for the
+	// URL path), surfaced by `Rebus.DumpFixtureIes` so the operator can see WHICH .ies file
+	// is currently driving the SpotLight without re-reading the inline cache.
+	float   IesCandelaMax = -1.f;
+	FString ActiveIesProfileId;
 
 	bool bAnimating = false;
 };

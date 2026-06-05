@@ -44,6 +44,7 @@ namespace
 	IConsoleCommand* GOverrideTrussMaterialCommand = nullptr;
 	IConsoleCommand* GSetGroundTilingCommand = nullptr;
 	IConsoleCommand* GInternalBeamCommand = nullptr;
+	IConsoleCommand* GDumpFixtureIesCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -263,6 +264,57 @@ namespace
 			}
 		}
 		UE_LOG(LogRebusVisualiser, Log, TEXT("Rebus.DumpGoboState: dumped %d fixture(s)."), Total);
+	}
+
+	// v1.0.91: `Rebus.DumpFixtureIes [fixtureId]` -- per-fixture IES runtime dump. Confirms
+	// the full chain landed for the v1.0.91 "use the IES profile + IES intensity for the
+	// SpotLight" change:
+	//   * IES source (inline iesText vs URL vs synthetic-cone fallback) + profileId
+	//   * zoomDmx that selected the active entry (paired with the live ZoomDeg.Current half-angle)
+	//   * the live UTextureLightProfile UObject name (proves SpotLight->SetIESTexture landed)
+	//   * the PEAK CANDELA parsed from the .ies file -- the BASE value that drives Intensity
+	//   * SpotLight->IntensityUnits (must be `2` = Candelas for the cd values to be physically
+	//     meaningful) + the live SpotLight->Intensity, plus the expected `base*dim*gate` value
+	//     so the operator can tell at a glance whether dimmer / shutter-gate are zeroing the
+	//     beam vs. the IES being missing
+	// With NO fixtureId arg, dumps EVERY fixture in every Game/PIE/Editor world. With an
+	// optional fixtureId arg (the Speckle node id -- the same key SetFixture* uses), dumps
+	// just the matching fixture; logs a warning if not found.
+	void HandleDumpFixtureIesCommand(const TArray<FString>& Args)
+	{
+		if (!GEngine) return;
+		const FString Filter = (Args.Num() > 0) ? Args[0] : FString();
+		int32 Total = 0, Matched = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE && Ctx.WorldType != EWorldType::Editor)) continue;
+			for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+			{
+				const ARebusFixtureActor* F = *It;
+				if (!F) continue;
+				++Total;
+				if (!Filter.IsEmpty() && !F->GetFixtureId().Equals(Filter, ESearchCase::IgnoreCase)) continue;
+				F->DumpIesStateForDebug();
+				++Matched;
+			}
+		}
+		if (Filter.IsEmpty())
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.DumpFixtureIes: dumped %d fixture(s) (no filter)."), Matched);
+		}
+		else if (Matched == 0)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.DumpFixtureIes '%s': NOT FOUND (scanned %d fixture(s) -- check the Speckle node id, same key SetFixture* uses)."),
+				*Filter, Total);
+		}
+		else
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.DumpFixtureIes '%s': dumped %d matching fixture(s)."), *Filter, Matched);
+		}
 	}
 
 	// v1.0.79 helpers: pluck the live cinematic camera pawn from any game/PIE world. There's
@@ -1258,6 +1310,23 @@ void FRebusVisualiserModule::StartupModule()
 			 "Usage: Rebus.AAMode [tsr|taa|fxaa|msaa|off|status]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleAAModeCommand),
 		ECVF_Default);
+
+	// v1.0.91 per-fixture IES runtime dump. Useful to confirm the v1.0.91 chain landed:
+	// .ies peak candela -> IesCandelaMax -> RefreshIntensity -> SpotLight->Intensity, with
+	// IntensityUnits=Candelas. Pass a fixtureId (Speckle node id) to filter to one fixture.
+	GDumpFixtureIesCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.DumpFixtureIes"),
+		TEXT("Dump per-fixture IES runtime state in one line: IES source (inline/url/none), "
+			 "active profileId, selected zoomDmx + live zoom half-angle, IESTexture object name, "
+			 "parsed peak candela max, BaseCandela fallback, SpotLight IntensityUnits + live "
+			 "Intensity + expected (=base*dim*gate), dimmer/shutter, inline+url IES counts, "
+			 "and bUseIESBrightness/IESBrightnessScale. With no arg dumps every fixture; with "
+			 "a fixtureId (Speckle node id, the same key SetFixture* uses) dumps just that one. "
+			 "Use this to verify the .ies file's peak candela actually drives SpotLight->Intensity "
+			 "in InternalBeam mode (v1.0.87+) or the classic Epic-beam path. "
+			 "Usage: Rebus.DumpFixtureIes [fixtureId]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpFixtureIesCommand),
+		ECVF_Default);
 }
 
 void FRebusVisualiserModule::ShutdownModule()
@@ -1356,6 +1425,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GInternalBeamCommand);
 		GInternalBeamCommand = nullptr;
+	}
+	if (GDumpFixtureIesCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GDumpFixtureIesCommand);
+		GDumpFixtureIesCommand = nullptr;
 	}
 	// v1.0.73 / v1.0.78: restore both CVar packs to their snapshotted values so a hot-reload
 	// of the module doesn't leak a permanent override into the engine session. Both packs
