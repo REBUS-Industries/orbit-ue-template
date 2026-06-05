@@ -44,6 +44,14 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// Hybrid cone-mesh volumetric beam is the default beam mode (v1.0.31); seed it so SceneState
 	// round-trips the control and a respawn re-asserts it via ReapplyAll.
 	Values.Add(TEXT("bMeshBeams"), FRebusPropertyValue::MakeBool(true));
+	// v1.0.87 InternalBeam A/B mode. Default OFF (the Epic / cone-mesh beam stays the visible
+	// shaft on first load). When the portal flips it ON, every fixture hides its Epic beam,
+	// promotes its SpotLight to a volumetric shaft pushed back inside the head by
+	// lensRadius / tan(maxZoomHalfAngle), and opts its own body meshes out of shadow casting so
+	// the head can't extinguish the internal spot. Seeded here so SceneState round-trips the
+	// control and the v1.0.87 ReapplyAll re-asserts the operator's choice on every fixture (re)
+	// spawn (so a freshly spawned fixture inherits the live mode without needing a manual recycle).
+	Values.Add(TEXT("bInternalBeam"), FRebusPropertyValue::MakeBool(false));
 	// Drive Orbit-imported fixture models from each fixture's pan/tilt solve. v1.0.35 introduced
 	// this as a Phase-1 A/B test (default OFF). v1.0.65 flipped the SceneState seed to TRUE so
 	// the SceneState round-trip reports the new default consistently with the control subsystem's
@@ -253,6 +261,47 @@ void URebusSceneSettingsSubsystem::SetMeshBeamsEnabled(bool bEnabled)
 		bEnabled ? TEXT("cone-mesh beam") : TEXT("fog beam restored"));
 }
 
+void URebusSceneSettingsSubsystem::SetInternalBeamEnabled(bool bEnabled)
+{
+	UWorld* World = GetWorld();
+	if (!World) return;
+
+	int32 Count = 0;
+	for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+	{
+		if (ARebusFixtureActor* Fixture = *It)
+		{
+			Fixture->SetInternalBeamModeEnabled(bEnabled);
+			++Count;
+		}
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("bInternalBeam=%d applied to %d fixture(s) (%s)."),
+		bEnabled ? 1 : 0, Count,
+		bEnabled
+			? TEXT("Epic beam hidden, SpotLight promoted to visible volumetric shaft + back-offset applied + body meshes opted out of shadow casting")
+			: TEXT("Epic beam restored, SpotLight pose + body shadow flags reverted byte-exact"));
+
+	// v1.0.87 visibility hint: the internal beam needs volumetric fog to be visible in the
+	// scene; surface it as a Verbose log so the operator can see why the toggle "did nothing"
+	// in a fog-off level (we deliberately do NOT force bVolumetricFog on -- that's a separate
+	// scene-property the operator owns).
+	if (bEnabled)
+	{
+		if (AExponentialHeightFog* Fog = GetFog())
+		{
+			if (UExponentialHeightFogComponent* FogComp = Fog->GetComponent())
+			{
+				if (!FogComp->bEnableVolumetricFog)
+				{
+					UE_LOG(LogRebusVisualiser, Verbose,
+						TEXT("bInternalBeam=1 but bVolumetricFog=0 on the scene fog -- the SpotLight's volumetric shaft will be invisible until you enable VolumetricFog (SetSceneProperty bVolumetricFog true)."));
+				}
+			}
+		}
+	}
+}
+
 void URebusSceneSettingsSubsystem::SetDriveOrbitModelsEnabled(bool bEnabled)
 {
 	// Delegate to the fixture control subsystem (GameInstance-scoped), which owns the fixture
@@ -456,6 +505,11 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 	else if (Name == TEXT("bMeshBeams"))
 	{
 		SetMeshBeamsEnabled(Value.bBool);
+	}
+	// --- v1.0.87 InternalBeam A/B mode: hide Epic / cone beam and use SpotLight for the shaft ---
+	else if (Name == TEXT("bInternalBeam"))
+	{
+		SetInternalBeamEnabled(Value.bBool);
 	}
 	// --- Phase-1 sync test: drive Orbit-imported fixture models from fixture motion ---
 	else if (Name == TEXT("bDriveOrbitModels"))

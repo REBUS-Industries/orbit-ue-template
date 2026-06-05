@@ -178,6 +178,13 @@ int32 ARebusFixtureActor::ShadowFogBeamCount = 0;
 // <float>`; default 4.0 is paired with RebusEpicBeamMaxIntensity=2000 and our current fog tuning
 // (r.VolumetricFog.GridPixelSize=4, r.VolumetricFog.HistoryWeight=0.95).
 float GRebusHeroShadowScatter = 4.0f;
+// v1.0.87: SpotLight VolumetricScatteringIntensity pushed onto every fixture while InternalBeam
+// mode is ON. The InternalBeam pose hides the Epic / cone-mesh beam and promotes the same SpotLight
+// that already lights the floor to ALSO be the visible volumetric shaft -- so a scatter value of
+// 1.0 (the default) produces a clearly visible beam in the default exponential-height-fog without
+// blasting the lit pool. Live-tunable via `Rebus.InternalBeamScatter <float>`; on change every
+// fixture currently in InternalBeam mode re-pushes its volumetric state immediately.
+float GRebusInternalBeamScatter = 1.0f;
 FAutoConsoleVariableRef CVarRebusHeroShadowScatter(
 	TEXT("Rebus.HeroShadowScatter"),
 	GRebusHeroShadowScatter,
@@ -202,6 +209,36 @@ FAutoConsoleVariableRef CVarRebusHeroShadowScatter(
 		}
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("Rebus.HeroShadowScatter -> %.2f, refreshed %d fixture(s)."),
+			CVar->GetFloat(), Refreshed);
+	}),
+	ECVF_Default);
+
+FAutoConsoleVariableRef CVarRebusInternalBeamScatter(
+	TEXT("Rebus.InternalBeamScatter"),
+	GRebusInternalBeamScatter,
+	TEXT("SpotLight VolumetricScatteringIntensity pushed onto every fixture while InternalBeam mode (v1.0.87) is ON. Live -- changing this re-pushes the value to every fixture currently in InternalBeam mode."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		if (!GEngine) return;
+		int32 Refreshed = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					if (F->IsInternalBeamModeEnabled())
+					{
+						F->RefreshBeamShadowMode();
+						++Refreshed;
+					}
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.InternalBeamScatter -> %.2f, refreshed %d InternalBeam fixture(s)."),
 			CVar->GetFloat(), Refreshed);
 	}),
 	ECVF_Default);
@@ -1675,6 +1712,20 @@ void ARebusFixtureActor::RefreshBeamShadowMode()
 {
 	if (!SpotLight) return;
 
+	// v1.0.87 InternalBeam A/B mode is the strongest override: when ON the SpotLight IS the visible
+	// volumetric shaft (the Epic / cone-mesh beams are hidden + deactivated by ApplyInternalBeamPose
+	// alongside this push), so we force volumetric scattering + Cast Volumetric Shadow on regardless
+	// of the bMeshBeamEnabled / bShadowActive paths below -- the hero-shadow budget is bypassed
+	// because there is no longer a competing mesh-cone "primary" beam to ration against.
+	if (bInternalBeamEnabled)
+	{
+		SpotLight->SetVolumetricScatteringIntensity(FMath::Max(GRebusInternalBeamScatter, 0.f));
+		SpotLight->SetCastShadows(true);
+		SpotLight->SetCastVolumetricShadow(true);
+		SpotLight->MarkRenderStateDirty();
+		return;
+	}
+
 	// A hero shadow beam is one that asked for volumetric shadows AND won a per-batch budget slot.
 	const bool bShadowActive = bWantsVolumetricShadow && bGrantedShadowHero;
 
@@ -1725,6 +1776,225 @@ void ARebusFixtureActor::SetMeshBeamEnabled(bool bEnabled)
 		bEnabled ? (bWantsVolumetricShadow && bGrantedShadowHero ? GRebusHeroShadowScatter : 0.f) : FogScatteringIntensity);
 }
 
+// ---- v1.0.87 InternalBeam A/B mode -----------------------------------------------------
+//
+// Resolve the spotlight back-offset (UE cm) so the visible cone exits the fixture head AT the
+// lens diameter (max zoom) and strictly INSIDE the lens diameter at every narrower zoom.
+//   offset = lensRadius / tan(MaxZoomHalfAngleRad)
+// MaxZoomHalfAngleRad = (Profile.Zoom.MaxDeg or InternalBeamMaxZoomFullDeg fallback) / 2.
+// The offset is FIXED at the MAX zoom value -- we deliberately do NOT key it off the current
+// ZoomDeg, because a wide-then-narrow zoom must keep the lens-diameter envelope (otherwise a
+// narrow zoom would project a cone that started inside the lens and ended outside on the head).
+float ARebusFixtureActor::ComputeInternalBeamBackOffsetCm() const
+{
+	// Resolve the LENS RADIUS in UE cm: prefer the same source BuildSpotLight cached as
+	// BaseSourceRadiusUnreal (lensDiameter/2 -> source.radius -> source.diameter/2 -> dims-fallback)
+	// so the offset uses the SAME physical lens the user sees in the lens-flare disc + the
+	// cone-mesh start. Synthetic fallback: 3 cm matches the RebusBeamLensRadiusFloorCm floor.
+	float LensRadiusCm = BaseSourceRadiusUnreal;
+	if (LensRadiusCm <= KINDA_SMALL_NUMBER)
+	{
+		const TCHAR* DiamSrc = TEXT("none");
+		const double DiamMeters = ResolveLensDiameterMeters(DiamSrc);
+		LensRadiusCm = (DiamMeters > KINDA_SMALL_NUMBER)
+			? (float)(DiamMeters * 0.5 * RebusCoords::METERS_TO_UNREAL)
+			: 3.f;
+	}
+	// Resolve the MAX zoom full angle in degrees, then half-angle in radians. Clamped to a sane
+	// minimum (1 deg full -> 0.5 deg half) so tan(0) doesn't blow up the divide.
+	float MaxZoomFullDeg = InternalBeamMaxZoomFullDeg;
+	if (Profile.Zoom.bValid && Profile.Zoom.MaxDeg > 0.0)
+	{
+		MaxZoomFullDeg = (float)Profile.Zoom.MaxDeg;
+	}
+	const float MaxHalfRad = FMath::DegreesToRadians(FMath::Max(MaxZoomFullDeg * 0.5f, 0.5f));
+	const float Tan = FMath::Max(FMath::Tan(MaxHalfRad), KINDA_SMALL_NUMBER);
+	const float OffsetCm = LensRadiusCm / Tan;
+	return FMath::Max(OffsetCm, 0.f);
+}
+
+// Walk this actor's UPrimitiveComponents and either opt them out of shadow casting (bRestore
+// Original == false) or restore their cached flags (bRestoreOriginal == true). The filter
+// deliberately TARGETS the GDTF body proxies (UProceduralMeshComponent[] populated by BuildMeshes)
+// and EXCLUDES the SpotLight (not a primitive anyway -- ULightComponentBase extends USceneComponent),
+// the Epic beam canvas (EpicBeamComp), the procedural cone (BeamCone), the lens-flare disc (LensDisc),
+// and any future debug-arrow / origin-gizmo / IES-debug primitive added later. Class-based filter
+// (UStaticMesh / UProceduralMesh) plus a same-object skip-list keeps the blast radius surgical.
+void ARebusFixtureActor::SetBodyMeshesCastShadow(bool bRestoreOriginal)
+{
+	if (bRestoreOriginal)
+	{
+		int32 Restored = 0;
+		for (const FInternalBeamShadowEntry& Entry : InternalBeamShadowCache)
+		{
+			UPrimitiveComponent* Comp = Entry.Comp.Get();
+			if (!Comp) continue;
+			Comp->SetCastShadow(Entry.bCastShadow != 0);
+			Comp->bCastDynamicShadow = Entry.bCastDynamicShadow != 0;
+			Comp->bCastHiddenShadow = Entry.bCastHiddenShadow != 0;
+			Comp->bCastShadowAsTwoSided = Entry.bCastShadowAsTwoSided != 0;
+			Comp->MarkRenderStateDirty();
+			++Restored;
+		}
+		UE_LOG(LogRebusVisualiser, Verbose,
+			TEXT("Fixture %s InternalBeam: restored CastShadow flags on %d body primitive(s)."),
+			*FixtureId, Restored);
+		InternalBeamShadowCache.Reset();
+		return;
+	}
+
+	// Build the per-comp shadow opt-out cache from scratch. Same-name skip ensures EpicBeamComp /
+	// BeamCone / LensDisc never land in the cache regardless of how the actor was built.
+	InternalBeamShadowCache.Reset();
+	TArray<UPrimitiveComponent*> AllPrims;
+	GetComponents<UPrimitiveComponent>(AllPrims);
+	int32 Touched = 0;
+	for (UPrimitiveComponent* Comp : AllPrims)
+	{
+		if (!Comp) continue;
+		// Skip the beam-functional primitives. Pointer equality on the cached UPROPERTY refs is
+		// the most defensive filter (resilient to a rename or a derived type substitution).
+		if (Comp == (UPrimitiveComponent*)BeamCone.Get()) continue;
+		if (Comp == (UPrimitiveComponent*)EpicBeamComp.Get()) continue;
+		if (Comp == (UPrimitiveComponent*)LensDisc.Get()) continue;
+		// Defensive: never touch any USpotLightComponent / ULightComponent -- they aren't
+		// UPrimitiveComponents (ULightComponentBase extends USceneComponent, not UPrimitiveComponent)
+		// so they shouldn't show up here, but the filter keeps a future engine inheritance change
+		// from accidentally casting the spotlight's own shadow off (would break IES + LightFunction
+		// projection, since both require the light to be casting shadows).
+		if (Comp->IsA<ULightComponent>()) continue;
+
+		FInternalBeamShadowEntry Entry;
+		Entry.Comp = Comp;
+		Entry.bCastShadow = Comp->CastShadow ? 1 : 0;
+		Entry.bCastDynamicShadow = Comp->bCastDynamicShadow ? 1 : 0;
+		Entry.bCastHiddenShadow = Comp->bCastHiddenShadow ? 1 : 0;
+		Entry.bCastShadowAsTwoSided = Comp->bCastShadowAsTwoSided ? 1 : 0;
+		InternalBeamShadowCache.Add(Entry);
+
+		Comp->SetCastShadow(false);
+		Comp->bCastDynamicShadow = false;
+		Comp->bCastHiddenShadow = false;
+		Comp->bCastShadowAsTwoSided = false;
+		Comp->MarkRenderStateDirty();
+		++Touched;
+	}
+	UE_LOG(LogRebusVisualiser, Verbose,
+		TEXT("Fixture %s InternalBeam: opted %d body primitive(s) out of shadow casting (skipped SpotLight + BeamCone + EpicBeam + LensDisc)."),
+		*FixtureId, Touched);
+}
+
+void ARebusFixtureActor::ApplyInternalBeamPose()
+{
+	if (!SpotLight) return;
+
+	// Snapshot the construction state on the FIRST enable so subsequent ON / OFF cycles always
+	// land back on the original values (a second enable in the same session must NOT re-snapshot
+	// volumetrics that this very mode just pushed). bInternalBeamPoseCached is the latch.
+	if (!bInternalBeamPoseCached)
+	{
+		InternalBeamSpotVolScatterOrig = SpotLight->VolumetricScatteringIntensity;
+		bInternalBeamSpotCastVolShadowOrig = SpotLight->bCastVolumetricShadow != 0;
+		bInternalBeamEpicCompVisOrig = EpicBeamComp ? EpicBeamComp->IsVisible() : false;
+		bInternalBeamConeVisOrig = BeamCone ? BeamCone->IsVisible() : false;
+		bInternalBeamPoseCached = true;
+	}
+
+	// 1) Hide + deactivate the Epic beam canvas + the procedural cone-mesh fallback. We
+	//    deliberately do NOT destroy either component -- a subsequent ON -> OFF must return the
+	//    Epic beam INTACT, so we just clip visibility (which makes the canvas mesh stop drawing)
+	//    and let the cached visibility govern the restore on the OFF toggle.
+	if (EpicBeamComp)
+	{
+		EpicBeamComp->SetVisibility(false);
+	}
+	if (BeamCone)
+	{
+		BeamCone->SetVisibility(false);
+	}
+
+	// 2) Opt this actor's body meshes out of shadow casting so the head itself can't shadow
+	//    the now-internal spotlight (would otherwise extinguish the entire beam).
+	SetBodyMeshesCastShadow(/*bRestoreOriginal*/ false);
+
+	// 3) Push the spatial back-offset onto the SpotLight RIGHT NOW. RefreshMotion's post-step
+	//    will re-apply this every subsequent frame, but the operator toggled the mode in this
+	//    frame and we want the visible change immediately rather than waiting for the next
+	//    motion tick. RefreshMotion is idempotent so this redundant call is cheap (cone
+	//    geometry only rebuilds when zoom changes, etc.).
+	RefreshMotion();
+
+	// 4) Push the volumetric beam state onto the SpotLight (RefreshBeamShadowMode honors
+	//    bInternalBeamEnabled when true and forces the volumetric scatter + cast volumetric shadow
+	//    regardless of the hero-budget / mesh-beam paths).
+	RefreshBeamShadowMode();
+}
+
+void ARebusFixtureActor::RestoreInternalBeamPose()
+{
+	if (!SpotLight) return;
+
+	// 1) Restore SpotLight volumetric state from the cached construction values. RefreshBeam
+	//    ShadowMode is called immediately after flipping bInternalBeamEnabled to false (it
+	//    falls back to the bMeshBeamEnabled / hero-shadow paths), but the explicit set here is
+	//    defensive for a future code path that calls RestoreInternalBeamPose without flipping
+	//    the flag first.
+	if (bInternalBeamPoseCached)
+	{
+		SpotLight->SetVolumetricScatteringIntensity(InternalBeamSpotVolScatterOrig);
+		SpotLight->SetCastVolumetricShadow(bInternalBeamSpotCastVolShadowOrig);
+		if (EpicBeamComp)
+		{
+			EpicBeamComp->SetVisibility(bInternalBeamEpicCompVisOrig);
+		}
+		if (BeamCone)
+		{
+			BeamCone->SetVisibility(bInternalBeamConeVisOrig);
+		}
+		SpotLight->MarkRenderStateDirty();
+	}
+
+	// 2) Restore the per-body-primitive shadow flags from the cache. No-op if the cache is empty
+	//    (Apply was never run).
+	SetBodyMeshesCastShadow(/*bRestoreOriginal*/ true);
+
+	// 3) Re-push motion so the spotlight returns to its un-offset position byte-exact (Refresh
+	//    Motion's offset post-step skips when bInternalBeamEnabled is now false, and the prior
+	//    SetRelativeTransform(BeamRestTransform * Head) re-puts the spotlight at the
+	//    construction-time recipe).
+	RefreshMotion();
+
+	// 4) Final volumetric refresh.
+	RefreshBeamShadowMode();
+}
+
+void ARebusFixtureActor::SetInternalBeamModeEnabled(bool bEnabled)
+{
+	if (bEnabled == bInternalBeamEnabled)
+	{
+		// Idempotent: the per-fixture wire path (subsystem ReapplyAll on every fixture spawn)
+		// can call this with the existing value; bail to avoid an unnecessary log + re-snapshot.
+		return;
+	}
+	bInternalBeamEnabled = bEnabled;
+	if (bEnabled)
+	{
+		ApplyInternalBeamPose();
+	}
+	else
+	{
+		RestoreInternalBeamPose();
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s InternalBeam mode %s (backOffset=%.1fcm maxZoomFullDeg=%.1f scatter=%.2f bodyPrimsOptedOut=%d)."),
+		*FixtureId,
+		bEnabled ? TEXT("ENABLED") : TEXT("DISABLED -> Epic beam restored"),
+		bEnabled ? ComputeInternalBeamBackOffsetCm() : 0.f,
+		(Profile.Zoom.bValid && Profile.Zoom.MaxDeg > 0.0) ? (float)Profile.Zoom.MaxDeg : InternalBeamMaxZoomFullDeg,
+		GRebusInternalBeamScatter,
+		InternalBeamShadowCache.Num());
+}
+
 void ARebusFixtureActor::RefreshMotion()
 {
 	if (!Profile.MotionRig.bValid || Profile.MotionRig.Axes.Num() == 0)
@@ -1755,6 +2025,14 @@ void ARebusFixtureActor::RefreshMotion()
 			// hits cleanly without disturbing the SpotLight transform. So the SpotLight's
 			// relative rotation is restored to just the head-tracking rotation.
 			SpotLight->SetRelativeTransform(T);
+			// v1.0.87 InternalBeam back-offset: push the spotlight back along its LIVE aim (Dir,
+			// the synthetic pan/tilt-rotated emission forward) so the cone exits the lens plane
+			// at the lens diameter at MAX zoom. Applied in the no-rig synthetic-aim path so the
+			// offset rotates with the synthetic aim instead of staying locked to the static rest.
+			if (bInternalBeamEnabled)
+			{
+				SpotLight->AddRelativeLocation(-ComputeInternalBeamBackOffsetCm() * Dir);
+			}
 
 			// Lens disc tracks the same synthetic aim: plane normal along the beam Dir.
 			if (LensDisc)
@@ -1808,6 +2086,17 @@ void ARebusFixtureActor::RefreshMotion()
 		// inheriting any motion via the parented EpicBeamComp. SpotLight relative transform is
 		// just the head-tracking rotation again.
 		SpotLight->SetRelativeTransform(BeamRestTransform * Head);
+		// v1.0.87 InternalBeam back-offset: push the spotlight back along its LIVE FixtureRoot-
+		// space forward (= the spotlight's local +X rotated into FixtureRoot, which is the head-
+		// rotated GDTF emission forward) so the cone exits the lens plane at the lens diameter
+		// at MAX zoom and strictly inside the lens diameter at every narrower zoom. The offset
+		// rides through pan/tilt because we sample the LIVE relative rotation (set just above)
+		// instead of a static fixture-local axis.
+		if (bInternalBeamEnabled)
+		{
+			const FVector LiveFwd = SpotLight->GetRelativeRotation().RotateVector(FVector::ForwardVector);
+			SpotLight->AddRelativeLocation(-ComputeInternalBeamBackOffsetCm() * LiveFwd);
+		}
 
 		// Lens disc rides the SAME head transform (LensDiscRest * Head), so it stays co-located
 		// with the beam origin and perpendicular to the v1.0.21 beam direction through pan/tilt.
@@ -2373,6 +2662,14 @@ void ARebusFixtureActor::ApplyZoom(float ZoomHalfAngleDeg, float FadeSeconds)
 	ZoomDeg.SetTarget(ZoomHalfAngleDeg, FadeSeconds);
 	bAnimating = true;
 	if (FadeSeconds <= 0.f) { RecomputeConeAngles(); SelectIesForZoom(); }
+	// v1.0.87: re-apply the InternalBeam back-offset on every zoom change. Currently the offset
+	// is derived from the fixture's MAX zoom (constant for the actor's lifetime), so this is a
+	// no-op pose-wise, but it future-proofs a per-fixture-descriptor MaxZoom retune (where the
+	// max can shift between zoom messages) without needing a separate "MaxZoom changed" hook.
+	if (bInternalBeamEnabled)
+	{
+		ApplyInternalBeamPose();
+	}
 }
 
 void ARebusFixtureActor::ApplyIris(float Iris01, float FadeSeconds)

@@ -43,6 +43,7 @@ namespace
 	IConsoleCommand* GAAModeCommand = nullptr;
 	IConsoleCommand* GOverrideTrussMaterialCommand = nullptr;
 	IConsoleCommand* GSetGroundTilingCommand = nullptr;
+	IConsoleCommand* GInternalBeamCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -863,6 +864,30 @@ namespace
 			TEXT("Rebus.SetGroundTiling %.3f: pushed to %d scene-settings subsystem(s)."), Metres, Subsystems);
 	}
 
+	// v1.0.87: `Rebus.InternalBeam [0|1]` -- toggle the temporary InternalBeam A/B mode on every
+	// spawned fixture in every Game/PIE world. Routes through URebusSceneSettingsSubsystem::Apply
+	// SceneProperty(bInternalBeam, ...) so the SceneState read-back ALSO reflects the new value
+	// (otherwise the portal would render correctly but a SceneState query would still report the
+	// old value, and a fixture respawn would snap the mode back to the stored default via ReapplyAll).
+	void HandleInternalBeamCommand(const TArray<FString>& Args)
+	{
+		const bool bEnable = ParseBoolArg(Args, true);
+		if (!GEngine) return;
+		int32 Subsystems = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+			URebusSceneSettingsSubsystem* Sce = World->GetSubsystem<URebusSceneSettingsSubsystem>();
+			if (!Sce) continue;
+			++Subsystems;
+			Sce->ApplySceneProperty(TEXT("bInternalBeam"), FRebusPropertyValue::MakeBool(bEnable));
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.InternalBeam %d: pushed to %d scene-settings subsystem(s)."),
+			bEnable ? 1 : 0, Subsystems);
+	}
+
 	// v1.0.85: `Rebus.OverrideTrussMaterial [0|1]` -- enable / disable the powdercoat material
 	// override on every Orbit-imported primitive NOT bound to a fixture. ON applies the truss
 	// material (loaded from /Game/REBUS/Materials/M_RebusTruss.M_RebusTruss if present, else a
@@ -1182,6 +1207,29 @@ void FRebusVisualiserModule::StartupModule()
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleSetGroundTilingCommand),
 		ECVF_Default);
 
+	// v1.0.87 InternalBeam A/B mode -- temporary while the Epic beam is being evaluated.
+	GInternalBeamCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.InternalBeam"),
+		TEXT("Toggle the v1.0.87 InternalBeam A/B mode on every fixture in every Game/PIE world. "
+			 "ON hides each fixture's Epic DMX-Fixtures beam canvas + procedural cone-mesh fallback "
+			 "and promotes the SpotLight that already lights the floor to ALSO be the visible "
+			 "volumetric shaft (VolumetricScatteringIntensity = Rebus.InternalBeamScatter, default "
+			 "1.0; CastVolumetricShadow forced ON so the shaft carves through the fog). The "
+			 "SpotLight is pushed back inside the head by lensRadius / tan(maxZoomHalfAngle) so "
+			 "the cone exits at the lens diameter at max zoom and strictly inside the lens at "
+			 "every narrower zoom. The fixture's own body meshes are opted out of shadow casting "
+			 "(per-primitive CastShadow=false + bCastDynamicShadow=false + bCastHiddenShadow=false "
+			 "+ bCastShadowAsTwoSided=false) so the head can't extinguish its own internal "
+			 "spotlight; world lights (sun / sky / key) still light the head from outside since "
+			 "lighting channels are untouched. OFF restores every change byte-exact: the Epic "
+			 "beam returns to its prior visibility, the SpotLight relative location + volumetric "
+			 "state revert to construction values, and every cached primitive's CastShadow flag "
+			 "set is replayed from the per-actor cache. Routes through SetSceneProperty bInternalBeam "
+			 "so SceneState round-trips the value and a fixture respawn re-asserts the operator's "
+			 "choice via ReapplyAll. Usage: Rebus.InternalBeam [0|1]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleInternalBeamCommand),
+		ECVF_Default);
+
 	// v1.0.85 truss / set-piece powdercoat material override -- ON by default. See the
 	// HandleOverrideTrussMaterialCommand comment header for the full rationale.
 	GOverrideTrussMaterialCommand = IConsoleManager::Get().RegisterConsoleCommand(
@@ -1303,6 +1351,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GSetGroundTilingCommand);
 		GSetGroundTilingCommand = nullptr;
+	}
+	if (GInternalBeamCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GInternalBeamCommand);
+		GInternalBeamCommand = nullptr;
 	}
 	// v1.0.73 / v1.0.78: restore both CVar packs to their snapshotted values so a hot-reload
 	// of the module doesn't leak a permanent override into the engine session. Both packs

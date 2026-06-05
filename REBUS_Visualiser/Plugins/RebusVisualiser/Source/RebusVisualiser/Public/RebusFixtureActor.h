@@ -158,6 +158,32 @@ public:
 	// SpotLight's fog scattering is restored (the old fog beam), so the two can be A/B'd at runtime.
 	void SetMeshBeamEnabled(bool bEnabled);
 
+	// v1.0.87: temporary InternalBeam A/B mode. When ON:
+	//   * the Epic DMX-Fixtures beam canvas + the procedural cone-mesh fallback are hidden +
+	//     deactivated (but NOT destroyed -- toggling OFF returns the Epic beam intact);
+	//   * the same `SpotLightComponent` that already lights the floor / projects gobos is promoted
+	//     to ALSO be the visible volumetric beam: VolumetricScatteringIntensity is pushed to a
+	//     sensible default (1.0) and CastVolumetricShadow is forced ON so the spotlight's beam
+	//     carves through the exponential-height-fog froxels;
+	//   * the SpotLight is pushed BACK along its local -X (the negation of the GDTF emission
+	//     forward) by `offset = lensRadius / tan(MaxZoomHalfAngleRadians)`. With the offset fixed
+	//     at the MAX zoom half-angle, the cone at the lens plane is exactly the lens diameter at
+	//     MaxZoom and strictly INSIDE the lens at every narrower zoom -- the visible shaft exits
+	//     the fixture head at the correct size at every zoom setting;
+	//   * every fixture-body `UPrimitiveComponent` on this actor (the GDTF-derived head / yoke /
+	//     base proxies -- NOT the SpotLight, the Epic beam, the cone, the lens disc, etc.) is
+	//     opted out of the SpotLight's shadow casting (CastShadow + bCastDynamicShadow +
+	//     bCastHiddenShadow + bCastShadowAsTwoSided -> false). Otherwise the head body would
+	//     self-shadow the internal spotlight and no light could escape the fixture. World lights
+	//     (sun / sky / key) still light the head from outside -- this is the per-primitive flag,
+	//     not a lighting-channel reshuffle, so the blast radius is intentionally small.
+	// When OFF every change above is byte-exact reversed: the Epic beam's prior visibility is
+	// restored, the SpotLight relative location + volumetric flags go back to construction
+	// defaults, and every cached primitive's CastShadow flags are restored from the per-comp
+	// cache captured the first time the mode was enabled.
+	void SetInternalBeamModeEnabled(bool bEnabled);
+	bool IsInternalBeamModeEnabled() const { return bInternalBeamEnabled; }
+
 	// ---- Orbit-imported model binding (v1.0.35 introduced; v1.0.65 default ON) --------------
 	// Bind the Orbit-imported fixture-model components (already matched to this fixture by object
 	// id by the control subsystem) so their world transforms can be driven by this fixture's head
@@ -592,6 +618,68 @@ private:
 	float MeshBeamUserScale = 1.f;
 	float FogScatteringIntensity = 2.5f;
 	bool bWantsVolumetricShadow = false;
+
+	// v1.0.87 InternalBeam A/B mode state. bInternalBeamEnabled gates the whole pose change so
+	// RefreshBeamShadowMode / RefreshMotion / ApplyZoom can branch without re-deriving it. The
+	// cached fields below are the byte-exact pre-toggle state used by RestoreInternalBeamPose --
+	// they are NOT touched again after InternalBeam goes ON, so a second OFF -> ON -> OFF cycle
+	// still lands the fixture on the same construction-time values.
+	//
+	// MaxZoomFullDeg defaults to a SAFE 45 degrees (a common stage moving-head MAX zoom). When
+	// Profile.Zoom.bValid and Profile.Zoom.MaxDeg > 0, ApplyInternalBeamPose uses the profile's
+	// value verbatim -- so an MVR / GDTF push with a real zoom range always wins. The 45-deg
+	// fallback only fires for profile-less data-channel pushes (which is rare in production).
+	UPROPERTY()
+	float InternalBeamMaxZoomFullDeg = 45.f;
+	bool bInternalBeamEnabled = false;
+	// The back-offset is NOT applied by mutating BeamRestTransform: that would lock the offset
+	// to the fixture-local rest direction in the no-rig synthetic-pan/tilt fallback (where the
+	// spotlight aim follows a runtime Dir, not BeamForwardLocal). Instead RefreshMotion applies
+	// the offset as a POST-STEP after SetRelativeTransform: AddRelativeLocation along the
+	// spotlight's CURRENT FixtureRoot-space forward (read off the relative rotation), so the
+	// rig path AND the synthetic path both push the spotlight back along its live aim. The
+	// "byte-exact restore" guarantee then comes for free -- the next RefreshMotion after the
+	// flag flips back to false re-sets the SpotLight relative transform from BeamRestTransform
+	// * Head (the construction-time recipe), so no separate cached location is needed.
+	// Cached SpotLight volumetric state from construction (so the InternalBeam push doesn't
+	// permanently override a non-default scatter that the portal pushed via the hero-shadow path).
+	float InternalBeamSpotVolScatterOrig = 0.f;
+	bool bInternalBeamSpotCastVolShadowOrig = false;
+	// Cached Epic beam / procedural cone visibility flags so toggling OFF returns whichever was
+	// the visible shaft pre-InternalBeam (the bMeshBeamEnabled wire path drives both visibilities).
+	bool bInternalBeamEpicCompVisOrig = true;
+	bool bInternalBeamConeVisOrig = true;
+	bool bInternalBeamPoseCached = false;
+
+	// Per-primitive shadow cache captured the first time InternalBeam is enabled on this actor.
+	// Each entry holds a weak ref + the original CastShadow flag set so RestoreInternalBeamPose
+	// can push them back byte-exact. Weak refs tolerate component destruction (rebuild between
+	// ON / OFF), in which case the restore is a no-op for that entry rather than a crash.
+	struct FInternalBeamShadowEntry
+	{
+		TWeakObjectPtr<UPrimitiveComponent> Comp;
+		uint8 bCastShadow : 1;
+		uint8 bCastDynamicShadow : 1;
+		uint8 bCastHiddenShadow : 1;
+		uint8 bCastShadowAsTwoSided : 1;
+	};
+	TArray<FInternalBeamShadowEntry> InternalBeamShadowCache;
+
+	// Apply the InternalBeam pose: hide Epic / cone, push the SpotLight back by the computed
+	// back-offset, force volumetrics + volumetric shadow on, opt the body meshes out of shadow
+	// casting. Snapshots the pre-toggle state into the InternalBeam* fields above on first call.
+	void ApplyInternalBeamPose();
+	// Reverse of ApplyInternalBeamPose: restore the cached SpotLight pose / volumetrics, the
+	// Epic-beam / cone visibility flags, and every cached primitive's CastShadow flags.
+	void RestoreInternalBeamPose();
+	// Compute the spotlight back-offset (UE cm) so the cone at the lens plane is the lens
+	// diameter at MaxZoom: offset = lensRadius / tan(MaxZoomHalfAngleRadians). Clamped >= 0.
+	float ComputeInternalBeamBackOffsetCm() const;
+	// When bRestoreOriginal=false, walk this actor's UPrimitiveComponents (skipping the SpotLight,
+	// the Epic beam canvas, the procedural cone, the lens disc and any other beam-functional comp)
+	// and force CastShadow + bCastDynamicShadow + bCastHiddenShadow + bCastShadowAsTwoSided to
+	// false, caching the original flags. When bRestoreOriginal=true, push the cached flags back.
+	void SetBodyMeshesCastShadow(bool bRestoreOriginal);
 	// True once this fixture has been granted a hero volumetric-shadow slot (under the per-batch
 	// RebusMaxShadowFogBeams budget). Latched so toggling shadow on/off doesn't re-consume budget.
 	bool bGrantedShadowHero = false;

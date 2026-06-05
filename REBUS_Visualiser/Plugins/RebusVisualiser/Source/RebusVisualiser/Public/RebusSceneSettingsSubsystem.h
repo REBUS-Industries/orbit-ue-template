@@ -83,6 +83,14 @@ private:
 	// Public so the v1.0.47 `Rebus.MeshBeams [0|1]` console command can drive the same path.
 public:
 	void SetMeshBeamsEnabled(bool bEnabled);
+
+	// v1.0.87 InternalBeam A/B mode. When ON, every fixture hides its Epic / cone-mesh beam and
+	// promotes its SpotLight to the visible volumetric shaft, applying the back-offset that places
+	// the cone exit at the lens diameter and opting the body meshes out of self-shadowing. When OFF
+	// the Epic beam returns intact + every per-fixture cached state restores byte-exact. Public so
+	// the v1.0.87 `Rebus.InternalBeam [0|1]` console command can drive the same path the
+	// SetSceneProperty bInternalBeam wire route uses.
+	void SetInternalBeamEnabled(bool bEnabled);
 private:
 
 	// Enable/disable driving Orbit-imported fixture models from fixture motion (bDriveOrbitModels

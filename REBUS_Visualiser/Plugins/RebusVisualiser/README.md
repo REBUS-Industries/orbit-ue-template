@@ -594,6 +594,161 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **InternalBeam A/B mode -- SpotLight provides the volumetric beam, back-offset places the cone exit at the lens (v1.0.87).**
+> User: *"I want temporary turn off the epicbeam and just use the spotlight we use for the floor
+> to create the beam. this will have volumetrics and volumetric shadows. We want the beam to
+> exit the fixture at the right size so can we add an offset position for the spotlight that
+> pushes it back inside the fixture head. The offset is calculated by taking the max zoom range
+> angle and the diameter of the lens to work out how far back it needs to be to exit the lens
+> at the right size. Its own fixture head object can not cause shadowing on this spotlight
+> otherwise the light couldnt output."*
+>
+> **What it does.** A new runtime, operator-toggleable A/B mode on `ARebusFixtureActor` --
+> `bInternalBeam` -- hides the Epic DMX-Fixtures beam canvas + the procedural cone-mesh fallback
+> and promotes the same `USpotLightComponent` that already lights the floor / projects gobos to
+> ALSO be the visible volumetric shaft. Default OFF; the Epic beam remains the visible shaft on
+> first load. Flip ON via `Rebus.InternalBeam 1` (console) or `SetSceneProperty bInternalBeam
+> true` (data channel). The mode is intentionally TEMPORARY -- the Epic beam component is
+> preserved on disable (visibility flipped off, NOT destroyed) and snaps back intact on
+> `Rebus.InternalBeam 0`, so the Epic beam path can be re-evaluated without a rebuild.
+>
+> **Back-offset derivation.** With the SpotLight pushed back into the head by a fixed offset, a
+> cone of outer half-angle `theta` at distance `D` from the source has radius `D * tan(theta)`
+> on the lens plane. We want that radius to equal the lens radius at the MAX zoom half-angle
+> (= the widest beam the fixture can produce); solve for `D`:
+>
+> ```
+>   lens_radius / tan(maxZoomHalfAngle) = back-offset (cm)
+>   e.g. lensRadius = 7 cm, maxZoomFull = 45 deg -> halfAngle = 22.5 deg ->
+>        offset = 7 / tan(22.5 deg) = 7 / 0.4142 ~= 16.9 cm
+> ```
+>
+> Lens radius comes from the SAME resolution chain the existing lens-flare disc + SpotLight
+> SourceRadius already use (`Profile.Photometrics.LensDiameter` -> `Profile.Source.RadiusMeters` ->
+> `Profile.Source.DiameterMeters` -> a clamped fraction of the fixture dimensions -> a 3 cm
+> floor). Max zoom comes from `Profile.Zoom.MaxDeg` when the parsed GDTF / MVR profile carries
+> a zoom range, otherwise the UPROPERTY `InternalBeamMaxZoomFullDeg` fallback (default **45
+> deg**, a common stage moving-head MAX zoom).
+>
+> **Why MAX zoom and not the live zoom.** The offset is FIXED at construction time so the cone
+> at the lens plane is EXACTLY the lens diameter at MaxZoom and strictly INSIDE the lens diameter
+> at every narrower zoom. If we keyed the offset off the current zoom, a wide-then-narrow zoom
+> would project a cone whose mouth started inside the lens but whose body widened past the lens
+> as it travelled outward (because at narrower outer cone half-angle the back-offset would have
+> to be LARGER to keep the lens-radius exit; instead we leave the back-offset at the largest
+> value and tolerate the cone being narrower-than-lens at narrower zooms). The visual: at MAX
+> zoom the cone meets the lens; at any narrower zoom there's a small unlit annulus inside the
+> lens disc, which is correct for a moving-head fixture.
+>
+> **Volumetric state pushed onto the SpotLight.** When InternalBeam goes ON:
+> - `VolumetricScatteringIntensity = Rebus.InternalBeamScatter` (default `1.0`; live-tunable
+>   via the CVar).
+> - `bCastVolumetricShadow = true` so the spotlight's shaft carves through the
+>   exponential-height-fog froxels and gets light-blocking shadows from any non-fixture
+>   geometry (trusses, set pieces) in the beam.
+> - `CastShadows = true` (volumetric shadow needs the per-light shadow data; this is a
+>   requirement of UE's VSM volumetric path).
+>
+> The mode does NOT touch `bVolumetricFog` on the scene `ExponentialHeightFog` -- the operator
+> still owns that scene property (`SetSceneProperty bVolumetricFog`). If `bVolumetricFog=0`
+> when `bInternalBeam=1`, the shaft is invisible and the subsystem logs a Verbose hint
+> ("InternalBeam=1 but VolumetricFog=0 -- enable VolumetricFog to see the shaft") so the
+> operator can self-diagnose without us re-asserting a fog flag against the operator's intent.
+>
+> **Head-body self-shadow opt-out.** With the SpotLight now sitting INSIDE the fixture head, the
+> head's own body geometry would otherwise cast a shadow into the spot's cone and extinguish
+> nearly all the light it tries to emit. Two ways to fix this in UE 5.7:
+>
+> 1. **Per-primitive `CastShadow=false`** on the head/yoke/base body meshes. Pros: surgical --
+>    only this fixture's body opts out, world lights (sun / sky / key) still light the head
+>    from outside, every other fixture / truss / set piece is untouched. Cons: the head no
+>    longer casts a self-shadow back onto its own surface (a near-invisible loss because the
+>    head is a small airborne object and most of its self-shadowing is invisible behind the
+>    other body parts).
+> 2. **Lighting channels** (the UE per-light primitive inclusion bitmask). Pros: the head can
+>    still shadow OTHER lights' rays. Cons: requires every world light AND every other light
+>    in the rig to share the channel, otherwise the head goes black to the sun / sky / fill --
+>    a much larger blast radius for the same fix.
+>
+> v1.0.87 picks **(1)** because the blast radius is intentionally small: the SpotLight is the
+> ONLY light that needs the head transparent to its rays, and per-primitive opt-out is the
+> exact "make this fixture's body invisible to this fixture's spotlight" tool. The opt-out
+> walks this actor's `UPrimitiveComponent`s and force-sets `CastShadow` + `bCastDynamicShadow`
+> + `bCastHiddenShadow` + `bCastShadowAsTwoSided` to `false`, EXCLUDING the SpotLight (not a
+> primitive anyway), the Epic beam canvas, the procedural cone, the lens-flare disc, and any
+> debug primitive. Restore on OFF replays each cached flag set byte-exact.
+>
+> **Re-applied on zoom.** `ApplyZoom` calls `ApplyInternalBeamPose` while the mode is ON, even
+> though the current implementation derives the back-offset from MAX zoom (a constant for the
+> actor's lifetime). The redundant hook future-proofs a per-fixture descriptor that retunes
+> MaxZoom between zoom messages.
+>
+> **C++ surface (`ARebusFixtureActor`).**
+>
+> * `void SetInternalBeamModeEnabled(bool bEnabled)` -- toggle the mode on a single fixture.
+> * `bool IsInternalBeamModeEnabled() const` -- live read; used by the
+>   `Rebus.InternalBeamScatter` CVar live-refresh sink to identify which fixtures need a
+>   volumetric-state re-push when the scatter scalar is retuned.
+> * `void ApplyInternalBeamPose()` -- private; hides Epic / cone, pushes the SpotLight back,
+>   forces volumetrics on, opts the body meshes out of shadow casting. Snapshots the
+>   construction-time SpotLight state into private cache fields on FIRST call so OFF restores
+>   byte-exact.
+> * `void RestoreInternalBeamPose()` -- private; replays the cached pose + Epic-beam visibility
+>   + per-primitive shadow flags.
+> * `float ComputeInternalBeamBackOffsetCm() const` -- private; the `lensRadius / tan(maxHalf)`
+>   solve, clamped to non-negative.
+> * `void SetBodyMeshesCastShadow(bool bRestoreOriginal)` -- private; the per-primitive
+>   walk + cache.
+>
+> **Subsystem (`URebusSceneSettingsSubsystem`).**
+>
+> * New `bInternalBeam` scene property, default `false` -- shipped on every `SceneState`
+>   read-back so the portal sees the current mode without polling.
+> * `SetInternalBeamEnabled(bool)` walks `TActorIterator<ARebusFixtureActor>` and calls
+>   `SetInternalBeamModeEnabled` per fixture (mirrors the existing `SetMeshBeamsEnabled`
+>   pattern from v1.0.31 / v1.0.47).
+> * `ApplySceneProperty` routes the new `bInternalBeam` name. `ReapplyAll` re-asserts the
+>   value after every fixture (re)spawn so a freshly-spawned fixture inherits the live mode
+>   without needing a manual recycle (mirrors how `bMeshBeams` / `bDriveOrbitModels` already
+>   work).
+>
+> **Console.** `Rebus.InternalBeam [0|1]`. Routes through `ApplySceneProperty(bInternalBeam,
+> ...)` so the SceneState reflects the new value (instead of pushing the per-fixture path
+> directly, which would render correctly but leave `SceneState` and the respawn re-assertion
+> path out of sync). `Rebus.InternalBeamScatter <float>` (live CVar) re-tunes the scatter on
+> every fixture currently in InternalBeam mode.
+>
+> **Operator checklist.**
+>
+> ```text
+> # 1. Enable. Verify the shaft is visible (requires the scene's volumetric fog to be enabled).
+> Rebus.InternalBeam 1
+> #    Expected log:
+> #    bInternalBeam=1 applied to N fixture(s) (Epic beam hidden, SpotLight promoted ...).
+> #    Per fixture: Fixture <id> InternalBeam mode ENABLED (backOffset=<cm> maxZoomFullDeg=<deg> scatter=1.00 bodyPrimsOptedOut=<n>).
+>
+> # 2. If the shaft is INVISIBLE, check VolumetricFog.
+> #    The fog must be on for the shaft to scatter:
+> SetSceneProperty bVolumetricFog true   # via the portal data channel, or
+> r.VolumetricFog 1                       # via console (Editor / Game world)
+>
+> # 3. Verify shadows carve through the fog.
+> #    Put a truss in the beam path -- a clean gap should appear in the shaft where the truss
+> #    occludes the SpotLight. If the truss DOESN'T occlude, check the truss isn't an
+> #    OrbitConnector-imported glTF without distance fields (those fall back to VSM, which
+> #    the InternalBeam mode does enable).
+>
+> # 4. A/B against the Epic beam. The Epic beam component is preserved -- toggle OFF returns
+> #    to the prior visible shaft.
+> Rebus.InternalBeam 0
+> #    Expected log:
+> #    bInternalBeam=0 applied to N fixture(s) (Epic beam restored, SpotLight pose + body shadow flags reverted byte-exact).
+>
+> # 5. Tune the scatter live (default 1.0).
+> Rebus.InternalBeamScatter 1.5    # punchier shaft in light fog
+> Rebus.InternalBeamScatter 0.4    # subtle, for thicker fog
+> ```
+
 > **Floor textures tile at 1 m physical scale (v1.0.86).**
 > User: *"can we make sure that the floor textures scale correctly on the infinite plane. They
 > are currently being stretched but they need to be scaled to a 1m x 1m size and then spread
