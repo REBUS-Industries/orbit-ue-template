@@ -593,6 +593,63 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Rotating-gobo ghosting fix: TSR flicker rejection + full-res light functions (v1.0.73).**
+> User reported *"When the gobo is rotating fast we are getting ghosting. Is it a historyweight?"*.
+> Yes -- it's exactly that, and TSR's purpose-built mitigation for it has shipped since 5.3.
+>
+> **Why it ghosts.** TSR (UE's default upscaler since 5.2) is a temporal accumulator that relies
+> on motion vectors to know "this pixel moved by N pixels last frame, so go fetch the value
+> from there in history". Animated light functions (our rotating gobo, projected via a
+> SpotLight cookie onto opaque floor / set geometry) violate the assumption: the LIGHTING
+> moves but the SURFACE does not, so the motion vector for the lit floor pixel is zero. TSR
+> sees "same pixel, different colour every frame", reads it as flickering shading, and the
+> history rejection trails the new value as the pattern rotates -- visible as a smear behind
+> the rotating cookie. (The gobo render target itself is fine: `OnGoboRTUpdate` redraws it
+> rotated, transparent-cleared, every Tick; the smear is downstream in TSR's accumulator,
+> not in the RT.)
+>
+> **The fix.** Three CVars, pushed automatically on `FCoreDelegates::OnPostEngineInit` (so
+> the renderer module is guaranteed loaded and the CVars are registered):
+>
+> ```
+> r.TSR.ShadingRejection.Flickering 1                    // enable flicker-aware shading rejection
+> r.TSR.ShadingRejection.Flickering.AdjustToFrameRate 1  // scale threshold to fps (30fps shadows stay)
+> r.LightFunctionQuality 2                               // full-res light functions (smoother per-frame)
+> ```
+>
+> `r.TSR.ShadingRejection.Flickering` is TSR's purpose-built rejection path for "lighting
+> changes on a static surface" -- introduced specifically for club / disco / stage lighting
+> in 5.3 and tightened through 5.5. With it on, TSR detects the per-pixel colour oscillation
+> from a moving gobo, rejects the stale history sample for those pixels, and the trail
+> disappears (at a small per-pixel cost: the new sample stands more on its own jittered
+> sub-pixel reconstruction instead of leaning on history).
+>
+> **Snapshot + restore.** The push uses `ECVF_SetByGameOverride` priority, and snapshots the
+> prior `int` value of each CVar before writing. The `OFF` path restores each CVar to its
+> snapshotted value byte-exact (per-CVar `bValid` guard skips ones that weren't registered
+> at push time, so a hot-loaded renderer module is benign).
+>
+> **Live toggle: `Rebus.GoboAntiGhost [0|1]`.** Default ON since v1.0.73. Use it for A/B
+> comparison or if a specific scene wants raw TSR back. Each toggle logs which CVar moved:
+>
+> ```
+> GoboAntiGhost ON [PostEngineInit]: r.TSR.ShadingRejection.Flickering was=0 now=1
+> GoboAntiGhost ON [PostEngineInit]: r.TSR.ShadingRejection.Flickering.AdjustToFrameRate was=0 now=1
+> GoboAntiGhost ON [PostEngineInit]: r.LightFunctionQuality was=1 now=2
+> Rebus.GoboAntiGhost 1 -> live state ON.
+> GoboAntiGhost OFF [ConsoleCommand]: r.TSR.ShadingRejection.Flickering was=1 restored=0
+> ...
+> Rebus.GoboAntiGhost 0 -> live state OFF.
+> ```
+>
+> **Out of scope.** We deliberately do NOT touch `r.AntiAliasingMethod` (the project might
+> have a deliberate non-TSR setting), `r.TSR.History.UpdateRate` (lowering it reduces ghost
+> at cost of generalised flicker on real moving content -- too situational to push globally),
+> or `r.MegaLights.*` (light-function paths there have a different temporal pipeline; the
+> flicker-rejection CVar above is the right knob for both classic and MegaLights paths in
+> 5.5+). If a scene still ghosts on a non-light-function path (e.g. translucent particle
+> trails) that's a separate issue and not covered by this toggle.
+
 > **Rebus.* prefix tolerance on the fixture-channel ConsoleCommand path (v1.0.72).** Portal
 > sent `{ "type":"ConsoleCommand", "command":"ShowOrbitFixtures 0" }` and the log line read
 > `Fixture-channel ConsoleCommand: 'ShowOrbitFixtures 0' (success=0)`. Our IConsoleCommand

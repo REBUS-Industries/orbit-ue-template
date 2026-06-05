@@ -28,6 +28,110 @@ namespace
 	IConsoleCommand* GShowOrbitFixturesCommand = nullptr;
 	IConsoleCommand* GShowOrbitCommand = nullptr;
 	IConsoleCommand* GOverrideFixtureMaterialsCommand = nullptr;
+	IConsoleCommand* GGoboAntiGhostCommand = nullptr;
+
+	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
+	// handler below uses it before its in-file definition.
+	bool ParseBoolArg(const TArray<FString>& Args, bool bDefault);
+
+	// v1.0.73: rotating-gobo ghosting mitigation.
+	//
+	// Symptom (user): "When the gobo is rotating fast we are getting ghosting. Is it a
+	// historyweight?". Yes, exactly that. TSR (UE's default upscaler since 5.2) is a temporal
+	// accumulator that relies on motion vectors to know "this pixel moved by N pixels last
+	// frame, so go fetch the value from there in history". Animated light functions (our
+	// rotating gobo, projected onto opaque floor/set geometry) violate the assumption: the
+	// LIGHTING moves but the SURFACE does not, so the motion vector for the lit floor pixel
+	// is zero. TSR sees "same pixel, different colour every frame" -> reads as flickering
+	// shading -> the history rejection trails the new value as the pattern rotates. Result:
+	// a smear/trail behind the rotating cookie.
+	//
+	// UE5 added a TSR rejection mode specifically for this -- introduced for club / disco /
+	// stage lighting in 5.3 and refined through 5.5. The CVars:
+	//   r.TSR.ShadingRejection.Flickering 1        // enable the flicker-aware rejection path
+	//   r.TSR.ShadingRejection.Flickering.AdjustToFrameRate 1
+	//                                              // scale the rejection threshold with fps so
+	//                                              // a 30fps scene doesn't blur a real moving
+	//                                              // shadow as "flicker"
+	//   r.LightFunctionQuality 2                   // full-res light function (smoother
+	//                                              // per-frame projection -> less for TSR to
+	//                                              // reject in the first place)
+	//
+	// We push these on PostEngineInit (renderer module is loaded by then -- pushing earlier
+	// just logs "CVar not registered") with priority ECVF_SetByGameOverride so per-scene
+	// scalability overrides still win for diagnostics. We snapshot prior values into
+	// GGoboAntiGhostPrior so the toggle can restore byte-exact. Default ON since v1.0.73.
+	struct FCVarSnapshot { FString Name; int32 PriorInt = 0; bool bValid = false; };
+	TArray<FCVarSnapshot> GGoboAntiGhostPrior;
+	bool GGoboAntiGhostEnabled = false; // tracks the LIVE state, not the requested state
+
+	struct FAntiGhostCVarDef { const TCHAR* Name; int32 OnValue; };
+	const FAntiGhostCVarDef GAntiGhostCVars[] = {
+		{ TEXT("r.TSR.ShadingRejection.Flickering"),                  1 },
+		{ TEXT("r.TSR.ShadingRejection.Flickering.AdjustToFrameRate"),1 },
+		{ TEXT("r.LightFunctionQuality"),                             2 },
+	};
+
+	void ApplyGoboAntiGhost(bool bEnable, const TCHAR* Phase)
+	{
+		if (bEnable == GGoboAntiGhostEnabled) return; // no-op if already in target state
+
+		if (bEnable)
+		{
+			GGoboAntiGhostPrior.Reset();
+			for (const FAntiGhostCVarDef& Def : GAntiGhostCVars)
+			{
+				IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(Def.Name);
+				FCVarSnapshot Snap;
+				Snap.Name = Def.Name;
+				if (CVar)
+				{
+					Snap.PriorInt = CVar->GetInt();
+					Snap.bValid = true;
+					CVar->Set(Def.OnValue, ECVF_SetByGameOverride);
+					UE_LOG(LogRebusVisualiser, Log,
+						TEXT("GoboAntiGhost ON [%s]: %s was=%d now=%d"),
+						Phase, Def.Name, Snap.PriorInt, CVar->GetInt());
+				}
+				else
+				{
+					UE_LOG(LogRebusVisualiser, Log,
+						TEXT("GoboAntiGhost ON [%s]: %s NOT REGISTERED (renderer module not loaded yet, or CVar renamed in this engine version -- benign, the other CVars still apply)."),
+						Phase, Def.Name);
+				}
+				GGoboAntiGhostPrior.Add(Snap);
+			}
+		}
+		else
+		{
+			for (const FCVarSnapshot& Snap : GGoboAntiGhostPrior)
+			{
+				if (!Snap.bValid) continue;
+				IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(*Snap.Name);
+				if (!CVar) continue;
+				const int32 BeforeRestore = CVar->GetInt();
+				CVar->Set(Snap.PriorInt, ECVF_SetByGameOverride);
+				UE_LOG(LogRebusVisualiser, Log,
+					TEXT("GoboAntiGhost OFF [%s]: %s was=%d restored=%d"),
+					Phase, *Snap.Name, BeforeRestore, CVar->GetInt());
+			}
+			GGoboAntiGhostPrior.Reset();
+		}
+		GGoboAntiGhostEnabled = bEnable;
+	}
+
+	// v1.0.73: `Rebus.GoboAntiGhost [0|1]` -- toggle the rotating-gobo ghosting mitigation
+	// (TSR flicker-aware shading rejection + full-res light functions). Default ON since
+	// v1.0.73 (auto-applied on PostEngineInit). Disable for A/B comparison or if a specific
+	// scene needs raw TSR back.
+	void HandleGoboAntiGhostCommand(const TArray<FString>& Args)
+	{
+		const bool bEnable = ParseBoolArg(Args, true);
+		ApplyGoboAntiGhost(bEnable, TEXT("ConsoleCommand"));
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.GoboAntiGhost %d -> live state %s."),
+			bEnable ? 1 : 0, GGoboAntiGhostEnabled ? TEXT("ON") : TEXT("OFF"));
+	}
 
 	// v1.0.55: Pixel Streaming console-command gate. v1.0.54 set only the PS1 CVar
 	// ("PixelStreaming.AllowPixelStreamingCommands") and had no effect because this project enables
@@ -328,6 +432,11 @@ void FRebusVisualiserModule::StartupModule()
 	{
 		TryForcePixelStreamingGate(TEXT("PostEngineInit"));
 		LogPixelStreamingGateStatus();
+
+		// v1.0.73: rotating-gobo ghosting mitigation, auto-applied at PostEngineInit so the
+		// renderer module's TSR CVars are guaranteed registered. Default ON; disable per
+		// session with `Rebus.GoboAntiGhost 0` for A/B against the prior look.
+		ApplyGoboAntiGhost(true, TEXT("PostEngineInit"));
 	});
 
 	GDriveOrbitModelsCommand = IConsoleManager::Get().RegisterConsoleCommand(
@@ -389,6 +498,19 @@ void FRebusVisualiserModule::StartupModule()
 			 "Usage: Rebus.OverrideFixtureMaterials [0|1]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleOverrideFixtureMaterialsCommand),
 		ECVF_Default);
+
+	// v1.0.73 rotating-gobo ghosting toggle (TSR flicker rejection + full-res light functions).
+	GGoboAntiGhostCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.GoboAntiGhost"),
+		TEXT("Toggle the v1.0.73 rotating-gobo ghosting mitigation. ON (default since v1.0.73, "
+			 "auto-applied at PostEngineInit) pushes r.TSR.ShadingRejection.Flickering=1, "
+			 "r.TSR.ShadingRejection.Flickering.AdjustToFrameRate=1, r.LightFunctionQuality=2 "
+			 "-- TSR's purpose-built rejection mode for animated light functions on opaque "
+			 "surfaces (eliminates the trail behind a fast-rotating cookie projection). "
+			 "OFF restores each CVar to its pre-push value byte-exact (snapshot taken on first "
+			 "ON). Usage: Rebus.GoboAntiGhost [0|1]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleGoboAntiGhostCommand),
+		ECVF_Default);
 }
 
 void FRebusVisualiserModule::ShutdownModule()
@@ -423,6 +545,14 @@ void FRebusVisualiserModule::ShutdownModule()
 		IConsoleManager::Get().UnregisterConsoleObject(GOverrideFixtureMaterialsCommand);
 		GOverrideFixtureMaterialsCommand = nullptr;
 	}
+	if (GGoboAntiGhostCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GGoboAntiGhostCommand);
+		GGoboAntiGhostCommand = nullptr;
+	}
+	// v1.0.73: restore the anti-ghost CVars to their snapshotted values so a hot-reload of
+	// the module doesn't leak a permanent override into the engine session.
+	ApplyGoboAntiGhost(false, TEXT("ShutdownModule"));
 
 	UE_LOG(LogRebusVisualiser, Log, TEXT("RebusVisualiser module shut down."));
 }
