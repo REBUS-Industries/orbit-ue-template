@@ -186,6 +186,18 @@ struct FRebusMesh
 	FString ModelName;
 	TArray<double> Vertices; // flat, 3 per vertex, metres, engine Y-up
 	TArray<int32> Faces;     // Speckle face encoding (0 = tri, 1 = quad, then indices)
+
+	// v1.0.88 -- mesh-blob v3 additive identifier fields. The portal now emits the GDTF <Beam>
+	// geometry (= the physical lens disc) as its own mesh in /meshes; v3 stamps each emitted
+	// mesh with the raw GDTF XML type plus a convenience flag so the plugin can find the lens
+	// disc by an AUTHORITATIVE flag instead of string-matching the mesh Name / GeometryName
+	// against "Beam" (which silently broke for any GDTF that names the beam node differently).
+	// Both fields are OPTIONAL: v2-blob meshes (and v3-blob meshes that came through the
+	// data-channel push without a profile.fixtureParts hint) simply leave them as
+	// empty / false, which the consumer (RebusFixtureActor) treats as "unknown" -- the existing
+	// synthetic-disc fallback path takes over so older blobs / older portals never regress.
+	FString GeometryType;   // raw GDTF XML type ("Beam", "Geometry", "Axis", ...); empty when absent (blob v2 / unknown)
+	bool    bIsBeam = false; // true when the mesh is the GDTF <Beam> lens disc; false when absent / unknown
 };
 
 struct FRebusMeshBundle

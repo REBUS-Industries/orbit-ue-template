@@ -429,6 +429,19 @@ namespace RebusJson
 		TryGetString(MO, TEXT("geometryName"), Mesh.GeometryName);
 		TryGetString(MO, TEXT("modelName"), Mesh.ModelName);
 
+		// v1.0.88 -- mesh-blob v3 additive identifier fields. Absence is the v2-blob path so we
+		// deliberately do NOT log on missing fields (would be noisy across every legacy import).
+		// When `isBeam` is true we drop a Verbose breadcrumb so a startup grep proves the flag is
+		// arriving end-to-end without polluting Log on every fixture.
+		TryGetString(MO, TEXT("geometryType"), Mesh.GeometryType);
+		TryGetBool(MO, TEXT("isBeam"), Mesh.bIsBeam);
+		if (Mesh.bIsBeam)
+		{
+			UE_LOG(LogRebusVisualiser, Verbose,
+				TEXT("Mesh '%s' tagged isBeam=1 (geometryType='%s')."),
+				*Mesh.Name, *Mesh.GeometryType);
+		}
+
 		const TArray<TSharedPtr<FJsonValue>>* Verts = nullptr;
 		if (MO->TryGetArrayField(TEXT("vertices"), Verts) && Verts)
 		{

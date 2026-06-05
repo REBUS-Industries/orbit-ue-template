@@ -594,6 +594,158 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Real `<Beam>` lens disc -- isBeam mesh flag + mirror/glass material (v1.0.88).**
+> User: *"We are now sending a beam object (Lens Disc) from our portal. This needs to be included
+> in the fixture and move with the head. It needs the lens mirror/glass material applied to it."*
+>
+> Portal-team plugin-team note (verbatim): *"In `ParseMeshes` / `FRebusMesh`, parse the two new
+> optional fields: `GeometryType` (`FString`) and `bIsBeam` (`bool`; default false / 'unknown'
+> when absent). Additive; older blobs simply omit them, no breakage. When building geometry,
+> find the lens disc by `bIsBeam == true` instead of matching the mesh `Name`/`GeometryName`
+> against `"Beam"`. Attach the emissive lens material / light-emitting origin to that mesh and
+> place the `photometrics.lensDiameter` emissive lens-flare on the `isBeam` mesh when one
+> exists; keep the synthetic `lensDiameter` disc as the fallback for GDTFs whose `<Beam>` has
+> no `<Model>` (no lens mesh) and for blobs that lack the flag. Do NOT change motion handling.
+> The `isBeam` mesh is bucketed to the head by the existing `geometryName` rule (the `<Beam>`
+> node lives under the tilt axis), so it already pans/tilts. `isBeam` is an identification
+> hint, not a motion flag -- do NOT special-case it out of `BuildBucketMap` /
+> `affectedGeometryNames` bucketing or the lens will detach from the head. A simple moving
+> head has exactly one `isBeam` mesh; an LED-matrix fixture (e.g. MAC Aura) emits one per
+> pixel -- handle the multi-beam case (each is an emitter) rather than assuming a single
+> lens."*
+>
+> **What it does.** The portal's `/meshes` blob now bumps `version` 2 -> 3 and stamps each
+> emitted mesh with two new OPTIONAL identifier fields:
+>
+> | Field          | Type     | Meaning                                                                 |
+> | -------------- | -------- | ----------------------------------------------------------------------- |
+> | `geometryType` | string   | Raw GDTF XML type (`"Beam"`, `"Geometry"`, `"Axis"`, ...) -- diagnostic |
+> | `isBeam`       | boolean  | True when the mesh IS the GDTF `<Beam>` lens disc -- authoritative      |
+>
+> Both fields are ADDITIVE: a v2 blob (or a v3 blob that came through the data-channel push
+> without a `profile.fixtureParts` hint) simply omits them and the plugin treats the mesh as
+> "not a known lens". That means the synthetic single-disc fallback (the pre-v1.0.88
+> `BuildLensDisc` path) ALWAYS continues to work for older portals + for GDTFs whose `<Beam>`
+> node has no `<Model>` child -- no breakage.
+>
+> **Plugin behaviour when `isBeam=true` meshes are present.**
+>
+> 1. For every isBeam mesh:
+>    * The procedural mesh component is tagged `RebusIsBeamLens` (grep-friendly) and added to
+>      `IsBeamLensComponents`.
+>    * The v1.0.71 mirror/glass material is applied to EVERY material slot
+>      (`FixtureLensMaterialOverride` when the user authored `/Game/REBUS/Materials/M_RebusFixtureLens`,
+>      otherwise the runtime `FixtureLensMID` with `Metallic=1, Roughness=0.05`). When BOTH
+>      are null the actor logs a Warning once per fixture and leaves the procedural-mesh
+>      default in place.
+>    * One emissive lens-flare disc (`M_RebusLensFlare`) is spawned and parented to the isBeam
+>      mesh so the flare inherits the mesh's motion automatically -- no separate
+>      `RefreshMotion` call required. Sizing:
+>      * Single isBeam mesh: `photometrics.lensDiameter` when set, else mesh local-bounds
+>        radius x 2.
+>      * Multi isBeam meshes (LED matrix / MAC Aura): ALWAYS mesh local-bounds radius x 2
+>        (the photometric diameter describes the whole-fixture lens hole and would
+>        over-size per-pixel flares).
+> 2. The synthetic `LensDisc` is HIDDEN (`SetVisibility(false)`, NOT destroyed -- kept around
+>    for A/B at runtime).
+> 3. `RefreshLensDisc` now drives BOTH the synthetic disc MID AND every per-beam flare MID
+>    each call (one source of truth for `EmissiveColor` + `EmissiveStrength` =
+>    `Dimmer.Current * shutter-gate * RebusLensFlareMaxEmissive`).
+>
+> **Motion preservation (regression-tested in code review).** The isBeam mesh is bucketed by
+> `RebusMotion::ResolveAxisForMesh(Mesh.GeometryName, Mesh.ModelName)` in `BuildMeshes`,
+> EXACTLY as every other mesh is. The new isBeam block deliberately does NOT touch that call
+> -- `bIsBeam` is an identification hint for the lens-visual path, never a motion override.
+> The GDTF `<Beam>` node lives under the tilt axis, so the mesh continues to pan/tilt with
+> the head via the existing `MeshAxisBucket` mechanism. Per-beam flare discs are parented to
+> the isBeam mesh component, so they inherit motion through the scene component hierarchy
+> without any additional code path. Verified: no special-case branch in `BuildMeshes` /
+> `RefreshMotion` / `MeshAxisBucket` keys off `bIsBeam`.
+>
+> **Self-heal forward-compat diagnostic.** `BuildMeshes` now logs the mesh-blob version + mesh
+> count on every fixture:
+>
+> ```
+> LogRebusVisualiser: Fixture <id>: MeshBundle version 3, 7 mesh(es).
+> ```
+>
+> Grep `MeshBundle version` on startup to confirm v3 blobs are arriving end-to-end. A v2 line
+> means the portal hasn't been refreshed since v1.0.88 -- the synthetic-disc fallback is in
+> force for that fixture (everything still works, just no real `<Beam>` geometry rendered).
+>
+> **Operator A/B toggle.** `Rebus.ForceSyntheticLensFallback [0|1]` (default `0`).
+>
+> * `0` (default): when a fixture has isBeam meshes, the real geometry IS the lens disc
+>   (mirror/glass material + per-beam emissive flare); the synthetic disc is hidden.
+> * `1`: every isBeam mesh + per-beam flare is hidden (`SetVisibility(false)` --
+>   "invisible/passthrough" on the visible surface), the synthetic `LensDisc` is re-shown.
+>   Fixtures with no isBeam meshes are unaffected (the synthetic disc was already the visual).
+>
+> The toggle is fully live: changing the CVar walks `TActorIterator<ARebusFixtureActor>` and
+> per-fixture flips `SetUseSyntheticLensFallback`, which only re-applies visibility (no
+> rebuild). Per-fixture log:
+>
+> ```
+> Rebus.ForceSyntheticLensFallback -> 1, refreshed N fixture(s) (M with isBeam meshes; N-M on v2-blob/no-flag fallback regardless).
+> Fixture <id> lens-fallback toggle: FORCED synthetic disc (isBeam meshes hidden) (isBeamMeshes=1 perBeamFlares=1 syntheticDisc=visible).
+> ```
+>
+> **Mirror/glass material source.** Re-uses the v1.0.71 lens-material pipeline verbatim --
+> see the v1.0.71 changelog block below for the EnsureFixtureMIDs / FixtureLensMaterial
+> Override resolution. The isBeam path does NOT introduce a new material asset; it just
+> applies the existing one authoritatively (the pre-v1.0.88 path matched on the case-
+> insensitive substring "lens"/"glass"/"crystal"/"optic"/"front" in the mesh name, which
+> missed any GDTF whose `<Beam>` was named anything else).
+>
+> **Verification log lines.** Per fixture on Setup:
+>
+> ```
+> LogRebusVisualiser: Fixture <id>: MeshBundle version 3, 7 mesh(es).
+> LogRebusVisualiser: Fixture <id>: built 7 mesh proxies (1 tagged isBeam -- real <Beam> geometry will be the lens disc; synthetic disc hidden).
+> LogRebusVisualiser: Fixture <id> isBeam flare[0]: spawned diam=15.00cm (src=photometrics.lensDiameter (single-beam)) planeScale=0.1500 localRadius=7.50cm
+> LogRebusVisualiser: Fixture <id> isBeam flares: built 1/1 (synthetic LensDisc kept alive as fallback; toggle with Rebus.ForceSyntheticLensFallback).
+> ```
+>
+> And the Verbose breadcrumb (enable `LogRebusVisualiser` at `Verbose`) confirms parse-side
+> arrival:
+>
+> ```
+> LogRebusVisualiser: Verbose: Mesh '<name>' tagged isBeam=1 (geometryType='Beam').
+> ```
+>
+> **Operator checklist.**
+>
+> ```text
+> # 1. Confirm v3 blobs are arriving (look for one line per fixture).
+> grep "MeshBundle version" PIE.log
+> #    Expect: ... MeshBundle version 3, N mesh(es).
+> #    If you see "version 2" the portal hasn't been refreshed since v1.0.88 -- everything
+> #    still works, just no real <Beam> geometry rendered (synthetic disc fallback in force).
+>
+> # 2. Confirm isBeam meshes were detected (a moving head -> 1; MAC Aura -> N per pixel).
+> grep "tagged isBeam" PIE.log
+> #    Expect: Fixture <id>: built K mesh proxies (M tagged isBeam -- real <Beam> geometry ...).
+>
+> # 3. A/B against the synthetic disc.
+> Rebus.ForceSyntheticLensFallback 1   # hide real lens, show synthetic
+> Rebus.ForceSyntheticLensFallback 0   # back to real lens (default)
+>
+> # 4. If the mirror/glass doesn't render, check the material chain.
+> #    Author /Game/REBUS/Materials/M_RebusFixtureLens.uasset (any PBR material) OR rely on
+> #    the runtime MID off BasicShapeMaterial (Metallic=1, Roughness=0.05). If neither
+> #    resolves, the actor logs a Warning per isBeam mesh and the procedural-mesh default
+> #    stays in place -- check /Engine/BasicShapes/BasicShapeMaterial is packaged.
+> ```
+>
+> **C4458 build-blocking hotfix rolled in.** v1.0.88 also includes a one-line rename in
+> `ARebusFixtureActor::GetBoundOrbitPrimitives`: the local `TArray<USceneComponent*> Children`
+> is now `ChildComps`. The original name shadowed `AActor::Children` (`TArray<TObjectPtr<AActor>>`),
+> which the Game target tolerated but the **Editor** target compiles with C4458 ("declaration
+> hides class member") treated as an error -- so every Editor build from **v1.0.85 through
+> v1.0.87 inclusive** failed with `RebusFixtureActor.cpp(2446,28): error C4458`. v1.0.88 is
+> therefore the first **cleanly-buildable Editor tag** since v1.0.84. No behaviour change;
+> the local is purely a holder for `GetChildrenComponents` output.
+
 > **InternalBeam A/B mode -- SpotLight provides the volumetric beam, back-offset places the cone exit at the lens (v1.0.87).**
 > User: *"I want temporary turn off the epicbeam and just use the spotlight we use for the floor
 > to create the beam. this will have volumetrics and volumetric shadows. We want the beam to

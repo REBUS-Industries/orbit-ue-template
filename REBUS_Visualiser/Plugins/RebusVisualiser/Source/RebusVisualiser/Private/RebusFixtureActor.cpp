@@ -243,6 +243,41 @@ FAutoConsoleVariableRef CVarRebusInternalBeamScatter(
 	}),
 	ECVF_Default);
 
+// v1.0.88 A/B toggle: force the synthetic single-disc lens fallback even when the portal sent
+// mesh-blob v3 with isBeam meshes. Default 0 (real geometry wins when available). On change,
+// every spawned fixture re-evaluates its lens-visuals visibility: see
+// ARebusFixtureActor::SetUseSyntheticLensFallback for the per-fixture state transitions.
+int32 GRebusForceSyntheticLensFallback = 0;
+FAutoConsoleVariableRef CVarRebusForceSyntheticLensFallback(
+	TEXT("Rebus.ForceSyntheticLensFallback"),
+	GRebusForceSyntheticLensFallback,
+	TEXT("0 (default) = when /meshes carries isBeam meshes (v3 blob), the real geometry IS the lens disc (mirror/glass material) and the synthetic single-disc is HIDDEN. 1 = hide every isBeam mesh + per-beam flare and re-show the synthetic LensDisc (A/B testing the v1.0.88 real-geometry path against the pre-v1.0.88 synthetic fallback). Live -- changing this re-pushes visibility on every spawned fixture."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		if (!GEngine) return;
+		const bool bForce = (CVar->GetInt() != 0);
+		int32 Refreshed = 0;
+		int32 WithIsBeam = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					F->SetUseSyntheticLensFallback(bForce);
+					if (F->GetIsBeamMeshCount() > 0) ++WithIsBeam;
+					++Refreshed;
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.ForceSyntheticLensFallback -> %d, refreshed %d fixture(s) (%d with isBeam meshes; %d on v2-blob/no-flag fallback regardless)."),
+			CVar->GetInt(), Refreshed, WithIsBeam, Refreshed - WithIsBeam);
+	}),
+	ECVF_Default);
+
 void ARebusFixtureActor::ResetVolumetricShadowBudget()
 {
 	VolumetricShadowBeamCount = 0;
@@ -524,8 +559,20 @@ void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
 	// light-only fixtures whose meshes matched nothing.
 	ResolveHeadAxisFromMeshes();
 	BuildSpotLight();
-	BuildLensDisc();   // emissive lens-flare disc at the beam origin (reuses the beam transform)
-	BuildBeamCone();   // hybrid cone-mesh volumetric beam (sized to IES + lens, rides the head)
+	BuildLensDisc();          // emissive lens-flare disc at the beam origin (synthetic fallback)
+	BuildIsBeamLensFlares();  // v1.0.88: per-isBeam-mesh emissive flare disc (real <Beam> path)
+	BuildBeamCone();          // hybrid cone-mesh volumetric beam (sized to IES + lens, rides the head)
+	// v1.0.88: synchronise lens-visuals visibility. The synthetic LensDisc is hidden when at
+	// least one isBeam mesh was built (real geometry wins); the per-beam flares are hidden when
+	// the operator has forced the synthetic fallback via `Rebus.ForceSyntheticLensFallback 1`.
+	// Reads the GLOBAL CVar value so a freshly-spawned fixture inherits the live A/B setting.
+	{
+		if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.ForceSyntheticLensFallback")))
+		{
+			bUseSyntheticLensFallback = (CVar->GetInt() != 0);
+		}
+	}
+	RefreshIsBeamLensVisuals();
 	RefreshMotion();
 	RecomputeConeAngles();
 	RefreshIntensity();
@@ -781,6 +828,15 @@ ARebusFixtureActor::FFixtureMaterialApplyCount ARebusFixtureActor::SetFixtureMat
 
 void ARebusFixtureActor::BuildMeshes(const FRebusMeshBundle& Meshes)
 {
+	// v1.0.88 self-heal forward-compat diagnostic: one log line per fixture surfacing the
+	// mesh-blob version + count so a grep on startup proves whether v3 blobs (carrying the new
+	// isBeam / geometryType fields) are arriving end-to-end or whether the portal is still
+	// emitting v2. Older blobs simply omit the fields -- the synthetic-disc fallback path takes
+	// over and no isBeam meshes are detected below.
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s: MeshBundle version %d, %d mesh(es)."),
+		*FixtureId, Meshes.Version, Meshes.Meshes.Num());
+
 	for (const FRebusMesh& Mesh : Meshes.Meshes)
 	{
 		if (Mesh.Vertices.Num() < 9 || Mesh.Faces.Num() == 0)
@@ -866,6 +922,64 @@ void ARebusFixtureActor::BuildMeshes(const FRebusMeshBundle& Meshes)
 		// so opting out via the console command leaves the procedural-mesh default in place.
 		ApplyFixtureMaterialTo(PMC, Mesh.Name, Mesh.GeometryName, /*bIsOrbitComp*/ false);
 
+		// v1.0.88: AUTHORITATIVE lens-disc detection from the mesh-blob v3 isBeam flag. The
+		// portal stamps this field from the raw GDTF XML type (geometryType == "Beam"), so it
+		// is the only path that survives a fixture whose <Beam> node is named anything other
+		// than literally "Beam" -- the pre-v1.0.88 IsLensToken path was a best-effort keyword
+		// scan and missed many of those. For each isBeam mesh:
+		//   1. Cache the procedural-mesh default material BEFORE the lens override so the
+		//      synthetic-fallback toggle can revert to "no mirror" cleanly.
+		//   2. Tag the component so a grep ('RebusIsBeamLens' in component tags) confirms the
+		//      flag landed. Helps the next portal-team debug round.
+		//   3. Force the mirror/glass FixtureLensMaterialOverride (.uasset, when the user
+		//      authored one at /Game/REBUS/Materials/M_RebusFixtureLens) or the runtime
+		//      FixtureLensMID (Metallic=1, Roughness=0.05) onto EVERY material slot the
+		//      procedural mesh exposes (GetNumMaterials() may be >1 for fan-triangulated
+		//      multi-section beams). When BOTH are null (the v1.0.71 mat-parent missed too)
+		//      we log a one-shot Warning and leave the mesh's default material -- so a
+		//      missing-asset deployment does not crash, just looks like the pre-v1.0.71
+		//      procedural-mesh default.
+		//   4. Record the component in IsBeamLensComponents (cap on the WEAK arrays grows in
+		//      lockstep with IsBeamFlareDiscs once BuildIsBeamLensFlares runs after BuildLens
+		//      Disc -- both arrays stay index-aligned so the synthetic-fallback toggle can
+		//      flip them in pairs).
+		// IMPORTANT: this block deliberately leaves the existing axis bucketing UNTOUCHED. The
+		// isBeam mesh is bucketed by RebusMotion::ResolveAxisForMesh(GeometryName, ModelName)
+		// above -- the GDTF <Beam> node lives under the tilt axis, so the mesh already
+		// pans/tilts with the head. Special-casing it out of the bucket map (e.g. forcing
+		// HeadAxisIndex) would detach the lens from the head and the user-doc explicitly
+		// warned about this regression. The isBeam flag is an identification hint, never a
+		// motion override.
+		if (Mesh.bIsBeam)
+		{
+			// (1) Tag for grep + outside-of-actor lookups (e.g. truss-pass material exclusion).
+			PMC->ComponentTags.AddUnique(FName(TEXT("RebusIsBeamLens")));
+
+			// (2) Resolve the mirror/glass material. Re-uses the v1.0.71 lens-material
+			// pipeline: prefer the user override .uasset, fall back to the runtime MID.
+			EnsureFixtureMIDs();
+			UMaterialInterface* LensMat = FixtureLensMaterialOverride
+				? FixtureLensMaterialOverride.Get()
+				: Cast<UMaterialInterface>(FixtureLensMID);
+			if (LensMat)
+			{
+				const int32 NumSlots = FMath::Max(1, PMC->GetNumMaterials());
+				for (int32 Slot = 0; Slot < NumSlots; ++Slot)
+				{
+					PMC->SetMaterial(Slot, LensMat);
+				}
+			}
+			else
+			{
+				UE_LOG(LogRebusVisualiser, Warning,
+					TEXT("Fixture %s isBeam mesh[%d] geom='%s' name='%s': lens material is null (FixtureLensMaterialOverride + FixtureLensMID both unresolved) -- leaving procedural-mesh default. Check /Game/REBUS/Materials/M_RebusFixtureLens or /Engine/BasicShapes/BasicShapeMaterial."),
+					*FixtureId, ComponentIndex, *Mesh.GeometryName, *Mesh.Name);
+			}
+
+			// (3) Record for the per-beam flare build + the visibility toggle.
+			IsBeamLensComponents.Add(TWeakObjectPtr<UPrimitiveComponent>(PMC));
+		}
+
 		// Per-mesh diagnostics: which motion axis (if any) this proxy bucketed onto, so the
 		// portal team can verify a pushed mesh actually attached to its pan/tilt group.
 		FString AxisDesc;
@@ -893,7 +1007,12 @@ void ARebusFixtureActor::BuildMeshes(const FRebusMeshBundle& Meshes)
 			*Mesh.GeometryName, *Mesh.Name, *AxisDesc);
 	}
 
-	UE_LOG(LogRebusVisualiser, Log, TEXT("Fixture %s: built %d mesh proxies."), *FixtureId, MeshComponents.Num());
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s: built %d mesh proxies (%d tagged isBeam -- %s)."),
+		*FixtureId, MeshComponents.Num(), IsBeamLensComponents.Num(),
+		IsBeamLensComponents.Num() > 0
+			? TEXT("real <Beam> geometry will be the lens disc; synthetic disc hidden")
+			: TEXT("no isBeam meshes; synthetic lens disc fallback in force"));
 }
 
 void ARebusFixtureActor::BuildSpotLight()
@@ -1140,9 +1259,168 @@ void ARebusFixtureActor::BuildLensDisc()
 
 void ARebusFixtureActor::RefreshLensDisc()
 {
-	if (!LensDiscMID) return;
+	// v1.0.88: both the synthetic disc (LensDiscMID) AND the per-isBeam flare MIDs need to be
+	// refreshed each call -- a fixture whose synthetic disc failed to build (LensDiscMID null)
+	// can STILL have isBeam meshes whose per-beam flares need driving, and vice-versa. So
+	// guard each branch separately rather than the v1.0.87 single early return.
+	if (LensDiscMID)
+	{
+		float Gate = 1.f;
+		switch (ShutterMode)
+		{
+		case ERebusShutterMode::Closed: Gate = 0.f; break;
+		case ERebusShutterMode::Strobe: Gate = (ShutterPhase < 0.5f) ? 1.f : 0.f; break;
+		default: break;
+		}
 
-	// Same shutter-gate the SpotLight uses, so the flare strobes/blacks-out in lockstep.
+		const FLinearColor Linear(
+			FMath::Clamp(ColorR.Current, 0.f, 1.f),
+			FMath::Clamp(ColorG.Current, 0.f, 1.f),
+			FMath::Clamp(ColorB.Current, 0.f, 1.f), 1.f);
+		LensDiscMID->SetVectorParameterValue(TEXT("EmissiveColor"), Linear);
+		LensDiscMID->SetScalarParameterValue(TEXT("EmissiveStrength"),
+			RebusLensFlareMaxEmissive * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate);
+	}
+
+	// Keep the per-isBeam-mesh flare MIDs in lockstep with the synthetic disc above (same
+	// EmissiveColor / EmissiveStrength formula, driven by the same live dimmer + colour +
+	// shutter-gate state). Cheap when IsBeamFlareMIDs is empty (legacy v2-blob fixtures).
+	RefreshIsBeamFlareEmissive();
+}
+
+// ---- v1.0.88 real <Beam> (isBeam) per-mesh emissive flares + synthetic-fallback toggle -----
+//
+// BuildIsBeamLensFlares spawns one M_RebusLensFlare disc PER isBeam mesh, parented to that
+// mesh's UProceduralMeshComponent so the flare inherits the mesh's motion automatically
+// (no parallel RefreshMotion call required -- the procedural mesh component is already
+// driven by Cumulative[MeshAxisBucket[i]] in RefreshMotion). Each flare is:
+//   * a static-mesh-component plane (re-using the cook-safe LensPlaneMesh CDO ref from the
+//     synthetic-disc path) sized by photometrics.lensDiameter when present, OR by the
+//     isBeam mesh's local-space bounding-sphere radius x 2 (so a MAC Aura's per-pixel
+//     emitters get appropriately-sized per-pixel flares even when the photometric diameter
+//     describes only the whole-fixture lens hole),
+//   * oriented with its +Z normal along BeamForwardLocal (the same emission forward the
+//     synthetic disc + the SpotLight use), so the visible glow faces straight out the lens,
+//   * positioned at the mesh's local-bounds CENTRE (so a lens disc whose vertices are
+//     offset from the mesh-local origin still ends up with the flare on the disc, not
+//     hovering off to one side), pushed slightly proud along the beam forward to keep
+//     opaque head geometry from clipping it (mirrors the synthetic disc's ForwardOffset).
+//
+// No-op when IsBeamLensComponents is empty (v2 blobs OR v3 blobs whose GDTF <Beam> had no
+// <Model> -- the synthetic disc remains the visible flare). LensPlaneMesh / LensMaterial
+// missing also short-circuits to keep cooked-build asset-missing failures non-fatal (the
+// synthetic-disc path already logs that failure mode).
+void ARebusFixtureActor::BuildIsBeamLensFlares()
+{
+	if (IsBeamLensComponents.Num() == 0) return;
+
+	UStaticMesh* Plane = LensPlaneMesh ? LensPlaneMesh.Get()
+		: LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane"));
+	UMaterialInterface* LensMat = LensMaterial ? LensMaterial.Get()
+		: LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/REBUS/Materials/M_RebusLensFlare.M_RebusLensFlare"));
+	if (!Plane || !LensMat)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s isBeam flares: SKIP (asset load failed) meshOk=%d matOk=%d -- per-beam emissive flares unavailable for %d isBeam mesh(es), real geometry will still render mirror/glass."),
+			*FixtureId, Plane ? 1 : 0, LensMat ? 1 : 0, IsBeamLensComponents.Num());
+		return;
+	}
+
+	// Photometric lens diameter (metres) when the profile carries one; sentinel < 0 means absent.
+	// Sizing precedence:
+	//   * Single isBeam mesh (typical moving head): prefer photometrics.lensDiameter so the
+	//     flare matches the SpotLight SourceRadius / synthetic-disc diameter exactly.
+	//   * Multi isBeam meshes (LED-matrix, e.g. MAC Aura): IGNORE the photometric lens diameter
+	//     because it describes the WHOLE-fixture lens hole, not the per-pixel emitter -- using
+	//     it would over-size every per-pixel flare. Use the per-mesh local-bounds radius so
+	//     each pixel gets its own pixel-sized flare. The user-doc explicitly calls this out.
+	//   * Either case with photometric diameter absent: fall back to per-mesh local bounds so
+	//     something visible always renders.
+	const double PhotoDiamMeters = Profile.Photometrics.LensDiameter; // -1 when absent
+	const bool bSingleBeam = (IsBeamLensComponents.Num() == 1);
+	const bool bUsePhotoDiam = bSingleBeam && (PhotoDiamMeters > KINDA_SMALL_NUMBER);
+
+	IsBeamFlareDiscs.Reset();
+	IsBeamFlareMIDs.Reset();
+	IsBeamFlareDiscs.Reserve(IsBeamLensComponents.Num());
+	IsBeamFlareMIDs.Reserve(IsBeamLensComponents.Num());
+
+	int32 SpawnedFlares = 0;
+	for (int32 i = 0; i < IsBeamLensComponents.Num(); ++i)
+	{
+		UPrimitiveComponent* Beam = IsBeamLensComponents[i].Get();
+		if (!Beam)
+		{
+			IsBeamFlareDiscs.Add(nullptr);
+			IsBeamFlareMIDs.Add(nullptr);
+			continue;
+		}
+
+		// Local-space bounds (computed at identity so we read the mesh-LOCAL extent, not the
+		// motion-transformed world extent). CalcBounds is the right entry-point for procedural
+		// meshes; for an LED-matrix fixture this returns the per-pixel disc's local extent.
+		const FBoxSphereBounds LocalBounds = Beam->CalcBounds(FTransform::Identity);
+		const float LocalRadiusCm = FMath::Max(LocalBounds.SphereRadius, 1.f); // floor at 1 cm
+		const FVector LocalCentre = LocalBounds.Origin;                         // mesh-local
+
+		float FlareDiamCm = bUsePhotoDiam
+			? (float)(PhotoDiamMeters * RebusCoords::METERS_TO_UNREAL)
+			: LocalRadiusCm * 2.f;
+		FlareDiamCm = FMath::Max(FlareDiamCm, 1.f);
+
+		const float PlaneScale = FlareDiamCm / 100.f; // engine Plane is 100 cm wide
+		const float ForwardOffsetCm = FMath::Max(FlareDiamCm * 0.10f, 0.5f);
+		const FQuat FlareRot = LensDiscRotationFromForward(BeamForwardLocal, BeamUpLocal);
+		const FVector FlareOrigin = LocalCentre + BeamForwardLocal.GetSafeNormal() * ForwardOffsetCm;
+
+		UStaticMeshComponent* Flare = NewObject<UStaticMeshComponent>(this);
+		Flare->SetupAttachment(Beam);
+		Flare->RegisterComponent();
+		Flare->SetMobility(EComponentMobility::Movable);
+		Flare->SetStaticMesh(Plane);
+		Flare->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		Flare->SetCastShadow(false);
+		Flare->bCastDynamicShadow = false;
+		Flare->ComponentTags.AddUnique(FName(TEXT("RebusIsBeamFlare")));
+		Flare->SetVisibility(true);
+		Flare->SetHiddenInGame(false);
+
+		UMaterialInstanceDynamic* MID = UMaterialInstanceDynamic::Create(LensMat, this);
+		if (MID)
+		{
+			Flare->SetMaterial(0, MID);
+		}
+
+		Flare->SetRelativeTransform(FTransform(FlareRot, FlareOrigin, FVector(PlaneScale, PlaneScale, PlaneScale)));
+
+		IsBeamFlareDiscs.Add(Flare);
+		IsBeamFlareMIDs.Add(MID);
+		++SpawnedFlares;
+
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s isBeam flare[%d]: spawned diam=%.2fcm (src=%s) planeScale=%.4f localRadius=%.2fcm"),
+			*FixtureId, i, FlareDiamCm,
+			bUsePhotoDiam ? TEXT("photometrics.lensDiameter (single-beam)") : TEXT("mesh-local-bounds-radius*2 (multi-beam or no photo diam)"),
+			PlaneScale, LocalRadiusCm);
+	}
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s isBeam flares: built %d/%d (synthetic LensDisc kept alive as fallback; toggle with Rebus.ForceSyntheticLensFallback)."),
+		*FixtureId, SpawnedFlares, IsBeamLensComponents.Num());
+
+	// Push the initial emissive seed so the flare lights up immediately if Dimmer.Current > 0
+	// (which it isn't on a fresh spawn, but RefreshLensDisc is the unified entry-point and we
+	// want to behave identically to the synthetic disc -- see the call from BuildLensDisc).
+	RefreshIsBeamFlareEmissive();
+}
+
+void ARebusFixtureActor::RefreshIsBeamFlareEmissive()
+{
+	if (IsBeamFlareMIDs.Num() == 0) return;
+
+	// Identical formula to RefreshLensDisc above -- one source of truth, copied here only
+	// because the per-flare MID list is the new thing. If RefreshLensDisc ever evolves
+	// (e.g. a flicker model), refactor both into a shared helper.
 	float Gate = 1.f;
 	switch (ShutterMode)
 	{
@@ -1150,14 +1428,74 @@ void ARebusFixtureActor::RefreshLensDisc()
 	case ERebusShutterMode::Strobe: Gate = (ShutterPhase < 0.5f) ? 1.f : 0.f; break;
 	default: break;
 	}
-
 	const FLinearColor Linear(
 		FMath::Clamp(ColorR.Current, 0.f, 1.f),
 		FMath::Clamp(ColorG.Current, 0.f, 1.f),
 		FMath::Clamp(ColorB.Current, 0.f, 1.f), 1.f);
-	LensDiscMID->SetVectorParameterValue(TEXT("EmissiveColor"), Linear);
-	LensDiscMID->SetScalarParameterValue(TEXT("EmissiveStrength"),
-		RebusLensFlareMaxEmissive * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate);
+	const float Strength = RebusLensFlareMaxEmissive
+		* FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate;
+
+	for (UMaterialInstanceDynamic* MID : IsBeamFlareMIDs)
+	{
+		if (!MID) continue;
+		MID->SetVectorParameterValue(TEXT("EmissiveColor"), Linear);
+		MID->SetScalarParameterValue(TEXT("EmissiveStrength"), Strength);
+	}
+}
+
+void ARebusFixtureActor::RefreshIsBeamLensVisuals()
+{
+	// Visibility rules (see RebusFixtureActor.h header comment on SetUseSyntheticLensFallback):
+	//   * IsBeamLensComponents.Num() == 0 -> always show the synthetic disc (the per-beam
+	//     arrays are empty and there is nothing to A/B). The toggle is a no-op.
+	//   * bUseSyntheticLensFallback == true -> hide every isBeam mesh + every per-beam flare,
+	//     re-show the synthetic disc.
+	//   * Otherwise (default) -> show every isBeam mesh + every per-beam flare, hide the
+	//     synthetic disc.
+	const bool bHaveIsBeam = (IsBeamLensComponents.Num() > 0);
+	const bool bShowSynthetic = (!bHaveIsBeam) || bUseSyntheticLensFallback;
+	const bool bShowReal = bHaveIsBeam && !bUseSyntheticLensFallback;
+
+	if (LensDisc)
+	{
+		LensDisc->SetVisibility(bShowSynthetic, /*bPropagateToChildren*/ true);
+		LensDisc->SetHiddenInGame(!bShowSynthetic);
+	}
+
+	for (int32 i = 0; i < IsBeamLensComponents.Num(); ++i)
+	{
+		UPrimitiveComponent* Beam = IsBeamLensComponents[i].Get();
+		if (Beam)
+		{
+			// Hide the procedural mesh itself when forcing synthetic fallback -- the user-doc
+			// asked for the real isBeam meshes to be "invisible/passthrough" so the synthetic
+			// disc is the sole lens visual in fallback mode.
+			Beam->SetVisibility(bShowReal, /*bPropagateToChildren*/ true);
+		}
+		UStaticMeshComponent* Flare = IsBeamFlareDiscs.IsValidIndex(i) ? IsBeamFlareDiscs[i] : nullptr;
+		if (Flare)
+		{
+			Flare->SetVisibility(bShowReal, /*bPropagateToChildren*/ true);
+			Flare->SetHiddenInGame(!bShowReal);
+		}
+	}
+}
+
+void ARebusFixtureActor::SetUseSyntheticLensFallback(bool bForceSynthetic)
+{
+	if (bForceSynthetic == bUseSyntheticLensFallback)
+	{
+		return;
+	}
+	bUseSyntheticLensFallback = bForceSynthetic;
+	RefreshIsBeamLensVisuals();
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s lens-fallback toggle: %s (isBeamMeshes=%d perBeamFlares=%d syntheticDisc=%s)."),
+		*FixtureId,
+		bUseSyntheticLensFallback ? TEXT("FORCED synthetic disc (isBeam meshes hidden)")
+		                          : TEXT("real <Beam> geometry (synthetic disc hidden)"),
+		IsBeamLensComponents.Num(), IsBeamFlareDiscs.Num(),
+		LensDisc ? (LensDisc->IsVisible() ? TEXT("visible") : TEXT("hidden")) : TEXT("not-built"));
 }
 
 // ---- Hybrid cone-mesh volumetric beam (Phase 1, §8.4a) --------------------------------
@@ -2443,9 +2781,12 @@ void ARebusFixtureActor::GetBoundOrbitPrimitives(TSet<UPrimitiveComponent*>& Out
 		{
 			OutSet.Add(P);
 		}
-		TArray<USceneComponent*> Children;
-		Top->GetChildrenComponents(/*bIncludeAllDescendants*/ true, Children);
-		for (USceneComponent* Child : Children)
+		// Local is named ChildComps (not Children) so it doesn't shadow AActor::Children --
+		// the Editor target compiles with C4458 (declaration hides class member) treated as an
+		// error and would otherwise fail the build (introduced in v1.0.85; fixed v1.0.87.1).
+		TArray<USceneComponent*> ChildComps;
+		Top->GetChildrenComponents(/*bIncludeAllDescendants*/ true, ChildComps);
+		for (USceneComponent* Child : ChildComps)
 		{
 			if (UPrimitiveComponent* PC = Cast<UPrimitiveComponent>(Child))
 			{

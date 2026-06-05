@@ -184,6 +184,28 @@ public:
 	void SetInternalBeamModeEnabled(bool bEnabled);
 	bool IsInternalBeamModeEnabled() const { return bInternalBeamEnabled; }
 
+	// v1.0.88 -- operator-flippable A/B toggle for the new <Beam> (isBeam) lens path.
+	//
+	// Default (bForceSynthetic=false): when /meshes carries at least one mesh flagged isBeam=true
+	// (mesh-blob v3 from the portal), that REAL geometry IS the lens disc -- the mirror/glass
+	// material is applied to it and one emissive lens-flare disc is co-located per isBeam mesh
+	// (MAC-Aura-style LED matrices send N isBeam meshes; each gets its own correctly-sized
+	// flare). The synthetic single-disc fallback (BuildLensDisc / LensDisc) is HIDDEN but kept
+	// alive so re-enabling fallback at runtime doesn't require a respawn.
+	//
+	// Forced (bForceSynthetic=true via `Rebus.ForceSyntheticLensFallback 1`): every isBeam mesh
+	// component is hidden (SetVisibility(false)), every per-beam emissive flare disc is hidden,
+	// and the synthetic LensDisc is re-shown -- restores the pre-v1.0.88 visual exactly. Used
+	// to A/B the real-geometry vs synthetic-disc paths on the same fixture without a respawn.
+	//
+	// Fixtures whose blob carries NO isBeam meshes (v2 blobs, or GDTFs whose <Beam> has no
+	// <Model>) ALWAYS show the synthetic disc -- the toggle is a no-op for them.
+	void SetUseSyntheticLensFallback(bool bForceSynthetic);
+	bool IsUsingSyntheticLensFallback() const { return bUseSyntheticLensFallback; }
+	// Diagnostic: count of mesh proxies on this actor tagged isBeam=true. Zero means the blob
+	// carried no isBeam flag (or arrived as v2) and the synthetic disc fallback is in force.
+	int32 GetIsBeamMeshCount() const { return IsBeamLensComponents.Num(); }
+
 	// ---- Orbit-imported model binding (v1.0.35 introduced; v1.0.65 default ON) --------------
 	// Bind the Orbit-imported fixture-model components (already matched to this fixture by object
 	// id by the control subsystem) so their world transforms can be driven by this fixture's head
@@ -525,6 +547,47 @@ private:
 	// falls back to a runtime load and logs which asset failed.
 	UPROPERTY() TObjectPtr<UStaticMesh> LensPlaneMesh = nullptr;
 	UPROPERTY() TObjectPtr<UMaterialInterface> LensMaterial = nullptr;
+
+	// ---- v1.0.88 real <Beam> (isBeam) lens path -------------------------------------------
+	//
+	// IsBeamLensComponents: the procedural-mesh components built from `/meshes` entries whose
+	//   FRebusMesh.bIsBeam == true (mesh-blob v3). Each has the mirror/glass FixtureLensMID (or
+	//   the FixtureLensMaterialOverride .uasset) on every material slot, the ComponentTag
+	//   "RebusIsBeamLens" for grep, and ALWAYS rides the head via the existing geometry-name
+	//   axis bucketing (`RebusMotion::ResolveAxisForMesh`) -- the isBeam flag is purely an
+	//   identification hint, never a motion override (the user-doc explicitly warned that
+	//   special-casing isBeam meshes out of the bucket map would detach the lens from the
+	//   head).
+	// IsBeamFlareDiscs / IsBeamFlareMIDs: per-isBeam emissive lens-flare disc + MID (using the
+	//   same M_RebusLensFlare material the synthetic LensDisc uses). One flare per isBeam mesh
+	//   so an LED matrix like MAC Aura gets one correctly-sized flare per pixel. Sized by
+	//   `photometrics.lensDiameter` when a SINGLE isBeam mesh exists; multi-beam fixtures
+	//   ALWAYS size from per-mesh local bounds (so the whole-fixture photometric diameter does
+	//   not over-size every per-pixel flare). Arrays are index-aligned to IsBeamLensComponents.
+	// bUseSyntheticLensFallback: live flag flipped by `Rebus.ForceSyntheticLensFallback` (or
+	//   the `SetUseSyntheticLensFallback` public API). When true, the isBeam meshes + per-beam
+	//   flares are hidden (SetVisibility(false) -- "invisible/passthrough" on the visible
+	//   surface; the procedural-mesh geometry stays in the scene so toggling back is a single
+	//   visibility flip with no rebuild) and the synthetic LensDisc is re-shown. Default false.
+	TArray<TWeakObjectPtr<UPrimitiveComponent>> IsBeamLensComponents;
+	UPROPERTY() TArray<TObjectPtr<UStaticMeshComponent>> IsBeamFlareDiscs;
+	UPROPERTY() TArray<TObjectPtr<class UMaterialInstanceDynamic>> IsBeamFlareMIDs;
+	bool bUseSyntheticLensFallback = false;
+
+	// One-time emissive lens-flare build for every IsBeamLensComponents entry, called from
+	// Setup() AFTER BuildLensDisc so the synthetic disc + its CDO refs are already resolved
+	// (the per-beam flares re-use LensPlaneMesh + LensMaterial for cook-safety). No-op when
+	// IsBeamLensComponents is empty (v2 blob / no <Beam>-with-<Model> in the GDTF).
+	void BuildIsBeamLensFlares();
+	// Re-apply mirror/glass material vs original-material AND visibility on every isBeam
+	// component + per-beam flare AND show/hide the synthetic LensDisc, based on the current
+	// value of `bUseSyntheticLensFallback` + whether any isBeam meshes were detected. Called
+	// from Setup (end), SetUseSyntheticLensFallback, and by the console-CVar refresh sink.
+	void RefreshIsBeamLensVisuals();
+	// Sister to RefreshLensDisc (which drives the synthetic disc emissive): pushes the live
+	// dimmer x colour x shutter-gate onto every per-beam flare MID. Called from the same call
+	// sites RefreshLensDisc is called from.
+	void RefreshIsBeamFlareEmissive();
 
 	// v1.0.71 fixture body/lens material override -- the user-facing "make every fixture look
 	// like a black satin plastic moving head, with mirrored-glass lenses" pass.
