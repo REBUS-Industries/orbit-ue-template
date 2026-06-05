@@ -593,6 +593,68 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Orbit-imported fixtures now move in lockstep with the control channel by default (v1.0.65).**
+> User question after the v1.0.64 focus fix: *"the fixtures that are imported via orbit and not
+> over the control channel. Do these have the same IDs now as the control channel fixtures? if
+> so can you wire them to exactly the same motion control so they move insync with the control
+> channel ones."* Yes -- and the wiring was already there since v1.0.35; it just defaulted off.
+>
+> **ID match -- same Speckle node id on both sides.** Control-channel fixtures are registered
+> under their Speckle node id in `URebusFixtureControlSubsystem::RegisterFixture(NodeId, Actor)`
+> (called from `RebusVisualiserSubsystem`'s portal-scene spawn loop with `F.Id` -- the same id
+> the portal references in every `SetFixture*` descriptor). On the OrbitConnector side, imported
+> scene components are tagged with their glb node-name ancestry, which carries the same Speckle
+> node id at one of the tag levels. `RebindOrbitModels` matches them with a plain string-equality
+> `OrbitIndex.Find(FixtureId)` lookup -- nothing fancy, no portal contract changes, the two trees
+> are addressed by the same canonical id.
+>
+> **Motion contract -- same matrix, not a parallel recomputation.** In `RefreshMotion` the head
+> axis transform is solved exactly once per fixture per frame
+> (`RebusMotion::Solve` → `Cumulative[HeadAxisIndex]`) and that EXACT `FTransform` is used for
+> both:
+>
+> ```cpp
+> SpotLight->SetRelativeTransform(BeamRestTransform * Head);  // control-channel head + beam
+> ...
+> DriveOrbitModel(OrbitHead);                                  // Orbit-imported geometry
+> ```
+>
+> So the two render on top of each other and move in perfect lockstep -- they cannot drift
+> because they consume the same matrix, not two parallel pan/tilt solves. `DriveOrbitModel`
+> applies `CompRestWorld * HeadWorldRest^-1 * HeadWorldNow` per bound component (one matrix
+> multiply per component per update, precomputed prefix), so each Orbit mesh follows the
+> incremental delta from its imported (rest) pose.
+>
+> **What v1.0.65 changes.**
+>
+> 1. `URebusFixtureControlSubsystem::bDriveOrbitModels` default flipped from `false` → `true`.
+> 2. `ARebusFixtureActor::bDriveOrbitModel` default flipped from `false` → `true` (defends the
+>    1 Hz rebind gap -- the per-actor flag is set true on first match, but defaulting it true
+>    means a freshly-spawned fixture starts driving the moment its components are bound, not on
+>    whichever later frame `RebindOrbitModels` happens to set it explicitly).
+> 3. `URebusSceneSettingsSubsystem` seed for `bDriveOrbitModels` flipped to `true` so the
+>    SceneState round-trip reports the new default consistently (otherwise the portal would see
+>    the seed as false on first query and could re-disable).
+> 4. `RegisterFixture` now kicks an immediate `RebindOrbitModels` when driving is enabled, so a
+>    freshly-spawned fixture binds on THE SAME frame instead of waiting up to ~1 s for the
+>    periodic rebind timer in `URebusVisualiserSubsystem::Tick`. The periodic rebind now mostly
+>    catches the inverse case (Orbit import re-arrives after fixtures already spawned).
+> 5. Dropped the "Phase 1 A/B sync test" framing from comments and the `Rebus.DriveOrbitModels`
+>    console-command help -- it's no longer an A/B test, it's the default sync. The console
+>    command is preserved as the kill-switch for debugging (`Rebus.DriveOrbitModels 0` reverts
+>    Orbit components to their imported rest pose so a user can compare the two trees side-by-
+>    side if they ever suspect drift).
+>
+> **What you should see.** Spawn a scene, drag pan/tilt -- the Orbit-imported geometry rotates
+> with the control-channel head meshes, identically. The throttled per-update log
+> (`Fixture %s: drove Orbit model '%s' pan=%.1f tilt=%.1f headRot=...`) confirms each tick;
+> the periodic match summary
+> (`Orbit bind: roots=%d taggedComps=%d distinctObjectIds=%d | fixtures matched=%d unmatched=%d`)
+> reports which fixtures found their Orbit twin and which didn't (the unmatched-ids list is
+> truncated to 12 to keep the line readable). If a fixture stays unmatched, the portal's glb
+> export likely dropped the Speckle node id from the imported component tags -- not a code bug,
+> a data-pipeline issue.
+
 > **Focus now pulls the beam / gobo in and out of focus (v1.0.64).** User report after the
 > v1.0.63 iris+frost fix: *"Focus doesnt do anything. can it pull a beam or gobo in and out of
 > focus."* Before v1.0.64 `ApplyFocus` only stored the value in `Focus.Current` for the visual

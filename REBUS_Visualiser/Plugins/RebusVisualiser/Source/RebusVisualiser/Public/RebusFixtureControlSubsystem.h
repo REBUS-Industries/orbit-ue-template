@@ -57,10 +57,17 @@ public:
 	// this subsystem owns (so the caller can fall through to scene-property handling).
 	bool HandleControlDescriptor(const FString& Type, const TSharedPtr<FJsonObject>& Msg);
 
-	// ---- Orbit-imported model binding (Phase 1 A/B sync test, v1.0.35) --------------------
+	// ---- Orbit-imported model binding (v1.0.35 introduced as A/B test; v1.0.65 default ON) --
 	// Enable/disable driving every fixture's matched Orbit-imported model from its motion solve.
 	// Toggled live via the bDriveOrbitModels scene property or the Rebus.DriveOrbitModels console
 	// command. Pushes the flag to all fixtures and (re)binds against the current Orbit import.
+	//
+	// Match contract: control-channel fixtures are registered under their Speckle node id (see
+	// RegisterFixture call sites). OrbitConnector tags imported scene components with their glb
+	// node-name ancestry, which carries the SAME Speckle node id at one of the tag levels. The
+	// binding loop in RebindOrbitModels matches by string equality between the registered fixture
+	// id and any component tag, so the two trees overlap pose-for-pose as long as the portal /
+	// importer kept the node id stable through the glb export.
 	void SetDriveOrbitModels(bool bEnabled);
 	bool IsDrivingOrbitModels() const { return bDriveOrbitModels; }
 
@@ -77,9 +84,13 @@ private:
 	TArray<FString> CurrentSelection;
 	FString PrimarySelection;
 
-	// Global enable for driving Orbit-imported models (default off; the control-channel meshes
-	// remain the source of truth until Phase 2). Per-fixture flag lives on each ARebusFixtureActor.
-	bool bDriveOrbitModels = false;
+	// Global enable for driving Orbit-imported models. v1.0.65: default flipped from false to
+	// true so Orbit-imported geometry tracks the live pan/tilt out-of-the-box -- previously the
+	// portal (or `Rebus.DriveOrbitModels 1`) had to explicitly enable the A/B overlay, which
+	// meant Orbit fixtures sat at their imported pose while the control-channel meshes moved.
+	// Per-fixture flag lives on each ARebusFixtureActor (also defaulted true so the 1 Hz rebind
+	// gap can't briefly orphan freshly-spawned fixtures).
+	bool bDriveOrbitModels = true;
 	// Logged-once guard so the "no Orbit import present" / match-summary lines don't spam the timer.
 	int32 LastOrbitMatchLogged = -1;
 };

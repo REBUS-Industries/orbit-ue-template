@@ -202,10 +202,13 @@ bool URebusVisualiserSubsystem::Tick(float DeltaSeconds)
 		TrySendReady();
 	}
 
-	// Periodic Orbit-model rebind (Phase 1 A/B sync test): while driving is enabled, retry binding
-	// so a late OrbitConnector import (or a re-import that replaced the components) binds to the
+	// Periodic Orbit-model rebind: while driving is enabled, retry binding so a late
+	// OrbitConnector import (or a re-import that replaced the components) binds to the
 	// already-spawned fixtures without a manual re-toggle. Cheap no-op when driving is off or no
-	// Orbit import is present.
+	// Orbit import is present. (RegisterFixture also kicks an immediate rebind for the
+	// fixture-spawn-then-import-arrives case, so this 1 Hz timer mostly catches the inverse:
+	// import refreshes mid-session and the existing fixtures need to re-bind to the new
+	// components.)
 	if (URebusFixtureControlSubsystem* Ctl = GetControl())
 	{
 		if (Ctl->IsDrivingOrbitModels())

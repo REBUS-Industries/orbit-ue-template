@@ -129,14 +129,18 @@ public:
 	// SpotLight's fog scattering is restored (the old fog beam), so the two can be A/B'd at runtime.
 	void SetMeshBeamEnabled(bool bEnabled);
 
-	// ---- Orbit-imported model binding (Phase 1 A/B sync test, v1.0.35) --------------------
+	// ---- Orbit-imported model binding (v1.0.35 introduced; v1.0.65 default ON) --------------
 	// Bind the Orbit-imported fixture-model components (already matched to this fixture by object
 	// id by the control subsystem) so their world transforms can be driven by this fixture's head
 	// motion. Caches each component's imported (rest) world transform + the head world transform at
 	// the rest pose (pan=tilt=0), so DriveOrbitModel applies ONLY the incremental head motion since
-	// rest -- the Orbit model then tracks pan/tilt exactly like the control-channel head meshes
-	// (both stay visible; this is an A/B sync confirmation, not a replacement). Re-binding replaces
-	// any previous binding (e.g. after a re-import).
+	// rest -- the Orbit model then tracks pan/tilt exactly like the control-channel head meshes,
+	// using the SAME cumulative axis transform (Cumulative[HeadAxisIndex] in RefreshMotion), not a
+	// parallel recomputation, so they cannot drift relative to each other. Re-binding replaces any
+	// previous binding (e.g. after a re-import). Both meshes stay visible by default: the
+	// control-channel proxies and the Orbit-imported geometry render on top of each other and
+	// move in lockstep; teams that want only the Orbit geometry visible can hide the control-
+	// channel mesh proxies separately.
 	void BindOrbitComponents(const TArray<USceneComponent*>& Components, const FString& MatchedObjectId);
 	void ClearOrbitBinding();
 	// True only while at least one bound Orbit component is still alive (false after a re-import
@@ -475,9 +479,14 @@ private:
 	FTransform BeamRestTransform = FTransform::Identity;
 	int32 HeadAxisIndex = INDEX_NONE;
 
-	// ---- Orbit-imported model binding state (Phase 1 sync test) ----
-	// When true, RefreshMotion also drives the bound Orbit components from the head motion.
-	bool bDriveOrbitModel = false;
+	// ---- Orbit-imported model binding state ----
+	// When true, RefreshMotion also drives the bound Orbit components from the head motion (the
+	// SAME cumulative pan/tilt solve that drives the control-channel head meshes -- not a parallel
+	// recomputation -- so the Orbit mesh tracks the control mesh pose-for-pose). v1.0.65: default
+	// flipped from false to true so a freshly-spawned fixture starts driving on the first frame
+	// it gets bound by RebindOrbitModels, instead of waiting up to 1 s for the periodic rebind to
+	// also call SetDriveOrbitModel(true) on it.
+	bool bDriveOrbitModel = true;
 	// Object id (Speckle node id) this fixture is bound to on the Orbit-import side.
 	FString BoundOrbitObjectId;
 	// The matched Orbit-imported components (weak so a re-import that destroys them is tolerated).

@@ -152,7 +152,9 @@ private:
 
 	float FrameStatsTimer = 0.f;
 
-	// Throttle for the periodic Orbit-model rebind (Phase 1 sync test). While driving is enabled
-	// this re-scans for a late/re-import and binds it to existing fixtures; cheap no-op otherwise.
+	// Throttle for the periodic Orbit-model rebind (1 Hz). While driving is enabled this re-scans
+	// for a late/re-import and binds it to existing fixtures; cheap no-op otherwise. (Fresh fixture
+	// registrations trigger their own immediate rebind in URebusFixtureControlSubsystem::Register
+	// Fixture, so this timer mostly catches the import-arrived-after-fixtures-spawned case.)
 	float OrbitRebindTimer = 0.f;
 };

@@ -1567,7 +1567,7 @@ void ARebusFixtureActor::RefreshMotion()
 	DriveOrbitModel(OrbitHead);
 }
 
-// ---- Orbit-imported model binding (Phase 1 A/B sync test) -----------------------------
+// ---- Orbit-imported model binding (v1.0.35 introduced; v1.0.65 default ON) --------------
 
 FTransform ARebusFixtureActor::ComputeHeadLocal(float InPanDeg, float InTiltDeg) const
 {

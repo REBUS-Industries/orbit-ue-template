@@ -35,9 +35,12 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// Hybrid cone-mesh volumetric beam is the default beam mode (v1.0.31); seed it so SceneState
 	// round-trips the control and a respawn re-asserts it via ReapplyAll.
 	Values.Add(TEXT("bMeshBeams"), FRebusPropertyValue::MakeBool(true));
-	// Phase-1 A/B sync test (v1.0.35): drive Orbit-imported fixture models from fixture motion.
-	// Default OFF -- the control-channel meshes stay authoritative; the toggle enables the overlay.
-	Values.Add(TEXT("bDriveOrbitModels"), FRebusPropertyValue::MakeBool(false));
+	// Drive Orbit-imported fixture models from each fixture's pan/tilt solve. v1.0.35 introduced
+	// this as a Phase-1 A/B test (default OFF). v1.0.65 flipped the SceneState seed to TRUE so
+	// the SceneState round-trip reports the new default consistently with the control subsystem's
+	// own bDriveOrbitModels default (also now true) -- otherwise the portal would see the seed
+	// as false on first SceneState query and could re-disable the feature.
+	Values.Add(TEXT("bDriveOrbitModels"), FRebusPropertyValue::MakeBool(true));
 
 	// Seed the lightest tier as the runtime default (live previs streaming). This overrides the
 	// heavier [SystemSettings] baseline from DefaultEngine.ini for the live stream; the portal

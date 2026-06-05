@@ -223,7 +223,7 @@ void FRebusVisualiserModule::StartupModule()
 
 	GDriveOrbitModelsCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Rebus.DriveOrbitModels"),
-		TEXT("Drive Orbit-imported fixture models from fixture motion (Phase 1 A/B sync test). "
+		TEXT("Drive Orbit-imported fixture models from fixture motion (default ON since v1.0.65). "
 			 "Usage: Rebus.DriveOrbitModels [0|1]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDriveOrbitModelsCommand),
 		ECVF_Default);

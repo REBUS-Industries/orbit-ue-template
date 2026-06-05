@@ -15,6 +15,16 @@ void URebusFixtureControlSubsystem::RegisterFixture(const FString& NodeId, ARebu
 {
 	if (NodeId.IsEmpty() || !Actor) return;
 	Fixtures.Add(NodeId, Actor);
+	// v1.0.65: kick an immediate rebind so the new fixture binds to any matching Orbit-imported
+	// node on THIS frame rather than waiting up to ~1 s for the periodic timer in
+	// URebusVisualiserSubsystem::Tick. The rebind early-outs cheaply when there's no Orbit import
+	// in the world, so the worst case for a no-Orbit setup is one TActorIterator scan per fixture
+	// spawn -- negligible next to the actor spawn itself. With Orbit present this is what keeps
+	// the imported geometry pose-aligned with the control-channel head meshes from frame one.
+	if (bDriveOrbitModels)
+	{
+		RebindOrbitModels();
+	}
 }
 
 void URebusFixtureControlSubsystem::UnregisterFixture(const FString& NodeId)
@@ -407,7 +417,7 @@ bool URebusFixtureControlSubsystem::HandleControlDescriptor(const FString& Type,
 	return false; // not a fixture/selection type -> let scene-property handling try.
 }
 
-// ---- Orbit-imported model binding (Phase 1 A/B sync test) -----------------------------
+// ---- Orbit-imported model binding (v1.0.35 introduced; v1.0.65 default ON) --------------
 
 void URebusFixtureControlSubsystem::SetDriveOrbitModels(bool bEnabled)
 {
@@ -434,7 +444,7 @@ void URebusFixtureControlSubsystem::SetDriveOrbitModels(bool bEnabled)
 
 void URebusFixtureControlSubsystem::RebindOrbitModels()
 {
-	if (!bDriveOrbitModels) return; // only spend cycles while the A/B test is on
+	if (!bDriveOrbitModels) return; // explicit disable -- portal / console toggled Orbit drive off
 
 	UWorld* World = nullptr;
 	if (UGameInstance* GI = GetGameInstance())
