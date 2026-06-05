@@ -221,13 +221,21 @@ public:
 private:
 	float ResolveOuterHalfDeg() const; // current outer cone half-angle (zoom range + iris), degrees
 	void RefreshMotion();         // re-solve pan/tilt and push transforms to groups + light
-	// Apply the fixture's current head motion (HeadLocal = the head axis' cumulative fixture-local
-	// transform, or identity for no-rig fixtures) to the bound Orbit-imported components, in world
-	// space, as the delta from the rest pose. No-op when not driving / unbound.
-	void DriveOrbitModel(const FTransform& HeadLocal);
+	// v1.0.68: per-component-axis drive. Each bound Orbit component carries its own bucketed
+	// motion axis (OrbitAxisBucket[i]) -- INDEX_NONE for base components (no motion), pan axis for
+	// yoke arms, tilt axis for the head -- exactly mirroring how MeshAxisBucket drives the
+	// control-channel mesh proxies. DriveOrbitModel walks Cumulative (full axis array from
+	// RebusMotion::Solve, parent-first) and applies Cumulative[OrbitAxisBucket[i]] per component
+	// instead of one uniform HeadLocal for the whole fixture. An empty Cumulative (no-rig fixture)
+	// leaves every component at its imported rest pose. No-op when not driving / unbound.
+	void DriveOrbitModel(const TArray<FTransform>& Cumulative);
 	// The head's fixture-local transform for a given pan/tilt (deepest head axis' cumulative solve;
 	// identity for no-rig fixtures). Shared by the Orbit-bind rest capture + live drive.
 	FTransform ComputeHeadLocal(float InPanDeg, float InTiltDeg) const;
+	// v1.0.68 helper: convenience wrapper that solves the rig for InPan/InTilt and forwards the
+	// resulting Cumulative array to DriveOrbitModel. Used by the bind + set-drive code paths
+	// where the caller only has scalar pan/tilt, not the full Cumulative.
+	void DriveOrbitModelFromPanTilt(float InPanDeg, float InTiltDeg);
 
 	// Stop a primitive owned by THIS fixture (a control-channel body mesh or a bound Orbit model
 	// component) from casting the dynamic VSM shadow that mottles its own beam's volumetric fog,
@@ -493,9 +501,21 @@ private:
 	TArray<TWeakObjectPtr<USceneComponent>> OrbitComponents;
 	// Each bound component's imported (rest) world transform; restored when driving is disabled.
 	TArray<FTransform> OrbitCompRestWorld;
-	// Per-component constant: CompRestWorld * HeadWorldRest^-1, so the driven world transform is
-	// just OrbitBindBase[i] * HeadWorldNow (one multiply per component per update).
+	// Per-component constant: CompRestWorld * ActorWorld^-1 (captured at bind time when every
+	// axis' RestCumulative is identity, so AxisWorldRest == ActorWorld for ALL axes -- one
+	// formula serves every bucket). Driven world transform per component:
+	//   NewWorld = OrbitBindBase[i] * (Cumulative[OrbitAxisBucket[i]] * ActorWorld)
+	// which simplifies (Cumulative=Identity at rest) to CompRest -- so an axis the user isn't
+	// driving still leaves the component on its imported pose.
 	TArray<FTransform> OrbitBindBase;
+	// v1.0.68: per-component motion-axis bucket, parallel to OrbitComponents. INDEX_NONE means
+	// "base" (never moves); otherwise an index into Profile.MotionRig.Axes that drives the
+	// component. Classified by BindOrbitComponents using a multi-strategy chain (tag-name match
+	// against AffectedGeometryNames -> comp-name match -> keyword scan -> attach-hierarchy depth
+	// -> nearest-pivot in world space -> default head). Pre-v1.0.68 every component effectively
+	// rode HeadAxisIndex, so the whole fixture tilted instead of just the head -- the user's
+	// report that "we are not seeing the orbit fixture being treated as base, yoke and head".
+	TArray<int32> OrbitAxisBucket;
 	// Head world transform at the rest (pan=tilt=0) pose, captured at bind time.
 	FTransform OrbitHeadWorldRest = FTransform::Identity;
 	// Last pan/tilt we emitted a drive-sync log for (throttles the per-update sync log).

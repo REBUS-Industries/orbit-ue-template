@@ -593,6 +593,95 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Per-component axis classification: base stays put, yoke pans, head pans+tilts (v1.0.68).**
+> v1.0.67 finally got the Orbit-imported mesh bound to the control-channel fixture, but the
+> user immediately reported: *"we now have control of the Orbit fixture mesh but it's treating
+> it as one object so the whole fixture tilts instead of just the head. We are not seeing the
+> orbit fixture being treated as base, yoke and head."*
+>
+> **Root cause.** The control-channel mesh proxies have always classified per-mesh-per-axis via
+> `MeshAxisBucket[i] = RebusMotion::ResolveAxisForMesh(rig, geometryName, modelName)`, so the
+> base sits static, the yoke rides `Cumulative[panAxis]`, and the head rides
+> `Cumulative[tiltAxis]` (which is itself `tilt * pan` because `Cumulative` is parent-composed
+> in `RebusMotion::Solve`). The Orbit-bind path (introduced in v1.0.35) cached one
+> `OrbitHeadWorldRest` for the WHOLE bind and `DriveOrbitModel(headLocal)` did
+> `Comp->SetWorldTransform(OrbitBindBase[i] * (HeadLocal * ActorWorld))` for every component
+> using the same `HeadLocal` -- so every component, regardless of whether it was the base, yoke
+> or head mesh, rode the head's pan*tilt cumulative. Visually that meant a moving-head fixture's
+> entire body tilted as one rigid lump.
+>
+> **What v1.0.68 changes.** The Orbit drive now mirrors the control-channel pipeline: per
+> component motion-axis bucket + drive each bucket from its own `Cumulative[axis]`.
+>
+> 1. **`OrbitAxisBucket[]`** (new state, parallel to `OrbitComponents[]`): per-component axis
+>    index from `Profile.MotionRig.Axes` (or `INDEX_NONE` = static base). Built in
+>    `BindOrbitComponents` by a six-strategy chain that tries name-based identification first
+>    and only falls through to fuzzier heuristics if the importer hasn't surfaced GDTF names:
+>
+>    1. **Tag-name** -- each `Comp->ComponentTags` entry tested against the rig's
+>       `AffectedGeometryNames` via the existing `ResolveAxisForMesh` (catches the easy case
+>       where orbit-cli exposes GDTF geometry names directly as tags, e.g. `"yoke"`, `"head"`).
+>    2. **Comp-name** -- `Comp->GetName()` tested the same way (covers importers that put the
+>       GDTF name on the component itself rather than as a tag).
+>    3. **Keyword scan** -- name + tags concatenated and case-folded, then substring-matched
+>       for `head`/`tilt` -> tilt axis, `yoke`/`arm`/`pan` -> pan axis, `base`/`body` -> static.
+>       Tolerates glb node names like `Light_Head_001` or `MovingHead.yoke.arm` that don't
+>       match the GDTF vocabulary exactly.
+>    4. **Hierarchy depth** -- if the components form an attach-tree with different
+>       `GetAttachParent` depths (importer preserved the glTF node hierarchy), the deepest
+>       component is the head, max-1 is the yoke, the rest are base. Skipped when everything
+>       is flat at the same depth (typical for procedural importers that re-parent under one
+>       root).
+>    5. **Position-fallback** -- world-space distance from `Comp->GetComponentLocation()` to
+>       each axis's pivot (Y-up metres in the rig, converted to engine cm + transformed by
+>       `ActorWorld`); nearest pivot wins. `AxisPivots` is sorted deepest-first so a tie picks
+>       head over yoke, matching how a real moving-head's pivots stack (tilt nested inside
+>       pan). Works without any naming convention and without an orientation assumption (the
+>       comparison is pure 3-D distance, so hanging and standing rigs both classify correctly).
+>    6. **Default head** -- last resort, equivalent to pre-v1.0.68 behaviour; reported in the
+>       log as `default-head` (or `default-static` if the rig has no head axis) so the user
+>       can see we punted.
+>
+> 2. **`DriveOrbitModel(const TArray<FTransform>& Cumulative)`** -- signature changed from
+>    `(const FTransform& HeadLocal)`. Per component, looks up
+>    `OrbitAxisBucket[i]` and applies `Cumulative[axis]` (or `Identity` for base / invalid
+>    bucket / empty Cumulative). The bind-base captured at rest collapses to
+>    `CompRest * ActorWorld^-1` for every bucket because every axis's rest-cumulative is the
+>    identity transform (verified: `RotateAboutPivot` with a zero-angle quat is the identity),
+>    so ONE `OrbitBindBase` array still drives every axis -- no per-axis storage needed.
+>
+> 3. **All four call sites updated**:
+>    - `RefreshMotion` no-rig path: pass `TArray<FTransform>{}` (empty -> base for everyone ->
+>      every component holds rest).
+>    - `RefreshMotion` full path: pass the already-solved `Cumulative` directly (no redundant
+>      solve per tick).
+>    - `BindOrbitComponents`, `SetDriveOrbitModel(true)`: route through the new
+>      `DriveOrbitModelFromPanTilt(InPan, InTilt)` helper, which solves once and forwards.
+>
+> **What you should see in the log.** The bind line is now diagnostic:
+>
+> ```
+> Fixture <id>: BOUND 6 Orbit-imported component(s) by objectId 'mvr-symdef-instance-...'
+>   (drive=ON) | axis-buckets: base=1 pan=2 tilt=3 other=0 default=0
+>   | sample: 'StaticMeshComponent_0'->position(a=-1) | ...->position(a=0) | ...->position(a=1)
+> ```
+>
+> - `base=N` -- components held static (the body / clamp / base plate).
+> - `pan=N` -- components riding the yoke axis (the arms that swing left/right).
+> - `tilt=N` -- components riding the head axis (the lamp that tilts up/down).
+> - `default=N` -- count we couldn't classify, defaulted to head; non-zero means we should
+>   look at the sample line and tighten a strategy. Healthy result: `default=0`.
+> - `sample:` -- first 6 components with the *strategy that fired* (`tag-name`, `comp-name`,
+>   `keyword-head`, `depth-yoke`, `position`, `default-head`, ...) so you can see which signal
+>   the importer is actually giving us.
+>
+> **If the per-fixture split still looks wrong**, send me the `axis-buckets:` line and the
+> `sample:` line and I'll either tighten a strategy or add a portal-side override field on
+> `FRebusSceneFixture`. The position fallback is generic enough to work on most moving heads
+> regardless of naming, but a fixture geometry that happens to put the base and yoke at the
+> same world-space distance from the pan pivot can fall over -- in that case strategies 1-3
+> need explicit naming hints from the importer.
+
 > **Position-based Orbit match: bridge the MVR-UUID vs Speckle-id namespace gap (v1.0.67).**
 > The v1.0.66 id-shape diagnostic answered "why doesn't substring match work" -- the two sides
 > are in totally different id namespaces:

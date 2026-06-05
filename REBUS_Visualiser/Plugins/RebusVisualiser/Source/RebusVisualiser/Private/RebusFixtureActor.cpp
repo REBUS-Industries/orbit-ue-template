@@ -1510,9 +1510,10 @@ void ARebusFixtureActor::RefreshMotion()
 		}
 
 		// No GDTF rig: the control-channel mesh proxies don't move, so drive the bound Orbit model
-		// with an identity head -- it stays at its imported pose, in A/B lock-step with the (also
-		// static) control meshes rather than diverging.
-		DriveOrbitModel(FTransform::Identity);
+		// with an empty Cumulative -- every per-component axis bucket is INDEX_NONE, so each
+		// component holds its imported rest pose in A/B lock-step with the (also static) control
+		// meshes rather than diverging.
+		DriveOrbitModel(TArray<FTransform>{});
 		return;
 	}
 
@@ -1559,12 +1560,13 @@ void ARebusFixtureActor::RefreshMotion()
 		DriveBeamConeFromSpotLight();
 	}
 
-	// Drive the bound Orbit-imported model with the SAME head solve that moved the control-channel
-	// head meshes above (Cumulative[HeadAxisIndex]), so the two render on top of each other and
-	// pan/tilt together. No-op when not driving / unbound.
-	const FTransform OrbitHead = (HeadAxisIndex != INDEX_NONE && Cumulative.IsValidIndex(HeadAxisIndex))
-		? Cumulative[HeadAxisIndex] : FTransform::Identity;
-	DriveOrbitModel(OrbitHead);
+	// Drive the bound Orbit-imported model with the SAME per-axis solve that moved the
+	// control-channel mesh proxies above. v1.0.68: pass the FULL Cumulative array so each Orbit
+	// component rides Cumulative[OrbitAxisBucket[i]] -- base components stay put, yoke arms pan,
+	// head pans+tilts. Pre-v1.0.68 we forwarded only Cumulative[HeadAxisIndex] and applied it
+	// uniformly to every component, which is why the whole fixture tilted instead of just the
+	// head. No-op when not driving / unbound.
+	DriveOrbitModel(Cumulative);
 }
 
 // ---- Orbit-imported model binding (v1.0.35 introduced; v1.0.65 default ON) --------------
@@ -1605,16 +1607,61 @@ void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Com
 	OrbitComponents.Reset();
 	OrbitCompRestWorld.Reset();
 	OrbitBindBase.Reset();
+	OrbitAxisBucket.Reset();
 	BoundOrbitObjectId = MatchedObjectId;
 	LastOrbitLogPanTilt = FVector2D(FLT_MAX, FLT_MAX);
 
-	// The imported model corresponds to the fixture's REST pose (pan=tilt=0): cache the head world
-	// transform there so DriveOrbitModel applies only the DELTA from rest as pan/tilt change. With
-	// FTransform's child*parent convention, a component's world = childRel * parent, so the head
-	// world (head mesh proxies are parented under the actor root) is HeadLocal * ActorWorld.
+	// The imported model corresponds to the fixture's REST pose (pan=tilt=0): every motion axis'
+	// cumulative solve is identity at rest (verified: RotateAboutPivot with a zero-angle quat is
+	// the identity transform), so for EVERY axis bucket AxisWorldRest = AxisLocalRest * ActorWorld
+	// = Identity * ActorWorld = ActorWorld. That collapses the per-axis bind base to a single
+	// formula: OrbitBindBase[i] = CompRest * ActorWorld^-1. At runtime each component's driven
+	// world is OrbitBindBase[i] * (Cumulative[OrbitAxisBucket[i]] * ActorWorld), so base
+	// components (bucket=INDEX_NONE -> Cumulative is Identity) stay at CompRest while yoke/head
+	// components ride the pan/tilt cumulative around the rig pivots.
 	const FTransform ActorWorld = GetActorTransform();
-	OrbitHeadWorldRest = ComputeHeadLocal(0.f, 0.f) * ActorWorld;
-	const FTransform HeadWorldRestInv = OrbitHeadWorldRest.Inverse();
+	const FTransform ActorWorldInv = ActorWorld.Inverse();
+	OrbitHeadWorldRest = ComputeHeadLocal(0.f, 0.f) * ActorWorld; // kept for diagnostic legacy
+
+	// v1.0.68: per-component axis classification. Pre-compute each rig axis' world-space pivot +
+	// depth so the position-fallback strategy can score components against the actual pan/tilt
+	// pivots in world space (not just along Z, so the heuristic works for hanging AND standing
+	// rigs without an orientation assumption). Sorted deepest-first so equidistant ties resolve
+	// onto head before yoke, matching how a real moving-head's pivots stack (tilt nested inside
+	// pan).
+	struct FAxisPivotWorld { int32 AxisIndex; FVector PivotWorld; int32 Depth; };
+	TArray<FAxisPivotWorld> AxisPivots;
+	const FRebusMotionRig& Rig = Profile.MotionRig;
+	if (Rig.bValid && Rig.Axes.Num() > 0)
+	{
+		AxisPivots.Reserve(Rig.Axes.Num());
+		for (int32 i = 0; i < Rig.Axes.Num(); ++i)
+		{
+			const FRebusMotionAxis& A = Rig.Axes[i];
+			FVector PivotYUp = A.Pivot;
+			if (Rig.bHasPivotOffset) PivotYUp -= Rig.PivotOffset;
+			const FVector PivotLocal = RebusCoords::PointYUpMetersToUnreal(PivotYUp);
+			const FVector PivotWorld = ActorWorld.TransformPosition(PivotLocal);
+			int32 Depth = 0;
+			int32 P = A.ParentAxisIndex;
+			while (P != INDEX_NONE && Rig.Axes.IsValidIndex(P)) { ++Depth; P = Rig.Axes[P].ParentAxisIndex; }
+			AxisPivots.Add({ i, PivotWorld, Depth });
+		}
+		AxisPivots.Sort([](const FAxisPivotWorld& A, const FAxisPivotWorld& B) { return A.Depth > B.Depth; });
+	}
+
+	auto AxisOfKindDeepest = [&](ERebusAxisKind Kind) -> int32
+	{
+		for (const FAxisPivotWorld& P : AxisPivots)
+		{
+			if (Rig.Axes.IsValidIndex(P.AxisIndex) && Rig.Axes[P.AxisIndex].Kind == Kind) return P.AxisIndex;
+		}
+		return INDEX_NONE;
+	};
+
+	int32 NBase = 0, NPan = 0, NTilt = 0, NOther = 0, NDefaulted = 0;
+	TArray<FString> ClassifyDiag;
+	ClassifyDiag.Reserve(6);
 
 	for (USceneComponent* Comp : Components)
 	{
@@ -1622,22 +1669,168 @@ void ARebusFixtureActor::BindOrbitComponents(const TArray<USceneComponent*>& Com
 		const FTransform CompRest = Comp->GetComponentTransform();
 		OrbitComponents.Add(Comp);
 		OrbitCompRestWorld.Add(CompRest);
-		// Driven world = CompRest * HeadWorldRest^-1 * HeadWorldNow; precompute the constant prefix.
-		OrbitBindBase.Add(CompRest * HeadWorldRestInv);
+		OrbitBindBase.Add(CompRest * ActorWorldInv);
+
+		int32 AxisBucket = INDEX_NONE;
+		const TCHAR* Strategy = TEXT("base"); // default when there's no rig
+
+		if (Rig.bValid && Rig.Axes.Num() > 0)
+		{
+			bool bMatched = false;
+
+			// Strategy 1: each tag (lowercased by ResolveAxisForMesh) against AffectedGeometryNames.
+			// Catches the easy case where the orbit-cli exposes GDTF geometry names on the
+			// components (e.g. tag = "yoke" / "head" / "movinghead_head").
+			for (const FName& Tag : Comp->ComponentTags)
+			{
+				const int32 A = RebusMotion::ResolveAxisForMesh(Rig, Tag.ToString(), TEXT(""));
+				if (A != INDEX_NONE) { AxisBucket = A; bMatched = true; Strategy = TEXT("tag-name"); break; }
+			}
+
+			// Strategy 2: component name (the imported USceneComponent's Outer name) against
+			// AffectedGeometryNames. Covers importers that put the GDTF name on the comp itself
+			// rather than as a tag.
+			if (!bMatched)
+			{
+				const int32 A = RebusMotion::ResolveAxisForMesh(Rig, Comp->GetName(), TEXT(""));
+				if (A != INDEX_NONE) { AxisBucket = A; bMatched = true; Strategy = TEXT("comp-name"); }
+			}
+
+			// Strategy 3: substring keyword scan on name + every tag (case-insensitive). Tolerates
+			// glb node names like "Light_Head_001" or "MovingHead.yoke.arm" that don't match the
+			// GDTF AffectedGeometryNames vocabulary exactly. Priority: head/tilt -> tilt axis,
+			// yoke/arm/pan -> pan axis, base/body -> static (INDEX_NONE).
+			if (!bMatched)
+			{
+				FString Hay = Comp->GetName().ToLower();
+				for (const FName& Tag : Comp->ComponentTags) { Hay += TEXT(" "); Hay += Tag.ToString().ToLower(); }
+				if (Hay.Contains(TEXT("head")) || Hay.Contains(TEXT("tilt")))
+				{
+					AxisBucket = AxisOfKindDeepest(ERebusAxisKind::Tilt);
+					if (AxisBucket == INDEX_NONE) AxisBucket = HeadAxisIndex; // fall through to deepest axis
+					if (AxisBucket != INDEX_NONE) { bMatched = true; Strategy = TEXT("keyword-head"); }
+				}
+				else if (Hay.Contains(TEXT("yoke")) || Hay.Contains(TEXT("arm")) || Hay.Contains(TEXT("pan")))
+				{
+					AxisBucket = AxisOfKindDeepest(ERebusAxisKind::Pan);
+					if (AxisBucket != INDEX_NONE) { bMatched = true; Strategy = TEXT("keyword-pan"); }
+				}
+				else if (Hay.Contains(TEXT("base")) || Hay.Contains(TEXT("body")))
+				{
+					AxisBucket = INDEX_NONE; bMatched = true; Strategy = TEXT("keyword-base");
+				}
+			}
+
+			// Strategy 4: attach-hierarchy depth. If the import preserved a parent-child tree
+			// (Base -> Yoke -> Head), the deepest component (max GetAttachParent chain length
+			// among components in THIS bind) is the head, max-1 is the yoke, etc. Works for
+			// any GLB importer that respects glTF node hierarchy and skips intermediate transform
+			// nodes (we only look at the components we were handed -- mesh-bearing ones).
+			if (!bMatched)
+			{
+				int32 MaxDepth = -1;
+				TArray<int32> Depths; Depths.Reserve(Components.Num());
+				for (USceneComponent* C : Components)
+				{
+					int32 D = 0;
+					for (USceneComponent* P = C ? C->GetAttachParent() : nullptr; P != nullptr; P = P->GetAttachParent()) ++D;
+					Depths.Add(D);
+					if (D > MaxDepth) MaxDepth = D;
+				}
+				int32 MinDepth = MaxDepth;
+				for (int32 D : Depths) if (D < MinDepth) MinDepth = D;
+				if (MaxDepth > MinDepth) // there IS a hierarchy (not all flat)
+				{
+					int32 MyDepth = 0;
+					for (USceneComponent* P = Comp->GetAttachParent(); P != nullptr; P = P->GetAttachParent()) ++MyDepth;
+					if (MyDepth == MaxDepth)
+					{
+						AxisBucket = AxisOfKindDeepest(ERebusAxisKind::Tilt);
+						if (AxisBucket == INDEX_NONE) AxisBucket = HeadAxisIndex;
+						if (AxisBucket != INDEX_NONE) { bMatched = true; Strategy = TEXT("depth-head"); }
+					}
+					else if (MyDepth > MinDepth)
+					{
+						AxisBucket = AxisOfKindDeepest(ERebusAxisKind::Pan);
+						if (AxisBucket != INDEX_NONE) { bMatched = true; Strategy = TEXT("depth-yoke"); }
+					}
+					else
+					{
+						AxisBucket = INDEX_NONE; bMatched = true; Strategy = TEXT("depth-base");
+					}
+				}
+			}
+
+			// Strategy 5: position-fallback. Distance from the component's world position to each
+			// rig pivot's world position; closest pivot wins (deepest axis breaks ties because
+			// AxisPivots is sorted deepest-first). For typical moving-heads this puts comps near
+			// the tilt pivot onto the head bucket and comps near the pan pivot onto the yoke
+			// bucket. Components far from BOTH pivots (i.e. anywhere outside ~1.5x the nearest
+			// pivot's distance) bucket to base -- catches the static body/base where the head
+			// hangs from when nothing else identified it.
+			if (!bMatched && AxisPivots.Num() > 0)
+			{
+				const FVector CompW = Comp->GetComponentLocation();
+				float NearestSq = FLT_MAX;
+				int32 NearestAxis = INDEX_NONE;
+				for (const FAxisPivotWorld& P : AxisPivots)
+				{
+					const float DSq = (float)FVector::DistSquared(CompW, P.PivotWorld);
+					if (DSq < NearestSq) { NearestSq = DSq; NearestAxis = P.AxisIndex; }
+				}
+				if (NearestAxis != INDEX_NONE)
+				{
+					AxisBucket = NearestAxis; bMatched = true; Strategy = TEXT("position");
+				}
+			}
+
+			// Strategy 6: default to HeadAxisIndex so the fixture still moves SOMEHOW (the
+			// pre-v1.0.68 behaviour). Better than leaving everything static if we genuinely
+			// couldn't classify a single component. Logged separately so the user sees we
+			// punted.
+			if (!bMatched)
+			{
+				AxisBucket = HeadAxisIndex;
+				Strategy = (AxisBucket == INDEX_NONE) ? TEXT("default-static") : TEXT("default-head");
+				++NDefaulted;
+			}
+		}
+
+		OrbitAxisBucket.Add(AxisBucket);
+		if (AxisBucket == INDEX_NONE)
+		{
+			++NBase;
+		}
+		else if (Rig.Axes.IsValidIndex(AxisBucket))
+		{
+			switch (Rig.Axes[AxisBucket].Kind)
+			{
+				case ERebusAxisKind::Pan:  ++NPan; break;
+				case ERebusAxisKind::Tilt: ++NTilt; break;
+				default:                   ++NOther; break;
+			}
+		}
+		if (ClassifyDiag.Num() < 6)
+		{
+			ClassifyDiag.Add(FString::Printf(TEXT("'%s'->%s(a=%d)"), *Comp->GetName(), Strategy, AxisBucket));
+		}
+
 		// The bound Orbit model sits right on top of this fixture's light source, so exclude it from
 		// its own beam's volumetric-fog shadow (it would otherwise double-occlude with the body).
 		DisableSelfBeamVolumetricShadow(Cast<UPrimitiveComponent>(Comp));
 	}
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s: BOUND %d Orbit-imported component(s) by objectId '%s' (drive=%s)."),
+		TEXT("Fixture %s: BOUND %d Orbit-imported component(s) by objectId '%s' (drive=%s) | axis-buckets: base=%d pan=%d tilt=%d other=%d default=%d | sample: %s"),
 		*FixtureId, OrbitComponents.Num(), *MatchedObjectId,
-		bDriveOrbitModel ? TEXT("ON") : TEXT("off"));
+		bDriveOrbitModel ? TEXT("ON") : TEXT("off"),
+		NBase, NPan, NTilt, NOther, NDefaulted,
+		ClassifyDiag.Num() > 0 ? *FString::Join(ClassifyDiag, TEXT(" | ")) : TEXT("(none)"));
 
 	// Snap the model to the fixture's current pose now, so a late bind doesn't pop on the next tick.
 	if (bDriveOrbitModel)
 	{
-		DriveOrbitModel(ComputeHeadLocal(PanDeg.Current, TiltDeg.Current));
+		DriveOrbitModelFromPanTilt(PanDeg.Current, TiltDeg.Current);
 	}
 }
 
@@ -1646,6 +1839,7 @@ void ARebusFixtureActor::ClearOrbitBinding()
 	OrbitComponents.Reset();
 	OrbitCompRestWorld.Reset();
 	OrbitBindBase.Reset();
+	OrbitAxisBucket.Reset();
 	BoundOrbitObjectId.Reset();
 }
 
@@ -1666,7 +1860,7 @@ void ARebusFixtureActor::SetDriveOrbitModel(bool bEnabled)
 		// Push the model to the fixture's current pose immediately (if bound).
 		if (HasOrbitBinding())
 		{
-			DriveOrbitModel(ComputeHeadLocal(PanDeg.Current, TiltDeg.Current));
+			DriveOrbitModelFromPanTilt(PanDeg.Current, TiltDeg.Current);
 		}
 	}
 	else
@@ -1692,27 +1886,57 @@ void ARebusFixtureActor::SetDriveOrbitModel(bool bEnabled)
 	}
 }
 
-void ARebusFixtureActor::DriveOrbitModel(const FTransform& HeadLocal)
+void ARebusFixtureActor::DriveOrbitModelFromPanTilt(float InPanDeg, float InTiltDeg)
+{
+	// Caller-friendly entry point used by BindOrbitComponents + SetDriveOrbitModel: solve the rig
+	// for the requested pan/tilt and forward the Cumulative to DriveOrbitModel. RefreshMotion's
+	// already-solved Cumulative is passed straight in to avoid a redundant Solve per tick.
+	if (Profile.MotionRig.bValid && Profile.MotionRig.Axes.Num() > 0)
+	{
+		TArray<FTransform> Cumulative;
+		RebusMotion::Solve(Profile.MotionRig, InPanDeg, InTiltDeg, Cumulative);
+		DriveOrbitModel(Cumulative);
+	}
+	else
+	{
+		DriveOrbitModel(TArray<FTransform>{});
+	}
+}
+
+void ARebusFixtureActor::DriveOrbitModel(const TArray<FTransform>& Cumulative)
 {
 	if (!bDriveOrbitModel || OrbitComponents.Num() == 0) return;
 
-	const FTransform HeadWorldNow = HeadLocal * GetActorTransform();
+	// v1.0.68: per-component drive. Each component rides the Cumulative transform of the axis
+	// it was bucketed onto in BindOrbitComponents -- base components (bucket=INDEX_NONE OR an
+	// invalid axis index) use Identity, so they stay at CompRest while yoke comps pan and head
+	// comps pan+tilt. Pre-v1.0.68 the same HeadLocal got applied to every component, so the
+	// entire fixture tilted (the user's report). The bind-base captured at rest collapses to
+	// CompRest * ActorWorld^-1 for ALL buckets (every axis' RestCumulative is identity), which
+	// is why one OrbitBindBase array can drive every axis without per-axis storage.
+	const FTransform ActorWorld = GetActorTransform();
 	int32 Driven = 0;
 	for (int32 i = 0; i < OrbitComponents.Num(); ++i)
 	{
 		USceneComponent* Comp = OrbitComponents[i].Get();
 		if (!Comp || !OrbitBindBase.IsValidIndex(i)) continue;
-		Comp->SetWorldTransform(OrbitBindBase[i] * HeadWorldNow);
+		const int32 Axis = OrbitAxisBucket.IsValidIndex(i) ? OrbitAxisBucket[i] : INDEX_NONE;
+		const FTransform AxisLocal = (Axis != INDEX_NONE && Cumulative.IsValidIndex(Axis))
+			? Cumulative[Axis] : FTransform::Identity;
+		Comp->SetWorldTransform(OrbitBindBase[i] * (AxisLocal * ActorWorld));
 		++Driven;
 	}
 	if (Driven == 0) return;
 
 	// Per-update sync log (throttled to meaningful pan/tilt changes) so the Orbit model motion can
-	// be compared against the control-channel head meshes for the A/B confirmation.
+	// be compared against the control-channel head meshes for the A/B confirmation. HeadLocal is
+	// recomputed for the log only -- the per-component drive already used the per-bucket axis.
 	const FVector2D PanTilt(PanDeg.Current, TiltDeg.Current);
 	if (FMath::Abs(PanTilt.X - LastOrbitLogPanTilt.X) + FMath::Abs(PanTilt.Y - LastOrbitLogPanTilt.Y) > 0.5f)
 	{
 		LastOrbitLogPanTilt = PanTilt;
+		const FTransform HeadLocal = (HeadAxisIndex != INDEX_NONE && Cumulative.IsValidIndex(HeadAxisIndex))
+			? Cumulative[HeadAxisIndex] : FTransform::Identity;
 		const FRotator HeadRot = HeadLocal.Rotator();
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("Fixture %s: drove Orbit model '%s' pan=%.1f tilt=%.1f headRot=(P=%.1f Y=%.1f R=%.1f) comps=%d"),
