@@ -26,6 +26,35 @@
 
 namespace
 {
+	// v1.0.76 reflection helpers for UCanvasRenderTarget2D::bShouldClearRenderTargetOnReceive-
+	// Update. The field is `protected` on UCanvasRenderTarget2D in UE 5.7 (UPROPERTY-exposed
+	// for Blueprint via meta=(AllowPrivateAccess="true"), but C++ outside the class can't read
+	// or write it directly -- v1.0.74's `GoboRT->b... = true` failed with C2248). Defaults to
+	// true in 5.7 (CanvasRenderTarget2D.h), so the no-op fallback (when FindPropertyByName
+	// returns null on a future engine rename) is correct. v1.0.77: helpers MUST live at the
+	// top of the file because DumpGoboStateForDebug at line ~360 calls the reader -- v1.0.76
+	// put them in an anonymous namespace down near EnsureGoboRT at line ~2783, which broke
+	// the build with "identifier not found" at the dump line.
+	FBoolProperty* FindClearOnUpdateProperty(UCanvasRenderTarget2D* RT)
+	{
+		if (!RT) return nullptr;
+		return CastField<FBoolProperty>(
+			RT->GetClass()->FindPropertyByName(TEXT("bShouldClearRenderTargetOnReceiveUpdate")));
+	}
+	void SetGoboRTClearOnUpdate(UCanvasRenderTarget2D* RT, bool bValue)
+	{
+		if (FBoolProperty* Prop = FindClearOnUpdateProperty(RT))
+		{
+			Prop->SetPropertyValue_InContainer(RT, bValue);
+		}
+	}
+	int32 ReadGoboRTClearOnUpdate(UCanvasRenderTarget2D* RT) // -1 = couldn't read, 0/1 = value
+	{
+		FBoolProperty* Prop = FindClearOnUpdateProperty(RT);
+		if (!Prop) return -1;
+		return Prop->GetPropertyValue_InContainer(RT) ? 1 : 0;
+	}
+
 	// Per-channel sRGB -> linear (the wire sends sRGB 0..1; §5.2 SetFixtureColor).
 	FORCEINLINE float SrgbToLinearChannel(float C)
 	{
@@ -2778,39 +2807,6 @@ bool ARebusFixtureActor::ApplyGoboTextureFromBytes(const TArray<uint8>& Bytes)
 	ApplyCurrentGoboToEpicBeam(); // tail-calls ApplyCurrentGoboToLightFn (cone + cookie).
 	RefreshBeamShadowMode();      // enables CastShadows now that bGoboActive is true.
 	return true;
-}
-
-// v1.0.76 reflection helpers for UCanvasRenderTarget2D::bShouldClearRenderTargetOnReceiveUpdate.
-//
-// The field is declared `protected` on UCanvasRenderTarget2D in UE 5.7 (it's a UPROPERTY for
-// Blueprint access via meta=(AllowPrivateAccess="true"), but C++ outside the class can't read
-// or write it directly -- which broke the v1.0.74 explicit-set with C2248). Defaults to true
-// in 5.7 (verified in CanvasRenderTarget2D.h), so a no-op fallback is fine for the writer.
-// We go through FProperty reflection so the v1.0.74 defensive assertion semantics survive
-// (set is provable from the dump, write succeeds even though the field is protected). If the
-// engine ever renames the property the FindPropertyByName returns null and we silently fall
-// back to the documented default behaviour -- no crash, no regression vs. omitting the call.
-namespace
-{
-	FBoolProperty* FindClearOnUpdateProperty(UCanvasRenderTarget2D* RT)
-	{
-		if (!RT) return nullptr;
-		return CastField<FBoolProperty>(
-			RT->GetClass()->FindPropertyByName(TEXT("bShouldClearRenderTargetOnReceiveUpdate")));
-	}
-	void SetGoboRTClearOnUpdate(UCanvasRenderTarget2D* RT, bool bValue)
-	{
-		if (FBoolProperty* Prop = FindClearOnUpdateProperty(RT))
-		{
-			Prop->SetPropertyValue_InContainer(RT, bValue);
-		}
-	}
-	int32 ReadGoboRTClearOnUpdate(UCanvasRenderTarget2D* RT) // -1 = couldn't read, 0/1 = value
-	{
-		FBoolProperty* Prop = FindClearOnUpdateProperty(RT);
-		if (!Prop) return -1;
-		return Prop->GetPropertyValue_InContainer(RT) ? 1 : 0;
-	}
 }
 
 // v1.0.75: configurable per-actor gobo RT resolution.
