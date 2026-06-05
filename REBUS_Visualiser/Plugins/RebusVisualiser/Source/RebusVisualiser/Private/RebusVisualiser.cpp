@@ -32,6 +32,7 @@ namespace
 	IConsoleCommand* GDumpGoboStateCommand = nullptr;
 	IConsoleCommand* GGoboRTSizeCommand = nullptr;
 	IConsoleCommand* GDLSSCommand = nullptr;
+	IConsoleCommand* GLumenFastResponseCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -68,13 +69,75 @@ namespace
 	TArray<FCVarSnapshot> GGoboAntiGhostPrior;
 	bool GGoboAntiGhostEnabled = false; // tracks the LIVE state, not the requested state
 
+	// v1.0.78: shared snapshot-restore machinery for any "Rebus.*FastResponse" / antighost-style
+	// CVar pack. ApplyCVarPack runs the pack defined by `Defs[]`, writes each to OnValue with
+	// ECVF_SetByGameOverride priority, captures the prior string value into `PriorState[]` (one
+	// snapshot entry per def, index-aligned), and on the OFF path restores byte-exact from the
+	// snapshot. Stringified set/restore handles both int and float CVars uniformly.
+	struct FCVarPackDef { const TCHAR* Name; float OnValue; };
+
+	void ApplyCVarPack(
+		bool bEnable,
+		const TCHAR* Phase,
+		const TCHAR* PackLabel,
+		bool& bLiveStateRef,
+		TArray<FCVarSnapshot>& PriorState,
+		const FCVarPackDef* Defs,
+		int32 NumDefs)
+	{
+		if (bEnable == bLiveStateRef) return;
+
+		if (bEnable)
+		{
+			PriorState.Reset();
+			for (int32 i = 0; i < NumDefs; ++i)
+			{
+				const FCVarPackDef& Def = Defs[i];
+				IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(Def.Name);
+				FCVarSnapshot Snap;
+				Snap.Name = Def.Name;
+				if (CVar)
+				{
+					Snap.PriorInt = CVar->GetInt(); // int truncation is fine for the labels we push (0/1/2 + 0.6 etc.)
+					Snap.bValid = true;
+					CVar->Set(*FString::SanitizeFloat(Def.OnValue), ECVF_SetByGameOverride);
+					UE_LOG(LogRebusVisualiser, Log,
+						TEXT("%s ON [%s]: %s was=%d now=%s"),
+						PackLabel, Phase, Def.Name, Snap.PriorInt, *CVar->GetString());
+				}
+				else
+				{
+					UE_LOG(LogRebusVisualiser, Log,
+						TEXT("%s ON [%s]: %s NOT REGISTERED (renderer module not loaded yet, or CVar renamed in this engine version -- benign, the other CVars still apply)."),
+						PackLabel, Phase, Def.Name);
+				}
+				PriorState.Add(Snap);
+			}
+		}
+		else
+		{
+			for (const FCVarSnapshot& Snap : PriorState)
+			{
+				if (!Snap.bValid) continue;
+				IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(*Snap.Name);
+				if (!CVar) continue;
+				const FString BeforeRestore = CVar->GetString();
+				CVar->Set(Snap.PriorInt, ECVF_SetByGameOverride);
+				UE_LOG(LogRebusVisualiser, Log,
+					TEXT("%s OFF [%s]: %s was=%s restored=%s"),
+					PackLabel, Phase, *Snap.Name, *BeforeRestore, *CVar->GetString());
+			}
+			PriorState.Reset();
+		}
+		bLiveStateRef = bEnable;
+	}
+
 	// CVar definitions for the anti-ghost pack. Each entry has a name and an "on" value; some
 	// are int, some are float (kept as float here so the int-snapshot path is just the int
 	// truncation of the prior float -- restore-via-Set on a float CVar accepts a stringified
 	// value with no precision drama for our 1-decimal settings). v1.0.74 expands the v1.0.73
 	// pack with three additions; see comments alongside each entry below.
-	struct FAntiGhostCVarDef { const TCHAR* Name; float OnValue; };
-	const FAntiGhostCVarDef GAntiGhostCVars[] = {
+	const FCVarPackDef GAntiGhostCVars[] = {
 		// v1.0.73 baseline: TSR flicker-rejection mode + full-res light functions. Necessary
 		// but not sufficient -- biases TSR to reject flickering pixels, but the underlying
 		// temporal history weight is still high enough to leave a trail behind a fast cookie.
@@ -103,53 +166,66 @@ namespace
 
 	void ApplyGoboAntiGhost(bool bEnable, const TCHAR* Phase)
 	{
-		if (bEnable == GGoboAntiGhostEnabled) return; // no-op if already in target state
+		ApplyCVarPack(bEnable, Phase, TEXT("GoboAntiGhost"),
+			GGoboAntiGhostEnabled, GGoboAntiGhostPrior,
+			GAntiGhostCVars, UE_ARRAY_COUNT(GAntiGhostCVars));
+	}
 
-		if (bEnable)
-		{
-			GGoboAntiGhostPrior.Reset();
-			for (const FAntiGhostCVarDef& Def : GAntiGhostCVars)
-			{
-				IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(Def.Name);
-				FCVarSnapshot Snap;
-				Snap.Name = Def.Name;
-				if (CVar)
-				{
-					// Snapshot via int (truncation is fine for restore since we only push 1
-					// fractional digit at most -- 0.6 etc. -- and the int round-trip preserves
-					// any prior int CVars exactly).
-					Snap.PriorInt = CVar->GetInt();
-					Snap.bValid = true;
-					CVar->Set(*FString::SanitizeFloat(Def.OnValue), ECVF_SetByGameOverride);
-					UE_LOG(LogRebusVisualiser, Log,
-						TEXT("GoboAntiGhost ON [%s]: %s was=%d now=%s"),
-						Phase, Def.Name, Snap.PriorInt, *CVar->GetString());
-				}
-				else
-				{
-					UE_LOG(LogRebusVisualiser, Log,
-						TEXT("GoboAntiGhost ON [%s]: %s NOT REGISTERED (renderer module not loaded yet, or CVar renamed in this engine version -- benign, the other CVars still apply)."),
-						Phase, Def.Name);
-				}
-				GGoboAntiGhostPrior.Add(Snap);
-			}
-		}
-		else
-		{
-			for (const FCVarSnapshot& Snap : GGoboAntiGhostPrior)
-			{
-				if (!Snap.bValid) continue;
-				IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(*Snap.Name);
-				if (!CVar) continue;
-				const FString BeforeRestore = CVar->GetString();
-				CVar->Set(Snap.PriorInt, ECVF_SetByGameOverride);
-				UE_LOG(LogRebusVisualiser, Log,
-					TEXT("GoboAntiGhost OFF [%s]: %s was=%s restored=%s"),
-					Phase, *Snap.Name, *BeforeRestore, *CVar->GetString());
-			}
-			GGoboAntiGhostPrior.Reset();
-		}
-		GGoboAntiGhostEnabled = bEnable;
+	// v1.0.78: Lumen GI fast-response pack. User reported: "the ghosting is to do with Global
+	// illumination and the camera. When we turn lights on and off there is a fade off of GI,
+	// we want this instant." -- correct diagnosis. The fade and the residual gobo trail on
+	// the floor are both Lumen temporal accumulation symptoms:
+	//
+	//   * Lights toggle: direct lighting flips instantly, but Lumen's screen-probe gather +
+	//     radiosity history hold onto the previous lit state for many frames -> the floor
+	//     glow fades out instead of cutting.
+	//   * Rotating gobo: each frame Lumen samples the lit floor sparsely for indirect bounce;
+	//     prior-frame samples linger in history -> ghost trail in the GI on TOP of any TSR
+	//     smear (v1.0.73/74 fixed the TSR layer; this is the layer underneath).
+	//
+	// The fix is to disable Lumen's temporal filters so direct light changes propagate to GI
+	// at full strength on the very next frame. Cost: noisier GI (the temporal accumulator was
+	// hiding sparse-sampling noise) -- but for a stage lighting visualiser, instant response
+	// trumps smoothness. The eye reads the slight grain as natural surface texture; the eye
+	// reads a slow GI fade-off as "the lights aren't actually responding".
+	//
+	// CVars (UE 5.7 names):
+	//   r.Lumen.ScreenProbeGather.Temporal 0    -- primary screen-probe temporal filter off
+	//   r.Lumen.Reflections.Temporal 0          -- reflection temporal filter off (catches
+	//                                              the gobo bounce reflected off shiny surfaces)
+	//   r.Lumen.Radiosity.Temporal 0            -- radiosity (final-gather bounced light)
+	//                                              temporal off
+	//   r.LumenScene.SurfaceCache.RecaptureLightingPerFrame 1
+	//                                           -- force per-frame surface cache lighting
+	//                                              recapture (otherwise the surface cache
+	//                                              ALSO holds stale direct-lighting samples
+	//                                              for several frames -> compounds the fade)
+	bool GLumenFastResponseEnabled = false;
+	TArray<FCVarSnapshot> GLumenFastResponsePrior;
+	const FCVarPackDef GLumenFastResponseCVars[] = {
+		{ TEXT("r.Lumen.ScreenProbeGather.Temporal"),                       0.f },
+		{ TEXT("r.Lumen.Reflections.Temporal"),                             0.f },
+		{ TEXT("r.Lumen.Radiosity.Temporal"),                               0.f },
+		{ TEXT("r.LumenScene.SurfaceCache.RecaptureLightingPerFrame"),      1.f },
+	};
+
+	void ApplyLumenFastResponse(bool bEnable, const TCHAR* Phase)
+	{
+		ApplyCVarPack(bEnable, Phase, TEXT("LumenFastResponse"),
+			GLumenFastResponseEnabled, GLumenFastResponsePrior,
+			GLumenFastResponseCVars, UE_ARRAY_COUNT(GLumenFastResponseCVars));
+	}
+
+	// v1.0.78: `Rebus.LumenFastResponse [0|1]` -- toggle the Lumen GI temporal-disable pack.
+	// Default ON since v1.0.78 (auto-applied at PostEngineInit). Disable for A/B comparison
+	// or for cinematic scenes where smooth GI matters more than instant light response.
+	void HandleLumenFastResponseCommand(const TArray<FString>& Args)
+	{
+		const bool bEnable = ParseBoolArg(Args, true);
+		ApplyLumenFastResponse(bEnable, TEXT("ConsoleCommand"));
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.LumenFastResponse %d -> live state %s."),
+			bEnable ? 1 : 0, GLumenFastResponseEnabled ? TEXT("ON") : TEXT("OFF"));
 	}
 
 	// v1.0.74: `Rebus.DumpGoboState` -- per-fixture gobo runtime dump. Useful to confirm:
@@ -611,6 +687,11 @@ void FRebusVisualiserModule::StartupModule()
 		// renderer module's TSR CVars are guaranteed registered. Default ON; disable per
 		// session with `Rebus.GoboAntiGhost 0` for A/B against the prior look.
 		ApplyGoboAntiGhost(true, TEXT("PostEngineInit"));
+
+		// v1.0.78: Lumen GI fast-response pack, same auto-apply pattern. Default ON; disable
+		// for cinematic scenes via `Rebus.LumenFastResponse 0`. See the pack definition above
+		// for the full diagnosis (lights on/off GI fade, gobo bounce ghost).
+		ApplyLumenFastResponse(true, TEXT("PostEngineInit"));
 	});
 
 	GDriveOrbitModelsCommand = IConsoleManager::Get().RegisterConsoleCommand(
@@ -712,6 +793,22 @@ void FRebusVisualiserModule::StartupModule()
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleGoboRTSizeCommand),
 		ECVF_Default);
 
+	// v1.0.78 Lumen GI fast-response toggle.
+	GLumenFastResponseCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.LumenFastResponse"),
+		TEXT("Toggle the Lumen GI fast-response pack -- disables Lumen's temporal filters so "
+			 "direct light changes propagate to GI instantly. Default ON since v1.0.78 (auto-"
+			 "applied at PostEngineInit). Fixes: 'lights on/off shows a GI fade-off instead "
+			 "of cutting' AND 'rotating gobo leaves a GI ghost trail on the floor underneath "
+			 "the TSR-side trail'. Pushes: r.Lumen.ScreenProbeGather.Temporal=0, "
+			 "r.Lumen.Reflections.Temporal=0, r.Lumen.Radiosity.Temporal=0, "
+			 "r.LumenScene.SurfaceCache.RecaptureLightingPerFrame=1. OFF restores each CVar "
+			 "byte-exact (snapshot taken on first ON). Cost: noisier GI -- the temporal "
+			 "filter was hiding sparse-sampling noise. Trade-off favours stage shows where "
+			 "instant response trumps smoothness. Usage: Rebus.LumenFastResponse [0|1]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleLumenFastResponseCommand),
+		ECVF_Default);
+
 	GDLSSCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Rebus.DLSS"),
 		TEXT("Enable NVIDIA DLSS upscaling (requires the NVIDIA DLSS plugin installed in this "
@@ -777,9 +874,15 @@ void FRebusVisualiserModule::ShutdownModule()
 		IConsoleManager::Get().UnregisterConsoleObject(GDLSSCommand);
 		GDLSSCommand = nullptr;
 	}
-	// v1.0.73: restore the anti-ghost CVars to their snapshotted values so a hot-reload of
-	// the module doesn't leak a permanent override into the engine session.
+	if (GLumenFastResponseCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GLumenFastResponseCommand);
+		GLumenFastResponseCommand = nullptr;
+	}
+	// v1.0.73 / v1.0.78: restore both CVar packs to their snapshotted values so a hot-reload
+	// of the module doesn't leak a permanent override into the engine session.
 	ApplyGoboAntiGhost(false, TEXT("ShutdownModule"));
+	ApplyLumenFastResponse(false, TEXT("ShutdownModule"));
 
 	UE_LOG(LogRebusVisualiser, Log, TEXT("RebusVisualiser module shut down."));
 }

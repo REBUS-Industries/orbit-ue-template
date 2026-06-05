@@ -593,6 +593,64 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Lumen GI fast-response: disable temporal filters so lights respond instantly (v1.0.78).**
+> User identified the actual root cause: *"the ghosting is to do with Global illumination and
+> the camera. When we turn lights on and off there is a fade off of GI, we want this
+> instant."* Correct -- the fade-off when lights toggle, AND the residual gobo trail on the
+> floor that persisted through the v1.0.73/74 TSR fixes, are both Lumen temporal
+> accumulation symptoms, not TSR symptoms.
+>
+> **Why it happens.** Lumen is a screen-probe + radiosity GI system that samples sparsely
+> each frame and accumulates over many frames into a temporal history buffer (this is what
+> makes Lumen affordable -- you couldn't sample densely each frame at real-time rates).
+> Two consequences:
+>
+> - **Lights toggled off**: direct lighting flips instantly, but the screen-probe gather +
+>   radiosity history hold onto samples from the previous lit state for many frames. The
+>   floor glow "fades out" instead of cutting.
+> - **Rotating gobo**: each frame Lumen samples the cookie-lit floor sparsely as an
+>   indirect bounce source; prior-frame samples linger in history; the result is a GI
+>   trail in the bounced light, ON TOP of any TSR-side smear (v1.0.73/74 fixed TSR; this
+>   is the layer underneath).
+>
+> **The fix.** Disable Lumen's temporal filters so direct light changes propagate to GI at
+> full strength on the very next frame. Pack pushed at `PostEngineInit`, snapshot/restore
+> on the same machinery as `GoboAntiGhost` (which got refactored to share via
+> `ApplyCVarPack`):
+>
+> ```
+> r.Lumen.ScreenProbeGather.Temporal 0                       # primary -- screen-probe history off
+> r.Lumen.Reflections.Temporal 0                             # reflection bounce -- catches gobo on shiny floors
+> r.Lumen.Radiosity.Temporal 0                               # final-gather radiosity history off
+> r.LumenScene.SurfaceCache.RecaptureLightingPerFrame 1      # force per-frame surface cache refresh
+>                                                            #   (otherwise the cache ALSO holds stale direct
+>                                                            #   lighting samples and compounds the fade)
+> ```
+>
+> **Cost.** Noisier GI. The temporal filter was hiding the sparse-sampling noise; without it
+> you can see grain on indirect-lit surfaces. For a stage lighting visualiser this trade-off
+> is the right one: instant response trumps smoothness. The eye reads the slight grain as
+> natural surface texture; the eye reads a slow GI fade-off as "the lights aren't actually
+> responding". For cinematic scenes where smooth GI matters more, `Rebus.LumenFastResponse 0`
+> restores the snapshot byte-exact.
+>
+> **Live toggle: `Rebus.LumenFastResponse [0|1]`.** Default ON since v1.0.78, auto-applied
+> at `PostEngineInit`. Logs each CVar's before/after on every transition:
+>
+> ```
+> LumenFastResponse ON [PostEngineInit]: r.Lumen.ScreenProbeGather.Temporal was=1 now=0
+> LumenFastResponse ON [PostEngineInit]: r.Lumen.Reflections.Temporal was=1 now=0
+> LumenFastResponse ON [PostEngineInit]: r.Lumen.Radiosity.Temporal was=1 now=0
+> LumenFastResponse ON [PostEngineInit]: r.LumenScene.SurfaceCache.RecaptureLightingPerFrame was=0 now=1
+> Rebus.LumenFastResponse 1 -> live state ON.
+> ```
+>
+> **Refactor note.** v1.0.78 split the snapshot/restore implementation out into a generic
+> `ApplyCVarPack(bEnable, Phase, PackLabel, &liveState, &priorState, defs, numDefs)`. Both
+> `GoboAntiGhost` (TSR layer, v1.0.73/74) and `LumenFastResponse` (Lumen layer, v1.0.78) now
+> thin-wrap that. Future "Rebus.XFastResponse" packs (e.g. virtual shadow map temporal,
+> volumetric fog history) drop in as a new `FCVarPackDef` array + one call.
+
 > **Build hotfix: bShouldClearRenderTargetOnReceiveUpdate is protected in UE 5.7 (v1.0.76).**
 > v1.0.74 / v1.0.75 wrote `GoboRT->bShouldClearRenderTargetOnReceiveUpdate = true` directly,
 > which failed to compile in UE 5.7 with `C2248: cannot access protected member` -- the
