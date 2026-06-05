@@ -594,6 +594,169 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Cone-mesh InternalBeam shaft + Python-baked LF (`bUsedWithVolumetricFog=true`) + chrome lens (v1.0.93).**
+> User report (verbatim, against v1.0.92):
+>
+> > "We are not seeing gobos in the volumetric beam of the spotlight. I think you need to
+> > properly investigate how you do this in unreal. We should be adding it as a light function
+> > material. Pelase make sure you are apply it to the internalbeam. we are also see the
+> > volumetric beam inside the head, it should be hidden until it appears from out the lens.
+> > can we also look at creating the lens material in the startup python script. It should have
+> > metallic at 1 and roughness at 0. Base colour should be white."
+>
+> Three coupled fixes, one release.
+>
+> **Investigation finding (the smoking gun).** v1.0.92 forced `r.VolumetricFog.LightFunction=1`
+> + `r.LightFunctionQuality=2` and pushed `bAllowMegaLights=0` on every InternalBeam
+> SpotLight -- all necessary but **not sufficient**. The actual blocker is a per-`UMaterial`
+> flag: **`bUsedWithVolumetricFog`**. The engine's `LightFunctionPixelShader` gates whether
+> a light-function reaches the volumetric integrator on this flag on the bound `UMaterial`
+> instance; Epic's stock `MI_Light` (parent `M_Light_Master`, the cookie material the v1.0.49
+> path routes the gobo through) has `bUsedWithVolumetricFog = false`. With that flag off, no
+> amount of CVar pushing makes the cookie appear on the volumetric shaft -- the material
+> itself must opt in. v1.0.93 authors our own LF (`M_RebusGoboLightFunction`, Python-baked,
+> `bUsedWithVolumetricFog = true`) and binds it to `SpotLight->LightFunctionMaterial` while
+> InternalBeam mode is on. (The v1.0.92 CVar pushes stay -- they are still necessary; the new
+> LF material now actually benefits from them.)
+>
+> **Three new Python-baked masters (`build_rebus_base_level.py`).** Bake on every startup
+> via `ensure_base_level()`; force-regen on every full `build()`; self-heal probes detect a
+> stale shape (missing parameter, missing flag) and force-regen on the next launch.
+>
+> | Path                                      | Used by                                    | Purpose |
+> |-------------------------------------------|--------------------------------------------|---------|
+> | `M_RebusFixtureLens`                      | Lens disc (GDTF `<Beam>`)                  | Chrome mirror: `Metallic=1`, `Roughness=0`, `BaseColor` white. Replaces the operator-authored asset; runtime fallback MID kept as a safety net. |
+> | `M_RebusGoboLightFunction`                | `SpotLight->LightFunctionMaterial` in InternalBeam | LF with `bUsedWithVolumetricFog=true`; samples the per-fixture `GoboRT` so the cookie pattern reaches the volumetric integrator. |
+> | `M_RebusInternalBeamShaft`                | `InternalBeamShaft` cone-mesh component    | Unlit additive cone-mesh; world-space cross-section UV + Gaussian falloff + SceneDepth soft-clip; samples `GoboRT` so the cookie pattern appears IN the shaft. |
+>
+> **Fix 1 -- gobo on the volumetric shaft (LF wiring).** v1.0.93 routes the cookie through
+> the new `M_RebusGoboLightFunction` (LF MID, per fixture) instead of `MI_Light` while
+> InternalBeam mode is on. The MID's `GoboRT` parameter is pushed alongside the existing
+> v1.0.49 `DMX Gobo Disk Frosted` push (`ApplyCurrentGoboToLightFn` -> `PushGoboRTTo
+> InternalBeamMaterials`), so a single gobo change updates both the v1.0.49 floor-footprint
+> path AND the v1.0.93 LF that the engine's volumetric integrator samples. On the InternalBeam
+> OFF edge the SpotLight's prior `LightFunctionMaterial` is restored byte-exact from a
+> separate cache (`InternalBeamPriorLightFunction`) so the v1.0.49 cookie keeps owning the
+> floor footprint outside of InternalBeam mode.
+>
+> **Fix 2 -- no more "shaft inside the head" (cone-mesh shaft).** v1.0.87's back-offset
+> pushes the SpotLight INSIDE the head body; v1.0.92's per-light volumetric scattering then
+> painted scattering EVERYWHERE in the cone, including between the SpotLight and the lens
+> (the operator could see it from close camera angles). v1.0.93 decouples "lit footprint"
+> from "visible shaft": the SpotLight now lights surfaces only (`VolumetricScattering
+> Intensity = 0`), and a **translucent additive cone mesh** -- `InternalBeamShaft`,
+> procedurally built off `BuildBeamCone`'s frustum recipe -- starts AT the lens plane
+> (`SpotLoc - back-offset * LiveFwd`) and is the only visible shaft. Material is the new
+> `M_RebusInternalBeamShaft` which:
+>
+> - Projects each rasterized pixel into the cone's cross-section (Custom HLSL), so the
+>   `GoboRT` texture sample wraps the cone correctly regardless of how the procedural mesh is
+>   UV-mapped;
+> - Multiplies by per-fixture `Color` + `Intensity` (pushed live by `RefreshInternal
+>   BeamShaftEmissive` from `RefreshIntensity`, same envelope as `M_RebusBeam`);
+> - Soft-Gaussian-fades to the cone silhouette (no hard rim);
+> - Length fade so the shaft dims downrange (`1 / (1 + 1.5 * aN^2)`);
+> - SceneDepth soft-fade so the shaft soft-clips against opaque geometry (no hard
+>   intersection line).
+>
+> The cone is `CastShadow=false`, tagged `RebusInternalBeamShaft`, and explicitly skipped by
+> `SetBodyMeshesCastShadow` / `OptPrimitiveOutOfInternalBeamShadow` (would corrupt the
+> cache otherwise).
+>
+> **Fix 3 -- Python-author the chrome lens.** `M_RebusFixtureLens` was previously operator-
+> authored; v1.0.93 bakes it on every startup with `Metallic=1`, `Roughness=0`, `BaseColor`
+> white (exact spec the user asked for). C++ `ConstructorHelpers::FObjectFinder<UMaterial
+> Interface> UserLensMatFinder(...)` already auto-loads the asset at the expected path, so
+> the change is invisible to anyone whose project already had the operator-authored variant
+> -- the self-heal probe (`_fixture_lens_master_is_current`) checks for the three named
+> parameters (`Color` / `Metallic` / `Roughness`) and force-regens an older shape on the
+> next launch.
+>
+> **New CVar -- `Rebus.InternalBeamCookieCone [0|1]`** (default `1`). When `1` (default),
+> every fixture in InternalBeam mode uses the v1.0.93 cone-mesh shaft. When `0`, the cone
+> mesh is hidden and `RefreshBeamShadowMode` restores the v1.0.92 per-light scattering -- A/B
+> at runtime without a `Rebus.InternalBeam 0/1` cycle. Refresh sink walks every fixture in
+> InternalBeam mode and calls `ApplyInternalBeamShaft(true)` / `RestoreInternalBeamShaft()`
+> in-place.
+>
+> **Operator checklist after rebuilding to v1.0.93.**
+>
+> 1. **Run the Python builder once** (auto-runs on startup via `ensure_base_level`, but a
+>    manual run via *Tools > Execute Python Script > build_rebus_base_level.py* with the
+>    `build` entry point force-regenerates the three new masters under
+>    `/Game/REBUS/Materials/`):
+>    - `M_RebusFixtureLens` (chrome lens)
+>    - `M_RebusGoboLightFunction` (volumetric-aware LF)
+>    - `M_RebusInternalBeamShaft` (cone-mesh shaft)
+> 2. **Toggle InternalBeam ON** on a fixture and verify, from the editor viewport:
+>    - The visible volumetric shaft starts AT the lens plane (not inside the head body).
+>    - The shaft envelope tracks the live zoom (sweep the zoom channel; the cone-mesh
+>      far-radius rebuilds on changes > 0.5 cm via the same rebuild gate as `BeamCone`).
+>    - The lens disc reads as a **chrome mirror** (high specular, no roughness, white
+>      base) -- confirms `M_RebusFixtureLens` baked correctly.
+> 3. **Assign a gobo** (`/animations/{id}/gobo` or via the wire) and verify:
+>    - The cookie pattern projects through the floor footprint (v1.0.49 path, unchanged).
+>    - The cookie pattern **appears IN the volumetric beam shaft** (the v1.0.93 fix). Sweep
+>      `gobo.angle` -- the pattern spins in plane on the shaft AND on the floor in
+>      lock-step (single source of truth: `GoboRT`).
+>    - The shaft is GOBO-shaped through volumetric fog (`r.VolumetricFog 1`) -- this is
+>      the smoking-gun proof that the new LF's `bUsedWithVolumetricFog=true` flag is now
+>      reaching the integrator.
+> 4. **Toggle `Rebus.InternalBeamCookieCone 0`** -- the cone-mesh shaft disappears and the
+>    v1.0.92 per-light scattering returns (the shaft is now the SpotLight's volumetric
+>    scattering pass again, with the v1.0.87 back-offset; you should see the head-body
+>    artefact return). Toggle back to `1` -- the artefact goes away. A/B confirmation that
+>    the cone-mesh path is what fixed the "shaft inside the head" symptom.
+> 5. **Toggle InternalBeam OFF** and verify the SpotLight's `LightFunctionMaterial`
+>    returns to whatever it was before (typically the v1.0.49 `MI_Light` cookie MID, OR
+>    null if no gobo was active), `VolumetricScatteringIntensity` returns to the v1.0.92
+>    cached value, and the cone-mesh shaft is hidden (not destroyed -- the next ON toggle
+>    is cheap).
+>
+> **Trade-offs.**
+>
+> - The cone-mesh shaft is a SEPARATE draw call per InternalBeam fixture (one translucent
+>   additive primitive per fixture). Per-fixture cost is small (24-segment frustum, ~96
+>   triangles, no shadow casting, no Lumen contribution); negligible in a typical concert
+>   rig (~tens of InternalBeam fixtures). Heaviest cost is the per-pixel Custom HLSL
+>   (world-space basis computed per-pixel; ~12 alu); pre-rasterised by the additive blend
+>   so it doesn't pollute opaque depth.
+> - The cone-mesh shaft does NOT raymarch -- a single per-pixel sample of the cross-section
+>   gives a Gaussian-tube look, not a true integrated volume. The v1.0.92 per-light
+>   scattering remains available behind `Rebus.InternalBeamCookieCone 0` if a follow-up
+>   release needs true integration. A future v1.0.94+ could swap the Gaussian for a
+>   `M_RebusBeam`-style raymarch (`_BEAM_RAYMARCH_HLSL` is the prior art) at noticeably
+>   higher per-pixel cost.
+> - The SpotLight's per-light volumetric pass is OFF while the cone-mesh shaft is on. The
+>   SpotLight still casts shadows for surface lighting + IES / LF projection on opaque
+>   geometry; only the volumetric integration is suppressed. If a future scene needs BOTH
+>   the cone-mesh shaft AND per-light volumetric scattering on the same fixture (e.g. for
+>   fog that the cone-mesh's SceneDepth fade can't see), `Rebus.InternalBeamCookieCone 0`
+>   reverts to the v1.0.92 path; a future toggle could let them co-exist by restoring
+>   `VolumetricScatteringIntensity` to the cached value while leaving the cone-mesh
+>   visible -- not implemented now because it'd double-shade the shaft.
+> - The new LF MID is one-per-fixture (each fixture's `GoboRT` is independent, so the LF
+>   MID must be too). Memory cost is ~1 MID + a per-fixture reference to the shared master
+>   -- negligible.
+>
+> **Files touched (v1.0.93).**
+>
+> - `REBUS_Visualiser/Content/Python/build_rebus_base_level.py` -- three new ensure_*
+>   functions + self-heal probes + wired into `build()` and `ensure_base_level()`.
+> - `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Public/RebusFixture
+>   Actor.h` -- declared `ApplyInternalBeamShaft` / `RestoreInternalBeamShaft` +
+>   `EnsureFixtureInternalBeamMIDs` / `UpdateInternalBeamShaftGeometry` / `RefreshInternal
+>   BeamShaftEmissive` / `DriveInternalBeamShaftFromSpotLight` / `PushGoboRTToInternalBeam
+>   Materials`; declared the new master / MID / component UPROPERTYs.
+> - `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusFixture
+>   Actor.cpp` -- new `Rebus.InternalBeamCookieCone` CVar + refresh sink; constructor
+>   `FObjectFinder` for the new masters; full implementations + wiring into `ApplyInternal
+>   BeamPose` / `RestoreInternalBeamPose` / `RefreshMotion` (Drive*) / `RefreshIntensity`
+>   (Refresh*) / `RecomputeConeAngles` (Update*Geometry) / `ApplyCurrentGoboToLightFn`
+>   (PushGoboRT*); `InternalBeamShaft` skip-add to `SetBodyMeshesCastShadow` + `Opt
+>   PrimitiveOutOfInternalBeamShadow`.
+> - `README.md` / this file -- v1.0.93 release block (this one).
+
 > **Gobo + IES modulate the volumetric beam shaft -- force legacy path, push volumetric LF CVars (v1.0.92).**
 > User report (verbatim, against v1.0.90):
 > *"gobo or IES is not being applied to the volumetric beam of the spotlight"*.

@@ -365,6 +365,71 @@ FAutoConsoleVariableRef CVarRebusInternalBeamForceLegacy(
 	}),
 	ECVF_Default);
 
+// v1.0.93 -- gate for the cookie-cone path inside InternalBeam mode. Default 1 (cone-mesh
+// shaft on; the v1.0.92 per-light volumetric scattering is suppressed, the gobo cookie
+// reaches the shaft via the new `M_RebusGoboLightFunction` LF MID, and the visible cone is
+// the new `InternalBeamShaft` translucent additive mesh that starts AT the lens plane).
+//
+// User report (v1.0.92 -> v1.0.93): the gobo cookie was visible on the floor footprint but
+// NOT in the volumetric beam shaft; AND the volumetric beam was visible inside the head
+// (the v1.0.87 back-offset pushes the SpotLight inside the head body, so the engine's
+// per-light volumetric pass paints scattering everywhere in the cone including behind the
+// lens). v1.0.93 fixes BOTH by decoupling "lit footprint" from "visible shaft": the
+// SpotLight only lights surfaces (VolumetricScatteringIntensity = 0); the shaft is a
+// translucent additive cone-mesh that starts AT the lens and samples the GoboRT directly.
+//
+// Flip to 0 to revert to the v1.0.92 per-light volumetric scattering path for A/B (useful
+// to diagnose whether a Volumetric-Fog tuning issue is in the new shaft material vs the
+// engine's per-light path). The CVar refresh sink walks every fixture currently in
+// InternalBeam mode and toggles the per-fixture state in-place (Apply or Restore) so the
+// operator can A/B at runtime without a `Rebus.InternalBeam 0/1` cycle.
+int32 GRebusInternalBeamCookieCone = 1;
+FAutoConsoleVariableRef CVarRebusInternalBeamCookieCone(
+	TEXT("Rebus.InternalBeamCookieCone"),
+	GRebusInternalBeamCookieCone,
+	TEXT("0|1 -- when 1 (default since v1.0.93), every fixture in InternalBeam mode replaces "
+		 "the v1.0.92 per-light volumetric scattering with a translucent additive cone-mesh "
+		 "(`M_RebusInternalBeamShaft`) that starts AT the lens plane, samples the per-fixture "
+		 "GoboRT directly so the cookie pattern appears IN the shaft (not just on the floor "
+		 "footprint), and avoids the v1.0.87 'shaft inside the head' artefact (the SpotLight "
+		 "is back-offset INSIDE the head body; the engine's per-light volumetric pass painted "
+		 "scattering everywhere in the cone including behind the lens). The SpotLight also "
+		 "gets `M_RebusGoboLightFunction` (a Python-authored LF with `bUsedWithVolumetricFog = "
+		 "true`, the smoking-gun flag Epic's stock MI_Light is missing) so its volumetric "
+		 "contribution -- separate from the cone-mesh shaft, ungated by Rebus.InternalBeamForce "
+		 "Legacy -- is also gobo-shaped when the engine routes the LF through. Flip to 0 to "
+		 "revert to v1.0.92's per-light scattering for A/B (the cone-mesh is hidden, "
+		 "VolumetricScatteringIntensity is restored to Rebus.InternalBeamScatter). Live."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		if (!GEngine) return;
+		const bool bOn = (CVar->GetInt() != 0);
+		int32 Refreshed = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					if (F->IsInternalBeamModeEnabled())
+					{
+						if (bOn) F->ApplyInternalBeamShaft(/*bForceVisible*/ true);
+						else     F->RestoreInternalBeamShaft();
+						++Refreshed;
+					}
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.InternalBeamCookieCone -> %d, refreshed %d InternalBeam fixture(s) (%s)."),
+			CVar->GetInt(), Refreshed,
+			bOn ? TEXT("cone-mesh shaft ON; SpotLight VolumetricScatteringIntensity forced to 0; gobo cookie on shaft via M_RebusInternalBeamShaft + M_RebusGoboLightFunction")
+			    : TEXT("cone-mesh shaft hidden; SpotLight VolumetricScatteringIntensity restored to Rebus.InternalBeamScatter (v1.0.92 path)"));
+	}),
+	ECVF_Default);
+
 // v1.0.88 A/B toggle: force the synthetic single-disc lens fallback even when the portal sent
 // mesh-blob v3 with isBeam meshes. Default 0 (real geometry wins when available). On change,
 // every spawned fixture re-evaluates its lens-visuals visibility: see
@@ -667,6 +732,36 @@ ARebusFixtureActor::ARebusFixtureActor()
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> UserLensMatFinder(
 		TEXT("/Game/REBUS/Materials/M_RebusFixtureLens.M_RebusFixtureLens"));
 	if (UserLensMatFinder.Succeeded()) FixtureLensMaterialOverride = UserLensMatFinder.Object;
+
+	// v1.0.93 -- cook-safe hard refs to the two new Python-authored masters (baked by
+	// `build_rebus_base_level.py::ensure_gobo_light_function_material` +
+	// `ensure_internal_beam_shaft_material` on startup):
+	//
+	//   * `M_RebusGoboLightFunction` -- domain = MD_LightFunction, `bUsedWithVolumetricFog =
+	//     true`. The smoking-gun flag that's MISSING from Epic's stock MI_Light: it's a
+	//     per-UMaterial gate that decides whether the SpotLight->LightFunctionMaterial
+	//     reaches the volumetric scattering integrator. v1.0.49+ bound MI_Light which lacks
+	//     this flag, so every CVar push (r.LightFunctionAtlas.Enabled / r.VolumetricFog.
+	//     LightFunction / r.LightFunctionQuality) was necessary but not sufficient -- the
+	//     material itself never opted into the volumetric path. v1.0.93 authors our own LF.
+	//
+	//   * `M_RebusInternalBeamShaft` -- unlit additive cone-mesh shader. v1.0.87 promoted
+	//     the SpotLight INSIDE the head for the back-offset trick, then set Volumetric
+	//     ScatteringIntensity > 0 so the same SpotLight provided the visible shaft -- but
+	//     the engine then painted scattering INSIDE the head too (the user's report). The
+	//     v1.0.93 cone-mesh shaft starts AT the lens plane and is the only visible cone, so
+	//     the SpotLight's per-light scattering can be turned off (no painting inside head).
+	//
+	// FObjectFinder resolves in-editor / during cook. If a path is missing (Python builder
+	// hasn't run yet on a fresh checkout, or older project drop predates v1.0.93) the ref
+	// stays null and `EnsureFixtureInternalBeamMIDs` logs a benign one-shot Warning telling
+	// the operator to run `build_rebus_base_level.py` from the editor.
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> GoboLfMatFinder(
+		TEXT("/Game/REBUS/Materials/M_RebusGoboLightFunction.M_RebusGoboLightFunction"));
+	if (GoboLfMatFinder.Succeeded()) GoboLightFunctionMaterial = GoboLfMatFinder.Object;
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> InternalBeamShaftMatFinder(
+		TEXT("/Game/REBUS/Materials/M_RebusInternalBeamShaft.M_RebusInternalBeamShaft"));
+	if (InternalBeamShaftMatFinder.Succeeded()) InternalBeamShaftMaterial = InternalBeamShaftMatFinder.Object;
 }
 
 void ARebusFixtureActor::Setup(const FRebusSceneFixture& InSceneFixture,
@@ -892,6 +987,52 @@ void ARebusFixtureActor::EnsureFixtureMIDs()
 			FixtureLensMID->SetVectorParameterValue(TEXT("Color"), FLinearColor(0.95f, 0.95f, 0.95f, 1.f));
 			FixtureLensMID->SetScalarParameterValue(TEXT("Metallic"), 1.0f);
 			FixtureLensMID->SetScalarParameterValue(TEXT("Roughness"), 0.0f);
+		}
+	}
+}
+
+void ARebusFixtureActor::EnsureFixtureInternalBeamMIDs()
+{
+	// v1.0.93 -- lazy per-actor MIDs off the Python-baked masters
+	// (`M_RebusGoboLightFunction` + `M_RebusInternalBeamShaft`). If a master is missing
+	// (Python builder hasn't run yet on this checkout, or older project drop), we log a
+	// one-shot Warning per missing material and leave the MID null -- the v1.0.92 fallback
+	// path then keeps working (per-light volumetric scattering, gobo via Epic's MI_Light).
+	if (!GoboLightFunctionMID)
+	{
+		if (GoboLightFunctionMaterial)
+		{
+			GoboLightFunctionMID = UMaterialInstanceDynamic::Create(GoboLightFunctionMaterial, this);
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Fixture %s v1.0.93: MID'd %s for SpotLight->LightFunctionMaterial (LF with bUsedWithVolumetricFog=true; the v1.0.92 MI_Light path was MISSING that flag, which is the smoking-gun reason the gobo cookie didn't reach the volumetric beam shaft)."),
+				*FixtureId, *GoboLightFunctionMaterial->GetPathName());
+		}
+		else
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Fixture %s v1.0.93: M_RebusGoboLightFunction not found at /Game/REBUS/Materials/M_RebusGoboLightFunction -- the Python builder hasn't run yet. Run Tools > Execute Python Script > build_rebus_base_level.py (or restart the editor so the startup hook bakes it) so the gobo cookie can reach the volumetric beam shaft."),
+				*FixtureId);
+		}
+	}
+	if (!InternalBeamShaftMID)
+	{
+		if (InternalBeamShaftMaterial)
+		{
+			InternalBeamShaftMID = UMaterialInstanceDynamic::Create(InternalBeamShaftMaterial, this);
+			// Seed sensible defaults so the shaft renders SOMETHING the first frame -- the
+			// per-frame refresh paths (RefreshInternalBeamShaftEmissive + UpdateInternal
+			// BeamShaftGeometry) will overwrite these immediately.
+			InternalBeamShaftMID->SetVectorParameterValue(TEXT("Color"), FLinearColor::White);
+			InternalBeamShaftMID->SetScalarParameterValue(TEXT("Intensity"), 0.f);
+			InternalBeamShaftMID->SetScalarParameterValue(TEXT("BeamLength"), 6000.f);
+			InternalBeamShaftMID->SetScalarParameterValue(TEXT("LensRadius"), 2.f);
+			InternalBeamShaftMID->SetScalarParameterValue(TEXT("FarRadius"), 1000.f);
+		}
+		else
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Fixture %s v1.0.93: M_RebusInternalBeamShaft not found at /Game/REBUS/Materials/M_RebusInternalBeamShaft -- the Python builder hasn't run yet. Run build_rebus_base_level.py (or restart the editor); the cone-mesh shaft path will fall back to v1.0.92's per-light scattering until the master exists."),
+				*FixtureId);
 		}
 	}
 }
@@ -1717,6 +1858,301 @@ float ARebusFixtureActor::ResolveOuterHalfDeg() const
 	return OuterHalf;
 }
 
+// ---- v1.0.93 InternalBeam cookie-cone shaft ---------------------------------------------
+//
+// The visible volumetric shaft while InternalBeam-cookie-cone mode is on. Mirrors the
+// procedural cone-mesh + MID pattern of `BuildBeamCone` / `UpdateBeamConeGeometry`, with
+// three meaningful differences:
+//
+//   1. Anchored at the LENS plane, NOT at the SpotLight location. v1.0.87's back-offset
+//      pushes the SpotLight INSIDE the head; the shaft must originate at the lens or it
+//      would also be visible inside the head body (the user-reported regression).
+//   2. CastShadow = false. Purely emissive additive geometry; the SpotLight still casts
+//      shadows for surface lighting + IES / LF projection.
+//   3. Tagged `RebusInternalBeamShaft` so any future shadow walker / material-override
+//      pass can grep-skip it. The cone is also explicitly skipped in
+//      `SetBodyMeshesCastShadow` (pointer-equality on `InternalBeamShaft.Get()`).
+void ARebusFixtureActor::UpdateInternalBeamShaftGeometry()
+{
+	if (!InternalBeamShaft || !InternalBeamShaftMID) return;
+
+	// Resolve length / lens / outer-half identically to the v1.0.92 BeamCone path so the
+	// shaft envelope matches the SpotLight footprint (single source of truth: zoom changes
+	// re-derive both meshes from the same SpotLight outer cone half-angle).
+	const float L = SpotLight ? SpotLight->AttenuationRadius : 6000.f;
+	const float OuterHalf = ResolveOuterHalfDeg();
+	const float TanHalf = FMath::Tan(FMath::DegreesToRadians(OuterHalf));
+	const float r0 = FMath::Max(BeamBaseRadiusUnreal, RebusBeamLensRadiusFloorCm);
+	const float rF = FMath::Max(L * TanHalf, r0 + 0.1f);
+
+	if (InternalBeamShaftLastFarRadius >= 0.f
+		&& FMath::Abs(rF - InternalBeamShaftLastFarRadius) < 0.5f)
+	{
+		// Skip the rebuild but always re-push the spatial params (BeamLength can change
+		// independently of FarRadius -- e.g. AttenuationRadius retune at runtime).
+		InternalBeamShaftMID->SetScalarParameterValue(TEXT("BeamLength"), L);
+		InternalBeamShaftMID->SetScalarParameterValue(TEXT("LensRadius"), r0);
+		InternalBeamShaftMID->SetScalarParameterValue(TEXT("FarRadius"), rF);
+		return;
+	}
+	InternalBeamShaftLastFarRadius = rF;
+
+	const int32 Segs = RebusBeamConeSegments;
+
+	TArray<FVector> Positions;
+	TArray<int32> Triangles;
+	TArray<FVector> Normals;
+	TArray<FVector2D> UVs;
+	Positions.Reserve(Segs * 2 + 2);
+	Normals.Reserve(Segs * 2 + 2);
+	UVs.Reserve(Segs * 2 + 2);
+	Triangles.Reserve(Segs * 12);
+
+	// Generated along local +X (the spotlight emission axis); base ring at x=0 (lens) and
+	// far ring at x=+L (throw). The shader does its OWN world-space projection of pixels
+	// into the cone's cross-section, so the mesh UVs we hand it here are unused -- we still
+	// set them so the procedural-mesh component is happy.
+	for (int32 S = 0; S < Segs; ++S)
+	{
+		const float Angle = (2.f * PI * S) / Segs;
+		const float C = FMath::Cos(Angle);
+		const float Sn = FMath::Sin(Angle);
+		Positions.Add(FVector(0.f, r0 * C, r0 * Sn));
+		Positions.Add(FVector(L,   rF * C, rF * Sn));
+		const FVector N = FVector(0.f, C, Sn).GetSafeNormal();
+		Normals.Add(N);
+		Normals.Add(N);
+		UVs.Add(FVector2D((float)S / Segs, 0.f));
+		UVs.Add(FVector2D((float)S / Segs, 1.f));
+	}
+	for (int32 S = 0; S < Segs; ++S)
+	{
+		const int32 B0 = 2 * S;
+		const int32 F0 = 2 * S + 1;
+		const int32 B1 = 2 * ((S + 1) % Segs);
+		const int32 F1 = 2 * ((S + 1) % Segs) + 1;
+		Triangles.Add(B0); Triangles.Add(F0); Triangles.Add(F1);
+		Triangles.Add(B0); Triangles.Add(F1); Triangles.Add(B1);
+	}
+	// Caps: same scheme as BeamCone -- the additive material is two-sided + EXIT = own
+	// depth so the cap never double-adds. Cap at the FAR end only (no base cap, so the
+	// camera can fly INTO the shaft without hitting a wall right at the lens).
+	const int32 FarCenter = Positions.Num();
+	Positions.Add(FVector(L, 0.f, 0.f));
+	Normals.Add(FVector(1.f, 0.f, 0.f));
+	UVs.Add(FVector2D(0.5f, 1.f));
+	for (int32 S = 0; S < Segs; ++S)
+	{
+		const int32 F0 = 2 * S + 1;
+		const int32 F1 = 2 * ((S + 1) % Segs) + 1;
+		Triangles.Add(FarCenter); Triangles.Add(F1); Triangles.Add(F0);
+	}
+
+	const TArray<FColor> NoColors;
+	const TArray<FProcMeshTangent> NoTangents;
+	InternalBeamShaft->ClearMeshSection(0);
+	InternalBeamShaft->CreateMeshSection(0, Positions, Triangles, Normals, UVs, NoColors, NoTangents, /*bCreateCollision*/ false);
+
+	InternalBeamShaftMID->SetScalarParameterValue(TEXT("BeamLength"), L);
+	InternalBeamShaftMID->SetScalarParameterValue(TEXT("LensRadius"), r0);
+	InternalBeamShaftMID->SetScalarParameterValue(TEXT("FarRadius"), rF);
+}
+
+void ARebusFixtureActor::RefreshInternalBeamShaftEmissive()
+{
+	if (!InternalBeamShaftMID) return;
+
+	float Gate = 1.f;
+	switch (ShutterMode)
+	{
+	case ERebusShutterMode::Closed: Gate = 0.f; break;
+	case ERebusShutterMode::Strobe: Gate = (ShutterPhase < 0.5f) ? 1.f : 0.f; break;
+	default: break;
+	}
+	const FLinearColor Linear(
+		FMath::Clamp(ColorR.Current, 0.f, 1.f),
+		FMath::Clamp(ColorG.Current, 0.f, 1.f),
+		FMath::Clamp(ColorB.Current, 0.f, 1.f), 1.f);
+	const float Dim = FMath::Clamp(Dimmer.Current, 0.f, 1.f);
+	// Use the same RebusMeshBeamMaxIntensity envelope as M_RebusBeam (v1.0.40 default 4.0
+	// reads as a clearly-visible volumetric shaft against the standard exponential-height-
+	// fog tuning). The IES profile shapes the SpotLight footprint; the shaft is a separate
+	// emissive draw that doesn't need IES-scaled physical units. MeshBeamUserScale rides
+	// the existing SetFixtureBeamVolumetrics path so the operator's per-fixture intensity
+	// multiplier applies to BOTH the v1.0.92 per-light scattering AND the v1.0.93 shaft.
+	InternalBeamShaftMID->SetVectorParameterValue(TEXT("Color"), Linear);
+	InternalBeamShaftMID->SetScalarParameterValue(TEXT("Intensity"),
+		RebusMeshBeamMaxIntensity * Dim * Gate * MeshBeamUserScale);
+}
+
+void ARebusFixtureActor::DriveInternalBeamShaftFromSpotLight()
+{
+	if (!SpotLight || !InternalBeamShaft || !InternalBeamShaftMID) return;
+
+	// The SpotLight is back-offset INSIDE the head by ComputeInternalBeamBackOffsetCm() *
+	// GRebusInternalBeamOffsetSign along its LiveFwd (the spotlight's world emission axis).
+	// To anchor the shaft AT the LENS PLANE we subtract that same offset along LiveFwd from
+	// the SpotLight's world location -- end result: the shaft origin is co-located with the
+	// LENS, not with the SpotLight, so the shaft can never be visible inside the head body.
+	const FVector SpotFwd = SpotLight->GetForwardVector().GetSafeNormal();
+	const FVector SpotLoc = SpotLight->GetComponentLocation();
+	const float OffsetCm = bInternalBeamEnabled
+		? GRebusInternalBeamOffsetSign * ComputeInternalBeamBackOffsetCm()
+		: 0.f;
+	// Subtract the offset along LiveFwd to recover the lens plane (the offset PUSHED the
+	// spotlight along LiveFwd; the lens is at SpotLoc - offset * LiveFwd).
+	const FVector LensPlane = SpotLoc - OffsetCm * SpotFwd;
+
+	InternalBeamShaft->SetWorldLocationAndRotation(LensPlane, FRotationMatrix::MakeFromX(SpotFwd).ToQuat());
+
+	// World-space spatial params for the shader's cross-section projection.
+	InternalBeamShaftMID->SetVectorParameterValue(TEXT("BeamOrigin"),
+		FLinearColor((float)LensPlane.X, (float)LensPlane.Y, (float)LensPlane.Z, 0.f));
+	InternalBeamShaftMID->SetVectorParameterValue(TEXT("BeamDir"),
+		FLinearColor((float)SpotFwd.X, (float)SpotFwd.Y, (float)SpotFwd.Z, 0.f));
+}
+
+void ARebusFixtureActor::PushGoboRTToInternalBeamMaterials()
+{
+	// Cookie texture: prefer the per-fixture GoboRT (live-rotated cookie) when a non-Open
+	// gobo is bound; revert to the engine white texture (the LF + shaft both default-sample
+	// white = "let the light through unchanged" = uniform untextured cone, matching the
+	// pre-v1.0.93 visual).
+	UTexture* CookieTex = nullptr;
+	if (bGoboActive && GoboRT)
+	{
+		CookieTex = static_cast<UTexture*>(GoboRT.Get());
+	}
+	else
+	{
+		CookieTex = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineResources/WhiteSquareTexture"));
+	}
+	if (!CookieTex) return;
+	if (GoboLightFunctionMID)
+	{
+		GoboLightFunctionMID->SetTextureParameterValue(TEXT("GoboRT"), CookieTex);
+	}
+	if (InternalBeamShaftMID)
+	{
+		InternalBeamShaftMID->SetTextureParameterValue(TEXT("GoboRT"), CookieTex);
+	}
+}
+
+// (Re)apply / restore the v1.0.93 cookie-cone path on this fixture. Two entry points:
+//   * `ApplyInternalBeamPose` calls `ApplyInternalBeamShaft(false)` on the ON edge, gated
+//     by `GRebusInternalBeamCookieCone` -- when 0 the v1.0.92 per-light path runs unchanged.
+//   * The `Rebus.InternalBeamCookieCone` CVar refresh sink calls it with bForceVisible=true
+//     so the operator can flip the cone-mesh on/off without a full `Rebus.InternalBeam` cycle.
+void ARebusFixtureActor::ApplyInternalBeamShaft(bool bForceVisible)
+{
+	if (!SpotLight) return;
+	if (!bForceVisible && GRebusInternalBeamCookieCone == 0)
+	{
+		// Operator explicitly opted out via the CVar -- leave the v1.0.92 per-light path in
+		// charge. Just hide the shaft component if it was previously built (idempotent
+		// "make sure cone is hidden").
+		if (InternalBeamShaft)
+		{
+			InternalBeamShaft->SetVisibility(false);
+		}
+		return;
+	}
+
+	EnsureFixtureInternalBeamMIDs();
+
+	// Lazy-build the shaft component the first time we need it. Subsequent toggles just
+	// flip visibility.
+	if (!InternalBeamShaft)
+	{
+		if (!InternalBeamShaftMID)
+		{
+			// Master missing -- log already fired in EnsureFixtureInternalBeamMIDs. Without a
+			// material there's nothing to render, so leave the shaft un-built; the OFF path
+			// will fall back to v1.0.92 per-light scattering via RefreshBeamShadowMode.
+			return;
+		}
+		InternalBeamShaft = NewObject<UProceduralMeshComponent>(this, TEXT("InternalBeamShaft"));
+		InternalBeamShaft->SetupAttachment(FixtureRoot);
+		InternalBeamShaft->RegisterComponent();
+		InternalBeamShaft->SetMobility(EComponentMobility::Movable);
+		InternalBeamShaft->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		// Purely emissive additive geometry -- never shadows anything (the SpotLight handles
+		// surface shadow casting). Also opt out of being an occluder so the long translucent
+		// shaft doesn't fight HZB / frustum culling.
+		InternalBeamShaft->SetCastShadow(false);
+		InternalBeamShaft->bCastDynamicShadow = false;
+		InternalBeamShaft->bCastHiddenShadow = false;
+		InternalBeamShaft->bUseAttachParentBound = false;
+		InternalBeamShaft->bUseAsOccluder = false;
+		// Skip-list grep tag for the body-shadow walker + truss-material pass.
+		InternalBeamShaft->ComponentTags.AddUnique(FName(TEXT("RebusInternalBeamShaft")));
+		// Generous bounds scale -- same trick as BeamCone, because an elongated additive
+		// shaft mostly overlapping closer opaque floor reads as a culling candidate.
+		InternalBeamShaft->SetBoundsScale(RebusBeamBoundsScale);
+		InternalBeamShaft->SetMaterial(0, InternalBeamShaftMID);
+		InternalBeamShaftLastFarRadius = -1.f;
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s v1.0.93: spawned InternalBeamShaft cone-mesh -- gobo cookie now appears IN the volumetric shaft (not just on the floor footprint), and the shaft starts AT the lens plane (no longer visible inside the head body)."),
+			*FixtureId);
+	}
+
+	// Cache the SpotLight's prior LightFunctionMaterial + VolumetricScatteringIntensity the
+	// FIRST time we install the cookie-cone path so the OFF restore can return both to the
+	// construction-time / pre-shift values byte-exact (the v1.0.92 cache only covered
+	// VolumetricScatteringIntensity + bCastVolumetricShadow; LF was previously left alone
+	// because the v1.0.92 gobo-cookie path on MI_Light was already installed by the time
+	// InternalBeam ON ran). Separate latch so the v1.0.92 + v1.0.93 caches don't stomp.
+	if (!bInternalBeamPriorLightFunctionCached)
+	{
+		InternalBeamPriorLightFunction = SpotLight->LightFunctionMaterial;
+		bInternalBeamPriorLightFunctionCached = true;
+	}
+
+	// Push the v1.0.93 LF MID onto the SpotLight (it has bUsedWithVolumetricFog=true, unlike
+	// Epic's MI_Light) AND force VolumetricScatteringIntensity = 0 so the engine's per-light
+	// path doesn't paint scattering INSIDE the head. The shaft cone-mesh is the visible
+	// cone now; the SpotLight is just a light source for the floor footprint + LF cookie.
+	if (GoboLightFunctionMID)
+	{
+		SpotLight->SetLightFunctionMaterial(GoboLightFunctionMID);
+	}
+	SpotLight->SetVolumetricScatteringIntensity(0.f);
+	SpotLight->MarkRenderStateDirty();
+
+	// Push the live gobo, color/intensity, and spatial params; then resize + show.
+	PushGoboRTToInternalBeamMaterials();
+	UpdateInternalBeamShaftGeometry();
+	RefreshInternalBeamShaftEmissive();
+	DriveInternalBeamShaftFromSpotLight();
+	InternalBeamShaft->SetVisibility(true);
+}
+
+void ARebusFixtureActor::RestoreInternalBeamShaft()
+{
+	if (!SpotLight) return;
+
+	// Hide the cone (don't destroy -- the next ON toggle is cheaper if we keep it alive).
+	if (InternalBeamShaft)
+	{
+		InternalBeamShaft->SetVisibility(false);
+	}
+
+	// Restore the cached SpotLight LightFunctionMaterial byte-exact, then re-let the
+	// existing v1.0.92 path own VolumetricScatteringIntensity (RefreshBeamShadowMode runs
+	// at the tail of RestoreInternalBeamPose and re-derives the value from bInternalBeam
+	// Enabled + bMeshBeamEnabled + the hero-shadow budget). When a gobo is still active
+	// and we just restored a NON-MI_Light LF, the next ApplyCurrentGoboToLightFn call will
+	// re-assert the v1.0.92 cookie-on-MI_Light path -- that's the correct end state
+	// outside of InternalBeam mode (the user keeps their gobo on the floor).
+	if (bInternalBeamPriorLightFunctionCached)
+	{
+		SpotLight->SetLightFunctionMaterial(InternalBeamPriorLightFunction.Get());
+		bInternalBeamPriorLightFunctionCached = false;
+		InternalBeamPriorLightFunction = nullptr;
+		SpotLight->MarkRenderStateDirty();
+	}
+}
+
 void ARebusFixtureActor::BuildBeamCone()
 {
 	// Base radius = the lens radius (same resolver as the SpotLight SourceRadius + lens disc so the
@@ -2385,6 +2821,12 @@ void ARebusFixtureActor::SetBodyMeshesCastShadow(bool bRestoreOriginal)
 		if (Comp == (UPrimitiveComponent*)BeamCone.Get()) continue;
 		if (Comp == (UPrimitiveComponent*)EpicBeamComp.Get()) continue;
 		if (Comp == (UPrimitiveComponent*)LensDisc.Get()) continue;
+		// v1.0.93 -- skip the InternalBeamShaft cone-mesh: it's already CastShadow=false by
+		// construction (purely emissive additive geometry); including it in the cache + the
+		// restore loop would (a) corrupt the cache for the OFF restore (the OFF transition
+		// expects every cached primitive to have a non-trivial original shadow flag to put
+		// back) and (b) churn the render state for zero behavioural change.
+		if (Comp == (UPrimitiveComponent*)InternalBeamShaft.Get()) continue;
 		// Defensive: never touch any USpotLightComponent / ULightComponent -- they aren't
 		// UPrimitiveComponents (ULightComponentBase extends USceneComponent, not UPrimitiveComponent)
 		// so they shouldn't show up here, but the filter keeps a future engine inheritance change
@@ -2426,6 +2868,8 @@ void ARebusFixtureActor::OptPrimitiveOutOfInternalBeamShadow(UPrimitiveComponent
 	if (Comp == (UPrimitiveComponent*)BeamCone.Get()) return;
 	if (Comp == (UPrimitiveComponent*)EpicBeamComp.Get()) return;
 	if (Comp == (UPrimitiveComponent*)LensDisc.Get()) return;
+	// v1.0.93 -- same skip as the walker (InternalBeamShaft never enters the shadow cache).
+	if (Comp == (UPrimitiveComponent*)InternalBeamShaft.Get()) return;
 	if (Comp->IsA<ULightComponent>()) return;
 	// Already in the cache (re-entrancy guard). Linear scan is cheap because this list is
 	// per-actor and bounded by the body-primitive count (~5-15 typical, ~30 for a pixel-LED
@@ -2515,6 +2959,15 @@ void ARebusFixtureActor::ApplyInternalBeamPose()
 	//    bInternalBeamEnabled when true and forces the volumetric scatter + cast volumetric shadow
 	//    regardless of the hero-budget / mesh-beam paths).
 	RefreshBeamShadowMode();
+
+	// v1.0.93 -- install the cookie-cone path (LF MID with bUsedWithVolumetricFog=true onto
+	// SpotLight->LightFunctionMaterial, force VolumetricScatteringIntensity=0 to suppress the
+	// engine per-light scattering pass which v1.0.87's back-offset made visible INSIDE the
+	// head, and spawn / refresh / show the additive cone-mesh shaft that starts AT the lens
+	// plane). Gated by Rebus.InternalBeamCookieCone (default 1) -- when 0 the cone-mesh is
+	// hidden and the prior RefreshBeamShadowMode leaves scattering at the v1.0.92 per-light
+	// value. ApplyInternalBeamShaft is idempotent so re-entry via the CVar sink is cheap.
+	ApplyInternalBeamShaft(false);
 }
 
 void ARebusFixtureActor::PushInternalBeamMegaLightsOptOut()
@@ -2639,6 +3092,16 @@ void ARebusFixtureActor::RestoreInternalBeamPose()
 
 	// 5) Final volumetric refresh.
 	RefreshBeamShadowMode();
+
+	// 6) v1.0.93 -- tear down the cookie-cone path (restore the cached SpotLight LightFunc
+	//    tion material byte-exact, hide the cone-mesh shaft component -- not destroy, so the
+	//    next ON toggle is cheap). The cached LF is whatever the SpotLight had bound before
+	//    InternalBeam took over (typically null, or the v1.0.49 cookie MID on MI_Light when a
+	//    gobo was active before InternalBeam was toggled on). If a gobo is still active, the
+	//    very next ApplyCurrentGoboToLightFn call will re-assert the v1.0.49 cookie path on
+	//    MI_Light (no volumetric, but the floor footprint keeps its cookie) -- which is the
+	//    correct end state outside of InternalBeam mode.
+	RestoreInternalBeamShaft();
 }
 
 void ARebusFixtureActor::SetInternalBeamModeEnabled(bool bEnabled)
@@ -2760,6 +3223,11 @@ void ARebusFixtureActor::RefreshMotion()
 			// samples SpotLight->GetForwardVector() AFTER the SetRelativeTransform above), so the
 			// shaft opens along EXACTLY the synthetic aim the spotlight lights, never 180deg out.
 			DriveBeamConeFromSpotLight();
+			// v1.0.93 -- ride the InternalBeam cone-mesh shaft off the same live SpotLight
+			// world emission, but anchor at the LENS plane (= SpotLoc - back-offset*LiveFwd)
+			// so the shaft can never be visible inside the head body. No-op when the shaft
+			// hasn't been spawned (cookie-cone path not active).
+			DriveInternalBeamShaftFromSpotLight();
 		}
 
 		// No GDTF rig: the control-channel mesh proxies don't move, so drive the bound Orbit model
@@ -2836,6 +3304,9 @@ void ARebusFixtureActor::RefreshMotion()
 		// (set just above) so the shaft opens along exactly the direction the floor is lit, through
 		// every pan/tilt, and can never invert relative to the spotlight.
 		DriveBeamConeFromSpotLight();
+		// v1.0.93 -- ride the InternalBeam cone-mesh shaft off the same live SpotLight world
+		// emission, but anchor at the LENS plane so the shaft never reads inside the head body.
+		DriveInternalBeamShaftFromSpotLight();
 	}
 
 	// Drive the bound Orbit-imported model with the SAME per-axis solve that moved the
@@ -3329,6 +3800,12 @@ void ARebusFixtureActor::RecomputeConeAngles()
 	// Keep the cone-mesh beam sized to the same field half-angle (regenerates the frustum far
 	// radius only when zoom/iris actually changed it -- see the rebuild gate in UpdateBeamConeGeometry).
 	UpdateBeamConeGeometry();
+
+	// v1.0.93 -- and the InternalBeam shaft cone matches in lock-step (same OuterHalf -> same
+	// far radius), so the visible shaft envelope tracks zoom live without the operator having
+	// to cycle InternalBeam. No-op when the shaft hasn't been spawned (cookie-cone path not
+	// active OR the master material wasn't baked yet).
+	UpdateInternalBeamShaftGeometry();
 }
 
 void ARebusFixtureActor::RefreshIntensity()
@@ -3375,6 +3852,12 @@ void ARebusFixtureActor::RefreshIntensity()
 	// Same for the cone-mesh beam: BeamColor follows the live colour, BeamIntensity follows
 	// dimmer x shutter-gate x SetFixtureBeamVolumetrics, so it fades to nothing when dimmed/closed.
 	RefreshBeamEmissive();
+
+	// v1.0.93 -- same path for the InternalBeam shaft cone (RefreshInternalBeamShaftEmissive
+	// pushes Color + Intensity = Dimmer * Gate * RebusMeshBeamMaxIntensity * MeshBeamUserScale,
+	// matching M_RebusBeam's envelope so a shutter close / dimmer fade collapses the visible
+	// shaft in lock-step with the SpotLight intensity). No-op when the shaft MID isn't built.
+	RefreshInternalBeamShaftEmissive();
 }
 
 // ---- Control surface ------------------------------------------------------------------
@@ -4449,6 +4932,18 @@ void ARebusFixtureActor::ApplyCurrentGoboToLightFn()
 			*FixtureId, SpotLight->bAllowMegaLights ? 1 : 0, bPrevMegaLights ? 1 : 0,
 			bPrevMegaLights ? TEXT("MarkRenderStateDirty") : TEXT("REREGISTERED restoring"));
 	}
+
+	// v1.0.93 -- ALSO push the per-fixture GoboRT pointer to the new InternalBeam LF MID +
+	// shaft MID (whichever exist on this fixture; the call is a no-op for either MID that
+	// isn't built yet). Safe to call from BOTH branches: if a gobo is active GoboRT carries
+	// the live-rotated cookie, if no gobo is active we revert the param to engine white so
+	// the LF + shaft both sample "let the light through unchanged" (untextured uniform cone,
+	// matching the pre-v1.0.93 visual). When the SpotLight is currently bound to the v1.0.93
+	// LF MID (InternalBeam mode + cookie-cone path on) the cookie pattern reaches the
+	// volumetric integrator via this push; when bound to the v1.0.49 MI_Light MID (outside
+	// of InternalBeam mode, or with Rebus.InternalBeamCookieCone 0) the v1.0.49 MID's own
+	// `DMX Gobo Disk Frosted` push above runs the floor footprint as before.
+	PushGoboRTToInternalBeamMaterials();
 }
 
 void ARebusFixtureActor::ClearGoboToOpen(const TCHAR* Reason)

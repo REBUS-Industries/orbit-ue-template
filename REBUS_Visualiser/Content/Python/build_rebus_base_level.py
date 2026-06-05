@@ -32,6 +32,35 @@ LEVEL_PACKAGE_PATH = "/Game/REBUS/Maps/BaseLevel"
 MATERIALS_DIR = "/Game/REBUS/Materials"
 GROUND_MASTER_PATH = MATERIALS_DIR + "/M_RebusGround"
 
+# v1.0.93: Python-authored masters that previously had to be operator-built (or were not
+# baked at all) so the user-reported "gobo not on the volumetric beam shaft" + "lens should
+# be a chrome mirror" + "shaft visible inside the head" trio can be solved without anyone
+# touching the editor. See the v1.0.93 README block for the full diagnosis (root cause:
+# Epic's stock MI_Light light-function material does NOT have bUsedWithVolumetricFog=true,
+# which is the per-material flag that gates whether a LF reaches the volumetric integrator
+# -- no amount of CVar pushing fixes that; the material itself has to be authored with the
+# flag flipped).
+#
+# FIXTURE_LENS_PATH (Fix 3) -- mirror/glass material for the GDTF <Beam> lens disc. The C++
+# constructor (ConstructorHelpers::FObjectFinder for FixtureLensMaterialOverride) already
+# auto-loads it from this path; v1.0.93 makes the Python builder bake it at startup so the
+# operator doesn't have to author it manually. Metallic=1, Roughness=0, BaseColor=white.
+FIXTURE_LENS_PATH = MATERIALS_DIR + "/M_RebusFixtureLens"
+# GOBO_LF_PATH (Fix 1) -- custom LightFunction-domain material with bUsedWithVolumetricFog
+# = true. SpotLight->LightFunctionMaterial is pointed at a MID built from this so the gobo
+# cookie modulates the volumetric beam shaft (not just the lit floor pool). Samples a
+# Texture2D parameter named `GoboRT` via LightVector-derived UVs.
+GOBO_LF_PATH = MATERIALS_DIR + "/M_RebusGoboLightFunction"
+# INTERNAL_BEAM_SHAFT_PATH (Fix 2) -- unlit additive cone-mesh shader. v1.0.87's
+# InternalBeam mode pushes the SpotLight INSIDE the head so the cone exits at the lens
+# diameter; that means the engine's per-light volumetric scattering pass also paints
+# scattering BEHIND the lens (inside the head body), which the operator can see from close
+# camera angles. v1.0.93 decouples "lit footprint" from "visible shaft": the SpotLight
+# only lights surfaces (VolumetricScatteringIntensity = 0); a translucent additive cone
+# mesh starting AT the lens and oriented along the emission axis is the visible shaft, and
+# it samples the per-fixture GoboRT directly so the cookie pattern appears IN the shaft.
+INTERNAL_BEAM_SHAFT_PATH = MATERIALS_DIR + "/M_RebusInternalBeamShaft"
+
 # Emissive "glowing lens" flare disc material (ue-plugin-build-guide.md §8.3a). Unlit, two-sided,
 # ADDITIVE so a radial UV mask reads as a round soft-edged lens regardless of facing AND so the
 # disc is invisible when the fixture is dark (additive adds nothing at EmissiveStrength 0) -- a
@@ -553,6 +582,460 @@ def ensure_beam_material(force=False):
     unreal.log("RebusBaseLevel: beam material ensured.")
 
 
+# ---------------------------------------------------------------------------------------
+# v1.0.93 -- Fix 3: M_RebusFixtureLens (mirror/glass lens disc).
+# ---------------------------------------------------------------------------------------
+#
+# Previously operator-authored (v1.0.71 added the asset PATH the C++ constructor's
+# FObjectFinder looks for, but never the Python builder). The runtime fallback MID
+# (FixtureLensMID off /Engine/BasicShapes/BasicShapeMaterial, Metallic=1 Roughness=0 since
+# v1.0.89) handles the case when the .uasset doesn't exist, but the user wants the asset
+# itself baked by the startup script so a fresh checkout / project regenerate lands the
+# polished-mirror lens the first time without the "missing asset" runtime fallback path.
+
+def _build_fixture_lens_master(mat):
+    """Mirror/glass for the GDTF <Beam> lens disc (v1.0.93 -- Python-authored).
+
+    Metallic=1.0, Roughness=0.0, BaseColor=white. Approximates a polished chrome lens
+    (true dielectric translucent glass is beyond the surface/lit domain; the dark fixture
+    interior absorbs the back so the metallic-mirror approximation reads visually correct
+    against the chrome accents on a moving head). Parameters live alongside the runtime
+    MID's parameter names (`Color` / `Metallic` / `Roughness`) so a future C++ push could
+    drive them on the asset MID identically to the runtime MID.
+    """
+    mel = unreal.MaterialEditingLibrary
+
+    _set(mat, "material_domain", unreal.MaterialDomain.MD_SURFACE)
+    _set(mat, "shading_model", unreal.MaterialShadingModel.MSM_DEFAULT_LIT)
+    _set(mat, "blend_mode", unreal.BlendMode.BLEND_OPAQUE)
+
+    color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -600, -150)
+    color.set_editor_property("parameter_name", "Color")
+    color.set_editor_property("default_value", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
+    mel.connect_material_property(color, "", unreal.MaterialProperty.MP_BASE_COLOR)
+
+    metal = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -600, 40)
+    metal.set_editor_property("parameter_name", "Metallic")
+    metal.set_editor_property("default_value", 1.0)
+    mel.connect_material_property(metal, "", unreal.MaterialProperty.MP_METALLIC)
+
+    rough = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -600, 200)
+    rough.set_editor_property("parameter_name", "Roughness")
+    rough.set_editor_property("default_value", 0.0)
+    mel.connect_material_property(rough, "", unreal.MaterialProperty.MP_ROUGHNESS)
+
+    mel.recompile_material(mat)
+
+
+def _fixture_lens_master_is_current(master):
+    """v1.0.93 self-heal probe -- True when the master exposes the expected parameter set
+    (`Color` vector + `Metallic` + `Roughness` scalars). False when an older shape (or an
+    operator hand-authored placeholder) is on disk, in which case the non-force ensure
+    promotes itself to a force regen.
+    """
+    try:
+        mel = unreal.MaterialEditingLibrary
+        vector_names = [str(n) for n in mel.get_vector_parameter_names(master)]
+        scalar_names = [str(n) for n in mel.get_scalar_parameter_names(master)]
+    except Exception:  # noqa: BLE001
+        return False
+    return ("Color" in vector_names
+            and "Metallic" in scalar_names
+            and "Roughness" in scalar_names)
+
+
+def ensure_fixture_lens_material(force=False):
+    """Generate the mirror/glass lens master material. Idempotent (only creates when
+    missing) unless force=True (delete + regenerate, e.g. during a full build()).
+
+    v1.0.93 self-heal: when an EXISTING master is on disk but is missing the v1.0.93
+    parameter contract (e.g. an operator-authored placeholder from before v1.0.93 baked
+    the asset), promote the call to a force-regen so the C++ FObjectFinder picks up the
+    correct shape on the next launch -- log a Warning so the change is auditable.
+    """
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+
+    if not force and unreal.EditorAssetLibrary.does_asset_exist(FIXTURE_LENS_PATH):
+        existing = unreal.EditorAssetLibrary.load_asset(FIXTURE_LENS_PATH)
+        if existing is not None and not _fixture_lens_master_is_current(existing):
+            unreal.log_warning("RebusBaseLevel: pre-v1.0.93 M_RebusFixtureLens detected "
+                               "(missing Color/Metallic/Roughness parameter contract); regenerating.")
+            force = True
+
+    if force and unreal.EditorAssetLibrary.does_asset_exist(FIXTURE_LENS_PATH):
+        unreal.EditorAssetLibrary.delete_asset(FIXTURE_LENS_PATH)
+
+    if not unreal.EditorAssetLibrary.does_asset_exist(FIXTURE_LENS_PATH):
+        mat = tools.create_asset("M_RebusFixtureLens", MATERIALS_DIR, unreal.Material, unreal.MaterialFactoryNew())
+        _build_fixture_lens_master(mat)
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+
+    unreal.log("RebusBaseLevel: M_RebusFixtureLens ensured (Python-authored mirror/glass).")
+
+
+# ---------------------------------------------------------------------------------------
+# v1.0.93 -- Fix 1: M_RebusGoboLightFunction (volumetric-fog-aware gobo cookie).
+# ---------------------------------------------------------------------------------------
+#
+# Root cause for "gobo not on the volumetric beam shaft": Epic's stock MI_Light material
+# (parent M_Light_Master, what v1.0.49+ binds via SpotLight->SetLightFunctionMaterial)
+# does NOT have `bUsedWithVolumetricFog = true`. That is a PER-MATERIAL flag on UMaterial
+# that gates whether the light function reaches the volumetric scattering integrator.
+# Without it, every CVar in the world (r.LightFunctionAtlas.Enabled = 1, r.VolumetricFog.
+# LightFunction = 1, r.LightFunctionQuality = 2) cannot reach the cookie onto the shaft.
+#
+# v1.0.93 authors our own LF material with the flag flipped, sampling a Texture2D
+# parameter named `GoboRT` (the same per-fixture UCanvasRenderTarget2D the existing cookie
+# pipeline draws into each tick) via LightVector-derived UVs.
+#
+# LightVector in a UMaterial of domain MD_LightFunction is the engine-provided direction
+# from the light to the shaded point in LIGHT-CLIP space: (x, y) span [-1..1] across the
+# cone and z is the projected depth. The standard projected-cookie UV mapping is
+# `uv = LightVector.xy * 0.5 + 0.5` -- same convention Epic's stock M_LightFunction
+# samples use, just rebuilt with our own sampler so we can set bUsedWithVolumetricFog.
+
+def _build_gobo_lf_master(mat):
+    """Author the v1.0.93 gobo light-function master.
+
+    Domain = MD_LightFunction, BlendMode = BLEND_Opaque (LF materials only write Emissive
+    -- the engine reinterprets it as the per-pixel light contribution multiplier).
+    Crucially: `bUsedWithVolumetricFog = true` so the LF actually reaches the volumetric
+    scattering integrator (the gating flag that's MISSING from Epic's stock MI_Light --
+    the smoking gun for "gobo on floor, NOT on the volumetric beam shaft").
+    """
+    mel = unreal.MaterialEditingLibrary
+
+    _set(mat, "material_domain", unreal.MaterialDomain.MD_LIGHT_FUNCTION)
+    _set(mat, "blend_mode", unreal.BlendMode.BLEND_OPAQUE)
+    # The smoking gun. Without this flag the SpotLight->LightFunctionMaterial is sampled
+    # only on the per-pixel surface lighting pass -- the volumetric integrator SKIPS it.
+    # `bUsedWithVolumetricFog` is the per-UMaterial gate; CVars (r.LightFunctionAtlas.
+    # Enabled / r.VolumetricFog.LightFunction / r.LightFunctionQuality) are NECESSARY but
+    # not sufficient -- they enable the renderer feature path; the material itself has to
+    # opt INTO that path via this flag. UE reflection name = `used_with_volumetric_fog`.
+    _set(mat, "used_with_volumetric_fog", True)
+
+    light_vec = mel.create_material_expression(mat, unreal.MaterialExpressionLightVector, -900, -100)
+
+    xy_mask = mel.create_material_expression(mat, unreal.MaterialExpressionComponentMask, -700, -100)
+    _set(xy_mask, "r", True)
+    _set(xy_mask, "g", True)
+    _set(xy_mask, "b", False)
+    _set(xy_mask, "a", False)
+    mel.connect_material_expressions(light_vec, "", xy_mask, "")
+
+    half = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -520, -100)
+    _set(half, "const_b", 0.5)
+    mel.connect_material_expressions(xy_mask, "", half, "A")
+
+    centered = mel.create_material_expression(mat, unreal.MaterialExpressionAdd, -340, -100)
+    _set(centered, "const_b", 0.5)
+    mel.connect_material_expressions(half, "", centered, "A")
+
+    # White-default Texture2D parameter named `GoboRT`. C++ rebinds the per-fixture
+    # UCanvasRenderTarget2D (the rotated/blurred cookie RT the existing gobo pipeline
+    # writes each tick) at every SetTextureParameterValue(TEXT("GoboRT"), GoboRT) push,
+    # so the cookie pattern arrives at the LF every frame the user rotates / changes it.
+    tex_sampler = mel.create_material_expression(mat, unreal.MaterialExpressionTextureSampleParameter2D, -120, 80)
+    tex_sampler.set_editor_property("parameter_name", "GoboRT")
+    white = unreal.EditorAssetLibrary.load_asset("/Engine/EngineResources/WhiteSquareTexture")
+    if white is not None:
+        _set(tex_sampler, "texture", white)
+    mel.connect_material_expressions(centered, "", tex_sampler, "Coordinates")
+
+    # LF materials write to EMISSIVE_COLOR -- the engine reinterprets it as the per-pixel
+    # multiplier on the light's contribution. A pure white pattern == "let the light
+    # through unchanged"; black == "no light here" (the cookie pattern).
+    mel.connect_material_property(tex_sampler, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+
+    mel.recompile_material(mat)
+
+
+def _gobo_lf_master_is_current(master):
+    """v1.0.93 self-heal probe for the LF master: a `GoboRT` Texture2D parameter must
+    exist, the domain must be MD_LightFunction, and `used_with_volumetric_fog` MUST be
+    true (the whole point of v1.0.93 -- a master without the flag is the v1.0.92 problem
+    we're solving and needs to be regenerated).
+    """
+    try:
+        mel = unreal.MaterialEditingLibrary
+        tex_names = [str(n) for n in mel.get_texture_parameter_names(master)]
+    except Exception:  # noqa: BLE001
+        return False
+    if "GoboRT" not in tex_names:
+        return False
+    try:
+        if master.get_editor_property("material_domain") != unreal.MaterialDomain.MD_LIGHT_FUNCTION:
+            return False
+        if not master.get_editor_property("used_with_volumetric_fog"):
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def ensure_gobo_light_function_material(force=False):
+    """Generate the v1.0.93 volumetric-fog-aware gobo LightFunction master. Self-heal
+    via `_gobo_lf_master_is_current` so a master without `bUsedWithVolumetricFog=true`
+    (the smoking-gun flag) is force-regenerated on the next launch.
+    """
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+
+    if not force and unreal.EditorAssetLibrary.does_asset_exist(GOBO_LF_PATH):
+        existing = unreal.EditorAssetLibrary.load_asset(GOBO_LF_PATH)
+        if existing is not None and not _gobo_lf_master_is_current(existing):
+            unreal.log_warning("RebusBaseLevel: pre-v1.0.93 M_RebusGoboLightFunction detected "
+                               "(missing GoboRT parameter, wrong domain, or bUsedWithVolumetricFog=false); "
+                               "regenerating. Without the volumetric-fog flag the gobo cookie can't reach the volumetric beam shaft.")
+            force = True
+
+    if force and unreal.EditorAssetLibrary.does_asset_exist(GOBO_LF_PATH):
+        unreal.EditorAssetLibrary.delete_asset(GOBO_LF_PATH)
+
+    if not unreal.EditorAssetLibrary.does_asset_exist(GOBO_LF_PATH):
+        mat = tools.create_asset("M_RebusGoboLightFunction", MATERIALS_DIR, unreal.Material, unreal.MaterialFactoryNew())
+        _build_gobo_lf_master(mat)
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+
+    unreal.log("RebusBaseLevel: M_RebusGoboLightFunction ensured (LF + bUsedWithVolumetricFog=true).")
+
+
+# ---------------------------------------------------------------------------------------
+# v1.0.93 -- Fix 2: M_RebusInternalBeamShaft (cone-mesh shaft with gobo + soft edges).
+# ---------------------------------------------------------------------------------------
+#
+# v1.0.87 promoted the SpotLight INSIDE the head (back-offset = lensRadius / tan(maxZoom
+# HalfAngle)) so the cone exits the lens at the correct diameter, AND set Volumetric
+# ScatteringIntensity > 0 so the SAME SpotLight provides the visible volumetric shaft.
+# The unwanted consequence: the engine's per-light volumetric pass paints scattering
+# EVERYWHERE in the cone -- including the volume INSIDE the head between the SpotLight
+# and the lens -- which the operator sees from close camera angles ("we are seeing the
+# volumetric beam inside the head").
+#
+# Fix: decouple "lit footprint" from "visible shaft":
+#   * SpotLight->VolumetricScatteringIntensity = 0 (it only lights surfaces now);
+#   * Spawn a translucent additive cone mesh, attached at the LENS PLANE (not inside the
+#     head), oriented along the SpotLight's emission axis, sized to the IES throw;
+#   * The cone material samples the per-fixture GoboRT directly so the cookie pattern
+#     appears IN the shaft (not just on the floor), multiplied by per-fixture color +
+#     intensity + a soft Gaussian falloff to the cone silhouette + a SceneDepth fade
+#     so the shaft soft-clips against geometry.
+#
+# Custom HLSL computes everything: world-space projection of the pixel into the cone's
+# cross-section (so the gobo texture wraps the cone correctly regardless of how the
+# procedural mesh is UV-mapped), radial Gaussian, distance falloff, depth-fade. Output is
+# float3(u, v, coverage) so we can hand u/v to a TextureSampleParameter2D outside the
+# Custom node (avoids the texture-input-into-custom complexity); coverage is the final
+# additive-emissive multiplier.
+
+_INTERNAL_BEAM_SHAFT_HLSL = """
+// v1.0.93 cone-mesh shaft -- world-space projection of the rasterized pixel into the
+// cone's cross-section, packed as float3(uv.x, uv.y, coverage) so the GoboRT texture
+// sample is performed by a TextureSampleParameter2D OUTSIDE the Custom node (cheaper +
+// avoids the texture-input-into-custom plumbing). coverage = radial-Gaussian * length-
+// fade * camera-depth-fade so the shaft fades to invisible at the cone silhouette,
+// dims downrange, and soft-clips against scene geometry (no hard wall).
+float3 ro = BeamOrigin.xyz;
+float3 bd = normalize(BeamDir.xyz);
+float blen = max(BeamLength, 1.0);
+float r0 = max(LensRadius, 0.1);
+float rF = max(FarRadius, r0 + 0.01);
+
+float3 rel = PixelPos.xyz - ro;
+float axial = dot(rel, bd);
+float aN = saturate(axial / blen);
+
+float3 perp = rel - axial * bd;
+float radiusAt = lerp(r0, rF, aN);
+float rN = length(perp) / max(radiusAt, 0.01);   // 0 at axis, 1 at cone wall, >1 outside
+
+// Cross-section basis: pick a worldUp that is NOT collinear with the beam direction.
+// This is computed per-pixel which is wasteful for a fixed-direction beam, but it lets
+// the shader be self-contained (no per-frame CPU push for the basis vectors).
+float3 worldUp = float3(0.0, 0.0, 1.0);
+if (abs(dot(bd, worldUp)) > 0.99) { worldUp = float3(1.0, 0.0, 0.0); }
+float3 right = normalize(cross(bd, worldUp));
+float3 upV   = cross(right, bd);
+float u = dot(perp, right) / max(radiusAt, 0.01) * 0.5 + 0.5;
+float v = dot(perp, upV)   / max(radiusAt, 0.01) * 0.5 + 0.5;
+
+// Soft Gaussian cross-section -- the shaft has a bright core that fades smoothly to the
+// silhouette (no hard rim at rN=1 like a pow(1-rN) would give).
+float gauss = exp(-rN * rN * 2.5);
+
+// Length fade: distance-from-lens softened inverse-square (brightest at the lens, dims
+// downrange). The +1 keeps the value finite at axial=0.
+float lenFade = 1.0 / (1.0 + 1.5 * aN * aN);
+
+// Camera-depth soft-fade: the shaft fades where it meets opaque geometry (DMX-style
+// soft particle), no hard intersection line. SceneDepth/PixelDepth are camera-Z; the
+// difference is in centimetres, so a 30 cm fade band reads as a gentle dissolve.
+float depthFade = saturate((SceneDepth - PixelDepth) / 30.0);
+
+// Strictly NO coverage outside the cone (rN > 1.0). lerp from inside (rN < 0.95) -> 0
+// over the last 5% so there's no hard cutoff edge.
+float coneMask = 1.0 - smoothstep(0.95, 1.05, rN);
+
+float coverage = saturate(gauss * lenFade * depthFade * coneMask);
+return float3(u, v, coverage);
+"""
+
+
+def _build_internal_beam_shaft_master(mat):
+    """Author the v1.0.93 cone-mesh shaft master.
+
+    Domain = Surface, ShadingModel = Unlit, BlendMode = Additive, two-sided. Samples
+    the per-fixture GoboRT (Texture2D parameter `GoboRT`) via world-space cross-section
+    UVs computed in a Custom HLSL node, multiplied by per-fixture `Color` (vector) and
+    `Intensity` (scalar) and the Custom's coverage term (Gaussian * length fade * depth
+    fade * cone mask). C++ drives BeamOrigin / BeamDir / BeamLength / LensRadius /
+    FarRadius live (same vocabulary as M_RebusBeam so a future consolidation is cheap).
+    """
+    mel = unreal.MaterialEditingLibrary
+
+    _set(mat, "material_domain", unreal.MaterialDomain.MD_SURFACE)
+    _set(mat, "shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
+    _set(mat, "blend_mode", unreal.BlendMode.BLEND_ADDITIVE)
+    _set(mat, "two_sided", True)
+
+    # ---- Per-fixture MID parameters --------------------------------------------------
+    color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, -260)
+    color.set_editor_property("parameter_name", "Color")
+    color.set_editor_property("default_value", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
+
+    def _scalar(name, default, y):
+        s = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -1100, y)
+        s.set_editor_property("parameter_name", name)
+        s.set_editor_property("default_value", default)
+        return s
+
+    intensity = _scalar("Intensity", 0.0, -120)
+    beamlen   = _scalar("BeamLength", 6000.0, 60)
+    lensrad   = _scalar("LensRadius", 2.0, 140)
+    farrad    = _scalar("FarRadius", 1000.0, 220)
+
+    beamorigin = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 320)
+    beamorigin.set_editor_property("parameter_name", "BeamOrigin")
+    beamorigin.set_editor_property("default_value", unreal.LinearColor(0.0, 0.0, 0.0, 0.0))
+
+    beamdir = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, 400)
+    beamdir.set_editor_property("parameter_name", "BeamDir")
+    beamdir.set_editor_property("default_value", unreal.LinearColor(1.0, 0.0, 0.0, 0.0))
+
+    # ---- Scene/view inputs -----------------------------------------------------------
+    pixelpos = mel.create_material_expression(mat, unreal.MaterialExpressionWorldPosition, -1100, 500)
+    scenedepth = mel.create_material_expression(mat, unreal.MaterialExpressionSceneDepth, -1100, 580)
+    pixeldepth = mel.create_material_expression(mat, unreal.MaterialExpressionPixelDepth, -1100, 660)
+
+    # ---- Custom HLSL node (UV + coverage packed as float3) ---------------------------
+    custom = mel.create_material_expression(mat, unreal.MaterialExpressionCustom, -600, 80)
+    custom.set_editor_property("output_type", unreal.CustomMaterialOutputType.CMOT_FLOAT3)
+    custom.set_editor_property("description", "RebusInternalBeamShaft")
+    custom.set_editor_property("code", _INTERNAL_BEAM_SHAFT_HLSL)
+
+    input_names = [
+        "PixelPos", "SceneDepth", "PixelDepth",
+        "BeamOrigin", "BeamDir", "BeamLength", "LensRadius", "FarRadius",
+    ]
+    custom_inputs = []
+    for n in input_names:
+        ci = unreal.CustomInput()
+        ci.set_editor_property("input_name", unreal.Name(n))
+        custom_inputs.append(ci)
+    custom.set_editor_property("inputs", custom_inputs)
+
+    src_for = {
+        "PixelPos": pixelpos, "SceneDepth": scenedepth, "PixelDepth": pixeldepth,
+        "BeamOrigin": beamorigin, "BeamDir": beamdir,
+        "BeamLength": beamlen, "LensRadius": lensrad, "FarRadius": farrad,
+    }
+    for n in input_names:
+        mel.connect_material_expressions(src_for[n], "", custom, n)
+
+    # ---- UV mask + GoboRT sampler ----------------------------------------------------
+    uv_mask = mel.create_material_expression(mat, unreal.MaterialExpressionComponentMask, -300, 0)
+    _set(uv_mask, "r", True)
+    _set(uv_mask, "g", True)
+    _set(uv_mask, "b", False)
+    _set(uv_mask, "a", False)
+    mel.connect_material_expressions(custom, "", uv_mask, "")
+
+    cov_mask = mel.create_material_expression(mat, unreal.MaterialExpressionComponentMask, -300, 180)
+    _set(cov_mask, "r", False)
+    _set(cov_mask, "g", False)
+    _set(cov_mask, "b", True)
+    _set(cov_mask, "a", False)
+    mel.connect_material_expressions(custom, "", cov_mask, "")
+
+    gobo_tex = mel.create_material_expression(mat, unreal.MaterialExpressionTextureSampleParameter2D, -80, -40)
+    gobo_tex.set_editor_property("parameter_name", "GoboRT")
+    white = unreal.EditorAssetLibrary.load_asset("/Engine/EngineResources/WhiteSquareTexture")
+    if white is not None:
+        _set(gobo_tex, "texture", white)
+    mel.connect_material_expressions(uv_mask, "", gobo_tex, "Coordinates")
+
+    # ---- Compose Emissive = gobo.rgb * Color * Intensity * coverage -----------------
+    cs = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, 160, -100)
+    mel.connect_material_expressions(color, "", cs, "A")
+    mel.connect_material_expressions(intensity, "", cs, "B")
+
+    cs2 = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, 320, -40)
+    mel.connect_material_expressions(gobo_tex, "", cs2, "A")  # default RGB pin
+    mel.connect_material_expressions(cs, "", cs2, "B")
+
+    cs3 = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, 480, 40)
+    mel.connect_material_expressions(cs2, "", cs3, "A")
+    mel.connect_material_expressions(cov_mask, "", cs3, "B")
+    mel.connect_material_property(cs3, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+
+    mel.recompile_material(mat)
+
+
+def _internal_beam_shaft_master_is_current(master):
+    """v1.0.93 self-heal probe -- True when the master exposes the expected parameter
+    set (`Color` + `Intensity` + `GoboRT` + the spatial params). Catches an older shape
+    on disk and promotes the call to a regen.
+    """
+    try:
+        mel = unreal.MaterialEditingLibrary
+        vec_names = [str(n) for n in mel.get_vector_parameter_names(master)]
+        scalar_names = [str(n) for n in mel.get_scalar_parameter_names(master)]
+        tex_names = [str(n) for n in mel.get_texture_parameter_names(master)]
+    except Exception:  # noqa: BLE001
+        return False
+    needed_scalars = {"Intensity", "BeamLength", "LensRadius", "FarRadius"}
+    return ("Color" in vec_names
+            and "BeamOrigin" in vec_names
+            and "BeamDir" in vec_names
+            and needed_scalars.issubset(set(scalar_names))
+            and "GoboRT" in tex_names)
+
+
+def ensure_internal_beam_shaft_material(force=False):
+    """Generate the v1.0.93 cone-mesh shaft master material. Self-heal probe
+    (`_internal_beam_shaft_master_is_current`) regenerates a stale master so the C++
+    shaft component always sees the expected parameter contract.
+    """
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+
+    if not force and unreal.EditorAssetLibrary.does_asset_exist(INTERNAL_BEAM_SHAFT_PATH):
+        existing = unreal.EditorAssetLibrary.load_asset(INTERNAL_BEAM_SHAFT_PATH)
+        if existing is not None and not _internal_beam_shaft_master_is_current(existing):
+            unreal.log_warning("RebusBaseLevel: pre-v1.0.93 M_RebusInternalBeamShaft detected "
+                               "(missing one of Color/Intensity/GoboRT/BeamOrigin/BeamDir/BeamLength/LensRadius/FarRadius); regenerating.")
+            force = True
+
+    if force and unreal.EditorAssetLibrary.does_asset_exist(INTERNAL_BEAM_SHAFT_PATH):
+        unreal.EditorAssetLibrary.delete_asset(INTERNAL_BEAM_SHAFT_PATH)
+
+    if not unreal.EditorAssetLibrary.does_asset_exist(INTERNAL_BEAM_SHAFT_PATH):
+        mat = tools.create_asset("M_RebusInternalBeamShaft", MATERIALS_DIR, unreal.Material, unreal.MaterialFactoryNew())
+        _build_internal_beam_shaft_master(mat)
+        unreal.EditorAssetLibrary.save_loaded_asset(mat)
+
+    unreal.log("RebusBaseLevel: M_RebusInternalBeamShaft ensured (cone-mesh shaft, gobo + soft Gaussian + depth fade).")
+
+
 def _master_has_tiling_meters(master):
     """v1.0.86: detect whether the on-disk master is the new (1 m world-driven tiling) version.
 
@@ -753,11 +1236,18 @@ def build():
     # A full bake always overwrites the generated materials (no confirmation dialog);
     # safe because new_level below replaces the open level, so nothing references the
     # instances we just deleted/recreated.
-    ensure_ground_materials(force=True)
-    ensure_lens_material(force=True)
-    ensure_beam_material(force=True)
+	ensure_ground_materials(force=True)
+	ensure_lens_material(force=True)
+	ensure_beam_material(force=True)
+	# v1.0.93 trio (mirror lens / volumetric-fog-aware gobo LF / cone-mesh shaft) baked
+	# in the SAME order on every full build so a fresh checkout lands the v1.0.93 visuals
+	# (gobo on the volumetric beam shaft, mirror lens reads correctly, no shaft inside
+	# the head) WITHOUT requiring the operator to touch the editor.
+	ensure_fixture_lens_material(force=True)
+	ensure_gobo_light_function_material(force=True)
+	ensure_internal_beam_shaft_material(force=True)
 
-    les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+	les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
 
     # Create a fresh, empty level (replaces whatever is open) and make it current.
     les.new_level(LEVEL_PACKAGE_PATH)
@@ -776,12 +1266,18 @@ def ensure_base_level():
     opening the project always lands on a populated stage without clobbering an
     existing BaseLevel on every launch.
     """
-    # Ground + lens materials self-heal independently of the map (cheap if already present).
-    ensure_ground_materials()
-    ensure_lens_material()
-    ensure_beam_material()
+	# Ground + lens materials self-heal independently of the map (cheap if already present).
+	ensure_ground_materials()
+	ensure_lens_material()
+	ensure_beam_material()
+	# v1.0.93 trio: same self-heal-per-master path (probe + force regen on stale shape)
+	# so an older operator-authored placeholder / pre-v1.0.93 baked master is replaced
+	# on the next launch without anyone running build() manually.
+	ensure_fixture_lens_material()
+	ensure_gobo_light_function_material()
+	ensure_internal_beam_shaft_material()
 
-    if unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH):
+	if unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH):
         return False
     unreal.log("RebusBaseLevel: '{}' missing; generating it.".format(LEVEL_PACKAGE_PATH))
     build()

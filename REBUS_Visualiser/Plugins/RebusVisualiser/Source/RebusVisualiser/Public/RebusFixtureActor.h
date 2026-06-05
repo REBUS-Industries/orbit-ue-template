@@ -220,6 +220,25 @@ public:
 	// chooses -- which is the correct end state.
 	void RestoreInternalBeamMegaLights();
 
+	// v1.0.93 -- (re)apply the InternalBeam cookie-cone state to this fixture (gated by the
+	// global `Rebus.InternalBeamCookieCone` CVar, default 1). When ON, the visible volumetric
+	// shaft is a translucent additive cone mesh (`InternalBeamShaft`, built off
+	// `M_RebusInternalBeamShaft`) that starts AT the lens plane and is sized to the live
+	// SpotLight throw -- per-light VolumetricScatteringIntensity is forced to 0 so the engine
+	// doesn't paint extra scattering INSIDE the head, and the cone mesh samples the per-fixture
+	// GoboRT directly so the cookie appears IN the shaft (not just on the floor footprint).
+	// When OFF, the shaft component is hidden and `RefreshBeamShadowMode` restores the v1.0.92
+	// per-light scattering path. Called from `ApplyInternalBeamPose`, from `ApplyZoom` /
+	// `RefreshMotion` (to re-size the cone), and from the `Rebus.InternalBeamCookieCone` CVar
+	// refresh sink. Idempotent / cheap when nothing changed.
+	void ApplyInternalBeamShaft(bool bForceVisible = false);
+	// v1.0.93 -- restore the cached SpotLight `LightFunctionMaterial` + `VolumetricScattering
+	// Intensity` from the v1.0.93 cache (separate from the v1.0.92 `bAllowMegaLights` cache so
+	// each toggle can roundtrip independently). Called from `RestoreInternalBeamPose` on the
+	// InternalBeam OFF edge AND from the `Rebus.InternalBeamCookieCone 0` CVar refresh sink
+	// (when the operator opts out of the cone-mesh path while the mode is still on).
+	void RestoreInternalBeamShaft();
+
 	// v1.0.88 -- operator-flippable A/B toggle for the new <Beam> (isBeam) lens path.
 	//
 	// Default (bForceSynthetic=false): when /meshes carries at least one mesh flagged isBeam=true
@@ -656,6 +675,42 @@ private:
 	UPROPERTY() TObjectPtr<UMaterialInterface> FixtureLensMaterialOverride = nullptr;
 	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> FixtureBodyMID = nullptr;
 	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> FixtureLensMID = nullptr;
+
+	// v1.0.93 -- cook-safe hard refs to the two new Python-authored masters (built by
+	// `build_rebus_base_level.py::ensure_*` on startup):
+	//   * `GoboLightFunctionMaterial` -- `M_RebusGoboLightFunction`, the cookie LF with
+	//     `bUsedWithVolumetricFog=true`. The smoking-gun flag missing from Epic's stock
+	//     MI_Light: the per-material gate that lets the LF reach the volumetric integrator.
+	//   * `InternalBeamShaftMaterial` -- `M_RebusInternalBeamShaft`, unlit additive cone-mesh
+	//     shader that samples the per-fixture GoboRT directly so the cookie pattern reads in
+	//     the visible volumetric beam shaft (the user-reported "gobo not in the volumetric
+	//     beam" fix). Domain=Surface, ShadingModel=Unlit, BlendMode=Additive, two-sided.
+	// Both refs are resolved by the constructor (FObjectFinder) so the cooker packages them.
+	// If a path is missing (e.g. the Python builder hasn't run yet on a fresh checkout) the
+	// ref stays null and the runtime falls back to the v1.0.92 per-light scattering path --
+	// a benign Warning is logged in `EnsureFixtureInternalBeamMIDs` so the operator can see
+	// they need to run `build_rebus_base_level.py` (or restart the editor so the startup
+	// hook runs).
+	UPROPERTY() TObjectPtr<UMaterialInterface> GoboLightFunctionMaterial = nullptr;
+	UPROPERTY() TObjectPtr<UMaterialInterface> InternalBeamShaftMaterial = nullptr;
+	// v1.0.93 per-fixture MIDs built off the masters above. `GoboLightFunctionMID` carries
+	// the per-fixture `GoboRT` texture parameter (so each fixture's cookie is independent)
+	// and is assigned as the SpotLight's `LightFunctionMaterial` while InternalBeam mode +
+	// a gobo are both active. `InternalBeamShaftMID` carries `Color` / `Intensity` / `GoboRT`
+	// + the spatial params (`BeamOrigin` / `BeamDir` / `BeamLength` / `LensRadius` /
+	// `FarRadius`) and is applied to `InternalBeamShaft` (the cone-mesh component below).
+	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> GoboLightFunctionMID = nullptr;
+	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> InternalBeamShaftMID = nullptr;
+	// v1.0.93 -- the procedural cone mesh that IS the visible volumetric shaft while
+	// InternalBeam-cookie-cone mode is on. Geometry mirrors `BeamCone` (truncated frustum,
+	// base = LensRadius at the lens plane, far = BeamLength * tan(outerHalf)) but attaches
+	// at the LENS plane (NOT inside the head where the SpotLight sits after the v1.0.87
+	// back-offset), so the shaft cannot be visible inside the head body. Material is
+	// `InternalBeamShaftMID`, which samples the per-fixture GoboRT so the cookie pattern
+	// appears IN the shaft. CastShadow = false (purely emissive). Tagged with
+	// `RebusInternalBeamShaft` so the shadow walker can skip it.
+	UPROPERTY() TObjectPtr<UProceduralMeshComponent> InternalBeamShaft = nullptr;
+	float InternalBeamShaftLastFarRadius = -1.f;   // rebuild gate (same trick as BeamConeLastFarRadius)
 	UPROPERTY() TArray<TObjectPtr<UMaterialInterface>> OriginalMeshMaterials; // index-aligned to MeshComponents
 	// Non-UPROPERTY because TMap with TWeakObjectPtr key is not reliably UHT-supported; value is
 	// weak too so a GC'd material (or destroyed comp on re-import) makes the restore a no-op
@@ -668,6 +723,34 @@ private:
 	// Build (once) the per-actor body + lens MIDs from FixtureMatParent. No-op if the parent is
 	// missing OR the user-override variants are present (in which case we use those verbatim).
 	void EnsureFixtureMIDs();
+
+	// v1.0.93 -- build (once) the per-actor InternalBeam gobo LF MID + shaft MID off the
+	// Python-baked masters (`GoboLightFunctionMaterial` + `InternalBeamShaftMaterial`).
+	// Logs a one-shot Warning per missing master (the Python builder hasn't baked it yet on
+	// a fresh checkout, OR an older project drop predates v1.0.93) and returns null in that
+	// slot so the caller falls back to whatever the pre-v1.0.93 path did.
+	void EnsureFixtureInternalBeamMIDs();
+	// v1.0.93 -- (re)build the cone-mesh shaft geometry from the live throw / lens radius /
+	// outer cone half-angle. Same rebuild-gate trick as `UpdateBeamConeGeometry` so live
+	// zoom fades don't allocate every frame. Also pushes the spatial params (`BeamOrigin` /
+	// `BeamDir` / `BeamLength` / `LensRadius` / `FarRadius`) to `InternalBeamShaftMID`.
+	void UpdateInternalBeamShaftGeometry();
+	// v1.0.93 -- push the live color + dimmer*shutter-gate*candela onto the shaft MID so the
+	// shaft tracks the SpotLight intensity in lockstep (it's the visible cone now, the
+	// SpotLight only lights surfaces). Called from `RefreshIntensity` alongside the existing
+	// `RefreshBeamEmissive`.
+	void RefreshInternalBeamShaftEmissive();
+	// v1.0.93 -- ride the shaft cone off the SpotLight's live world transform (lens-plane
+	// origin -- the SpotLight is back-offset INSIDE the head, so we subtract LiveFwd * back-
+	// offset to recover the lens plane; the shaft starts AT the lens, not inside the head).
+	// Mirrors `DriveBeamConeFromSpotLight` but anchors at the lens plane rather than the
+	// SpotLight location.
+	void DriveInternalBeamShaftFromSpotLight();
+	// v1.0.93 -- push the per-fixture `GoboRT` Texture2D parameter onto the LF MID + the
+	// shaft MID (or revert to the white default if no gobo is active). Idempotent / cheap;
+	// safe to call from the cookie path (`ApplyCurrentGoboToLightFn`) without checking the
+	// InternalBeam mode state -- the param just lands on whichever MID is bound.
+	void PushGoboRTToInternalBeamMaterials();
 	// Apply the override to a single mesh component. Captures the original material into
 	// OutOriginal* the first time, so the override can be reverted cleanly. bIsOrbitComp picks
 	// which cache to use. Returns true when a material was applied.
@@ -775,6 +858,19 @@ private:
 	bool bInternalBeamAllowMegaLightsOrig = true;
 	bool bInternalBeamMegaLightsOrigCached = false;
 
+	// v1.0.93 -- cached per-fixture SpotLight LightFunctionMaterial pointer captured the
+	// FIRST time the cookie-cone path installs `MID_RebusGoboLightFunction` so the OFF edge
+	// can byte-exactly restore whatever the SpotLight had as its light function before
+	// InternalBeam took over (typically null, or `MID_GoboLightFn` from the v1.0.49 cookie
+	// path if a gobo went active before InternalBeam was toggled on). Separate latch from the
+	// v1.0.92 `bInternalBeamMegaLightsOrigCached` so the operator can flip
+	// `Rebus.InternalBeamCookieCone` independently of `Rebus.InternalBeamForceLegacy` without
+	// the two caches stomping each other. WeakObjectPtr is enough -- if the cached MID went
+	// dead before restore (e.g. operator hot-reloaded the cookie pipeline), the restore is
+	// a null assignment which is still a defensible end state ("no light function").
+	TWeakObjectPtr<class UMaterialInterface> InternalBeamPriorLightFunction;
+	bool bInternalBeamPriorLightFunctionCached = false;
+
 	// Per-primitive shadow cache captured the first time InternalBeam is enabled on this actor.
 	// Each entry holds a weak ref + the original CastShadow flag set so RestoreInternalBeamPose
 	// can push them back byte-exact. Weak refs tolerate component destruction (rebuild between
@@ -809,6 +905,9 @@ private:
 	// must not shadow it. The synthetic LensDisc is still skipped (it is an emissive disc,
 	// already non-shadowing). The per-beam emissive flares (`RebusIsBeamFlare`) are also already
 	// non-shadowing by construction (BuildIsBeamLensFlares hard-sets CastShadow=false).
+	// v1.0.93: the walker ALSO skips the new `InternalBeamShaft` cone-mesh component (it
+	// already has CastShadow=false by construction; including it in the cache + restore loop
+	// would corrupt the cache for the OFF restore).
 	void SetBodyMeshesCastShadow(bool bRestoreOriginal);
 
 	// v1.0.89: opt a single freshly-created primitive out of shadow casting AND cache its
