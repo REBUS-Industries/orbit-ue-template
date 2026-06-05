@@ -239,6 +239,106 @@ public:
 	void SetOrbitDoubleSidedEnabled(bool bEnabled);
 	bool IsOrbitDoubleSidedEnabled() const { return bOrbitDoubleSidedEnabled; }
 
+	// v1.0.105 -- enable Nanite on every Orbit-imported UStaticMesh post-import (operator-
+	// toggleable, default ON). User request (verbatim from the v1.0.105 brief): "can all
+	// imported objects from orbit be converted to nanite post import to improve performance."
+	//
+	// Why Nanite matters here: trusses, set pieces, banners, and fixture bodies are exactly
+	// the high-poly, low-material-count, opaque (or mostly-opaque) geometry that Nanite was
+	// designed for. UE 5.7's Nanite cuts the per-draw-call cost on imported geometry by
+	// ~5-50x depending on triangle count, plus virtualised shadow maps (VSM) make the
+	// v1.0.99 force-cast-shadows pass effectively free on every Nanite mesh -- a meaningful
+	// win on the truss-shadow visibility the v1.0.99/v1.0.103 work was about. Nanite-
+	// incompatible passes (the v1.0.104 two-sided opaque, masked, translucent) automatically
+	// route through the per-mesh fallback proxy that NaniteSettings.FallbackPercentTriangles
+	// reserves -- so the v1.0.97/v1.0.104 double-sided work is preserved verbatim (those
+	// pixels just don't get the Nanite per-pixel raster path; the rest of the mesh does).
+	//
+	// Why this is editor-only: Nanite resources are a cooked artefact -- they're built from
+	// source MeshDescription via UStaticMesh::Build (editor-time) or the runtime
+	// NaniteBuilder module (also editor-only in 5.7 -- no shipping-build entry point). The
+	// glTFRuntime parser DOES instantiate a real UStaticMesh UObject (NewObject<UStaticMesh>
+	// in glTFRuntimeParserStaticMeshes.cpp:30 -- not a UProceduralMeshComponent), and DOES
+	// commit a MeshDescription source model when bGenerateStaticMeshDescription=true on the
+	// import config (gated `#if WITH_EDITOR` in the same file at line 782). So in editor
+	// builds (PIE / Standalone Editor / -game with editor-built binaries) we can flip
+	// NaniteSettings.bEnabled and call Build() to (re)cook Nanite resources in-place.
+	// Packaged builds need cooked-Nanite GLB assets (operator pre-cooks the Orbit imports
+	// into UStaticMesh .uasset(s) with NaniteSettings.bEnabled=true in editor before
+	// packaging) -- documented in the v1.0.105 README block.
+	//
+	// What the walker does, per UStaticMesh (NOT per UStaticMeshComponent -- meshes are
+	// shared between components in the OrbitConnector import; a per-comp walker would
+	// rebuild the same mesh N times):
+	//   * Group every UStaticMeshComponent under OrbitImportRoot by its UStaticMesh.
+	//   * Skip if NaniteSettings.bEnabled already matches the requested state AND we've
+	//     attempted Build() on this mesh before this session (NaniteAttempted set entry).
+	//   * Skip if the mesh has no SourceModels[0] / no MeshDescription -- Build() would
+	//     crash on a missing source. Logs a one-shot Warning per mesh naming the operator
+	//     fix (OrbitConnector's import config likely has bGenerateStaticMeshDescription=
+	//     false; flipping it on rebuilds the import with editor-rebuildable meshes).
+	//   * Otherwise: NaniteSettings.bEnabled = bWantOn (+ conservative defaults on first-
+	//     time enable: PositionPrecision = MIN_int32 (auto bounds-derived precision),
+	//     FallbackPercentTriangles = 1.0f (full-quality fallback proxy preserves the
+	//     v1.0.97/v1.0.104 two-sided / masked passes), TrimRelativeError = 0.0f (no
+	//     aggressive simplification)), then StaticMesh->Build(false /*bSilent*/), then
+	//     MarkRenderStateDirty on every UStaticMeshComponent referencing this mesh so the
+	//     freshly-cooked NaniteResources land on the GPU on the next render frame.
+	//   * Per-mesh log line on success: `[Rebus] Nanite ENABLED on <Mesh> (LOD0 tris=N,
+	//     fallback=100.0%)`.
+	//
+	// All of the above is gated behind `#if WITH_EDITOR` -- packaged builds compile cleanly
+	// (UStaticMesh::Build is `#if WITH_EDITOR` in `Engine/StaticMesh.h`; NaniteSettings
+	// itself is a runtime-readable USTRUCT but the cook-time path the toggle drives is
+	// editor-only). In a packaged build the walker emits a one-shot Warning per session
+	// ("Nanite runtime-conversion unavailable in packaged builds; pre-cook GLBs to
+	// UStaticMesh assets with Nanite enabled in editor") and bails -- the toggle is still
+	// settable so SceneState round-trips it, but the conversion is no-effect.
+	//
+	// Operator overrides:
+	//   * `Rebus.NaniteOrbitImports [0|1]` flips bNaniteOrbitImportsEnabled. ON (default)
+	//     enables Nanite on every tracked + newly-encountered mesh; OFF walks the tracked
+	//     set and DISABLES Nanite + rebuilds. Disable path emits a single Warning
+	//     "Disabling Nanite on N Orbit meshes -- this will trigger a rebuild storm
+	//     (UStaticMesh::Build can take seconds per mesh, blocks the game thread)" so an
+	//     operator never fires the toggle casually mid-show.
+	//   * `bNaniteOrbitImports` scene property mirrors the same flag through the portal /
+	//     SetSceneProperty wire path -- routes via SetNaniteOrbitImportsEnabled below so
+	//     the console + portal paths can never diverge.
+	//   * `Rebus.DumpOrbitNanite` diagnostic walks every Orbit StaticMesh and dumps one
+	//     line per mesh: `Mesh='<n>' refs=<r> tris=<t> Nanite=ON|OFF FallbackTris=<ft>
+	//     dsSlots=<a/b>` (a = slots reporting bTwoSidedScalar=1.0, b = total slots).
+	//     Mirrors the `Rebus.DumpBeamShadow` style. Reports Nanite=ON on every entry once
+	//     the v1.0.105 walker has run successfully -- the canonical operator verification
+	//     step on the v1.0.105 ship.
+	struct FOrbitNaniteApplyCount
+	{
+		int32 Components      = 0; // total Orbit static-mesh components considered this pass
+		int32 Meshes          = 0; // unique UStaticMesh UObjects considered this pass
+		int32 Touched         = 0; // had NaniteSettings.bEnabled flipped + Build() called
+		int32 SkippedNoSource = 0; // mesh had no MeshDescription source -- Build() impossible
+		int32 SkippedAlready  = 0; // state already matched + we'd visited it before
+	};
+	FOrbitNaniteApplyCount EnsureImportedNanite();
+	void SetNaniteOrbitImportsEnabled(bool bEnabled);
+	bool IsNaniteOrbitImportsEnabled() const { return bNaniteOrbitImportsEnabled; }
+
+	// Per-mesh dump entry surfaced by `Rebus.DumpOrbitNanite`. Grouped by UStaticMesh so
+	// each unique imported asset reports ONCE with a count of components referencing it
+	// (the OrbitConnector import shares trusses / set-piece geometry between many
+	// component instances; per-comp dump would be O(comps) noisy).
+	struct FOrbitNaniteDumpEntry
+	{
+		FString MeshName;
+		int32 Faces           = 0; // sum of LOD0 triangles
+		int32 FallbackTris    = 0; // expected fallback proxy triangle count (Faces * FallbackPercent)
+		bool  bNaniteEnabled  = false;
+		int32 ComponentRefs   = 0;       // how many StaticMeshComponents reference this mesh
+		int32 SlotsTwoSided   = 0;       // material slots reporting bTwoSidedScalar >= 0.5
+		int32 SlotsTotal      = 0;       // total material slots on the first-seen component
+	};
+	TArray<FOrbitNaniteDumpEntry> DumpOrbitNanite() const;
+
 private:
 	// Config / launch tokens.
 	FString PortalUrl;
@@ -396,4 +496,21 @@ private:
 	// v1.0.99 OrbitShadowTouched contract (the OFF path uses this to restore the prior
 	// single-sided baseline). Weak so a destroyed comp on re-import is silently dropped.
 	TSet<TWeakObjectPtr<UPrimitiveComponent>> OrbitDoubleSidedTouched;
+
+	// v1.0.105 -- imported-mesh Nanite enable state. See the doc-comment on
+	// `EnsureImportedNanite` above for the rationale + algorithm. Default ON matches the
+	// scene-property seed in URebusSceneSettingsSubsystem::Initialize. Editor-only effect
+	// (the WITH_EDITOR-guarded walker is a no-op in packaged builds; the flag is still
+	// stored so SceneState round-trips correctly).
+	bool bNaniteOrbitImportsEnabled = true;
+	// Set of every UStaticMesh we've already attempted to enable / disable Nanite on this
+	// session. The per-tick walker reads this to skip the expensive Build() call once a
+	// mesh is in the desired state -- without it, every 1 Hz tick would re-invoke Build()
+	// on every mesh and stall the game thread for seconds. Weak so a destroyed mesh on a
+	// re-import is silently dropped on the next pass.
+	TSet<TWeakObjectPtr<UStaticMesh>> NaniteAttempted;
+	// One-shot session warning that we've logged "packaged build -- Nanite runtime
+	// conversion unavailable" so we don't spam every tick. Reset to false on a Set* call
+	// so the operator gets a fresh log line if they fire the toggle in a packaged build.
+	bool bNanitePackagedWarningLogged = false;
 };

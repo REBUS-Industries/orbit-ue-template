@@ -107,6 +107,30 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// master we actually flipped).
 	Values.Add(TEXT("bOrbitDoubleSided"), FRebusPropertyValue::MakeBool(true));
 
+	// v1.0.105 imported-mesh Nanite enable. Default ON: every OrbitImportRoot UStaticMesh
+	// gets NaniteSettings.bEnabled=true + a UStaticMesh::Build() rebuild on the same 1 Hz
+	// cadence as v1.0.99 EnsureImportedShadowsCast / v1.0.104 EnsureImportedDoubleSided
+	// (URebusVisualiserSubsystem::EnsureImportedNanite). User request: "can all imported
+	// objects from orbit be converted to nanite post import to improve performance." Why
+	// this is the right shipping default: trusses, set pieces, banners, fixture bodies are
+	// exactly the high-poly low-material-count opaque geometry Nanite was designed for --
+	// ~5-50x draw-call cost reduction is the typical win on imported scenes, and Nanite's
+	// virtualised shadow maps (VSM) make the v1.0.99 force-cast-shadows pass effectively
+	// free on Nanite meshes. Nanite-incompatible passes (v1.0.97 / v1.0.104 two-sided +
+	// masked + translucent) drop through to the per-mesh fallback proxy, so the v1.0.104
+	// double-sided work is preserved verbatim.
+	//
+	// Editor-only effect: the conversion (UStaticMesh::Build) is `#if WITH_EDITOR` in UE
+	// 5.7. Packaged builds need cooked-Nanite GLB assets (operator pre-cooks Orbit imports
+	// to UStaticMesh .uasset(s) with NaniteSettings.bEnabled=true in editor before
+	// packaging). The toggle remains settable in packaged so SceneState round-trips it,
+	// but the tick walker emits a one-shot Warning + bails. The portal can override per-
+	// scene via SetSceneProperty bNaniteOrbitImports=false, mirrored by the
+	// `Rebus.NaniteOrbitImports 0` console command. See the v1.0.105 README release block
+	// for the full algorithm, the editor-only constraint, the cooked-Nanite path for
+	// packaged builds, and the rebuild-storm caveat on the OFF path.
+	Values.Add(TEXT("bNaniteOrbitImports"), FRebusPropertyValue::MakeBool(true));
+
 	// v1.0.90: post-process Bloom / Lens Flare / Vignette exposed as portal scene properties.
 	// Seeded so SceneState round-trips them before the portal pushes its first value, and the
 	// v1.0.89 ReapplyAll re-asserts the operator's live values on every (re)spawn of the
@@ -608,6 +632,28 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 				if (URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>())
 				{
 					Viz->SetOrbitDoubleSidedEnabled(Value.bBool);
+				}
+			}
+		}
+	}
+	// v1.0.105 imported-mesh Nanite enable. Routes through the same GameInstance subsystem
+	// chokepoint as v1.0.99 / v1.0.104 so the portal scene-property push, the
+	// `Rebus.NaniteOrbitImports` console command, and the periodic tick walker all share
+	// one source of truth for `bNaniteOrbitImportsEnabled` -- a portal recycle would
+	// otherwise quietly drop the operator's choice. Editor-only effect (the walker's
+	// WITH_EDITOR guard makes the actual conversion a no-op in packaged builds; the flag
+	// is still stored so SceneState round-trips correctly + a packaged build is
+	// re-promotable to editor without losing portal state). Mirrors v1.0.104
+	// bOrbitDoubleSided branch byte-for-byte.
+	else if (Name == TEXT("bNaniteOrbitImports"))
+	{
+		if (UWorld* World = GetWorld())
+		{
+			if (UGameInstance* GI = World->GetGameInstance())
+			{
+				if (URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>())
+				{
+					Viz->SetNaniteOrbitImportsEnabled(Value.bBool);
 				}
 			}
 		}

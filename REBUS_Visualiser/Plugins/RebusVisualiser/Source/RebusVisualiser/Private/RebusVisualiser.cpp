@@ -50,6 +50,8 @@ namespace
 	IConsoleCommand* GRebuildBeamMaterialCommand = nullptr; // v1.0.103 -- editor-only runtime regen
 	IConsoleCommand* GOrbitCastShadowsCommand = nullptr;
 	IConsoleCommand* GOrbitDoubleSidedCommand = nullptr; // v1.0.104 -- imported-primitive double-sided normalisation
+	IConsoleCommand* GNaniteOrbitImportsCommand = nullptr; // v1.0.105 -- imported-mesh Nanite enable
+	IConsoleCommand* GDumpOrbitNaniteCommand = nullptr;    // v1.0.105 -- per-mesh Nanite diagnostic dump
 	// v1.0.101 -- per-fixture zoom / cone-mesh / SpotLight outer-cone runtime dump.
 	IConsoleCommand* GDumpFixtureZoomCommand = nullptr;
 
@@ -1452,6 +1454,128 @@ void FRebusVisualiserModule::StartupModule()
 		}),
 		ECVF_Default);
 
+	// v1.0.105 imported-mesh Nanite enable toggle. Mirrors the v1.0.99 / v1.0.104
+	// Rebus.Orbit* shape (same lambda body, same per-world Game/PIE walk, same
+	// GameInstance-subsystem chokepoint), routed through the v1.0.105
+	// SetNaniteOrbitImportsEnabled chokepoint. The scene-property `bNaniteOrbitImports`
+	// mirror lives in URebusSceneSettingsSubsystem::ApplySceneProperty -- both paths
+	// drive the same chokepoint so console + portal can never diverge. See the v1.0.105
+	// README release block for the user request ("can all imported objects from orbit
+	// be converted to nanite post import to improve performance"), the editor-only
+	// constraint (UStaticMesh::Build is `#if WITH_EDITOR` in UE 5.7), and the rebuild-
+	// storm caveat on the OFF path (every previously-Nanite-enabled mesh gets Build()
+	// re-invoked which can take seconds per mesh and blocks the game thread).
+	GNaniteOrbitImportsCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.NaniteOrbitImports"),
+		TEXT("v1.0.105 -- toggle the imported-Orbit-mesh Nanite enable pass (default ON). "
+			 "When ON the visualiser subsystem walks every OrbitImportRoot's UStaticMesh "
+			 "on the same 1 Hz cadence as RebindOrbitModels + EnsureImportedShadowsCast + "
+			 "EnsureImportedDoubleSided. Per unique UStaticMesh: skip if state already "
+			 "matches and we've visited the mesh before; skip with a one-shot operator-fix "
+			 "Warning if the mesh has no source MeshDescription (glTFRuntime needs "
+			 "bGenerateStaticMeshDescription=true on the OrbitConnector import config); "
+			 "otherwise set NaniteSettings.bEnabled=true (+ conservative defaults: "
+			 "PositionPrecision=auto, FallbackPercentTriangles=1.0 to preserve the "
+			 "v1.0.97/v1.0.104 two-sided fallback proxy, TrimRelativeError=0.0), call "
+			 "UStaticMesh::Build, MarkRenderStateDirty on every component referencing the "
+			 "mesh. OFF walks the same tracked set and DISABLES Nanite + Build()s -- emits "
+			 "a single Warning naming the rebuild-storm cost (Build() can take seconds "
+			 "per mesh and blocks the game thread; preferred is to A/B between scenes / "
+			 "shows, not during a live cue). Editor-only -- in packaged builds the toggle "
+			 "is still settable for SceneState parity but the conversion is no-effect "
+			 "(UStaticMesh::Build + INaniteBuilderModule are `#if WITH_EDITOR` in UE 5.7); "
+			 "pre-cook the Orbit GLBs to UStaticMesh .uasset(s) with NaniteSettings."
+			 "bEnabled=true in editor before packaging. Mirrors the `bNaniteOrbitImports` "
+			 "scene property -- both drive the same SetNaniteOrbitImportsEnabled "
+			 "chokepoint. Verify with `Rebus.DumpOrbitNanite` (every entry should report "
+			 "Nanite=ON once the walker has run). See the v1.0.105 README release block "
+			 "for the full diagnosis, the cooked-Nanite path for packaged builds, and the "
+			 "expected ~5-50x draw-call cost reduction on imported trusses + set pieces. "
+			 "Usage: Rebus.NaniteOrbitImports [0|1]"),
+		FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
+		{
+			const bool bEnable = ParseBoolArg(Args, true);
+			if (!GEngine) return;
+			int32 Subsystems = 0;
+			for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+			{
+				UWorld* World = Ctx.World();
+				if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+				UGameInstance* GI = World->GetGameInstance();
+				if (!GI) continue;
+				if (URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>())
+				{
+					Viz->SetNaniteOrbitImportsEnabled(bEnable);
+					++Subsystems;
+				}
+			}
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.NaniteOrbitImports %d: applied to %d subsystem(s)."),
+				bEnable ? 1 : 0, Subsystems);
+		}),
+		ECVF_Default);
+
+	// v1.0.105 per-mesh Nanite diagnostic dump. Walks every Orbit StaticMesh in every
+	// Game/PIE/Editor world and emits one log line per UNIQUE mesh (grouped by
+	// UStaticMesh* so multiple components sharing the same imported asset collapse to
+	// ONE entry with a ref count). Mirrors the `Rebus.DumpBeamShadow` style for
+	// consistency with the v1.0.99 / v1.0.103 diagnostic surfaces. Operator
+	// verification: every entry should report `Nanite=ON` once the v1.0.105 walker
+	// has run successfully -- if any entry shows `Nanite=OFF`, look one log line up
+	// for the matching `[Rebus] Nanite skip on '<Mesh>': no source MeshDescription`
+	// Warning (= the OrbitConnector import config needs bGenerateStaticMeshDescription=
+	// true) OR the operator may have toggled `Rebus.NaniteOrbitImports 0` recently.
+	GDumpOrbitNaniteCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.DumpOrbitNanite"),
+		TEXT("v1.0.105 -- dump every Orbit-imported UStaticMesh's Nanite state in one "
+			 "line each: Mesh='<n>' refs=<r> tris=<t> Nanite=ON|OFF FallbackTris=<ft> "
+			 "dsSlots=<a/b> (a = material slots reporting bTwoSidedScalar=1.0, b = "
+			 "total slots; surfaces the v1.0.104 double-sided pipeline alongside the "
+			 "v1.0.105 Nanite state so the operator can see at a glance which assets "
+			 "are getting which optimisations). Grouped by unique UStaticMesh* -- "
+			 "components sharing the same imported asset collapse to one entry with a "
+			 "ref count, so a busy Orbit import doesn't flood the log with hundreds of "
+			 "redundant lines. Use this as the canonical operator verification step "
+			 "after `Rebus.NaniteOrbitImports 1` or after a fresh PRISM session boot: "
+			 "every entry should report Nanite=ON. Any Nanite=OFF entry indicates "
+			 "either (a) a missing source MeshDescription (look one log line up for the "
+			 "matching `[Rebus] Nanite skip on '<Mesh>': no source MeshDescription` "
+			 "Warning -- the OrbitConnector import config needs bGenerateStaticMesh-"
+			 "Description=true), (b) a packaged build (Nanite conversion is editor-"
+			 "only -- pre-cook the Orbit GLBs in editor before packaging), OR (c) the "
+			 "operator recently sent `Rebus.NaniteOrbitImports 0`. Usage: "
+			 "Rebus.DumpOrbitNanite"),
+		FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& /*Args*/)
+		{
+			if (!GEngine) return;
+			int32 Worlds = 0;
+			int32 Entries = 0;
+			for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+			{
+				UWorld* World = Ctx.World();
+				if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE && Ctx.WorldType != EWorldType::Editor)) continue;
+				UGameInstance* GI = World->GetGameInstance();
+				if (!GI) continue;
+				URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>();
+				if (!Viz) continue;
+				++Worlds;
+				const TArray<URebusVisualiserSubsystem::FOrbitNaniteDumpEntry> Dump = Viz->DumpOrbitNanite();
+				for (const URebusVisualiserSubsystem::FOrbitNaniteDumpEntry& E : Dump)
+				{
+					UE_LOG(LogRebusVisualiser, Log,
+						TEXT("DumpOrbitNanite world='%s' Mesh='%s' refs=%d tris=%d Nanite=%s FallbackTris=%d dsSlots=%d/%d"),
+						*World->GetName(), *E.MeshName, E.ComponentRefs, E.Faces,
+						E.bNaniteEnabled ? TEXT("ON") : TEXT("OFF"),
+						E.FallbackTris, E.SlotsTwoSided, E.SlotsTotal);
+					++Entries;
+				}
+			}
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.DumpOrbitNanite: dumped %d unique Orbit mesh(es) across %d world(s)."),
+				Entries, Worlds);
+		}),
+		ECVF_Default);
+
 	// v1.0.99 per-fixture screen-space-shadow-trace runtime dump.
 	// v1.0.103 -- the dump is now the primary diagnostic for "v1.0.99 fix didn't materialise"
 	// because the per-scalar MID column reports EXISTS/MISSING explicitly (was a -999
@@ -1852,6 +1976,16 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GOrbitDoubleSidedCommand);
 		GOrbitDoubleSidedCommand = nullptr;
+	}
+	if (GNaniteOrbitImportsCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GNaniteOrbitImportsCommand);
+		GNaniteOrbitImportsCommand = nullptr;
+	}
+	if (GDumpOrbitNaniteCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GDumpOrbitNaniteCommand);
+		GDumpOrbitNaniteCommand = nullptr;
 	}
 	if (GDumpFixtureZoomCommand)
 	{

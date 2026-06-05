@@ -338,6 +338,16 @@ bool URebusVisualiserSubsystem::Tick(float DeltaSeconds)
 				// the back. See EnsureImportedDoubleSided doc-comment in the header for
 				// the full algorithm + the perf caveat.
 				EnsureImportedDoubleSided();
+				// v1.0.105: piggyback the imported-Nanite enable pass on the same cadence
+				// so freshly-imported Orbit static meshes inherit NaniteSettings.bEnabled=
+				// true (and a Build() rebuild for the cooked NaniteResources) on the next
+				// 1 Hz tick after import. Editor-only -- the WITH_EDITOR guard inside the
+				// walker makes this a free no-op in packaged builds. Per-mesh cache
+				// (NaniteAttempted) keeps the steady-state cost flat -- once a mesh is in
+				// the desired state we don't call Build() on it again. See
+				// EnsureImportedNanite doc-comment in the header for the full algorithm,
+				// the editor-only constraint, and the cooked-Nanite path for packaged.
+				EnsureImportedNanite();
 			}
 		}
 	}
@@ -2112,4 +2122,298 @@ void URebusVisualiserSubsystem::SetOrbitDoubleSidedEnabled(bool bEnabled)
 	UE_LOG(LogRebusVisualiser, Log,
 		TEXT("Rebus.OrbitDoubleSided %d: prior-touched=%d freshly-touched=%d (of %d Orbit primitive(s) walked, %d MIDs wrapped, %d bTwoSidedScalar pushes accepted)."),
 		bEnabled ? 1 : 0, Restored, Count.Touched, Count.Components, Count.MIDsWrapped, Count.SwitchesPushed);
+}
+
+// =========================================================================================
+// v1.0.105 imported-mesh Nanite enable. Walks every UStaticMesh under OrbitImportRoot
+// and (in editor builds only) flips NaniteSettings.bEnabled to the operator-chosen state
+// + rebuilds. See the EnsureImportedNanite doc-comment in the header for the full
+// rationale, the editor-only constraint (UStaticMesh::Build is `#if WITH_EDITOR` in
+// `Engine/StaticMesh.h`), and the operator-facing performance characteristics. The walker
+// runs on the same 1 Hz Tick cadence as RebindOrbitModels / EnsureImportedShadowsCast /
+// EnsureImportedDoubleSided so newly-imported geometry inherits the override on the next
+// second after import. Per-mesh cache (NaniteAttempted) keeps the steady-state cost flat.
+// =========================================================================================
+URebusVisualiserSubsystem::FOrbitNaniteApplyCount URebusVisualiserSubsystem::EnsureImportedNanite()
+{
+	FOrbitNaniteApplyCount Count;
+	UWorld* World = GetActiveWorld();
+	if (!World) return Count;
+
+#if WITH_EDITOR
+	const bool bWantOn = bNaniteOrbitImportsEnabled;
+
+	// Walk OrbitImportRoot actors first; group their UStaticMeshComponents by the
+	// underlying UStaticMesh so we visit each unique asset ONCE (Orbit imports share
+	// truss / set-piece geometry across many component instances; per-comp Build()
+	// would rebuild the same asset N times).
+	TMap<UStaticMesh*, TArray<UStaticMeshComponent*>> CompsByMesh;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor || Actor->GetClass()->GetName() != TEXT("OrbitImportRoot")) continue;
+
+		TArray<UStaticMeshComponent*> SMCs;
+		Actor->GetComponents<UStaticMeshComponent>(SMCs);
+		for (UStaticMeshComponent* SMC : SMCs)
+		{
+			if (!SMC) continue;
+			UStaticMesh* Mesh = SMC->GetStaticMesh();
+			if (!Mesh) continue; // component without a live mesh -- nothing to enable on
+			++Count.Components;
+			CompsByMesh.FindOrAdd(Mesh).Add(SMC);
+		}
+	}
+
+	for (TPair<UStaticMesh*, TArray<UStaticMeshComponent*>>& Pair : CompsByMesh)
+	{
+		UStaticMesh* Mesh = Pair.Key;
+		if (!Mesh) continue;
+		++Count.Meshes;
+
+		const bool bAlreadyMatches = (Mesh->NaniteSettings.bEnabled == bWantOn);
+		const bool bAttemptedBefore = NaniteAttempted.Contains(Mesh);
+		if (bAlreadyMatches && bAttemptedBefore)
+		{
+			++Count.SkippedAlready;
+			continue;
+		}
+
+		// UStaticMesh::Build requires SourceModels[0] with a valid MeshDescription. The
+		// glTFRuntime parser only commits one when StaticMeshConfig.bGenerateStaticMesh-
+		// Description=true on the import config (see glTFRuntimeParserStaticMeshes.cpp:782
+		// inside `#if WITH_EDITOR`); we don't own OrbitConnector's call site (the in-tree
+		// plugin is just ThirdParty/Cli/win-x64/orbit-cli.exe -- no UE source), so we can
+		// hit this path and must handle it gracefully. Log a one-shot Warning per mesh
+		// naming the operator-recovery action so a future "why isn't Nanite enabled on
+		// my Orbit imports?" report can be diagnosed in one log grep.
+		if (Mesh->GetNumSourceModels() == 0 || !Mesh->IsMeshDescriptionValid(0))
+		{
+			if (!NaniteAttempted.Contains(Mesh))
+			{
+				UE_LOG(LogRebusVisualiser, Warning,
+					TEXT("[Rebus] Nanite skip on '%s': no source MeshDescription -- glTFRuntime "
+						 "import config likely has bGenerateStaticMeshDescription=false on "
+						 "the OrbitConnector path (the parser only commits a MeshDescription "
+						 "in the editor when that flag is true; without it, UStaticMesh::Build "
+						 "has no source to cook NaniteResources from). Operator fix: enable "
+						 "the flag in OrbitConnector's import config OR pre-cook the Orbit "
+						 "GLBs into UStaticMesh .uasset(s) with NaniteSettings.bEnabled=true "
+						 "in editor before packaging."),
+					*Mesh->GetName());
+				NaniteAttempted.Add(Mesh); // suppress repeat warnings on subsequent ticks
+			}
+			++Count.SkippedNoSource;
+			continue;
+		}
+
+		Mesh->NaniteSettings.bEnabled = bWantOn;
+		if (bWantOn)
+		{
+			// Conservative defaults for first-time enable. PositionPrecision = MIN_int32
+			// is the engine's "auto" sentinel (Nanite picks precision based on bounds);
+			// FallbackPercentTriangles = 1.0 keeps a full-quality fallback proxy for the
+			// Nanite-incompatible passes the v1.0.97 / v1.0.104 work introduced (double-
+			// sided / masked / translucent materials drop out of the Nanite per-pixel
+			// raster path and use the fallback proxy instead -- so v1.0.104 is preserved
+			// verbatim); TrimRelativeError = 0.0 disables aggressive simplification on
+			// the Nanite cluster build (we want crisp geometry on imported set pieces,
+			// not auto-LODed approximations).
+			Mesh->NaniteSettings.PositionPrecision = MIN_int32;
+			Mesh->NaniteSettings.FallbackPercentTriangles = 1.0f;
+			Mesh->NaniteSettings.TrimRelativeError = 0.0f;
+		}
+
+		// Build() rebuilds RenderData (incl. NaniteResources). Real cost -- seconds per
+		// mesh on a busy import -- but it's a ONE-SHOT per state transition (the
+		// NaniteAttempted cache prevents subsequent ticks from re-invoking Build on a
+		// mesh whose state already matches). The rebuild blocks the game thread; the
+		// SetNaniteOrbitImportsEnabled rebuild-storm Warning warns the operator before
+		// they fire the OFF path mid-show.
+		Mesh->Build(/*bSilent*/ false);
+		NaniteAttempted.Add(Mesh);
+
+		// Force every component referencing this mesh to re-acquire its render proxy so
+		// the new NaniteResources land on the GPU on the next render frame. We already
+		// cached the per-comp set above so this is a free walk.
+		for (UStaticMeshComponent* C : Pair.Value)
+		{
+			if (C) C->MarkRenderStateDirty();
+		}
+
+		const int32 Faces = (Mesh->GetRenderData() && Mesh->GetRenderData()->LODResources.Num() > 0)
+			? Mesh->GetRenderData()->LODResources[0].GetNumTriangles() : 0;
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("[Rebus] Nanite %s on '%s' (LOD0 tris=%d, fallback=%.1f%%)"),
+			bWantOn ? TEXT("ENABLED") : TEXT("DISABLED"),
+			*Mesh->GetName(),
+			Faces,
+			Mesh->NaniteSettings.FallbackPercentTriangles * 100.f);
+		++Count.Touched;
+	}
+#else
+	// Packaged build -- UStaticMesh::Build / INaniteBuilderModule are editor-only in
+	// UE 5.7. The toggle remains settable so SceneState round-trips correctly, but the
+	// conversion is no-effect here. One-shot per session so we don't spam the log; reset
+	// to false on every Set* call so an operator A/Bing the toggle in a packaged build
+	// gets a fresh log line.
+	if (!bNanitePackagedWarningLogged)
+	{
+		bNanitePackagedWarningLogged = true;
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("[Rebus] Nanite runtime-conversion unavailable in packaged builds: "
+				 "UStaticMesh::Build + INaniteBuilderModule are `#if WITH_EDITOR` in UE "
+				 "5.7 (Engine/StaticMesh.h, Engine/Source/Developer/NaniteBuilder/). "
+				 "Pre-cook the Orbit GLBs into /Game/REBUS/... UStaticMesh .uasset(s) "
+				 "with NaniteSettings.bEnabled=true in editor before packaging -- the "
+				 "RebusVisualiser README v1.0.105 release block documents the cooked "
+				 "workflow. The bNaniteOrbitImports scene property + Rebus.NaniteOrbit"
+				 "Imports console command remain settable for SceneState parity but do "
+				 "not convert geometry in this build."));
+	}
+#endif
+
+	return Count;
+}
+
+void URebusVisualiserSubsystem::SetNaniteOrbitImportsEnabled(bool bEnabled)
+{
+	bNaniteOrbitImportsEnabled = bEnabled;
+	bNanitePackagedWarningLogged = false; // re-arm the packaged-build warning
+
+#if WITH_EDITOR
+	// Disable path is expensive: every previously-Nanite-enabled mesh gets Build() called
+	// which can take seconds per mesh and blocks the game thread. Warn the operator BEFORE
+	// the rebuild storm so a casual mid-show toggle isn't a multi-second hitch surprise.
+	if (!bEnabled && NaniteAttempted.Num() > 0)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("[Rebus] Disabling Nanite on %d Orbit mesh(es) -- this will trigger a "
+				 "rebuild storm (UStaticMesh::Build can take seconds per mesh, blocks the "
+				 "game thread). Use carefully mid-show; preferred is to A/B the toggle "
+				 "between scenes / shows, not during a live cue. The OFF path is provided "
+				 "primarily so operators can A/B against the non-Nanite baseline for "
+				 "perf comparison."),
+			NaniteAttempted.Num());
+	}
+
+	// Walk the previously-touched set so an OFF flips ALL prior meshes off (and a re-
+	// toggle ON flips them back). Then run the standard pass to pick up newly-imported
+	// meshes that haven't been visited yet on this cadence -- so a single toggle
+	// transition is fully consistent across the whole import on the same call. Mirrors
+	// v1.0.99 SetOrbitCastShadowsEnabled / v1.0.104 SetOrbitDoubleSidedEnabled byte-for-
+	// byte (only the per-mesh action body differs).
+	int32 Restored = 0;
+	for (auto It = NaniteAttempted.CreateIterator(); It; ++It)
+	{
+		UStaticMesh* Mesh = It->Get();
+		if (!Mesh)
+		{
+			It.RemoveCurrent();
+			continue;
+		}
+		if (Mesh->NaniteSettings.bEnabled == bEnabled) continue;
+		// Skip if the source MeshDescription is missing -- Build() would fail. The
+		// EnsureImportedNanite walker already logged the operator-fix Warning when the
+		// mesh first hit the no-source path.
+		if (Mesh->GetNumSourceModels() == 0 || !Mesh->IsMeshDescriptionValid(0)) continue;
+
+		Mesh->NaniteSettings.bEnabled = bEnabled;
+		Mesh->Build(/*bSilent*/ false);
+		++Restored;
+
+		// Re-acquire render proxies on every UStaticMeshComponent in the active world that
+		// references this mesh -- TObjectIterator catches comps NOT under OrbitImportRoot
+		// that happen to share the asset (e.g. fixture proxies that bound to the same
+		// glTFRuntime mesh via RebindOrbitModels), so the new NaniteResources land
+		// everywhere they're used.
+		if (UWorld* World = GetActiveWorld())
+		{
+			for (TObjectIterator<UStaticMeshComponent> CIt; CIt; ++CIt)
+			{
+				UStaticMeshComponent* C = *CIt;
+				if (C && C->GetWorld() == World && C->GetStaticMesh() == Mesh)
+				{
+					C->MarkRenderStateDirty();
+				}
+			}
+		}
+	}
+
+	const FOrbitNaniteApplyCount Count = EnsureImportedNanite();
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Rebus.NaniteOrbitImports %d: prior-rebuilt=%d freshly-rebuilt=%d "
+			 "(of %d Orbit primitive(s), %d unique mesh(es); skipped %d already-matching, %d no-source)."),
+		bEnabled ? 1 : 0, Restored, Count.Touched, Count.Components, Count.Meshes,
+		Count.SkippedAlready, Count.SkippedNoSource);
+#else
+	UE_LOG(LogRebusVisualiser, Warning,
+		TEXT("Rebus.NaniteOrbitImports %d: state stored for SceneState parity, but runtime "
+			 "Nanite conversion is unavailable in packaged builds (UStaticMesh::Build + the "
+			 "NaniteBuilder module are `#if WITH_EDITOR` in UE 5.7). Pre-cook the Orbit GLBs "
+			 "into UStaticMesh .uasset(s) with NaniteSettings.bEnabled=true in editor before "
+			 "packaging."),
+		bEnabled ? 1 : 0);
+#endif
+}
+
+TArray<URebusVisualiserSubsystem::FOrbitNaniteDumpEntry> URebusVisualiserSubsystem::DumpOrbitNanite() const
+{
+	TArray<FOrbitNaniteDumpEntry> Out;
+	UWorld* World = GetActiveWorld();
+	if (!World) return Out;
+
+	// Group by UStaticMesh so we report ONE line per unique mesh + its component-ref count
+	// (the OrbitConnector import shares trusses / set pieces between many comp instances;
+	// per-comp dump would be O(comps) noisy).
+	TMap<UStaticMesh*, FOrbitNaniteDumpEntry> ByMesh;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor || Actor->GetClass()->GetName() != TEXT("OrbitImportRoot")) continue;
+
+		TArray<UStaticMeshComponent*> SMCs;
+		Actor->GetComponents<UStaticMeshComponent>(SMCs);
+		for (UStaticMeshComponent* SMC : SMCs)
+		{
+			if (!SMC) continue;
+			UStaticMesh* Mesh = SMC->GetStaticMesh();
+			if (!Mesh) continue;
+
+			FOrbitNaniteDumpEntry& Entry = ByMesh.FindOrAdd(Mesh);
+			++Entry.ComponentRefs;
+			if (Entry.MeshName.IsEmpty())
+			{
+				Entry.MeshName = Mesh->GetName();
+				if (Mesh->GetRenderData() && Mesh->GetRenderData()->LODResources.Num() > 0)
+				{
+					Entry.Faces = Mesh->GetRenderData()->LODResources[0].GetNumTriangles();
+				}
+				Entry.bNaniteEnabled = Mesh->NaniteSettings.bEnabled;
+				Entry.FallbackTris = (int32)(Entry.Faces * Mesh->NaniteSettings.FallbackPercentTriangles);
+
+				// Per-slot bTwoSidedScalar probe (matches v1.0.104 EnsureImportedDoubleSided
+				// param contract). Reports how many of the first-seen component's slots
+				// carry the v1.0.104 marker -- gives the operator a single-glance view of
+				// how much of this mesh actually renders two-sided.
+				const int32 NumSlots = SMC->GetNumMaterials();
+				Entry.SlotsTotal = NumSlots;
+				for (int32 s = 0; s < NumSlots; ++s)
+				{
+					UMaterialInterface* Mat = SMC->GetMaterial(s);
+					if (!Mat) continue;
+					float V = 0.f;
+					const bool bHas = Mat->GetScalarParameterValue(FMaterialParameterInfo(TEXT("bTwoSidedScalar")), V);
+					if (bHas && V >= 0.5f) ++Entry.SlotsTwoSided;
+				}
+			}
+		}
+	}
+
+	Out.Reserve(ByMesh.Num());
+	for (TPair<UStaticMesh*, FOrbitNaniteDumpEntry>& P : ByMesh)
+	{
+		Out.Add(MoveTemp(P.Value));
+	}
+	return Out;
 }
