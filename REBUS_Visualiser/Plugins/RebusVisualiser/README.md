@@ -594,6 +594,139 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Every Rebus-authored Python master material is now double-sided (v1.0.97).**
+> User request (verbatim):
+>
+> > "can you make sure all materials are double sided"
+>
+> Single, contained deliverable: flip `two_sided = True` on every master that
+> `build_rebus_base_level.py` AUTHORS under `/Game/REBUS/Materials/`, plus a self-heal
+> probe so an EXISTING on-disk master baked by a pre-v1.0.97 startup gets regenerated on
+> the next launch (no operator action required). No engine / Epic / OrbitConnector /
+> glTFRuntime material is touched -- those are operator-controlled or owned by other
+> teams and out of scope.
+>
+> **Why double-sided.** With back-face culling the operator sees a black hole / "punch-
+> through" from any angle that catches a back face: the camera dipping under the 2 km
+> floor plane (sub-floor pit / off-axis swing-cam), or stepping INSIDE a moving-head
+> shell so the procedural `<Beam>` lens disc reads from its back face, or any operator-
+> authored sub-floor mesh that re-uses an `MI_RebusGround_*` instance. Flipping
+> `two_sided` on the masters fixes all three because UE's Material Instances inherit
+> top-level material settings from their parent -- no MI work needed.
+>
+> **What flipped, what was already.**
+>
+> | Master | Path | Pre-v1.0.97 | v1.0.97 |
+> | --- | --- | --- | --- |
+> | `M_RebusGround`      | `/Game/REBUS/Materials/M_RebusGround`      | single-sided      | **double-sided** |
+> | `M_RebusFixtureLens` | `/Game/REBUS/Materials/M_RebusFixtureLens` | single-sided      | **double-sided** |
+> | `M_RebusLensFlare`   | `/Game/REBUS/Materials/M_RebusLensFlare`   | double-sided (v1.0.32) | unchanged (verified) |
+> | `M_RebusBeam`        | `/Game/REBUS/Materials/M_RebusBeam`        | double-sided (v1.0.31) | unchanged (verified) |
+>
+> The v1.0.96 worker's `_build_beam_master` retouch is preserved -- it already set
+> `two_sided = True` (the cone-mesh raymarch needs it so the back wall carries the shaft
+> when the camera is inside the cone -- see v1.0.39 / v1.0.96 release blocks). v1.0.97
+> does not re-set the flag on those two masters, only verifies they're already true.
+>
+> **Self-heal probe -- `_master_is_two_sided`.** New helper next to v1.0.86's
+> `_master_has_tiling_meters`:
+>
+> ```python
+> def _master_is_two_sided(master):
+>     try:
+>         return bool(master.get_editor_property("two_sided"))
+>     except Exception:  # noqa: BLE001
+>         return False
+> ```
+>
+> Best-effort by design: any exception (engine-version rename, asset shape we don't
+> recognise) returns False so the self-heal path treats the master as "needs regen". A
+> false negative is cheap (one redundant rebake on next launch); a false positive would
+> leave the operator on the OLD single-sided master indefinitely, which is exactly what
+> this probe exists to prevent. Matches v1.0.86 / v1.0.93 / v1.0.96 probe semantics.
+>
+> Wired into:
+>
+> * **`ensure_ground_materials()`** -- combined with the v1.0.86 `_master_has_tiling_meters`
+>   check via OR. EITHER missing-TilingMeters OR single-sided triggers ONE force-regen
+>   (no double-bake on a project that pre-dates v1.0.86 + v1.0.97 simultaneously). The
+>   Warning log line now reads `pre-v1.0.97 ground master detected (missing TilingMeters
+>   or single-sided); regenerating master + instances.` so the operator can see the
+>   migration happen.
+> * **`ensure_fixture_lens_material()`** -- combined with the v1.0.93
+>   `_fixture_lens_master_is_current` check via OR, same shape, log line
+>   `pre-v1.0.97 M_RebusFixtureLens detected (missing Color/Metallic/Roughness parameter
+>   contract, or single-sided); regenerating.`
+> * `M_RebusBeam` already has its own v1.0.96 self-heal probe
+>   (`_beam_master_has_shadow_steps`); since the v1.0.96 master already ships double-
+>   sided, no extra probe was added for the beam master.
+> * `M_RebusLensFlare` has no self-heal probe in any previous version -- it's been
+>   double-sided since v1.0.32 and the project's `ensure_lens_material()` is purely
+>   missing-asset based. No probe added in v1.0.97 because there's nothing to migrate
+>   FROM (every shipped version was already two-sided).
+>
+> **Runtime MIDs follow automatically.** `ARebusFixtureActor` builds runtime MIDs from
+> three parent material references (`FixtureMatParent` -> chrome lens MID,
+> `FixtureBodyMaterialOverride` -> body MID, `TrussMaterialOverride` -> truss MID) and a
+> live `BasicShapeMaterial` fallback when the user-authored override is missing. UE
+> Material-Instance-Dynamic objects INHERIT the top-level `two_sided` flag from their
+> parent material asset; once the Python rebake lands the new double-sided
+> `M_RebusFixtureLens`, every per-fixture chrome-lens MID becomes double-sided on the
+> next spawn without any C++ change. Same for the ground MID stack on every
+> `MI_RebusGround_*` Concrete/Tarmac/Sand/Grass preset.
+>
+> **NO Python pass for non-Rebus materials.** Per the deliverable spec, we do NOT
+> iterate the asset registry and force-flip every material in `/Game/` to two-sided --
+> operator-authored materials and truss / set-piece materials assigned outside our
+> pipeline are operator-controlled, and a blanket flip would clobber intentional single-
+> sided choices (e.g. cards / billboards that read better with culling).
+>
+> **Limitation: engine-asset fallback stays single-sided.** The runtime
+> `BasicShapeMaterial` fallback (used when the user-authored `M_RebusFixtureLens` /
+> body / truss override asset doesn't exist) is `/Engine/BasicShapes/BasicShapeMaterial`
+> -- an engine-shipped material we can't and shouldn't mutate. **Operators should
+> confirm the v1.0.97 Python rebake ran** so the Rebus-authored masters take the
+> primary path; if a fixture still reads as a flat single-sided fallback, the log will
+> show `RebusFixtureActor: lens material asset missing, falling back to
+> BasicShapeMaterial` (pre-existing v1.0.95 warning -- same wording, still fires when
+> the Python bake didn't land the asset).
+>
+> **Operator checklist after rebuilding to v1.0.97.**
+>
+> 1. **Restart the editor once** -- `ensure_base_level()` runs on `init_unreal`, and the
+>    v1.0.97 self-heal will detect the pre-v1.0.97 `M_RebusGround` / `M_RebusFixtureLens`
+>    masters, log the two `pre-v1.0.97 ... detected ... regenerating` Warnings, and
+>    force-regen them with `two_sided = True`. A fresh checkout (no on-disk masters yet)
+>    just bakes them double-sided directly with no Warning.
+> 2. **Open one ground MI** in the Material Editor (e.g.
+>    `/Game/REBUS/Materials/MI_RebusGround_Concrete`), open the parent (`M_RebusGround`),
+>    confirm the **`Two Sided` checkbox is ticked** in the Material Editor's *Details*
+>    panel. Same for `M_RebusFixtureLens`. (Already true on `M_RebusBeam` and
+>    `M_RebusLensFlare` -- spot-check optional.)
+> 3. **Load a fixture in the level** and orbit the camera so it sits **inside** the moving-
+>    head shell, looking out through the lens disc. Pre-v1.0.97: the lens disc reads as
+>    a black hole from inside (culled back face). v1.0.97: the chrome-mirror disc is
+>    visible from inside the head, matching the v1.0.95 deliverable's intent ("lens is
+>    always visible").
+> 4. **Optional: dip the camera below the floor** (Z < 0 inside the 2 km plane footprint).
+>    Pre-v1.0.97: the floor punches through to skybox. v1.0.97: the back face renders
+>    the same procedural ground, reading as a real opaque surface from below.
+> 5. **If a fixture still reads single-sided** AND its body / lens / truss material is
+>    the engine `BasicShapeMaterial` fallback (check the log for the v1.0.95 "falling
+>    back to BasicShapeMaterial" Warning), that's the documented engine-asset
+>    limitation -- ensure the Python rebake landed the Rebus-authored masters as the
+>    primary path.
+>
+> **Files touched (v1.0.97).**
+>
+> | File | Change |
+> | --- | --- |
+> | `REBUS_Visualiser/Content/Python/build_rebus_base_level.py` | `_set(mat, "two_sided", True)` in `_build_ground_master` + `_build_fixture_lens_master`; new `_master_is_two_sided` probe alongside `_master_has_tiling_meters`; `OR not _master_is_two_sided(existing)` wired into `ensure_ground_materials` + `ensure_fixture_lens_material` self-heal checks (log lines updated to "pre-v1.0.97 ... regenerating"). |
+> | `REBUS_Visualiser/Plugins/RebusVisualiser/README.md` | v1.0.97 release block (this one). |
+>
+> No C++ changes (runtime MIDs inherit `two_sided` from the parent material asset). No
+> level / actor / subsystem surface changes. No CVars. No new scene properties.
+
 > **Self-shadowed cone-mesh raymarch (screen-space shadow trace) + camera/post-process defaults (v1.0.96).**
 > User report (verbatim):
 >

@@ -150,8 +150,21 @@ def _build_ground_master(mat):
     TilingMeters scalar to a per-floor MID on the live actor, so the operator can change
     the tile size at runtime via `Rebus.SetGroundTiling <metres>` or the scene property
     of the same name -- without re-cooking the material.
+
+    v1.0.97: the master is now double-sided ("make every Rebus-authored Python master
+    double-sided" -- see README v1.0.97). The 2 km floor plane is rendered from above in
+    99% of cases, but a camera that dips below the plane (sub-floor pit, off-axis
+    swing-cam) or an operator-authored sub-floor mesh that re-uses an `MI_RebusGround_*`
+    instance would otherwise punch through to skybox; the back-face draw makes the floor
+    read as a real opaque surface from either side. Shading model + opaque blend are
+    inherited from the asset factory defaults (Lit / Opaque) so this only flips two_sided.
     """
     mel = unreal.MaterialEditingLibrary
+
+    # v1.0.97: double-sided so the back of the floor plane (and any sub-floor mesh
+    # binding an MI_RebusGround_* instance) renders. Per-MI two_sided is inherited
+    # from the master, so the four shipped MI presets pick this up automatically.
+    _set(mat, "two_sided", True)
 
     # --- Procedural colour layer (back-compat with the pre-v1.0.86 master) ---
     color_a = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1400, -240)
@@ -735,12 +748,22 @@ def _build_fixture_lens_master(mat):
     against the chrome accents on a moving head). Parameters live alongside the runtime
     MID's parameter names (`Color` / `Metallic` / `Roughness`) so a future C++ push could
     drive them on the asset MID identically to the runtime MID.
+
+    v1.0.97: double-sided ("make every Rebus-authored Python master double-sided" -- see
+    README v1.0.97). The procedural <Beam> lens disc is a thin two-faced ring sitting at
+    the cone apex; once the camera passes inside the head shell (or the fixture is
+    physically wide enough that the lens reads from a glancing angle) the lens read as a
+    black hole because the back face was culled. Double-siding makes the chrome mirror
+    visible from inside the head, matching the v1.0.95 deliverable's intent that the lens
+    object is "always visible" in Epic-beam mode.
     """
     mel = unreal.MaterialEditingLibrary
 
     _set(mat, "material_domain", unreal.MaterialDomain.MD_SURFACE)
     _set(mat, "shading_model", unreal.MaterialShadingModel.MSM_DEFAULT_LIT)
     _set(mat, "blend_mode", unreal.BlendMode.BLEND_OPAQUE)
+    # v1.0.97: see docstring + README v1.0.97.
+    _set(mat, "two_sided", True)
 
     color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -600, -150)
     color.set_editor_property("parameter_name", "Color")
@@ -785,14 +808,21 @@ def ensure_fixture_lens_material(force=False):
     parameter contract (e.g. an operator-authored placeholder from before v1.0.93 baked
     the asset), promote the call to a force-regen so the C++ FObjectFinder picks up the
     correct shape on the next launch -- log a Warning so the change is auditable.
+
+    v1.0.97 self-heal: same path also detects a pre-v1.0.97 master (still single-sided)
+    and promotes to a force-regen so the new double-sided master ships on the next
+    launch. Combined via OR with the v1.0.93 contract check so EITHER upgrade triggers a
+    single regen.
     """
     tools = unreal.AssetToolsHelpers.get_asset_tools()
 
     if not force and unreal.EditorAssetLibrary.does_asset_exist(FIXTURE_LENS_PATH):
         existing = unreal.EditorAssetLibrary.load_asset(FIXTURE_LENS_PATH)
-        if existing is not None and not _fixture_lens_master_is_current(existing):
-            unreal.log_warning("RebusBaseLevel: pre-v1.0.93 M_RebusFixtureLens detected "
-                               "(missing Color/Metallic/Roughness parameter contract); regenerating.")
+        if existing is not None and (not _fixture_lens_master_is_current(existing)
+                                     or not _master_is_two_sided(existing)):
+            unreal.log_warning("RebusBaseLevel: pre-v1.0.97 M_RebusFixtureLens detected "
+                               "(missing Color/Metallic/Roughness parameter contract, "
+                               "or single-sided); regenerating.")
             force = True
 
     if force and unreal.EditorAssetLibrary.does_asset_exist(FIXTURE_LENS_PATH):
@@ -848,6 +878,29 @@ def _master_has_tiling_meters(master):
     return any(str(n) == "TilingMeters" for n in info)
 
 
+def _master_is_two_sided(master):
+    """v1.0.97: best-effort read of a master material's top-level `two_sided` editor property.
+
+    Used by the v1.0.97 self-heal so an EXISTING on-disk master that pre-dates v1.0.97 (and is
+    therefore still single-sided) gets force-regenerated on the next editor launch -- mirrors
+    v1.0.86 (`_master_has_tiling_meters`) / v1.0.93 (`_fixture_lens_master_is_current`) /
+    v1.0.96 (`_beam_master_has_shadow_steps`).
+
+    Best-effort: any exception (engine-version rename of the property, asset shape we don't
+    recognise) yields False so the self-heal path treats the master as "needs regen". False-
+    negatives are cheap (one redundant rebake on next launch); false-positives would leave the
+    operator on the OLD single-sided master indefinitely, which is the failure mode this
+    probe exists to prevent.
+
+    `two_sided` is a top-level editor property on `unreal.Material`; reading it does not
+    require loading the shader graph.
+    """
+    try:
+        return bool(master.get_editor_property("two_sided"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def ensure_ground_materials(force=False):
     """Generate the procedural ground master + one instance per surface preset.
 
@@ -863,18 +916,26 @@ def ensure_ground_materials(force=False):
     customised the master in the editor will lose those edits on first v1.0.86 startup --
     they should re-apply them after the regen (acceptable for an additive parameter
     upgrade; the regen logs a Warning so the change isn't silent).
+
+    v1.0.97 self-heal: the same path ALSO detects a pre-v1.0.97 master (top-level
+    `two_sided` reads False) and promotes the call to a force-regen so the new double-
+    sided master ships on the next launch. The two probes combine via OR so EITHER
+    upgrade triggers a single regen (no double-bake on a project that pre-dates v1.0.86
+    and v1.0.97 simultaneously).
     """
     tools = unreal.AssetToolsHelpers.get_asset_tools()
     mel = unreal.MaterialEditingLibrary
 
     # Non-force self-heal: if the existing master is the pre-v1.0.86 version (no TilingMeters
-    # parameter), promote the call to a force-regen so the new master ships on the next
-    # launch without the user manually running build().
+    # parameter) OR the pre-v1.0.97 version (single-sided), promote the call to a force-regen
+    # so the new master ships on the next launch without the user manually running build().
     if not force and unreal.EditorAssetLibrary.does_asset_exist(GROUND_MASTER_PATH):
         existing = unreal.EditorAssetLibrary.load_asset(GROUND_MASTER_PATH)
-        if existing is not None and not _master_has_tiling_meters(existing):
-            unreal.log_warning("RebusBaseLevel: pre-v1.0.86 ground master detected (no TilingMeters); "
-                               "regenerating master + instances for 1 m world tiling.")
+        if existing is not None and (not _master_has_tiling_meters(existing)
+                                     or not _master_is_two_sided(existing)):
+            unreal.log_warning("RebusBaseLevel: pre-v1.0.97 ground master detected "
+                               "(missing TilingMeters or single-sided); "
+                               "regenerating master + instances.")
             force = True
 
     if force:
