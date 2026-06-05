@@ -594,6 +594,164 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Auto-purge stale pre-v1.0.110 `M_RebusBeam` master on subsystem startup -- kill the screen-space pan-edge artefact for good (v1.0.112).**
+>
+> User report (verbatim):
+>
+> > "we are still seeing the origional attempt to shadow the cone/beam which cuts off the sides. remove this"
+>
+> This was filed against post-v1.0.111 binaries. v1.0.110 ripped out the
+> v1.0.96..v1.0.109 screen-space self-shadow trace. v1.0.111 replaced it with
+> the light-space depth-mask. Both source rewrites were complete -- and yet
+> the OLD screen-space pan-edge side-cutting artefact was still visible on
+> the user's deployment.
+>
+> **Cause A vs Cause B investigation (verifiable from the v1.0.112 commit).**
+>
+> Two failure modes were possible: (B) residual screen-space code in the
+> v1.0.111 source itself, or (A) a stale on-disk `M_RebusBeam.uasset` cooked
+> by a pre-v1.0.110 build of `build_rebus_base_level.py` whose embedded HLSL
+> still contained the old trace. We checked (B) first because it's the
+> cheaper miss:
+>
+> - `Grep` for `BeamShadowSteps|BeamShadowStrength|BeamShadowBias|
+>   BeamShadowDebug|BeamShadowFarCullCm|BeamShadowEdgeGuard|
+>   BeamShadowBiasScale|TranslatedWorldToClip|SceneTextureLookup|
+>   SceneDepthTexture|SceneTextureSample` across `REBUS_Visualiser/` returns
+>   zero hits in `_BEAM_RAYMARCH_HLSL` and zero hits in any v1.0.111 C++
+>   file outside a single README historical comment block in
+>   `RebusFixtureActor.cpp` (line 393, the v1.0.99 archaeology note).
+> - The only `abs(ndc.xy) < 1.0` clamp in the v1.0.111 raymarch is the
+>   LIGHT-space frustum bounds check using `BeamLightFwd / Right / Up`
+>   axes (`if (abs(ndcX) < 1.0 && abs(ndcY) < 1.0)` at the inner mask
+>   probe), NOT a screen-space NDC guard.
+> - The only `SceneDepth` read is the engine `MaterialExpressionScene
+>   Depth` node feeding `tOcc` for the v1.0.42 soft DMX depth-fade-against-
+>   geometry, NOT a per-step screen-space-trace lookup.
+>
+> Cause B is ruled out. The v1.0.111 source is provably clean.
+>
+> Cause A is unambiguously the diagnosis: the user's on-disk
+> `M_RebusBeam.uasset` is the pre-v1.0.110 cooked master, with the
+> v1.0.96..v1.0.109 screen-space self-shadow HLSL still embedded. The
+> per-fixture push reaches a parameter set that doesn't match the running
+> plugin binary's expectations, but the shader inside the cooked master is
+> what actually runs every frame -- and that shader carries the pan-edge
+> trace.
+>
+> **Why the v1.0.111 Python self-heal didn't fire on the user's deployment.**
+>
+> v1.0.111 added `_beam_master_has_shadow_mask` -- a non-force `ensure_beam_
+> material(force=False)` call detects a missing v1.0.111 parameter contract
+> and promotes itself to a force-regen. That probe is correct, and on a
+> machine where the script runs at editor startup it works. The defect:
+> `build_rebus_base_level.py` is NOT in `[Python] +StartupScripts` (verified
+> -- `REBUS_Visualiser/Config/DefaultEngine.ini` has no such entry, no
+> other auto-import path exists), so the module is loaded ONLY when an
+> operator manually runs `Tools > Execute Python Script >
+> build_rebus_base_level` (or the headless `-run=pythonscript` equivalent).
+> On the user's deployment that operator step has not been reliably
+> performed across upgrades -- the same failure mode that bit v1.0.103
+> (the v1.0.99 fix didn't take effect because the cooked master stayed
+> stale). We have now burned **four** release cycles asking the operator
+> to manually re-run Python: v1.0.99, v1.0.103, v1.0.110, v1.0.111.
+> Asking the operator to do it again is wrong. v1.0.112 makes it
+> automatic.
+>
+> **The system (v1.0.112 ships).**
+>
+> A new runtime probe `URebusVisualiserSubsystem::ProbeAndAutoPurgeStaleBeam
+> Master` runs once from `Initialize()` (gated by a `bBeamMasterAutoPurgeRun`
+> one-shot bool so any future re-entry is a clean no-op). It is the
+> spiritual successor to the v1.0.103 startup probe that v1.0.110 removed,
+> but with two material differences:
+>
+> 1. It detects the PRESENCE of any of the seven obsolete v1.0.96..v1.0.109
+>    `BeamShadow*` scalars (`BeamShadowSteps`, `BeamShadowStrength`,
+>    `BeamShadowBias`, `BeamShadowDebug`, `BeamShadowFarCullCm`,
+>    `BeamShadowEdgeGuard`, `BeamShadowBiasScale`) AND the ABSENCE of the
+>    v1.0.111 required contract (`BeamShadowMaskRT` texture + `BeamShadow
+>    MaskEnabled / BiasCm / FadeCm / FarCm / TanHalfFov / Debug` scalars +
+>    `BeamLightFwd / Right / Up` vectors). EITHER condition fires the
+>    auto-purge. The required-contract probe set matches the Python
+>    `_beam_master_has_shadow_mask` self-heal byte-for-byte so the C++
+>    and Python probes can never disagree.
+> 2. On staleness, it AUTO-REGENERATES the master by invoking
+>    `Rebus.RebuildBeamMaterial` directly -- routes through the engine's
+>    `py` console command to call `build_rebus_base_level.ensure_beam_
+>    material(force=True)` (same Python entry the manual operator step
+>    would take). Uses the v1.0.103 `WITH_EDITOR` + `FModuleManager::
+>    IsModuleLoaded("PythonScriptPlugin")` defence so a packaged-build
+>    invocation drops to a hard Warning instead of a silent no-op.
+>
+> The probe log line names the EXACT obsolete-present + missing-required
+> parameter names that triggered the verdict (no guessing from operators
+> or future bug-reports), and the post-regen log line spells out the
+> operator next-step ("ClearScene + LoadScene from the portal to rebuild
+> per-fixture BeamMIDs off the regenerated master, OR restart the
+> editor"). A new `RefreshAllSpawnedFixtureBeamMIDs` walker calls the
+> v1.0.112 `ARebusFixtureActor::RefreshBeamMaterialBindings` (`BeamMID->
+> ClearParameterValues()` + `RefreshBeamRadialParams` +
+> `RefreshBeamSpatialParams` + `RefreshBeamShadowMaskParams`) on every
+> already-spawned fixture as a belt-and-braces refresh. This is normally
+> a no-op at `Initialize()` time -- subsystem init runs BEFORE the per-
+> tick scene-fetch chain spawns any fixture -- but it costs nothing and
+> means the probe stays correct if a future tick-gated path ever re-fires
+> it mid-show.
+>
+> **Packaged-build fallback.** Python is editor-only. In packaged builds
+> the auto-regen cannot run (no PythonScriptPlugin, no `py` command, no
+> ensure_beam_material) and rewriting a cooked `.uasset` at runtime
+> isn't possible. The probe still detects the staleness and logs a hard
+> Warning naming the obsolete scalar that triggered the verdict + the
+> operator workflow ("open the project in editor on a v1.0.112+
+> workspace, run `Rebus.RebuildBeamMaterial`, re-package, re-deploy").
+> No silent no-op feature.
+>
+> **New diagnostic: `Rebus.DumpBeamMasterVersion`.** Loads the master,
+> probes the obsolete + required contracts, classifies, and emits one
+> line per GameInstance subsystem:
+>
+> ```
+> Rebus.DumpBeamMasterVersion world='BaseLevel': Master Version: v1.0.111+. Obsolete v1.0.96..v1.0.109 scalars present: [(none)]. Missing v1.0.111 scalars: [(none)]. Missing v1.0.111 vectors: [(none)]. Missing v1.0.111 textures: [(none)].
+> Rebus.DumpBeamMasterVersion: probed 1 world(s). Expect `v1.0.111+` after a fresh editor launch on a v1.0.112+ workspace; ...
+> ```
+>
+> Verdicts: `MISSING`, `pre-v1.0.96`, `v1.0.96..v1.0.109 (HAS OBSOLETE
+> -- screen-space trace cooked in)`, `v1.0.110 (clean slate, no shadow
+> path)`, `v1.0.111+`. After a fresh editor launch on a v1.0.112+
+> workspace the verdict should always be the last one; anything else
+> means the auto-purge didn't fire (grep `LogRebusVisualiser` for
+> `STALE BEAM MASTER detected`).
+>
+> **What this is honestly admitting.** We kept asking the operator to
+> manually re-run Python after every release that touched the beam
+> shader. That's wrong. The plugin owns its own assets and is the only
+> thing that knows when a cooked .uasset doesn't match the running
+> binary's expectations. v1.0.112 is the system finally doing that
+> check for the operator instead of asking them to do it.
+>
+> **Operator verification (v1.0.112).**
+>
+> 1. Launch the editor in an environment where the pre-v1.0.110 cooked
+>    `M_RebusBeam.uasset` is on disk (the user's current state).
+> 2. `LogRebusVisualiser` shows exactly once:
+>    `[Rebus] STALE BEAM MASTER detected -- v1.0.96..v1.0.109 (HAS
+>    OBSOLETE -- screen-space trace cooked in). Obsolete v1.0.96..v1.0.109
+>    scalars present: [BeamShadowSteps,BeamShadowStrength,...]. Missing
+>    v1.0.111 scalars: [BeamShadowMaskEnabled,...]. ... Auto-running
+>    `Rebus.RebuildBeamMaterial` now ...`.
+> 3. Within a few seconds the log shows the regen completing
+>    (`RebusBaseLevel: beam material ensured.`) followed by the
+>    operator next-step nudge.
+> 4. Operator sends ClearScene + LoadScene from the portal (or
+>    restarts the editor). Per-fixture BeamMIDs respawn against the
+>    regenerated master.
+> 5. Beam pan no longer exhibits pan-edge side-cutting.
+> 6. `Rebus.DumpBeamMasterVersion` reports `v1.0.111+`.
+> 7. `Rebus.DumpBeamShadowMask` reports all six v1.0.111 scalars as
+>    EXISTS (no `MISSING` flags).
+
 > **Light-space depth-mask beam occlusion -- per-fixture SceneCapture2D "shadow map for the beam" (v1.0.111).**
 >
 > User design direction (verbatim):

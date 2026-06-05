@@ -378,6 +378,29 @@ public:
 	// hot-reload scenario, or fixtures whose `M_RebusBeam` failed to load and so have no
 	// BeamMID). Idempotent / cheap (six scalar sets + three vector sets + one texture set).
 	void RefreshBeamShadowMaskParams();
+
+	// v1.0.112 -- "the master under me just changed underneath the MID" purge for the
+	// stale-master auto-regen path in URebusVisualiserSubsystem::ProbeAndAutoPurge
+	// StaleBeamMaster. Belt-and-braces helper called by the subsystem after the
+	// Python regen has rewritten `M_RebusBeam.uasset` on disk. The MID's parent
+	// UMaterial pointer is NOT auto-refreshed by UE 5.7 when the underlying .uasset
+	// is replaced (UMaterialInstanceDynamic caches its parent at Create() time --
+	// only a fresh `BuildBeamCone` would pick up the new master cleanly via
+	// LoadObject), so for already-spawned fixtures we do the next-best thing:
+	//   1. `BeamMID->ClearParameterValues()` drops any operator-pinned scalar
+	//      override set so the MID stops shadowing the stale-master defaults the
+	//      previous push had pinned on top.
+	//   2. `RefreshBeamRadialParams` / `RefreshBeamSpatialParams` /
+	//      `RefreshBeamShadowMaskParams` re-push the live `Rebus.Beam*` CVar
+	//      values + world axes + light-space mask bindings so the new parameter
+	//      contract is re-seeded against the regenerated master's defaults.
+	// Silently no-ops on a null BeamMID (fixture in pre-BuildBeamCone state).
+	// Normally the SpawnedFixtures list is empty at subsystem Initialize() time --
+	// fixtures spawn LATER on the per-tick scene-fetch chain and pick up the
+	// regenerated master cleanly via their own `BuildBeamCone` LoadObject -- so
+	// this helper is rarely actually exercised; kept so a future tick-gated retry
+	// of the probe stays correct.
+	void RefreshBeamMaterialBindings();
 private:
 	// v1.0.101 -- single-source-of-truth canonical zoom half-angle (degrees) for both the
 	// SpotLight outer-cone AND the procedural cone-mesh far-radius (and the Epic-beam DMX

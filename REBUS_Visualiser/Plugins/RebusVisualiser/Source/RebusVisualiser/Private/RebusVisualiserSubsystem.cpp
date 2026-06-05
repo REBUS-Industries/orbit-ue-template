@@ -31,9 +31,12 @@
 #include "Engine/StaticMesh.h"
 #include "Components/ExponentialHeightFogComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Materials/Material.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Components/PrimitiveComponent.h"
+#include "Engine/Texture.h"
+#include "Modules/ModuleManager.h"
 
 // v1.0.107 -- watermark overlay support. UDebugDrawService is the engine's
 // FCanvas-overlay registry; the "Foreground" extension fires after the world is
@@ -109,6 +112,24 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	// master failure mode worth a startup Warning; the runtime `Rebus.RebuildBeamMaterial`
 	// console command stays as the generic operator escape hatch for any future material
 	// graph changes.
+	//
+	// v1.0.112 REINSTATEMENT (different shape, different intent) -- the v1.0.103 probe is
+	// back, but as an AUTO-REGEN trigger rather than a passive Warning. User report against
+	// post-v1.0.111: the screen-space pan-edge side-cutting artefact is STILL on screen,
+	// even though the post-v1.0.111 `_BEAM_RAYMARCH_HLSL` source is provably clean. Root
+	// cause is the stale on-disk `M_RebusBeam.uasset` -- the Python self-heal
+	// (`_beam_master_has_shadow_mask` in `ensure_beam_material`) only fires when an
+	// operator manually runs the script (it isn't in `[Python] +StartupScripts`), so on
+	// the user's deployment the pre-v1.0.110 cooked HLSL is what's running. The C++ probe
+	// below detects the staleness from the runtime side (presence of any obsolete
+	// `BeamShadow*` scalar OR absence of the v1.0.111 `BeamShadowMaskRT` texture +
+	// `BeamShadowMaskBiasCm` scalar contract) and AUTO-INVOKES `Rebus.RebuildBeamMaterial`
+	// via the `py` console command -- the same Python regen path the manual operator
+	// step would take, just driven without operator intervention. See the public
+	// `EBeamMasterVersion` / `ProbeBeamMasterVersion` doc-comment in the header for the
+	// full diagnosis (Cause A vs Cause B), the obsolete + required parameter contracts,
+	// the editor-only Python regen path, and the packaged-build Warning fallback.
+	ProbeAndAutoPurgeStaleBeamMaster();
 
 	// v1.0.107 -- compose the watermark display string ONCE from the plugin
 	// descriptor's VersionName (the engine-blessed source-of-truth that always
@@ -2490,4 +2511,370 @@ TArray<URebusVisualiserSubsystem::FOrbitNaniteDumpEntry> URebusVisualiserSubsyst
 		Out.Add(MoveTemp(P.Value));
 	}
 	return Out;
+}
+
+// =========================================================================================
+// v1.0.112 -- runtime stale `M_RebusBeam` master probe + auto-purge. See the public
+// `EBeamMasterVersion` / `ProbeBeamMasterVersion` doc-comment in the header for the
+// full diagnosis (this is the C++-driven replacement for the manually-triggered
+// `_beam_master_has_shadow_mask` Python self-heal -- on the user's deployment that
+// only fired when an operator manually ran `Tools > Execute Python Script`, which they
+// hadn't, so the pre-v1.0.110 cooked HLSL kept producing the screen-space pan-edge
+// side-cutting artefact even on a v1.0.111 binary).
+// =========================================================================================
+
+namespace
+{
+	// v1.0.112 -- the seven obsolete `BeamShadow*` scalars that the v1.0.96..v1.0.109
+	// screen-space self-shadow trace pushed onto the BeamMID. The v1.0.110 rollback
+	// deleted both the HLSL trace AND these parameter declarations from `_build_beam_
+	// master`. If the loaded master still declares ANY of these, it was cooked by a
+	// v1.0.96..v1.0.109 build of `build_rebus_base_level.py` -- i.e. the pre-v1.0.110
+	// HLSL is what's compiled in. Order preserved for log-line predictability.
+	const TCHAR* GObsoleteBeamShadowScalars[] = {
+		TEXT("BeamShadowSteps"),
+		TEXT("BeamShadowStrength"),
+		TEXT("BeamShadowBias"),
+		TEXT("BeamShadowDebug"),
+		TEXT("BeamShadowFarCullCm"),
+		TEXT("BeamShadowEdgeGuard"),
+		TEXT("BeamShadowBiasScale"),
+	};
+
+	// v1.0.111 required parameter contract. The Python self-heal in
+	// `ensure_beam_material::_beam_master_has_shadow_mask` checks the same set;
+	// keep the lists in lockstep so the C++ + Python probes agree on the
+	// definition of "v1.0.111+". Missing ANY entry => pre-v1.0.111 master.
+	const TCHAR* GV111BeamMaskScalars[] = {
+		TEXT("BeamShadowMaskEnabled"),
+		TEXT("BeamShadowMaskBiasCm"),
+		TEXT("BeamShadowMaskFadeCm"),
+		TEXT("BeamShadowMaskFarCm"),
+		TEXT("BeamShadowMaskTanHalfFov"),
+		TEXT("BeamShadowMaskDebug"),
+	};
+	const TCHAR* GV111BeamMaskVectors[] = {
+		TEXT("BeamLightFwd"),
+		TEXT("BeamLightRight"),
+		TEXT("BeamLightUp"),
+	};
+	const TCHAR* GV111BeamMaskTextures[] = {
+		TEXT("BeamShadowMaskRT"),
+	};
+}
+
+const TCHAR* URebusVisualiserSubsystem::BeamMasterVersionLabel(EBeamMasterVersion V)
+{
+	switch (V)
+	{
+		case EBeamMasterVersion::Missing:        return TEXT("MISSING (M_RebusBeam.uasset not on disk)");
+		case EBeamMasterVersion::PreV96:         return TEXT("pre-v1.0.96 (cone-only, no shadow contract)");
+		case EBeamMasterVersion::V96ThroughV109: return TEXT("v1.0.96..v1.0.109 (HAS OBSOLETE -- screen-space trace cooked in)");
+		case EBeamMasterVersion::V110:           return TEXT("v1.0.110 (clean slate, no shadow path)");
+		case EBeamMasterVersion::V111Plus:       return TEXT("v1.0.111+");
+		default:                                 return TEXT("UNKNOWN");
+	}
+}
+
+URebusVisualiserSubsystem::FBeamMasterVersionReport URebusVisualiserSubsystem::ProbeBeamMasterVersion() const
+{
+	FBeamMasterVersionReport Report;
+
+	// Synthesise the on-disk asset path matching the Python author side
+	// (`build_rebus_base_level.py::BEAM_PATH = MATERIALS_DIR + "/M_RebusBeam"`).
+	// LoadObject<UMaterial> returns nullptr both when the asset is genuinely
+	// missing AND when the loader fails for any other reason (cooked-out, name
+	// collision, etc.). We treat both as Missing here -- the diagnostic line +
+	// the BuildBeamCone runtime fallback both cover the genuine-missing case.
+	UMaterial* Master = LoadObject<UMaterial>(nullptr,
+		TEXT("/Game/REBUS/Materials/M_RebusBeam.M_RebusBeam"));
+	if (!Master)
+	{
+		Report.Version = EBeamMasterVersion::Missing;
+		return Report;
+	}
+
+	// Detect any obsolete v1.0.96..v1.0.109 `BeamShadow*` scalar. UMaterial's
+	// `GetScalarParameterValue(FMaterialParameterInfo, OutValue)` returns true
+	// only when the parameter is declared on the master -- false for missing
+	// names (no exception, no log line). Exactly the semantics we want for a
+	// probe; mirrors the v1.0.104 EnsureImportedDoubleSided / DumpOrbitNanite
+	// reflection-probe pattern used elsewhere in this subsystem.
+	for (const TCHAR* Name : GObsoleteBeamShadowScalars)
+	{
+		float V = 0.f;
+		if (Master->GetScalarParameterValue(FMaterialParameterInfo(Name), V))
+		{
+			Report.DetectedObsoleteParams.Add(Name);
+		}
+	}
+
+	// Probe the v1.0.111 parameter contract. The Python self-heal probe checks
+	// the same set; keep them aligned so a stale master fails BOTH probes the
+	// same way regardless of which one fires first.
+	for (const TCHAR* Name : GV111BeamMaskScalars)
+	{
+		float V = 0.f;
+		if (!Master->GetScalarParameterValue(FMaterialParameterInfo(Name), V))
+		{
+			Report.MissingV111Scalars.Add(Name);
+		}
+	}
+	for (const TCHAR* Name : GV111BeamMaskVectors)
+	{
+		FLinearColor V = FLinearColor::Black;
+		if (!Master->GetVectorParameterValue(FMaterialParameterInfo(Name), V))
+		{
+			Report.MissingV111Vectors.Add(Name);
+		}
+	}
+	for (const TCHAR* Name : GV111BeamMaskTextures)
+	{
+		UTexture* T = nullptr;
+		if (!Master->GetTextureParameterValue(FMaterialParameterInfo(Name), T))
+		{
+			Report.MissingV111Textures.Add(Name);
+		}
+	}
+
+	// Classify. Order matters: obsolete-present is the loudest staleness mode
+	// (cooked-in HLSL is producing the user-visible artefact) so it wins. Then
+	// missing-v1.0.111-contract is the second staleness mode (clean v1.0.110
+	// rollback state). Then no-obsolete-and-has-v1.0.111 is the current state.
+	// PreV96 is the residual "nothing on either side" case -- not actively
+	// broken but not what the runtime expects.
+	const bool bHasObsolete = Report.DetectedObsoleteParams.Num() > 0;
+	const bool bMissingAnyV111 =
+		Report.MissingV111Scalars.Num() > 0 ||
+		Report.MissingV111Vectors.Num() > 0 ||
+		Report.MissingV111Textures.Num() > 0;
+
+	if (bHasObsolete)
+	{
+		Report.Version = EBeamMasterVersion::V96ThroughV109;
+	}
+	else if (bMissingAnyV111)
+	{
+		// No obsolete AND missing v1.0.111 contract. Could be either pre-v1.0.96
+		// (cone-only, never had a shadow contract) OR v1.0.110 (clean-slate
+		// state, shadow contract not yet authored). Heuristic: if ALL three
+		// v1.0.111 categories are missing entirely -- not a single mask scalar
+		// or vector or texture -- treat as pre-v1.0.96 (the v1.0.110 state
+		// would have had the v1.0.42-era cone params but never had any shadow
+		// contract by design, same shape as the pre-v1.0.96 case from the
+		// probe's perspective). Either way the auto-regen path is the same:
+		// upgrade to v1.0.111+. We pick V110 for the label since v1.0.96 is
+		// long dead -- it's the more recent of the two equally-stale shapes.
+		Report.Version = EBeamMasterVersion::V110;
+	}
+	else
+	{
+		Report.Version = EBeamMasterVersion::V111Plus;
+	}
+	return Report;
+}
+
+void URebusVisualiserSubsystem::RefreshAllSpawnedFixtureBeamMIDs()
+{
+	// SpawnedFixtures is normally EMPTY at Initialize() time -- the subsystem
+	// orchestrator's SpawnAllFixtures path runs much later on the per-tick
+	// scene-fetch chain -- so this is a no-op for the v1.0.112 first-launch
+	// case. Kept as a belt-and-braces refresh helper in case the auto-purge
+	// is ever re-fired from a tick-gated path where fixtures already exist
+	// (e.g. a future hot-reload of the master mid-show). Newly-spawned
+	// fixtures pick up the regenerated master directly via BuildBeamCone's
+	// LoadObject<UMaterialInterface> call -- no per-fixture push needed for
+	// them. Per-fixture body:
+	//   * ClearParameterValues drops any operator-pinned scalar overrides so
+	//     the MID reads the regenerated master's defaults instead of the
+	//     stale-master values previously pushed on top.
+	//   * The three Refresh* helpers re-push the live CVar values + world
+	//     axes + light-space mask scalar/RT bindings against the new master's
+	//     contract. Each helper silently no-ops when BeamMID is null (per
+	//     their existing doc-comments in RebusFixtureActor.h), so a fixture
+	//     that hadn't built its beam yet stays a clean no-op.
+	int32 Refreshed = 0;
+	for (ARebusFixtureActor* F : SpawnedFixtures)
+	{
+		if (!F) continue;
+		// RefreshBeamMaterialBindings null-checks BeamMID internally and skips silently
+		// for fixtures still in pre-BuildBeamCone state. Increment the counter
+		// unconditionally for any live fixture so the log line reflects the WALK count;
+		// the per-fixture body decides whether the work actually happened.
+		F->RefreshBeamMaterialBindings();
+		++Refreshed;
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("v1.0.112 stale-master purge: refreshed %d already-spawned fixture(s) (of %d) "
+			 "-- newly-spawned fixtures pick up the regenerated master via BuildBeamCone's "
+			 "LoadObject and do not need this push."),
+		Refreshed, SpawnedFixtures.Num());
+}
+
+void URebusVisualiserSubsystem::ProbeAndAutoPurgeStaleBeamMaster()
+{
+	// One-shot guard. Subsystem Initialize() only fires once per GameInstance, but the
+	// brief explicitly asks for a re-entry guard ("the probe doesn't re-fire if the
+	// user runs the regen then reloads the level") so any future tick-gated retry
+	// path stays a clean no-op.
+	if (bBeamMasterAutoPurgeRun) return;
+	bBeamMasterAutoPurgeRun = true;
+
+	const FBeamMasterVersionReport Report = ProbeBeamMasterVersion();
+
+	// Compose a one-line summary of the staleness shape for the log header. The
+	// operator (and any future bug report) wants to see exactly which obsolete /
+	// missing params triggered the auto-regen, not just "STALE".
+	auto JoinNames = [](const TArray<FString>& Names) -> FString
+	{
+		if (Names.Num() == 0) return FString(TEXT("(none)"));
+		return FString::Join(Names, TEXT(","));
+	};
+
+	const TCHAR* Label = BeamMasterVersionLabel(Report.Version);
+	const bool bStale =
+		Report.Version == EBeamMasterVersion::V96ThroughV109 ||
+		Report.Version == EBeamMasterVersion::V110 ||
+		Report.Version == EBeamMasterVersion::PreV96;
+
+	if (Report.Version == EBeamMasterVersion::Missing)
+	{
+		// Asset isn't on disk -- this is the first-launch case (no Python regen
+		// has ever run). BuildBeamCone's LoadObject + null-check covers this
+		// case at fixture-spawn time with its own Warning + skip; the v1.0.112
+		// probe just logs it here so a `Rebus.DumpBeamMasterVersion` operator
+		// run is consistent. Don't try to regen -- the Python author path needs
+		// an editor for ensure_beam_material to do create_asset, and a missing
+		// asset typically means the operator hasn't run the project's build
+		// step at all, which is a bigger problem the auto-regen can't fix.
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("[Rebus] BEAM MASTER %s -- the project's `build_rebus_base_level.py` has "
+				 "never run against this content folder. Run `Tools > Execute Python Script "
+				 "> build_rebus_base_level.build()` in the editor (or the headless "
+				 "`-run=pythonscript build_rebus_base_level` invocation) to bake the master."),
+			Label);
+		return;
+	}
+
+	if (!bStale)
+	{
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("[Rebus] BEAM MASTER version probe: %s -- no auto-purge needed."),
+			Label);
+		return;
+	}
+
+	// Stale. Compose the diagnostic line with the exact obsolete + missing params
+	// that triggered the verdict so operators / bug reports can correlate it.
+	UE_LOG(LogRebusVisualiser, Warning,
+		TEXT("[Rebus] STALE BEAM MASTER detected -- %s. Obsolete v1.0.96..v1.0.109 scalars "
+			 "present: [%s]. Missing v1.0.111 scalars: [%s]. Missing v1.0.111 vectors: [%s]. "
+			 "Missing v1.0.111 textures: [%s]. This is the same on-disk staleness that bit us "
+			 "v1.0.99/v1.0.103/v1.0.110/v1.0.111: the cooked HLSL inside `M_RebusBeam.uasset` "
+			 "is older than the running plugin binary, so the per-fixture push reaches a "
+			 "parameter set that doesn't match the shader. The pre-v1.0.110 screen-space "
+			 "self-shadow trace cooked into a stale master IS the pan-edge side-cutting "
+			 "artefact the user reported in v1.0.112. Auto-running `Rebus.RebuildBeamMaterial` "
+			 "now to regenerate against the current `_BEAM_RAYMARCH_HLSL` source."),
+		Label,
+		*JoinNames(Report.DetectedObsoleteParams),
+		*JoinNames(Report.MissingV111Scalars),
+		*JoinNames(Report.MissingV111Vectors),
+		*JoinNames(Report.MissingV111Textures));
+
+#if WITH_EDITOR
+	// Editor build -- invoke the Python regen via the engine's `py` console
+	// command. Mirrors `HandleRebuildBeamMaterialCommand` in RebusVisualiser.cpp
+	// byte-for-byte (same `WITH_EDITOR` + `FModuleManager::IsModuleLoaded`
+	// defence, same `py import build_rebus_base_level; ensure_beam_material(
+	// force=True)` expression, same world-pick precedence). Routed through
+	// GEngine->Exec rather than linking IPythonScriptPlugin directly to insulate
+	// the call site from UE 5.7 API renames; the `py` command is the stable
+	// engine entry point.
+	if (!GEngine)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("[Rebus] STALE BEAM MASTER auto-purge: GEngine null -- module not fully "
+				 "initialised; the Python regen can't be invoked from here. Fall back to "
+				 "manual: `Tools > Execute Python Script > build_rebus_base_level."
+				 "ensure_beam_material(force=True)` then ClearScene+LoadScene."));
+		return;
+	}
+
+	if (!FModuleManager::Get().IsModuleLoaded(TEXT("PythonScriptPlugin")))
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("[Rebus] STALE BEAM MASTER auto-purge: PythonScriptPlugin not loaded -- the "
+				 "`py` console command isn't registered in this run. Fall back to manual: "
+				 "`Tools > Execute Python Script > build_rebus_base_level.ensure_beam_material"
+				 "(force=True)` then ClearScene+LoadScene."));
+		return;
+	}
+
+	// Pick a world to scope the Exec call (Editor wins over Game/PIE, same
+	// precedence the manual `Rebus.RebuildBeamMaterial` handler uses so the
+	// auto-path and the manual path resolve to identical scopes). nullptr is
+	// acceptable for `py` (it doesn't need a world to run an import + a
+	// function call) but giving it a real world keeps the Exec routing aligned
+	// with the manual operator path.
+	UWorld* World = nullptr;
+	for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+	{
+		UWorld* W = Ctx.World();
+		if (!W) continue;
+		if (Ctx.WorldType == EWorldType::Editor) { World = W; break; }
+		if (Ctx.WorldType == EWorldType::Game || Ctx.WorldType == EWorldType::PIE)
+		{
+			if (!World) World = W;
+		}
+	}
+
+	const TCHAR* PyCmd = TEXT("py import build_rebus_base_level; build_rebus_base_level.ensure_beam_material(force=True)");
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("[Rebus] STALE BEAM MASTER auto-purge: invoking `%s` (auto-driven equivalent of "
+			 "`Rebus.RebuildBeamMaterial`). Expect a `RebusBaseLevel: ...` log block on the "
+			 "next line(s) confirming the regen landed."),
+		PyCmd);
+
+	const bool bExecOk = GEngine->Exec(World, PyCmd, *GLog);
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("[Rebus] STALE BEAM MASTER auto-purge: `py` Exec returned %s. NEXT-STEP for the "
+			 "operator -- the regen recreates `/Game/REBUS/Materials/M_RebusBeam.uasset` in "
+			 "place, but any existing per-fixture BeamMID still references the OLD master "
+			 "UObject (UMaterialInstanceDynamic parent pointers don't refresh automatically "
+			 "in UE 5.7). Send ClearScene + LoadScene from the portal to respawn every "
+			 "fixture and rebuild each BeamMID off the regenerated master -- OR restart the "
+			 "editor. After that, `Rebus.DumpBeamMasterVersion` will report `v1.0.111+` and "
+			 "`Rebus.DumpBeamShadowMask` will show all v1.0.111 scalars as EXISTS."),
+		bExecOk ? TEXT("OK") : TEXT("FAILED"));
+
+	// Belt-and-braces per-fixture refresh. Normally a no-op at Initialize() time
+	// (SpawnedFixtures is empty -- the subsystem hasn't fetched the scene yet),
+	// kept for the case where a future change re-fires the probe from a
+	// tick-gated path with fixtures already alive. Fixtures spawned AFTER this
+	// point use the regenerated master directly via BuildBeamCone, so the
+	// no-op-at-Initialize is correct, not a bug.
+	if (bExecOk)
+	{
+		RefreshAllSpawnedFixtureBeamMIDs();
+	}
+#else
+	// Packaged build -- PythonScriptPlugin is editor-only per the v1.0.103 design,
+	// so the `py` console command isn't registered and ensure_beam_material can't
+	// run. The cooked master is whatever shipped in the .pak; we cannot mutate a
+	// cooked .uasset at runtime. Hard Warning so the operator knows EXACTLY what
+	// to do to ship a correct binary -- mirrors the v1.0.105 packaged-build
+	// Nanite-conversion warning's shape ("state stored but conversion is no-effect
+	// in packaged builds; pre-cook in editor before packaging").
+	UE_LOG(LogRebusVisualiser, Warning,
+		TEXT("[Rebus] STALE BEAM MASTER auto-purge: packaged build is shipping a "
+			 "pre-v1.0.110 (or pre-v1.0.111) cooked `M_RebusBeam.uasset`. The Python regen "
+			 "path is editor-only (PythonScriptPlugin doesn't ship in packaged builds), so "
+			 "the auto-purge cannot rewrite the cooked .uasset at runtime. Operator fix: "
+			 "open the project in editor on a v1.0.112+ workspace, run "
+			 "`build_rebus_base_level.ensure_beam_material(force=True)` (or just `Rebus."
+			 "RebuildBeamMaterial`), re-package, re-deploy. Until then the v1.0.111 "
+			 "light-space depth-mask path is non-functional and the pre-v1.0.110 "
+			 "screen-space pan-edge side-cutting artefact will remain visible."));
+#endif
 }

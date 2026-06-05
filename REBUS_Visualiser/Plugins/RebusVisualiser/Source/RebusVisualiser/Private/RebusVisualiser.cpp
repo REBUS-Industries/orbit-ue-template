@@ -54,6 +54,10 @@ namespace
 	IConsoleCommand* GDumpFixtureZoomCommand = nullptr;
 	// v1.0.111 -- per-fixture light-space depth-mask beam-occlusion state dump.
 	IConsoleCommand* GDumpBeamShadowMaskCommand = nullptr;
+	// v1.0.112 -- on-disk M_RebusBeam master version probe (pre-v1.0.96 | v1.0.96..v1.0.109
+	// HAS OBSOLETE | v1.0.110 | v1.0.111+). Used to verify the v1.0.112 auto-purge
+	// landed and to diagnose any future "stale master" report from operators.
+	IConsoleCommand* GDumpBeamMasterVersionCommand = nullptr;
 	// v1.0.107 -- top-centre version watermark overlay (UDebugDrawService("Foreground")
 	// canvas draw). Two commands: the visibility toggle (with a `status` arg that
 	// prints the live state + cached version string + Y-margin) and the top-edge
@@ -461,6 +465,64 @@ namespace
 			UE_LOG(LogRebusVisualiser, Log,
 				TEXT("Rebus.DumpBeamShadowMask '%s': dumped %d matching fixture(s)."), *Filter, Matched);
 		}
+	}
+
+	// v1.0.112: `Rebus.DumpBeamMasterVersion` -- on-disk M_RebusBeam master version
+	// probe. Loads the master, walks the historical parameter contracts (the seven
+	// obsolete v1.0.96..v1.0.109 `BeamShadow*` scalars + the v1.0.111 light-space
+	// depth-mask required set), classifies, and emits one log line per
+	// GameInstance subsystem with the verdict + the exact obsolete-present /
+	// missing-required names that triggered it. Used to verify the v1.0.112
+	// auto-purge actually ran (expect `v1.0.111+` after a fresh editor launch on
+	// a project where the auto-purge succeeded) and to diagnose any future
+	// "stale master" operator report in one console command. Mirrors
+	// `Rebus.DumpOrbitNanite`'s shape -- walks every Game/PIE/Editor world,
+	// finds the subsystem on each, prints a structured one-line summary plus a
+	// final aggregate.
+	void HandleDumpBeamMasterVersionCommand(const TArray<FString>& /*Args*/)
+	{
+		if (!GEngine) return;
+
+		auto JoinNames = [](const TArray<FString>& Names) -> FString
+		{
+			if (Names.Num() == 0) return FString(TEXT("(none)"));
+			return FString::Join(Names, TEXT(","));
+		};
+
+		int32 Worlds = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World) continue;
+			const bool bRelevant =
+				Ctx.WorldType == EWorldType::Game ||
+				Ctx.WorldType == EWorldType::PIE ||
+				Ctx.WorldType == EWorldType::Editor;
+			if (!bRelevant) continue;
+			UGameInstance* GI = World->GetGameInstance();
+			if (!GI) continue;
+			URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>();
+			if (!Viz) continue;
+			++Worlds;
+
+			const URebusVisualiserSubsystem::FBeamMasterVersionReport Report = Viz->ProbeBeamMasterVersion();
+			const TCHAR* Label = URebusVisualiserSubsystem::BeamMasterVersionLabel(Report.Version);
+
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.DumpBeamMasterVersion world='%s': Master Version: %s. Obsolete v1.0.96..v1.0.109 scalars present: [%s]. Missing v1.0.111 scalars: [%s]. Missing v1.0.111 vectors: [%s]. Missing v1.0.111 textures: [%s]."),
+				*World->GetName(), Label,
+				*JoinNames(Report.DetectedObsoleteParams),
+				*JoinNames(Report.MissingV111Scalars),
+				*JoinNames(Report.MissingV111Vectors),
+				*JoinNames(Report.MissingV111Textures));
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.DumpBeamMasterVersion: probed %d world(s). Expect `v1.0.111+` after a "
+				 "fresh editor launch on a v1.0.112+ workspace; anything else means the v1.0.112 "
+				 "auto-purge didn't fire (look one log line up for `[Rebus] STALE BEAM MASTER "
+				 "detected`) OR the operator is on a packaged build with a stale cooked master "
+				 "(re-cook in editor on v1.0.112+)."),
+			Worlds);
 	}
 
 	// v1.0.79 helpers: pluck the live cinematic camera pawn from any game/PIE world. There's
@@ -1913,6 +1975,36 @@ void FRebusVisualiserModule::StartupModule()
 			 "[fixtureId]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpBeamShadowMaskCommand),
 		ECVF_Default);
+
+	// v1.0.112 -- on-disk `M_RebusBeam` master version probe. Diagnostic counterpart to
+	// the v1.0.112 runtime auto-purge (URebusVisualiserSubsystem::ProbeAndAutoPurge
+	// StaleBeamMaster, called from Initialize on every session). Same probe under the
+	// hood; this command lets the operator verify the auto-purge actually landed
+	// (`Master Version: v1.0.111+` after a fresh editor launch) and surfaces the EXACT
+	// obsolete-present / missing-required parameter names that triggered any staleness
+	// verdict. Mirrors `Rebus.DumpOrbitNanite`'s shape -- per-world line + a final
+	// aggregate. See URebusVisualiserSubsystem::EBeamMasterVersion in
+	// RebusVisualiserSubsystem.h for the full version enum + classification rules.
+	GDumpBeamMasterVersionCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.DumpBeamMasterVersion"),
+		TEXT("v1.0.112 -- probe the on-disk `/Game/REBUS/Materials/M_RebusBeam.uasset` and "
+			 "report which v1.0.x parameter contract it carries: `pre-v1.0.96` (cone-only, no "
+			 "shadow contract -- never had ensure_beam_material run against it), `v1.0.96.."
+			 "v1.0.109 (HAS OBSOLETE -- screen-space trace cooked in -- THIS IS THE STALE "
+			 "MASTER FAILURE MODE the v1.0.112 auto-purge fixes)`, `v1.0.110 (clean slate, "
+			 "no shadow path)`, or `v1.0.111+` (current). The line also lists the EXACT "
+			 "obsolete-present + missing-required parameter names that drove the verdict so "
+			 "an operator can diff against the Python source. Used to verify the v1.0.112 "
+			 "auto-purge actually ran (the same probe `ProbeAndAutoPurgeStaleBeamMaster` "
+			 "runs at subsystem Initialize() -- the diagnostic uses the SAME `ProbeBeamMaster"
+			 "Version` accessor, so the two paths can never disagree). After a fresh editor "
+			 "launch on a v1.0.112+ workspace the verdict should always be `v1.0.111+`; "
+			 "anything else means the auto-purge didn't fire (grep `LogRebusVisualiser` for "
+			 "`STALE BEAM MASTER detected`) OR the operator is on a packaged build with a "
+			 "stale cooked master (re-cook in editor on v1.0.112+ -- packaged builds cannot "
+			 "auto-purge, the Python regen is editor-only). Usage: Rebus.DumpBeamMasterVersion"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpBeamMasterVersionCommand),
+		ECVF_Default);
 }
 
 void FRebusVisualiserModule::ShutdownModule()
@@ -2046,6 +2138,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GDumpBeamShadowMaskCommand);
 		GDumpBeamShadowMaskCommand = nullptr;
+	}
+	if (GDumpBeamMasterVersionCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GDumpBeamMasterVersionCommand);
+		GDumpBeamMasterVersionCommand = nullptr;
 	}
 	if (GShowVersionCommand)
 	{

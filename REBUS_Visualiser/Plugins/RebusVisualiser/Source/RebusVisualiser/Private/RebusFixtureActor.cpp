@@ -3266,6 +3266,21 @@ void ARebusFixtureActor::RefreshBeamShadowMaskParams()
 	}
 }
 
+void ARebusFixtureActor::RefreshBeamMaterialBindings()
+{
+	// v1.0.112 -- belt-and-braces refresh helper invoked by URebusVisualiserSubsystem::
+	// ProbeAndAutoPurgeStaleBeamMaster after the Python regen of `M_RebusBeam.uasset`.
+	// See the public header doc-comment for the full rationale; this body is just the
+	// three-step purge that the subsystem-side helper composes onto every spawned
+	// fixture so the chokepoint stays on the actor (BeamMID is private; no need to
+	// expose it just for the subsystem to poke).
+	if (!BeamMID) return;
+	BeamMID->ClearParameterValues();
+	RefreshBeamRadialParams();
+	RefreshBeamSpatialParams();
+	RefreshBeamShadowMaskParams();
+}
+
 void ARebusFixtureActor::DumpBeamShadowMaskStateForDebug() const
 {
 	// v1.0.111 -- per-fixture light-space depth-mask diagnostic. Mirrors
