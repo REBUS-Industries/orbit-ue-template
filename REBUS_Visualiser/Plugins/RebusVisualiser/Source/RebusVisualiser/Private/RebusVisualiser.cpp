@@ -47,6 +47,8 @@ namespace
 	IConsoleCommand* GBeamShadowCommand = nullptr;
 	IConsoleCommand* GDumpBeamShadowCommand = nullptr;
 	IConsoleCommand* GOrbitCastShadowsCommand = nullptr;
+	// v1.0.101 -- per-fixture zoom / cone-mesh / SpotLight outer-cone runtime dump.
+	IConsoleCommand* GDumpFixtureZoomCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -316,6 +318,67 @@ namespace
 		{
 			UE_LOG(LogRebusVisualiser, Log,
 				TEXT("Rebus.DumpFixtureIes '%s': dumped %d matching fixture(s)."), *Filter, Matched);
+		}
+	}
+
+	// v1.0.101: `Rebus.DumpFixtureZoom [fixtureId]` -- per-fixture zoom / cone-mesh /
+	// SpotLight outer-cone runtime dump. Mirrors `Rebus.DumpFixtureIes`'s shape:
+	//   * No arg -> dumps every Rebus fixture in every Game/PIE/Editor world.
+	//   * Optional fixtureId arg (Speckle node id, the same key SetFixture* uses) ->
+	//     dumps just the matching fixture; logs a warning if not found.
+	// Each line carries the live ZoomDeg target, the GDTF zoom range from the profile,
+	// the resolved canonical half-angle (ResolveZoomHalfDeg -- the SINGLE source of
+	// truth shared by SpotLight outer cone + cone-mesh radius), the SpotLight's live
+	// Outer/Inner cone angles + their ratio (the linear-taper light model that makes
+	// the visible bright disc smaller than the geometric cone -- the v1.0.101 root
+	// cause), the procedural cone-mesh BeamLength + last-built far-radius + expected
+	// far-radius for the live state, the per-fixture BeamConeRadiusScale, the BeamMID's
+	// live FarRadius scalar param (read back from the MID), and bUsingEpicBeam /
+	// bMeshBeamEnabled / bGoboActive / iris status flags. Use this to verify the
+	// `Rebus.BeamConeRadiusScale` knob actually landed on every fixture (not just the
+	// CVar global) and that no portal push is fighting the per-fixture state.
+	void HandleDumpFixtureZoomCommand(const TArray<FString>& Args)
+	{
+		if (!GEngine) return;
+		const FString Filter = (Args.Num() > 0) ? Args[0] : FString();
+
+		// One-line CVar header so the operator has the global value alongside the
+		// per-fixture lines for diff. Mirrors `Rebus.DumpBeamShadow`'s pattern.
+		IConsoleVariable* ScaleCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamConeRadiusScale"));
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("DumpFixtureZoom CVars: Rebus.BeamConeRadiusScale=%s"),
+			ScaleCVar ? *ScaleCVar->GetString() : TEXT("<unregistered>"));
+
+		int32 Total = 0, Matched = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE && Ctx.WorldType != EWorldType::Editor)) continue;
+			for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+			{
+				const ARebusFixtureActor* F = *It;
+				if (!F) continue;
+				++Total;
+				if (!Filter.IsEmpty() && !F->GetFixtureId().Equals(Filter, ESearchCase::IgnoreCase)) continue;
+				F->DumpFixtureZoomStateForDebug();
+				++Matched;
+			}
+		}
+		if (Filter.IsEmpty())
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.DumpFixtureZoom: dumped %d fixture(s) (no filter)."), Matched);
+		}
+		else if (Matched == 0)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.DumpFixtureZoom '%s': NOT FOUND (scanned %d fixture(s) -- check the Speckle node id, same key SetFixture* uses)."),
+				*Filter, Total);
+		}
+		else
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.DumpFixtureZoom '%s': dumped %d matching fixture(s)."), *Filter, Matched);
 		}
 	}
 
@@ -1456,6 +1519,26 @@ void FRebusVisualiserModule::StartupModule()
 			 "Usage: Rebus.DumpFixtureIes [fixtureId]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpFixtureIesCommand),
 		ECVF_Default);
+
+	// v1.0.101 per-fixture zoom / cone-mesh / SpotLight outer-cone runtime dump.
+	GDumpFixtureZoomCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.DumpFixtureZoom"),
+		TEXT("v1.0.101 -- dump per-fixture zoom + cone-mesh + SpotLight outer-cone state in "
+			 "one line: live ZoomDeg target (half-angle), GDTF zoom range from the profile, "
+			 "resolved canonical half-angle (ResolveZoomHalfDeg -- single source of truth for "
+			 "both the SpotLight outer cone and the visible cone-mesh radius), SpotLight live "
+			 "Outer/Inner cone angles + their ratio (the linear-taper light model that makes "
+			 "the visible bright disc smaller than the geometric cone -- the v1.0.101 root "
+			 "cause), procedural cone-mesh BeamLength + last-built and expected far-radius, "
+			 "per-fixture BeamConeRadiusScale, BeamMID's live FarRadius scalar param read back "
+			 "from the MID, and bUsingEpicBeam / bMeshBeamEnabled / bGoboActive / iris flags. "
+			 "Use this to verify `Rebus.BeamConeRadiusScale` actually landed on every fixture "
+			 "and the visible shaft + lit footprint stay in sync with the GDTF zoom-range spec. "
+			 "With no arg dumps every fixture; with a fixtureId (Speckle node id, the same key "
+			 "SetFixture* uses) dumps just that one. Mirrors `Rebus.DumpFixtureIes`'s shape. "
+			 "Usage: Rebus.DumpFixtureZoom [fixtureId]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpFixtureZoomCommand),
+		ECVF_Default);
 }
 
 void FRebusVisualiserModule::ShutdownModule()
@@ -1569,6 +1652,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GOrbitCastShadowsCommand);
 		GOrbitCastShadowsCommand = nullptr;
+	}
+	if (GDumpFixtureZoomCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GDumpFixtureZoomCommand);
+		GDumpFixtureZoomCommand = nullptr;
 	}
 	// v1.0.73 / v1.0.78: restore both CVar packs to their snapshotted values so a hot-reload
 	// of the module doesn't leak a permanent override into the engine session. Both packs

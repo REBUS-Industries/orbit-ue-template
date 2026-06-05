@@ -347,7 +347,20 @@ public:
 	// refresh sinks (which walk every fixture). Silently no-ops when BeamMID is null.
 	void RefreshBeamShadowParams();
 private:
-	float ResolveOuterHalfDeg() const; // current outer cone half-angle (zoom range + iris), degrees
+	// v1.0.101 -- single-source-of-truth canonical zoom half-angle (degrees) for both the
+	// SpotLight outer-cone AND the procedural cone-mesh far-radius (and the Epic-beam DMX
+	// Zoom param). The wire protocol carries the FULL beam angle (per the v1.0.84
+	// standardisation -- portal slider value); the half-angle conversion happens in
+	// `URebusFixtureControlSubsystem::SetFixtureZoom` and the result is fed to `ApplyZoom`,
+	// which stores it in `ZoomDeg.Current` already-halved. This helper takes the FULL angle
+	// (so callers can audit / probe with arbitrary inputs) and returns the canonical
+	// half-angle clamped to the profile's zoom range, then to the global safe range, then
+	// pinched by the live iris when no gobo cookie is active. NO `BeamConeRadiusScale` is
+	// applied here -- that scalar is intentionally a separate operator-tweakable
+	// multiplier on the cone-mesh radius alone (it must NOT shrink the SpotLight outer
+	// cone or the lit footprint would shrink with it, defeating the entire fix).
+	float ResolveZoomHalfDeg(float ZoomFullDeg) const;
+	float ResolveOuterHalfDeg() const; // thin wrapper -- ResolveZoomHalfDeg(ZoomDeg.Current * 2.f). Kept for call-site readability.
 	void RefreshMotion();         // re-solve pan/tilt and push transforms to groups + light
 	// v1.0.68: per-component-axis drive. Each bound Orbit component carries its own bucketed
 	// motion axis (OrbitAxisBucket[i]) -- INDEX_NONE for base components (no motion), pan axis for
@@ -469,6 +482,26 @@ public:
 	// multipliers so the operator can confirm the candela-max -> SpotLight.Intensity chain
 	// landed. Called by `Rebus.DumpFixtureIes [fixtureId]`.
 	void DumpIesStateForDebug() const;
+
+	// v1.0.101: dump THIS fixture's zoom / cone-mesh / SpotLight outer-cone state in one
+	// line -- the live half-angle from the canonical `ResolveZoomHalfDeg(...)` helper, the
+	// SpotLight's live OuterConeAngle / InnerConeAngle, the procedural cone-mesh
+	// BeamLength + far-radius, the per-fixture `BeamConeRadiusScale`, and the BeamMID's
+	// live `FarRadius` scalar param (read back from the MID so the operator can confirm
+	// the push race against any portal override). Mirrors `Rebus.DumpFixtureIes`'s shape.
+	// Called by `Rebus.DumpFixtureZoom [fixtureId]`.
+	void DumpFixtureZoomStateForDebug() const;
+
+	// v1.0.101: assign the per-fixture cone-mesh radius scale + re-push the cone geometry
+	// + Epic-beam DMX Zoom param so a live `Rebus.BeamConeRadiusScale` change picks up
+	// without a respawn. Forces the rebuild gate in `UpdateBeamConeGeometry` (the gate
+	// sees no half-angle change so would otherwise skip). Public so the CVar refresh sink
+	// can call it without having to write to the UPROPERTY directly (the UPROPERTY itself
+	// stays private to keep the BP/editor surface tidy). Idempotent / safe when there
+	// is no BeamCone yet (the per-fixture init path will pick the new scalar up via the
+	// CVar's then-current value at `BuildBeamCone` time).
+	void RefreshBeamConeRadiusScaleFromCVar(float NewScale);
+	float GetBeamConeRadiusScale() const { return BeamConeRadiusScale; }
 
 	// v1.0.75: rebuild the gobo render target at a new square pixel size + re-bind it on the
 	// cookie/light-function MIDs. Called by Rebus.GoboRTSize. Size is clamped to [128, 8192]
@@ -708,6 +741,25 @@ private:
 	float BeamBaseRadiusUnreal = 2.f;    // cone base radius (lens radius), UE cm
 	float BeamLengthUnreal = 6000.f;     // cone length (= SpotLight AttenuationRadius), UE cm
 	float BeamConeLastFarRadius = -1.f;  // last-built far radius (rebuild gate), UE cm
+
+	// v1.0.101 -- per-fixture multiplier on the cone-mesh visible far-radius AND the Epic-
+	// beam canvas `DMX Zoom` param. Default 1.0 (the procedural cone is sized strictly to
+	// the GDTF zoom-range half-angle, identical to the SpotLight outer cone -- the
+	// geometric/photometric truth, no visual fudge). The user-facing knob exists because
+	// UE's `USpotLightComponent` linearly tapers brightness from `InnerConeAngle` (peak)
+	// to `OuterConeAngle` (zero), so the visible bright disc on the floor is the
+	// half-intensity edge -- approximately `(InnerHalf + OuterHalf) / 2`. With the default
+	// `InnerRatio = 0.8` (BeamAngle/FieldAngle when present, else fallback) the perceived
+	// disc edge sits at ~0.9 * outer, and the geometric cone-mesh reads ~10% wider than
+	// the lit footprint -- the user's "beam is slightly larger than the footprint" report.
+	// Operators tweak this scalar (typical range 0.85..1.0) per show OR globally via
+	// `Rebus.BeamConeRadiusScale <float>` (refresh sink walks every fixture).
+	// Crucially this does NOT touch `SpotLight->OuterConeAngle`: the lit footprint,
+	// IES sampling, and 1/r^2 falloff are STILL anchored to the GDTF zoom-range
+	// specification verbatim -- only the visible cone-mesh tightens. SpotLight outer
+	// cone + cone-mesh radius diverge by exactly this scalar, no other coupling.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rebus|Beam")
+	float BeamConeRadiusScale = 1.0f;
 
 	// bMeshBeams runtime toggle (default true = mesh beam on, fog scattering suppressed). When the
 	// portal pushes bMeshBeams=false the cone hides and FogScatteringIntensity is restored on the

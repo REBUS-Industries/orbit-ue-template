@@ -317,6 +317,59 @@ FAutoConsoleVariableRef CVarRebusBeamShadowDebug(
 	}),
 	ECVF_Default);
 
+// v1.0.101 -- per-fixture cone-mesh visible far-radius scale, applied identically to the
+// procedural M_RebusBeam cone (UpdateBeamConeGeometry) AND the Epic-beam canvas
+// `DMX Zoom` (UpdateEpicBeamParams). Default 1.0 = the visible shaft is sized strictly
+// to the GDTF zoom-range half-angle (the same angle the SpotLight outer cone uses for
+// the lit footprint). Operators flip to ~0.85..0.95 to match the perceived bright-disc
+// edge on the floor, which sits at roughly the average of the SpotLight's inner +
+// outer cone angles thanks to UE's linear-taper light model -- the user's "beam is
+// slightly larger than the footprint" report. The CVar refresh sink walks every
+// fixture and re-pushes the cone geometry + Epic DMX Zoom param.
+//
+// Crucially this scalar does NOT pinch the SpotLight outer cone, so the lit footprint,
+// IES sampling, and 1/r^2 falloff continue to track the GDTF zoom-range specification
+// verbatim. The scalar exists exclusively to bring the visible shaft inward to
+// coincide with the perceived (half-intensity) lit-disc edge, NOT to redefine where
+// the light reaches.
+float GRebusBeamConeRadiusScale = 1.0f;
+FAutoConsoleVariableRef CVarRebusBeamConeRadiusScale(
+	TEXT("Rebus.BeamConeRadiusScale"),
+	GRebusBeamConeRadiusScale,
+	TEXT("v1.0.101 -- multiplier on the visible cone-mesh shaft radius (procedural M_RebusBeam "
+		 "AND Epic-beam canvas DMX Zoom) so the visible shaft can be tightened to coincide with "
+		 "the perceived bright-disc edge of the lit footprint on the floor. Default 1.0 = "
+		 "geometric truth (visible shaft sized to the GDTF zoom-range half-angle, identical to "
+		 "the SpotLight outer cone). Operators typically flip to ~0.85..0.95 to bring the shaft "
+		 "edge in to the bright-disc edge (which sits ~mid of inner..outer cone thanks to UE's "
+		 "linear-taper light model). Does NOT pinch the SpotLight outer cone, so the lit "
+		 "footprint stays anchored to the GDTF zoom-range spec verbatim. Live -- the refresh "
+		 "sink walks every fixture and re-pushes cone geometry + Epic DMX Zoom. Pair with "
+		 "`Rebus.DumpFixtureZoom [fixtureId]` to verify the change landed."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		const float NewVal = FMath::Max(0.05f, CVar->GetFloat());
+		if (!GEngine) return;
+		int32 Refreshed = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					F->RefreshBeamConeRadiusScaleFromCVar(NewVal);
+					++Refreshed;
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.BeamConeRadiusScale -> %.3f, refreshed %d fixture(s) (procedural cone-mesh + Epic-beam DMX Zoom both re-pushed; SpotLight outer cone untouched)."),
+			NewVal, Refreshed);
+	}),
+	ECVF_Default);
+
 FAutoConsoleVariableRef CVarRebusHeroShadowScatter(
 	TEXT("Rebus.HeroShadowScatter"),
 	GRebusHeroShadowScatter,
@@ -747,6 +800,98 @@ void ARebusFixtureActor::DumpIesStateForDebug() const
 		Dim, (int32)ShutterMode, Gate,
 		InlineIes.Profiles.Num(), Profile.IesProfiles.Num(),
 		SpotLight->bUseIESBrightness ? 1 : 0, SpotLight->IESBrightnessScale);
+}
+
+void ARebusFixtureActor::DumpFixtureZoomStateForDebug() const
+{
+	// v1.0.101 per-fixture zoom / cone-mesh / SpotLight outer-cone dump for the new
+	// `Rebus.DumpFixtureZoom` console command. Surfaces the entire single-source-of-truth
+	// chain in one line so the operator can confirm:
+	//   * the live wire half-angle target (ZoomDeg.Current; pre v1.0.84 this WAS the wire,
+	//     post v1.0.84 the wire is full-angle and SetFixtureZoom halves it before storing),
+	//   * the GDTF zoom range from the profile (Profile.Zoom.MinDeg/MaxDeg, "n/a" when the
+	//     profile didn't carry a Zoom payload -- the helper then falls back to the global
+	//     [0.5, 80] safe clamp),
+	//   * the canonical resolved half-angle (ResolveZoomHalfDeg(Current * 2) -- the
+	//     SINGLE source of truth that drives both the SpotLight outer cone and the
+	//     visible cone-mesh radius),
+	//   * the SpotLight's LIVE OuterConeAngle + InnerConeAngle (must equal the resolved
+	//     half within float precision; an InnerCone substantially smaller than the outer
+	//     is what makes the visible bright disc on the floor read smaller than the
+	//     geometric cone -- the user's "slightly larger than the footprint" report; see
+	//     the BeamConeRadiusScale UPROPERTY rationale in the header for the math),
+	//   * the procedural cone-mesh BeamLength + last-built far-radius + per-fixture
+	//     BeamConeRadiusScale (the operator-facing knob),
+	//   * the BeamMID's live FarRadius scalar param read back from the MID (proves the
+	//     UpdateBeamConeGeometry push won the race against any portal/scene-property
+	//     override; mirrors `Rebus.DumpBeamShadow`'s read-back pattern).
+	if (!SpotLight)
+	{
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("DumpFixtureZoom '%s': NO SpotLight component -- fixture not fully constructed."),
+			*FixtureId);
+		return;
+	}
+
+	const float ResolvedHalf = ResolveOuterHalfDeg();
+	const float TanHalf      = FMath::Tan(FMath::DegreesToRadians(ResolvedHalf));
+	const float ConeScale    = FMath::Max(0.05f, BeamConeRadiusScale);
+	const float ExpectedFar  = FMath::Max(BeamLengthUnreal * TanHalf * ConeScale,
+	                                      BeamBaseRadiusUnreal + 0.1f);
+
+	float MidFarRadius = -999.f;
+	if (BeamMID)
+	{
+		BeamMID->GetScalarParameterValue(FMaterialParameterInfo(TEXT("FarRadius")), MidFarRadius);
+	}
+
+	const FString ZoomRange = Profile.Zoom.bValid
+		? FString::Printf(TEXT("[%.2f..%.2fdeg full]"), (float)Profile.Zoom.MinDeg, (float)Profile.Zoom.MaxDeg)
+		: FString(TEXT("<no profile zoom range>"));
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("DumpFixtureZoom '%s' zoomTarget=%.2fdeg(half) profileZoomRange=%s "
+			 "resolvedHalf=%.2fdeg | spotOuterCone=%.2fdeg spotInnerCone=%.2fdeg "
+			 "(InnerRatio=%.3f -- bright-disc edge ~mid of inner..outer) | "
+			 "beamLength=%.1fcm coneFarRadiusBuilt=%.1fcm coneFarRadiusExpected=%.1fcm "
+			 "BeamMID.FarRadius=%.1f | BeamConeRadiusScale=%.3f bUsingEpicBeam=%d "
+			 "bMeshBeamEnabled=%d bGoboActive=%d iris=%.3f"),
+		*FixtureId,
+		ZoomDeg.Current, *ZoomRange,
+		ResolvedHalf,
+		SpotLight->OuterConeAngle, SpotLight->InnerConeAngle,
+		(SpotLight->OuterConeAngle > KINDA_SMALL_NUMBER)
+			? (SpotLight->InnerConeAngle / SpotLight->OuterConeAngle) : 0.f,
+		BeamLengthUnreal, BeamConeLastFarRadius, ExpectedFar,
+		MidFarRadius,
+		ConeScale,
+		bUsingEpicBeam ? 1 : 0,
+		bMeshBeamEnabled ? 1 : 0,
+		bGoboActive ? 1 : 0,
+		FMath::Clamp(Iris.Current, 0.f, 1.f));
+}
+
+void ARebusFixtureActor::RefreshBeamConeRadiusScaleFromCVar(float NewScale)
+{
+	// v1.0.101 -- pick up a live `Rebus.BeamConeRadiusScale` change without a respawn.
+	// Assigns the per-fixture UPROPERTY first so the rest of the per-fixture state
+	// (BeamConeRadiusScale read by UpdateBeamConeGeometry / UpdateEpicBeamParams /
+	// DumpFixtureZoomStateForDebug / ApplyZoom) sees the new value immediately. The
+	// rebuild gate in UpdateBeamConeGeometry skips when the far-radius is essentially
+	// unchanged (sub-half-cm). Forcing the gate through `BeamConeLastFarRadius = -1`
+	// makes the next call regenerate the frustum vertices + re-push the BeamMID
+	// FarRadius scalar at the new scale, regardless of whether the half-angle moved.
+	// Also re-pushes the Epic-beam canvas DMX Zoom (so the Epic-path scale change is
+	// picked up too -- the procedural cone is the M_RebusBeam fallback, hidden when
+	// bUsingEpicBeam from v1.0.95). Idempotent / safe when no BeamCone yet
+	// (BuildBeamCone reads BeamConeRadiusScale on its own initial build).
+	BeamConeRadiusScale  = FMath::Max(0.05f, NewScale);
+	BeamConeLastFarRadius = -1.f;
+	UpdateBeamConeGeometry();
+	if (bUsingEpicBeam)
+	{
+		UpdateEpicBeamParams();
+	}
 }
 
 ARebusFixtureActor::ARebusFixtureActor()
@@ -1923,16 +2068,27 @@ void ARebusFixtureActor::SetUseSyntheticLensFallback(bool bForceSynthetic)
 
 // ---- Hybrid cone-mesh volumetric beam (Phase 1, §8.4a) --------------------------------
 
-float ARebusFixtureActor::ResolveOuterHalfDeg() const
+float ARebusFixtureActor::ResolveZoomHalfDeg(float ZoomFullDeg) const
 {
-	// The CURRENT outer (field) cone half-angle, matching the SpotLight's lit cone so the mesh
-	// beam and the real light agree: the zoom half-angle clamped to the fixture's zoom range, then
-	// (depending on cookie state) pinched by the iris. Frost is intentionally NOT applied here
-	// (it softens the inner cone + source radius, not the outer field extent).
-	float OuterHalf = ZoomDeg.Current;
+	// v1.0.101 -- canonical single-source-of-truth zoom half-angle in degrees. Used by the
+	// SpotLight outer-cone (RecomputeConeAngles), the procedural cone-mesh far-radius
+	// (UpdateBeamConeGeometry), and the Epic-beam canvas zoom (UpdateEpicBeamParams via
+	// SpotLight->OuterConeAngle which itself reads this). Both the lit footprint and the
+	// visible cone shaft therefore start from the SAME half-angle; the only knob that
+	// pulls them apart is `BeamConeRadiusScale` applied *only* to the visible cone-mesh
+	// (see UpdateBeamConeGeometry). Helper signature (full-angle in -> half-angle out)
+	// matches the wire protocol's full-angle convention -- pre-v1.0.84 the wire was
+	// half-angle; v1.0.84 standardised on full and converts to half in
+	// URebusFixtureControlSubsystem::SetFixtureZoom before calling ApplyZoom.
+	//
+	// Frost is intentionally NOT applied here -- it softens the INNER cone + source
+	// radius, not the outer field extent (RecomputeConeAngles handles that).
+	float OuterHalf = 0.5f * ZoomFullDeg;
 	if (Profile.Zoom.bValid)
 	{
-		OuterHalf = FMath::Clamp(OuterHalf, (float)(Profile.Zoom.MinDeg * 0.5), (float)(Profile.Zoom.MaxDeg * 0.5));
+		OuterHalf = FMath::Clamp(OuterHalf,
+			(float)(Profile.Zoom.MinDeg * 0.5),
+			(float)(Profile.Zoom.MaxDeg * 0.5));
 	}
 	OuterHalf = FMath::Clamp(OuterHalf, 0.5f, 80.f);
 	// v1.0.63: when a gobo cookie is live, iris is applied as a circular alpha mask baked into
@@ -1950,8 +2106,34 @@ float ARebusFixtureActor::ResolveOuterHalfDeg() const
 	return OuterHalf;
 }
 
+float ARebusFixtureActor::ResolveOuterHalfDeg() const
+{
+	// v1.0.101 -- thin wrapper around the canonical helper, kept for call-site readability
+	// (SpotLight outer-cone callers asking "what's the lit cone half-angle right now?"
+	// read more clearly with this name; the canonical helper carries the design rationale).
+	// `ZoomDeg.Current` is already a HALF angle (ApplyZoom stores the half it received from
+	// URebusFixtureControlSubsystem::SetFixtureZoom which divided the wire FullDeg by 2),
+	// so the round-trip via `ZoomDeg.Current * 2.f` recovers the full-angle the canonical
+	// helper expects. The arithmetic round-trip is fine -- no precision loss vs IEEE-754
+	// half-of-double-of-half, and clamping inside the helper makes any micro-rounding moot.
+	return ResolveZoomHalfDeg(ZoomDeg.Current * 2.f);
+}
+
 void ARebusFixtureActor::BuildBeamCone()
 {
+	// v1.0.101 -- seed the per-fixture cone-mesh radius scale from the CURRENT live CVar
+	// so a fresh-spawn fixture inherits the operator's chosen scale (the CVar refresh sink
+	// only walks already-spawned fixtures; without this seed, fixtures spawned AFTER an
+	// operator pushed `Rebus.BeamConeRadiusScale 0.9` would default-construct to 1.0 and
+	// the operator would see the same fixture flicker between scales as the spawn batch
+	// fired). Picks up the CVar at the same point BuildSpotLight reads BeamShadowSteps /
+	// BeamShadowStrength via RefreshBeamShadowParams below -- consistent seed point for
+	// every per-fixture beam scalar that has a global CVar pair.
+	if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamConeRadiusScale")))
+	{
+		BeamConeRadiusScale = FMath::Max(0.05f, CVar->GetFloat());
+	}
+
 	// Base radius = the lens radius (same resolver as the SpotLight SourceRadius + lens disc so the
 	// cone starts exactly at the lens). When no lens size is resolvable, fall back to a small
 	// visible base so the shaft still originates from a finite disc rather than a mathematical apex.
@@ -2054,9 +2236,18 @@ void ARebusFixtureActor::UpdateBeamConeGeometry()
 {
 	if (!BeamCone) return;
 
+	// v1.0.101 -- both the SpotLight outer cone (RecomputeConeAngles) AND the visible
+	// cone-mesh far-radius derive from the SAME canonical half-angle (ResolveOuterHalfDeg
+	// -> ResolveZoomHalfDeg -- the GDTF zoom-range spec). Single source of truth.
+	// `BeamConeRadiusScale` is applied ONLY to the visible cone-mesh radius below, NOT
+	// to the half-angle the SpotLight uses, so the lit footprint and IES sampling stay
+	// anchored to the GDTF zoom range while the operator can pinch the visible shaft to
+	// match the perceived bright disc edge (typically ~0.9 with default InnerRatio=0.8;
+	// see the BeamConeRadiusScale UPROPERTY comment in the header).
 	const float OuterHalf = ResolveOuterHalfDeg();
 	const float TanHalf = FMath::Tan(FMath::DegreesToRadians(OuterHalf));
-	const float FarRadius = FMath::Max(BeamLengthUnreal * TanHalf, BeamBaseRadiusUnreal + 0.1f);
+	const float ConeScale = FMath::Max(0.05f, BeamConeRadiusScale);
+	const float FarRadius = FMath::Max(BeamLengthUnreal * TanHalf * ConeScale, BeamBaseRadiusUnreal + 0.1f);
 
 	// Skip the rebuild when the far radius is essentially unchanged (zoom fades tick every frame).
 	if (BeamConeLastFarRadius >= 0.f && FMath::Abs(FarRadius - BeamConeLastFarRadius) < 0.5f)
@@ -2372,8 +2563,19 @@ void ARebusFixtureActor::UpdateEpicBeamParams()
 	// that defines the lit footprint -- single source of truth, so beam edge == pool edge and they
 	// can't diverge). Empirically M_Beam_Master reads ~the half-angle (feeding 2x made it too wide),
 	// hence RebusEpicBeamZoomScale defaults to 1.0. Length capped to the canvas mesh extent.
+	//
+	// v1.0.101 -- ALSO multiply by `BeamConeRadiusScale` so the same operator-tweakable
+	// scalar that pinches the procedural cone-mesh shaft (UpdateBeamConeGeometry) ALSO
+	// pinches the Epic-beam canvas. Without this, the user's `Rebus.BeamConeRadiusScale`
+	// would only narrow the M_RebusBeam fallback (hidden when Epic-beam is the live path
+	// from v1.0.95 onwards) and have no visible effect on the live shaft. The SpotLight's
+	// own OuterConeAngle stays at the un-scaled GDTF zoom-range half-angle (the lit
+	// footprint is unchanged), so the Epic-beam canvas + the procedural cone mesh tighten
+	// in sync while the lit footprint, IES sampling, and 1/r^2 falloff continue to track
+	// the GDTF zoom-range specification verbatim.
 	const float SpotOuterHalfDeg = SpotLight ? SpotLight->OuterConeAngle : ResolveOuterHalfDeg();
-	const float ZoomFullDeg = FMath::Clamp(RebusEpicBeamZoomScale * SpotOuterHalfDeg, 1.f, 179.f);
+	const float ConeScale = FMath::Max(0.05f, BeamConeRadiusScale);
+	const float ZoomFullDeg = FMath::Clamp(RebusEpicBeamZoomScale * ConeScale * SpotOuterHalfDeg, 1.f, 179.f);
 	const float DistCm = FMath::Clamp(BeamLengthUnreal, 1.f, RebusEpicBeamMaxDistanceCm);
 
 	// Epic M_Beam_Master param vocabulary (mirrors ADMXFixtureActor::FeedFixtureData + the BP zoom
@@ -3315,6 +3517,30 @@ void ARebusFixtureActor::ApplyZoom(float ZoomHalfAngleDeg, float FadeSeconds)
 	ZoomDeg.SetTarget(ZoomHalfAngleDeg, FadeSeconds);
 	bAnimating = true;
 	if (FadeSeconds <= 0.f) { RecomputeConeAngles(); SelectIesForZoom(); }
+
+	// v1.0.101 -- one Verbose log per ApplyZoom proving the single-source-of-truth chain
+	// for the user's "beam slightly larger than footprint" diagnosis. Prints the input
+	// half (= ZoomDeg target), the canonical resolved outer half (= ResolveOuterHalfDeg
+	// = ResolveZoomHalfDeg(half * 2), GDTF zoom-range clamp + iris pinch), the live
+	// SpotLight OuterConeAngle (the lit footprint extent -- MUST equal the resolved
+	// outer half within float precision), the cone-mesh far-radius the procedural
+	// frustum would build at this half-angle (BeamLength * tan(half) * scale), and the
+	// per-fixture BeamConeRadiusScale knob that pulls the visible shaft tighter than
+	// the lit footprint. Verbose-level so a busy show isn't spammed; flip
+	// `Log LogRebusVisualiser Verbose` (or use `Rebus.DumpFixtureZoom`) to surface.
+	const float ResolvedHalf = ResolveOuterHalfDeg();
+	const float SpotOuterDeg = SpotLight ? SpotLight->OuterConeAngle : -1.f;
+	const float SpotInnerDeg = SpotLight ? SpotLight->InnerConeAngle : -1.f;
+	const float TanHalf = FMath::Tan(FMath::DegreesToRadians(ResolvedHalf));
+	const float ConeScale = FMath::Max(0.05f, BeamConeRadiusScale);
+	const float ConeFarRadius = FMath::Max(BeamLengthUnreal * TanHalf * ConeScale, BeamBaseRadiusUnreal + 0.1f);
+	UE_LOG(LogRebusVisualiser, Verbose,
+		TEXT("Fixture %s ApplyZoom: zoomTarget=%.2fdeg(half) resolvedHalf=%.2fdeg "
+			 "spotOuterCone=%.2fdeg spotInnerCone=%.2fdeg coneFarRadius=%.1fcm "
+			 "beamLength=%.1fcm beamConeRadiusScale=%.3f fade=%.2fs (single-source-of-truth: "
+			 "spotOuter and coneFar both derive from resolvedHalf via ResolveZoomHalfDeg)"),
+		*FixtureId, ZoomHalfAngleDeg, ResolvedHalf, SpotOuterDeg, SpotInnerDeg,
+		ConeFarRadius, BeamLengthUnreal, ConeScale, FadeSeconds);
 }
 
 void ARebusFixtureActor::ApplyIris(float Iris01, float FadeSeconds)

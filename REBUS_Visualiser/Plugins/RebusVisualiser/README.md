@@ -594,6 +594,157 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Cone-mesh + SpotLight outer-cone in sync via single-source-of-truth zoom half-angle (v1.0.101).**
+> User report (verbatim):
+>
+> > "when the beam is zoomed in, its slighly larger that the footprint, can we make
+> > these in sync but follow the light zoom range specification,."
+>
+> The visible cone-mesh shaft was reading slightly WIDER than the actually-lit floor
+> footprint, especially at narrow zooms. The user wants both anchored to the GDTF
+> zoom-range spec so the visible shaft and the lit footprint coincide on the floor at
+> every zoom.
+>
+> **Audit -- which root cause was the actual mismatch.** The codebase already routed
+> both elements through one helper (`ResolveOuterHalfDeg()`), so SpotLight outer cone
+> AND procedural cone-mesh far-radius AND Epic-beam canvas `DMX Zoom` were all
+> deriving from the *same* GDTF zoom-range half-angle. Cause 1 (beam-vs-field
+> conflation) was therefore not the bug. The actual culprit is **Cause 2 -- UE's
+> linear-taper light model**: `USpotLightComponent` ramps brightness linearly from
+> `InnerConeAngle` (peak) to `OuterConeAngle` (zero), so the *visible bright disc on
+> the floor* sits at roughly the half-intensity edge ~ `(InnerHalf + OuterHalf) / 2`.
+> With `RecomputeConeAngles`'s default `InnerRatio = 0.8` (BeamAngle/FieldAngle when
+> the profile carries both, else fallback) the perceived disc edge sits at ~0.9 *
+> outer, while the geometric cone-mesh outer edge sits at exactly outer. The
+> cone-mesh therefore reads ~10% wider than the lit footprint -- exactly the user's
+> "slightly larger" observation, *not* a "this is twice as wide" geometry/spec bug.
+>
+> **The single-source-of-truth helper.** `ResolveOuterHalfDeg()` is preserved as a
+> thin wrapper for call-site readability; the canonical helper is now an explicit
+> `float ResolveZoomHalfDeg(float ZoomFullDeg) const` that takes a FULL beam angle
+> (matching the v1.0.84 wire-protocol convention) and returns the half-angle clamped
+> to the profile's `Profile.Zoom.MinDeg/MaxDeg` range, then to the global safe
+> `[0.5, 80]` range, then iris-pinched if no gobo cookie is active. Every consumer
+> -- SpotLight outer cone (`RecomputeConeAngles`), procedural cone-mesh far-radius
+> (`UpdateBeamConeGeometry`), Epic-beam canvas `DMX Zoom`
+> (`UpdateEpicBeamParams`) -- continues to funnel through this one helper, so
+> divergence between the lit footprint extent and the visible-shaft far edge is
+> impossible by construction.
+>
+> **The new operator handle: `BeamConeRadiusScale`.** A `UPROPERTY(EditAnywhere,
+> BlueprintReadWrite, Category = "Rebus|Beam") float BeamConeRadiusScale = 1.0f` on
+> `ARebusFixtureActor`, applied identically to:
+>
+> * `UpdateBeamConeGeometry()` -- the procedural M_RebusBeam cone's far-radius:
+>   `radius = max(BeamLength * tan(half) * BeamConeRadiusScale, BeamBaseRadius + 0.1)`
+>   AND re-pushed onto the `BeamMID` `FarRadius` scalar.
+> * `UpdateEpicBeamParams()` -- the Epic-beam canvas `DMX Zoom` scalar:
+>   `DMX Zoom = clamp(RebusEpicBeamZoomScale * BeamConeRadiusScale * SpotOuterHalfDeg, 1, 179)`.
+>
+> Crucially the scalar does NOT pinch `SpotLight->OuterConeAngle` -- so the lit
+> footprint, IES sampling, and 1/r^2 falloff continue to track the GDTF zoom-range
+> specification verbatim. The scalar exists exclusively to bring the *visible* shaft
+> inward to coincide with the perceived (half-intensity) lit-disc edge, NOT to
+> redefine where the light reaches.
+>
+> **Default 1.0 = geometric truth.** With no operator override the visible shaft is
+> sized to the GDTF zoom-range half-angle exactly (the pre-v1.0.101 behaviour --
+> nothing changes by default). Operators tweak the scalar per show, typically into
+> the `0.85..0.95` band, to bring the cone-mesh edge in to coincide with the
+> bright-disc edge that the eye actually reads as "the lit pool". The default stays
+> at 1.0 because what the eye sees as "the lit edge" is show- and content-dependent
+> (GDTF profiles with explicit BeamAngle/FieldAngle photometrics imply a ~0.9
+> match; flat-field LED matrices imply ~1.0). Console knob:
+>
+> ```
+> Rebus.BeamConeRadiusScale 0.9   # tighten the visible shaft to ~bright-disc edge
+> Rebus.BeamConeRadiusScale 1.0   # restore geometric truth (visible shaft = GDTF zoom-range cone)
+> ```
+>
+> The CVar refresh sink (`FAutoConsoleVariableRef CVarRebusBeamConeRadiusScale`)
+> walks every Rebus fixture in every Game/PIE/Editor world, sets each fixture's
+> per-actor `BeamConeRadiusScale` UPROPERTY to the new value, and calls
+> `RefreshBeamConeRadiusScaleFromCVar()` to re-trigger the rebuild gate in
+> `UpdateBeamConeGeometry` (which would otherwise skip when the half-angle hasn't
+> changed) and re-push the Epic `DMX Zoom`. Fresh-spawn fixtures inherit the live
+> CVar value at `BuildBeamCone` time.
+>
+> **New diagnostic: `Rebus.DumpFixtureZoom [fixtureId]`.** Mirrors
+> `Rebus.DumpFixtureIes`'s shape. With no arg, dumps every Rebus fixture in every
+> Game/PIE/Editor world; with an optional fixtureId (Speckle node id, the same key
+> `SetFixture*` uses), dumps just the matching fixture (warns when not found). Each
+> per-fixture line carries:
+>
+> * `zoomTarget` -- the live `ZoomDeg.Current` half-angle target from the wire,
+> * `profileZoomRange` -- `Profile.Zoom.MinDeg/MaxDeg` from the GDTF (or
+>   `<no profile zoom range>` when the profile carries no Zoom payload, in which
+>   case the resolver clamps to the global `[0.5, 80]` safe range only),
+> * `resolvedHalf` -- the canonical `ResolveZoomHalfDeg(ZoomDeg.Current * 2)` output
+>   (single source of truth),
+> * `spotOuterCone` / `spotInnerCone` -- the SpotLight's LIVE values + the
+>   `Inner/Outer` ratio (so the operator can see at a glance how much narrower the
+>   lit bright-disc is than the geometric cone),
+> * `beamLength` / `coneFarRadiusBuilt` / `coneFarRadiusExpected` -- the procedural
+>   cone-mesh size (built vs. recomputed-for-current-state),
+> * `BeamMID.FarRadius` -- read back from the live MID (proves the
+>   `UpdateBeamConeGeometry` push won the race against any portal/scene-property
+>   override; mirrors `Rebus.DumpBeamShadow`'s read-back pattern),
+> * `BeamConeRadiusScale` -- the per-fixture scalar applied to the cone-mesh +
+>   Epic DMX Zoom,
+> * `bUsingEpicBeam` / `bMeshBeamEnabled` / `bGoboActive` / `iris` -- mode flags so
+>   the operator knows which path is live and whether iris is contributing to the
+>   pinch.
+>
+> A header line above the per-fixture dumps prints the `Rebus.BeamConeRadiusScale`
+> CVar value so the global is visible alongside per-fixture overrides for diff.
+>
+> **Verbose `ApplyZoom` log.** Each `ARebusFixtureActor::ApplyZoom` call now emits a
+> single `Verbose` line listing the input half (= `ZoomDeg` target), the canonical
+> resolved outer half, the SpotLight Outer/Inner cone (live), the procedural
+> cone-mesh far-radius the frustum would build at this state, and the live
+> `BeamConeRadiusScale`. Verbose-level so a busy show isn't spammed; flip
+> `Log LogRebusVisualiser Verbose` (or use `Rebus.DumpFixtureZoom`) to surface.
+>
+> **What the SpotLight inner-cone keeps doing.** `RecomputeConeAngles` continues to
+> derive `InnerConeAngle = OuterHalf * InnerRatio * FrostSoften` from the photometrics
+> (BeamAngle/FieldAngle) -- v1.0.101 deliberately leaves this untouched because
+> it's the physically faithful taper for fixtures whose profile carries both
+> photometrics, AND the user's request was scoped to the visible-shaft-vs-lit-disc
+> sync, not to the IES-vs-cone faithfulness. Operators who want the inner-cone
+> tightened toward the outer (Cause 2's "tighten the inner cone" alternative fix)
+> can pursue that in a follow-up; v1.0.101 ships the cleaner cone-mesh-side knob.
+>
+> **Operator verification checklist.**
+>
+> 1. Spawn a single moving-head fixture, point it straight down at the floor.
+> 2. Push a narrow zoom (e.g. mid of the GDTF zoom range, ~10° full = 5° half).
+> 3. Drop a flat reference target (cube, plane) on the floor at the fixture's
+>    straight-down location.
+> 4. Look at the visible shaft disc on the floor vs the bright-disc lit edge: if
+>    the shaft reads as a halo around the bright disc, the v1.0.101 fix has
+>    surfaced the operator handle (no longer a hidden bug).
+> 5. Run `Rebus.DumpFixtureZoom` -- confirm `spotOuterCone == resolvedHalf` and
+>    `BeamMID.FarRadius == coneFarRadiusExpected`.
+> 6. Push `Rebus.BeamConeRadiusScale 0.9` -- shaft tightens; re-run the dump and
+>    confirm `coneFarRadiusBuilt` shrunk to ~0.9× the previous value while
+>    `spotOuterCone` is unchanged. The shaft disc and the bright-disc should
+>    coincide within 1-2%.
+> 7. Tweak the scalar in `[0.85..1.0]` to taste; the value applies live.
+>
+> **Files touched (v1.0.101).**
+>
+> | File | What changed |
+> | --- | --- |
+> | `Source/RebusVisualiser/Public/RebusFixtureActor.h` | Added the `BeamConeRadiusScale = 1.0f` UPROPERTY (under `Rebus|Beam` category). Added the `ResolveZoomHalfDeg(float ZoomFullDeg) const` canonical helper signature; `ResolveOuterHalfDeg()` is now a thin wrapper documented as such. Added public `DumpFixtureZoomStateForDebug() const` and `RefreshBeamConeRadiusScaleFromCVar()` for the new console command + CVar refresh sink. |
+> | `Source/RebusVisualiser/Private/RebusFixtureActor.cpp` | Implemented `ResolveZoomHalfDeg(float)` (the canonical body); `ResolveOuterHalfDeg()` round-trips `ZoomDeg.Current * 2.f` through it. `UpdateBeamConeGeometry` applies `BeamConeRadiusScale` to the cone-mesh far-radius (and the BeamMID `FarRadius` scalar). `UpdateEpicBeamParams` applies the same scale to the Epic-beam canvas `DMX Zoom` (so the live shaft tightens regardless of which beam path is active). `BuildBeamCone` seeds `BeamConeRadiusScale` from the CVar at spawn time. `ApplyZoom` emits a Verbose log. New `Rebus.BeamConeRadiusScale` `FAutoConsoleVariableRef` with refresh sink walks every fixture and re-pushes geometry + Epic DMX Zoom. New `DumpFixtureZoomStateForDebug` + `RefreshBeamConeRadiusScaleFromCVar` implementations. |
+> | `Source/RebusVisualiser/Private/RebusVisualiser.cpp` | New `Rebus.DumpFixtureZoom [fixtureId]` console command (handler + register + unregister), mirroring `Rebus.DumpFixtureIes`'s shape with a CVar header line above the per-fixture dumps. |
+> | `README.md` | This release block. |
+>
+> No engine / OrbitConnector / Epic-DMX-Fixtures asset is touched. The v1.0.99 +
+> v1.0.100 changes (shadow trace + force-cast-shadows + camera-pose default) are
+> orthogonal -- v1.0.101 only adds the cone-mesh radius scale + the canonical zoom
+> helper rename + the new dump command.
+
 > **Default cinematic-camera landing pose at (0,-20,2) m looking at (0,0,5) m (v1.0.100).**
 > User request (verbatim):
 >
