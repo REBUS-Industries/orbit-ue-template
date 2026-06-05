@@ -45,8 +45,6 @@ namespace
 	IConsoleCommand* GOverrideTrussMaterialCommand = nullptr;
 	IConsoleCommand* GSetGroundTilingCommand = nullptr;
 	IConsoleCommand* GDumpFixtureIesCommand = nullptr;
-	IConsoleCommand* GBeamShadowCommand = nullptr;
-	IConsoleCommand* GDumpBeamShadowCommand = nullptr;
 	IConsoleCommand* GRebuildBeamMaterialCommand = nullptr; // v1.0.103 -- editor-only runtime regen
 	IConsoleCommand* GOrbitCastShadowsCommand = nullptr;
 	IConsoleCommand* GOrbitDoubleSidedCommand = nullptr; // v1.0.104 -- imported-primitive double-sided normalisation
@@ -355,7 +353,7 @@ namespace
 		const FString Filter = (Args.Num() > 0) ? Args[0] : FString();
 
 		// One-line CVar header so the operator has the global value alongside the
-		// per-fixture lines for diff. Mirrors `Rebus.DumpBeamShadow`'s pattern.
+		// per-fixture lines for diff.
 		IConsoleVariable* ScaleCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamConeRadiusScale"));
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("DumpFixtureZoom CVars: Rebus.BeamConeRadiusScale=%s"),
@@ -870,146 +868,23 @@ namespace
 		}
 	}
 
-	// v1.0.96 -- `Rebus.BeamShadow [0|1]` master toggle for the M_RebusBeam screen-space shadow
-	// trace. Mirrors the operator's mental model of "is the shaft self-shadowing on or off?"
-	// without losing the tuned strength: OFF saves the live `Rebus.BeamShadowStrength` value
-	// into a file-static prior and forces strength = 0 (which the shader's `[branch] if (...)`
-	// gate takes the whole trace out of the per-pixel cost for); ON restores the saved prior
-	// (default 1.0 on a fresh launch where the toggle's never been touched). Both transitions
-	// route through the existing `Rebus.BeamShadowStrength` CVar so the refresh sink walks
-	// every fixture exactly once.
-	//
-	// Why a CONSOLE COMMAND (not a CVar): the binary semantics (save/restore the underlying
-	// float) need a custom handler. Pure-CVar bools can't store the prior value, and a
-	// CVar-on-CVar dependency would race with portal-driven strength pushes. The command
-	// pattern matches v1.0.47 `Rebus.MeshBeams` and keeps the state self-contained.
-	float GBeamShadowPriorStrength = 1.f; // last non-zero strength captured by `Rebus.BeamShadow 0`
-	void HandleBeamShadowCommand(const TArray<FString>& Args)
-	{
-		IConsoleVariable* StrengthCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowStrength"));
-		if (!StrengthCVar)
-		{
-			UE_LOG(LogRebusVisualiser, Warning,
-				TEXT("Rebus.BeamShadow: Rebus.BeamShadowStrength CVar not registered yet (fixture module not loaded?); no-op."));
-			return;
-		}
-
-		// No arg / "status" -> diagnostic only, never mutates state. Returns the live strength
-		// + the saved prior so the operator can see at a glance which one would land on the
-		// next `Rebus.BeamShadow 1`.
-		const bool bArgGiven = Args.Num() > 0;
-		const float LiveStrength = StrengthCVar->GetFloat();
-		if (!bArgGiven || (Args.Num() > 0 && Args[0].Equals(TEXT("status"), ESearchCase::IgnoreCase)))
-		{
-			UE_LOG(LogRebusVisualiser, Log,
-				TEXT("Rebus.BeamShadow status: live Rebus.BeamShadowStrength=%.3f (savedPrior=%.3f). "
-					 "Use `Rebus.BeamShadow 0` to disable (strength -> 0; saves prior). "
-					 "Use `Rebus.BeamShadow 1` to enable (restores prior, default 1.0)."),
-				LiveStrength, GBeamShadowPriorStrength);
-			return;
-		}
-
-		const bool bEnable = ParseBoolArg(Args, true);
-		if (!bEnable)
-		{
-			// OFF -- save the live strength (only when it's non-zero so a double-off doesn't
-			// clobber the prior with 0) then force strength to 0. The CVar's refresh sink
-			// walks every fixture and re-pushes the new value through `RefreshBeamShadowParams`.
-			if (LiveStrength > 0.001f)
-			{
-				GBeamShadowPriorStrength = LiveStrength;
-			}
-			StrengthCVar->Set(TEXT("0.0"), ECVF_SetByConsole);
-			UE_LOG(LogRebusVisualiser, Log,
-				TEXT("Rebus.BeamShadow 0: master OFF -- Rebus.BeamShadowStrength %.3f -> 0.0 (saved prior=%.3f for next ON)."),
-				LiveStrength, GBeamShadowPriorStrength);
-		}
-		else
-		{
-			// ON -- restore the saved prior. If the operator never touched the toggle the
-			// prior is the v1.0.96 default (1.0), so a first-time ON lands a sensible value.
-			const float Restore = (GBeamShadowPriorStrength > 0.001f) ? GBeamShadowPriorStrength : 1.0f;
-			StrengthCVar->Set(*FString::SanitizeFloat(Restore), ECVF_SetByConsole);
-			UE_LOG(LogRebusVisualiser, Log,
-				TEXT("Rebus.BeamShadow 1: master ON -- Rebus.BeamShadowStrength %.3f -> %.3f (restored prior)."),
-				LiveStrength, Restore);
-		}
-	}
-
-	// v1.0.99 -- `Rebus.DumpBeamShadow` console command. Walks every Rebus fixture in every
-	// Game/PIE/Editor world and dumps the live MID + CVar values for the screen-space shadow
-	// trace, plus a one-line per-fixture "shadowing enabled, debug mode N" diagnostic. Use
-	// this when the operator reports "I'm not seeing the shadow trace work" -- the dump
-	// proves whether the values landed on the BeamMID, whether the MID scalar contract is
-	// the v1.0.99 shape (Bias + Debug present), and whether the master toggle is in force.
-	void HandleDumpBeamShadowCommand(const TArray<FString>& /*Args*/)
-	{
-		if (!GEngine) return;
-		IConsoleVariable* StepsCVar       = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowSteps"));
-		IConsoleVariable* StrengthCVar    = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowStrength"));
-		IConsoleVariable* BiasCVar        = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowBias"));
-		IConsoleVariable* DebugCVar       = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowDebug"));
-		// v1.0.109 -- pan-edge / sky / far-distance guard CVars surfaced in the header
-		// line so the operator can see every Rebus.BeamShadow* knob in one pasted block.
-		IConsoleVariable* FarCullCVar     = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowFarCullCm"));
-		IConsoleVariable* EdgeGuardCVar   = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowEdgeGuard"));
-		IConsoleVariable* BiasScaleCVar   = IConsoleManager::Get().FindConsoleVariable(TEXT("Rebus.BeamShadowBiasScale"));
-		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("DumpBeamShadow CVars: Rebus.BeamShadowSteps=%s Rebus.BeamShadowStrength=%s "
-				 "Rebus.BeamShadowBias=%s Rebus.BeamShadowDebug=%s "
-				 "Rebus.BeamShadowFarCullCm=%s Rebus.BeamShadowEdgeGuard=%s Rebus.BeamShadowBiasScale=%s"),
-			StepsCVar      ? *StepsCVar->GetString()      : TEXT("<unregistered>"),
-			StrengthCVar   ? *StrengthCVar->GetString()   : TEXT("<unregistered>"),
-			BiasCVar       ? *BiasCVar->GetString()       : TEXT("<unregistered>"),
-			DebugCVar      ? *DebugCVar->GetString()      : TEXT("<unregistered>"),
-			FarCullCVar    ? *FarCullCVar->GetString()    : TEXT("<unregistered>"),
-			EdgeGuardCVar  ? *EdgeGuardCVar->GetString()  : TEXT("<unregistered>"),
-			BiasScaleCVar  ? *BiasScaleCVar->GetString()  : TEXT("<unregistered>"));
-
-		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
-		{
-			UWorld* World = Ctx.World();
-			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE && Ctx.WorldType != EWorldType::Editor)) continue;
-			int32 FixtureCount = 0;
-			for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
-			{
-				if (const ARebusFixtureActor* F = *It)
-				{
-					F->DumpBeamShadowStateForDebug();
-					++FixtureCount;
-				}
-			}
-			UE_LOG(LogRebusVisualiser, Log,
-				TEXT("DumpBeamShadow world '%s': dumped %d fixture(s)."),
-				*World->GetName(), FixtureCount);
-		}
-	}
-
 	// v1.0.103 -- `Rebus.RebuildBeamMaterial` editor-only runtime regen of `M_RebusBeam`.
 	//
-	// Why this exists: v1.0.99 / v1.0.100 / v1.0.101 / v1.0.102 each shipped Custom-HLSL
-	// changes inside `_BEAM_RAYMARCH_HLSL` (the LWC PreViewTranslation projection fix in
-	// v1.0.99 is the smoking gun for the user's "beams still going straight through
-	// objects" report against v1.0.102). The corrected HLSL only commits to the on-disk
-	// `M_RebusBeam.uasset` when `build_rebus_base_level.py::ensure_beam_material()` runs --
-	// which previously required either Tools > Execute Python Script in the editor (manual
-	// operator action) or a fresh `-run=pythonscript` headless invocation. An operator who
-	// `git pull`ed v1.0.99+ and opened the editor without re-running the Python script kept
-	// the v1.0.96 cooked master with the LWC projection bug; the C++ side then dutifully
-	// pushed BeamShadowStrength=1 onto a MID whose master never declared it,
-	// `SetScalarParameterValue` silently no-op'd, and the trace concluded "always
-	// unoccluded" (the user-visible symptom).
-	//
-	// `Rebus.RebuildBeamMaterial` invokes the SAME Python entry point at runtime via the
-	// `PythonScriptPlugin`'s built-in `py` console command, gated behind `WITH_EDITOR` so
-	// it's a no-op in packaged builds (PythonScriptPlugin is editor-only -- see
-	// `REBUS_Visualiser.uproject` `TargetAllowList: ["Editor"]`). After the regen the
+	// Generic master-regen tool: invokes `build_rebus_base_level.ensure_beam_material(force=
+	// True)` via the `PythonScriptPlugin`'s built-in `py` console command, gated behind
+	// `WITH_EDITOR` so it's a no-op in packaged builds (PythonScriptPlugin is editor-only --
+	// see `REBUS_Visualiser.uproject` `TargetAllowList: ["Editor"]`). After the regen the
 	// existing per-fixture `BeamMID`s still reference the OLD UMaterial (the Python side
 	// deletes + recreates the asset, which leaves dangling MID parents); the operator
 	// must follow up with ClearScene + LoadScene from the portal (the data-channel flow
 	// that respawns every fixture, rebuilding each `BeamMID` off the freshly-loaded
 	// `M_RebusBeam`) OR restart the editor. We log the next-step prompt explicitly so the
 	// operator never has to guess.
+	//
+	// v1.0.110: the original v1.0.103 motivation was the stale-master / silent-no-op trap
+	// in the (now deleted) screen-space shadow trace. With that system gone the command is
+	// still useful as a generic "regenerate M_RebusBeam without restarting the editor"
+	// utility for any future HLSL / parameter-graph work, so it stays.
 	//
 	// Defensive layout: we route through `GEngine->Exec` with the `py` command rather than
 	// linking against `IPythonScriptPlugin` directly so the call site stays insulated from
@@ -1057,10 +932,9 @@ namespace
 			}
 		}
 
-		// `py <expr>` is the engine-stable entry point. The expression matches the v1.0.99
-		// self-heal flow exactly (force-regen + write-back the .uasset), so the on-disk
-		// master picks up whatever Custom HLSL the current `_BEAM_RAYMARCH_HLSL` source
-		// declares -- v1.0.99 LWC fix on v1.0.99+ pulls, plus any later shader work.
+		// `py <expr>` is the engine-stable entry point. The expression deletes + regenerates
+		// `/Game/REBUS/Materials/M_RebusBeam.uasset` from the current `_BEAM_RAYMARCH_HLSL`
+		// source.
 		const TCHAR* PyCmd = TEXT("py import build_rebus_base_level; build_rebus_base_level.ensure_beam_material(force=True)");
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("Rebus.RebuildBeamMaterial: invoking `%s` via the engine's `py` console "
@@ -1076,10 +950,7 @@ namespace
 				 "(the Python side regenerates the .uasset in place; UMaterialInstanceDynamic "
 				 "parent pointers don't refresh automatically). Run ClearScene + LoadScene "
 				 "from the portal to respawn every fixture (which calls BuildBeamCone, which "
-				 "LoadObject's the freshly-regenerated master) -- OR restart the editor. "
-				 "Verify with `Rebus.DumpBeamShadow` (every MID scalar should show EXISTS) "
-				 "and `Rebus.BeamShadowDebug 1` (a cube placed between fixture + floor "
-				 "should appear RED inside the beam)."),
+				 "LoadObject's the freshly-regenerated master) -- OR restart the editor."),
 			bExecOk ? TEXT("OK") : TEXT("FAILED"));
 #else
 		UE_LOG(LogRebusVisualiser, Warning,
@@ -1458,24 +1329,6 @@ void FRebusVisualiserModule::StartupModule()
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleMeshBeamsCommand),
 		ECVF_Default);
 
-	// v1.0.96 -- screen-space shadow trace master toggle. Paired with the `Rebus.BeamShadowSteps`
-	// + `Rebus.BeamShadowStrength` CVars defined in RebusFixtureActor.cpp; the toggle saves/
-	// restores the strength so flicking the master off doesn't lose the operator's tuned value.
-	// See the HandleBeamShadowCommand doc-comment for the save/restore semantics.
-	GBeamShadowCommand = IConsoleManager::Get().RegisterConsoleCommand(
-		TEXT("Rebus.BeamShadow"),
-		TEXT("v1.0.96 -- master toggle for the M_RebusBeam screen-space shadow trace. "
-			 "`Rebus.BeamShadow 0` forces Rebus.BeamShadowStrength to 0 (the shader's "
-			 "`[branch] if (BeamShadowStrength > 0.001)` gate then takes the whole trace OUT of "
-			 "the per-pixel cost) and saves the prior strength. `Rebus.BeamShadow 1` restores "
-			 "the saved prior (default 1.0 on a fresh launch). No arg / `status` logs the live "
-			 "strength + saved prior without mutating either. Pair with `Rebus.BeamShadowSteps "
-			 "<n>` (default 8, clamp [1,16]) and `Rebus.BeamShadowStrength <0..1>` (default 1.0) "
-			 "for tuning. See the README v1.0.96 release block for the algorithm + limitations. "
-			 "Usage: Rebus.BeamShadow [0|1|status]"),
-		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleBeamShadowCommand),
-		ECVF_Default);
-
 	// v1.0.99 imported-primitive shadow-cast normalisation toggle.
 	GOrbitCastShadowsCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Rebus.OrbitCastShadows"),
@@ -1629,13 +1482,13 @@ void FRebusVisualiserModule::StartupModule()
 	// v1.0.105 per-mesh Nanite diagnostic dump. Walks every Orbit StaticMesh in every
 	// Game/PIE/Editor world and emits one log line per UNIQUE mesh (grouped by
 	// UStaticMesh* so multiple components sharing the same imported asset collapse to
-	// ONE entry with a ref count). Mirrors the `Rebus.DumpBeamShadow` style for
-	// consistency with the v1.0.99 / v1.0.103 diagnostic surfaces. Operator
-	// verification: every entry should report `Nanite=ON` once the v1.0.105 walker
-	// has run successfully -- if any entry shows `Nanite=OFF`, look one log line up
-	// for the matching `[Rebus] Nanite skip on '<Mesh>': no source MeshDescription`
-	// Warning (= the OrbitConnector import config needs bGenerateStaticMeshDescription=
-	// true) OR the operator may have toggled `Rebus.NaniteOrbitImports 0` recently.
+	// ONE entry with a ref count). Mirrors the diagnostic-dump shape used by
+	// `Rebus.DumpFixtureIes` / `Rebus.DumpFixtureZoom`. Operator verification: every
+	// entry should report `Nanite=ON` once the v1.0.105 walker has run successfully --
+	// if any entry shows `Nanite=OFF`, look one log line up for the matching
+	// `[Rebus] Nanite skip on '<Mesh>': no source MeshDescription` Warning (= the
+	// OrbitConnector import config needs bGenerateStaticMeshDescription=true) OR the
+	// operator may have toggled `Rebus.NaniteOrbitImports 0` recently.
 	GDumpOrbitNaniteCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Rebus.DumpOrbitNanite"),
 		TEXT("v1.0.105 -- dump every Orbit-imported UStaticMesh's Nanite state in one "
@@ -1687,52 +1540,23 @@ void FRebusVisualiserModule::StartupModule()
 		}),
 		ECVF_Default);
 
-	// v1.0.99 per-fixture screen-space-shadow-trace runtime dump.
-	// v1.0.103 -- the dump is now the primary diagnostic for "v1.0.99 fix didn't materialise"
-	// because the per-scalar MID column reports EXISTS/MISSING explicitly (was a -999
-	// sentinel pre-v1.0.103). MISSING on any scalar = stale master = run the new
-	// `Rebus.RebuildBeamMaterial` editor-only runtime regen.
-	GDumpBeamShadowCommand = IConsoleManager::Get().RegisterConsoleCommand(
-		TEXT("Rebus.DumpBeamShadow"),
-		TEXT("v1.0.99 / v1.0.109 -- dump every Rebus fixture's M_RebusBeam screen-space shadow "
-			 "trace state in one line each: live MID values (Steps/Strength/Bias/Debug as "
-			 "actually read by the per-pixel shader, PLUS the v1.0.109 pan-edge guard set "
-			 "FarCullCm/EdgeGuard/BiasScale) + global CVar values + a 'shadowing enabled, "
-			 "debug mode N' diagnostic. Use when the operator reports the shadow trace "
-			 "doesn't appear to work OR the v1.0.109 pan-edge beam clipping returned -- the "
-			 "dump proves whether RefreshBeamShadowParams is winning the push race against "
-			 "any portal override and whether the master scalar contract is the v1.0.109 "
-			 "shape (FarCullCm + EdgeGuard + BiasScale present). v1.0.103: the MID column "
-			 "now reports EXISTS/MISSING per scalar (was a -999 sentinel) so stale-master "
-			 "is unmistakable. v1.0.109: the stale-master note now distinguishes 'pre-"
-			 "v1.0.99' (LWC projection bug, missing Debug) from 'pre-v1.0.109' (pan-edge "
-			 "guards missing). MISSING on any scalar means run `Rebus.RebuildBeamMaterial`. "
-			 "Usage: Rebus.DumpBeamShadow"),
-		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpBeamShadowCommand),
-		ECVF_Default);
-
-	// v1.0.103 -- editor-only runtime regen of `M_RebusBeam` via PythonScriptPlugin's
-	// `py` console command (no module link required). Fixes the user-reported regression
-	// where v1.0.99..v1.0.102 shipped Custom-HLSL changes but the on-disk master only
-	// picks them up when the operator manually runs `build_rebus_base_level.py` -- this
-	// command runs the Python entry point at runtime so an editor restart isn't required.
-	// See the `HandleRebuildBeamMaterialCommand` doc-comment for the post-regen
+	// v1.0.103 / v1.0.110 -- editor-only runtime regen of `M_RebusBeam` via PythonScript
+	// Plugin's `py` console command (no module link required). Generic master-regen tool
+	// kept after the v1.0.110 shadow-trace rollback for any future HLSL / parameter-graph
+	// work. See the `HandleRebuildBeamMaterialCommand` doc-comment for the post-regen
 	// fixture-respawn step (the existing per-fixture BeamMIDs are still parented to the
 	// old UMaterial -- ClearScene + LoadScene OR editor restart is the chaser).
 	GRebuildBeamMaterialCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Rebus.RebuildBeamMaterial"),
-		TEXT("v1.0.103 -- regenerate `/Game/REBUS/Materials/M_RebusBeam.uasset` AT RUNTIME "
-			 "by invoking `build_rebus_base_level.ensure_beam_material(force=True)` via the "
-			 "engine's `py` console command (PythonScriptPlugin). Editor-only -- no-op in "
-			 "packaged builds. Use when `Rebus.DumpBeamShadow` reports MISSING on any MID "
-			 "scalar (= the operator pulled v1.0.99+ but the on-disk master is the stale "
-			 "v1.0.96 cooked version with the LWC projection bug). After this command: "
+		TEXT("v1.0.103 / v1.0.110 -- regenerate `/Game/REBUS/Materials/M_RebusBeam.uasset` "
+			 "AT RUNTIME by invoking `build_rebus_base_level.ensure_beam_material(force=True)` "
+			 "via the engine's `py` console command (PythonScriptPlugin). Editor-only -- "
+			 "no-op in packaged builds. Use after any HLSL / parameter-graph change to "
+			 "`_BEAM_RAYMARCH_HLSL` or `_build_beam_master` so the on-disk cooked master "
+			 "picks up the new shader without an editor restart. After this command: "
 			 "ClearScene + LoadScene from the portal (or restart the editor) so each "
-			 "fixture respawns + rebuilds its BeamMID off the freshly-regenerated master, "
-			 "then verify with `Rebus.DumpBeamShadow` (every scalar should show EXISTS) "
-			 "and `Rebus.BeamShadowDebug 1` (a cube placed between fixture + floor should "
-			 "appear RED inside the beam). See the v1.0.103 README release block for the "
-			 "full operator checklist. Usage: Rebus.RebuildBeamMaterial"),
+			 "fixture respawns + rebuilds its BeamMID off the freshly-regenerated master. "
+			 "Usage: Rebus.RebuildBeamMaterial"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleRebuildBeamMaterialCommand),
 		ECVF_Default);
 
@@ -2095,16 +1919,6 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GDumpFixtureIesCommand);
 		GDumpFixtureIesCommand = nullptr;
-	}
-	if (GBeamShadowCommand)
-	{
-		IConsoleManager::Get().UnregisterConsoleObject(GBeamShadowCommand);
-		GBeamShadowCommand = nullptr;
-	}
-	if (GDumpBeamShadowCommand)
-	{
-		IConsoleManager::Get().UnregisterConsoleObject(GDumpBeamShadowCommand);
-		GDumpBeamShadowCommand = nullptr;
 	}
 	if (GRebuildBeamMaterialCommand)
 	{

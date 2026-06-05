@@ -594,6 +594,186 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Remove v1.0.96 → v1.0.109 screen-space beam shadow trace (clean slate for redesign) (v1.0.110).**
+>
+> User instruction (verbatim):
+>
+> > "This shadow tracing,pen clip really isnt working, its terrible and completely wrong, remove it and we will start again."
+>
+> **What the v1.0.96 → v1.0.109 trace was trying to do.**
+> Inside the per-pixel raymarch through the procedural cone shaft (the
+> v1.0.42 Custom-HLSL `_BEAM_RAYMARCH_HLSL` node in `M_RebusBeam`), every
+> shadow step sampled `SceneDepth` at the projected screen UV of a march
+> sample halfway between the shaft sample `wp` and the spotlight origin,
+> compared the sampled depth against the march sample's own clip-space `w`,
+> and -- when the sampled depth was nearer than the sample (an occluder
+> stood between the fixture and that point in the shaft volume) -- scaled
+> the per-step density down by `(1 - BeamShadowStrength)`. The intent was
+> a CHEAP self-shadow that carved the visible shaft against any in-frustum
+> occluder (a hung truss, a person, a prop) without paying for a second
+> shadow-map / volumetric pass on every fixture.
+>
+> **Why it failed in practice.**
+> Even after the v1.0.99 LWC-projection fix (every step was landing
+> off-screen because of the missing `PreViewTranslation`) and the v1.0.109
+> off-screen / sky / far-distance guards (the user's "cutting the side of
+> the beams when we pan left or right" symptom), the trace's day-to-day
+> behaviour was unacceptable:
+>
+> 1. **Off-screen occluders cast nothing.** This is the architectural
+>    ceiling of any screen-space-shadow technique. As soon as the
+>    operator pans / dollies and the actual occluder falls outside the
+>    camera frustum (or behind the camera), the shaft suddenly stops
+>    being carved against it -- the same hung truss reads "no shadow"
+>    from one angle and "shadowed" from the next.
+> 2. **Pan-edge false occlusion.** Shadow samples landing in the screen-
+>    UV margin between the fixture's worldspace and the camera near-clip
+>    plane have no nearby depth to compare against; v1.0.109's edge-
+>    guard suppressed the most visible chunk of this but the residual
+>    noise was still wrong at the edges.
+> 3. **Reverse-Z precision crash at long throws.** Beyond ~500 m the
+>    `sd + stepBias < clipP.w` comparison is effectively random; the
+>    v1.0.109 `Rebus.BeamShadowFarCullCm` cull hid the worst of it but
+>    the underlying math doesn't survive that distance.
+> 4. **No participating-media awareness.** The trace knows about opaque
+>    SceneDepth and nothing else. It can't carve correctly against
+>    translucent / volumetric occluders, and there is no roadmap inside
+>    the screen-space approach that fixes that.
+>
+> The v1.0.109 release block's "fundamental fix would need a SECOND pass
+> over a 3D depth cube" footnote was honest about (1) and (4); the daily
+> visible behaviour even WITH the v1.0.109 guards in place was the
+> deciding factor. The user's direction is to clear the floor entirely and
+> redesign from a different starting point.
+>
+> **What came out (v1.0.110 rollback scope).**
+>
+> *Console variables (registered in `RebusVisualiser.cpp` / `RebusFixture
+> Actor.cpp`, all REMOVED):*
+>
+> - `Rebus.BeamShadowSteps`
+> - `Rebus.BeamShadowStrength`
+> - `Rebus.BeamShadowBias`
+> - `Rebus.BeamShadowDebug`
+> - `Rebus.BeamShadowFarCullCm`
+> - `Rebus.BeamShadowEdgeGuard`
+> - `Rebus.BeamShadowBiasScale`
+>
+> *Console commands (REMOVED):*
+>
+> - `Rebus.BeamShadow [0|1|status]` (the master save/restore toggle)
+> - `Rebus.DumpBeamShadow` (per-fixture EXISTS/MISSING diagnostic)
+>
+> *Material parameters declared by `_build_beam_master` (REMOVED from
+> `M_RebusBeam`):*
+>
+> - `BeamShadowSteps`
+> - `BeamShadowStrength`
+> - `BeamShadowBias`
+> - `BeamShadowDebug`
+> - `BeamShadowFarCullCm`
+> - `BeamShadowEdgeGuard`
+> - `BeamShadowBiasScale`
+>
+> *Code paths (REMOVED):*
+>
+> - `ARebusFixtureActor::RefreshBeamShadowParams()` (the seven-CVar push
+>   helper) + every call site (`BuildBeamCone`, the `Rebus.PreferProcedural
+>   Beam` flip handler).
+> - `ARebusFixtureActor::DumpBeamShadowStateForDebug()` (per-fixture dump
+>   used by the removed `Rebus.DumpBeamShadow` command).
+> - `URebusVisualiserSubsystem::ProbeBeamMasterAtStartup()` (one-shot
+>   "STALE BEAM MASTER" warning that specifically named the v1.0.99 /
+>   v1.0.109 shadow-trace scalars).
+> - `_BEAM_RAYMARCH_HLSL` -- the entire screen-space shadow block (per-
+>   sample SceneDepth tap, NDC guards, sky / far-cull / edge guards,
+>   debug-colour visualisation, accumulator counters). The shaft density
+>   composition is back to the v1.0.95 baseline `d = BeamDensity * core *
+>   widthNorm * srcAtten * nf * softOcc` so the cone-mesh shaft renders
+>   as a clean uncarved cone again.
+> - `build_rebus_base_level.py` -- the `_beam_master_has_shadow_steps`,
+>   `_beam_master_has_shadow_debug`, and `_beam_master_has_pan_edge_guard`
+>   self-heal probes + the v1.0.99 / v1.0.103 / v1.0.109 force-regen
+>   cascade inside `ensure_beam_material()`. `ensure_beam_material()`
+>   now only force-regens when `force=True` is passed explicitly (via
+>   `build()` or the runtime `Rebus.RebuildBeamMaterial`).
+>
+> **What stayed (intentionally untouched by the v1.0.110 rollback).**
+>
+> - `Rebus.PreferProceduralBeam` (v1.0.106 default ON, the procedural-vs-
+>   Epic visible-shaft toggle). Orthogonal to the shadow trace; the
+>   default stays ON in v1.0.110 because the v1.0.108 cone-mesh half-
+>   intensity geometry + radial-attenuation tuning lives on the procedural
+>   cone, not because of any shadow-trace requirement. Operators
+>   preferring Epic's `MI_Beam` canvas can still flip to `0`.
+> - `Rebus.BeamSharpness` / `Rebus.BeamDensity` / `Rebus.BeamFalloff`
+>   (v1.0.108) -- raymarch radial Gaussian + axial-falloff tuning. Lives
+>   inside the same `_BEAM_RAYMARCH_HLSL` Custom node but is the
+>   `softOcc * srcAtten * widthNorm * core` composition that was always
+>   on -- the v1.0.110 rollback simply removed the `* shadowAtten`
+>   factor that v1.0.96..v1.0.109 multiplied on top.
+> - `Rebus.BeamConeRadiusScale` + `ARebusFixtureActor::BeamConeRadius
+>   Scale` UPROPERTY (v1.0.101) -- per-fixture cone-mesh visible-radius
+>   scaler.
+> - `Rebus.DumpFixtureZoom` (v1.0.101 + v1.0.108) -- still the canonical
+>   per-fixture geometry-vs-photometry diagnostic.
+> - `Rebus.RebuildBeamMaterial` (v1.0.103) -- the editor-only runtime
+>   PythonScriptPlugin regen of `M_RebusBeam`. KEPT as a generic master-
+>   regen tool for any future HLSL / parameter-graph work; the help text
+>   no longer references the removed `Rebus.DumpBeamShadow` validation
+>   step.
+> - `ARebusFixtureActor::RefreshBeamShadowMode()` -- this is the **fog-
+>   vs-mesh switch system for hero fixtures** driven by `Rebus.Hero
+>   ShadowScatter` + `bWantsVolumetricShadow`, and it routes UE's
+>   native VSM volumetric-shadow path. Name collision only -- entirely
+>   separate from the deleted screen-space trace.
+> - `bCastVolumetricShadow` / `bWantsVolumetricShadow` per-fixture
+>   knobs that drive UE's native VSM volumetric-shadow path. Unrelated
+>   to the screen-space trace.
+>
+> **Migration note for operators with portal automation.**
+> Any external dispatcher (portal command bindings, Speckle automation,
+> debug shortcuts) that pushed the removed `Rebus.BeamShadow*` CVars or
+> issued the `Rebus.BeamShadow` / `Rebus.DumpBeamShadow` console commands
+> will now log `Unknown console variable` / `Unknown console command`
+> when the v1.0.110 build is loaded. Prune those entries from the
+> dispatcher tables on the v1.0.110 pull. The startup probe Warning
+> (`v1.0.103 + v1.0.109 startup probe: M_RebusBeam carries the v1.0.99
+> + v1.0.109 parameter contracts ...`) is also gone -- no replacement
+> Warning takes its place since there is no longer a parameter contract
+> the master can be "stale" against beyond the v1.0.95-shape baseline.
+>
+> **Operator verification (v1.0.110).**
+>
+> 1. Pull, build, launch. The procedural cone shaft should render as a
+>    clean uncarved cone (no occlusion against intervening geometry),
+>    matching the pre-v1.0.96 look. Cameras can pan freely; no pan-edge
+>    clipping of the shaft is possible because there is no shadow trace
+>    to misfire.
+> 2. `Rebus.DumpBeamShadow` -> editor logs `Unknown console command`.
+> 3. `Rebus.BeamShadowStrength 0.5` -> editor logs `Unknown console
+>    variable`. Repeat for any of the seven removed `BeamShadow*` CVars.
+> 4. `Rebus.RebuildBeamMaterial` still regenerates `M_RebusBeam` (now
+>    without the seven `BeamShadow*` scalar params).
+> 5. `Rebus.PreferProceduralBeam 0` still flips back to Epic's `MI_Beam`
+>    canvas. `Rebus.BeamSharpness 6.0` still tightens the procedural
+>    raymarch radial Gaussian.
+>
+> **Open architectural question for v1.0.111+.**
+> The user has explicitly cleared the floor for a redesign of beam-vs-
+> object interaction. The next direction is open and to be decided by
+> the user: candidates include (but are not limited to) raytraced
+> volumetric shadows from the SpotLight against the shaft volume, a
+> neighbour-view / multi-tap depth-cube sampling that escapes the
+> screen-space frustum trap, a VSM-based volumetric integration that
+> leans on UE's native volumetric-shadow path (the same one
+> `RefreshBeamShadowMode` already drives for hero fixtures' fog halo),
+> hand-painted clip planes or per-fixture occluder volumes, or simply
+> living with the unshadowed procedural cone if the visual cost-benefit
+> argues that direction. v1.0.111+ will land whichever approach the
+> user picks -- this release is the clean slate that enables that
+> choice.
+
 > **Screen-space beam-shadow off-screen + sky + distance guards (fix pan-edge clipping) (v1.0.109).**
 >
 > User report (verbatim):

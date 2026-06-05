@@ -341,18 +341,13 @@ private:
 	// v1.0.47 `Rebus.HeroShadowScatter` CVar's OnChanged sink can re-apply the new scatter live.
 public:
 	void RefreshBeamShadowMode();
-	// v1.0.96 -- push the three screen-space-shadow-trace scalars onto this fixture's BeamMID
-	// (M_RebusBeam) so the Custom HLSL shadow trace picks up the operator's current CVar values.
-	// Called from `BuildBeamCone` for the initial seed and from the `Rebus.BeamShadow*` CVar
-	// refresh sinks (which walk every fixture). Silently no-ops when BeamMID is null.
-	void RefreshBeamShadowParams();
 	// v1.0.108 -- push the three radial-attenuation scalars (BeamSharpness / BeamDensity /
-	// BeamFalloff) onto this fixture's BeamMID. Mirrors `RefreshBeamShadowParams` shape: called
-	// from `BuildBeamCone` after the initial constant-seeded push (so the live CVar wins over
-	// the constant) and from the `Rebus.BeamSharpness` / `Rebus.BeamDensity` /
-	// `Rebus.BeamFalloff` CVar refresh sinks (which walk every fixture). Silently no-ops when
-	// BeamMID is null. Cone-mesh geometry is NOT touched -- these knobs only reshape the
-	// radial Gaussian / axial falloff inside the existing cone volume.
+	// BeamFalloff) onto this fixture's BeamMID. Called from `BuildBeamCone` after the initial
+	// constant-seeded push (so the live CVar wins over the constant) and from the
+	// `Rebus.BeamSharpness` / `Rebus.BeamDensity` / `Rebus.BeamFalloff` CVar refresh sinks
+	// (which walk every fixture). Silently no-ops when BeamMID is null. Cone-mesh geometry is
+	// NOT touched -- these knobs only reshape the radial Gaussian / axial falloff inside the
+	// existing cone volume.
 	void RefreshBeamRadialParams();
 private:
 	// v1.0.101 -- single-source-of-truth canonical zoom half-angle (degrees) for both the
@@ -485,15 +480,6 @@ public:
 	// Called by the Rebus.DumpFixtureLights console command (registered in RebusVisualiser.cpp).
 	void DumpLightStateForDebug() const;
 
-	// v1.0.99: dump THIS fixture's M_RebusBeam screen-space-shadow-trace state in one line --
-	// whether BeamMID is bound, the live values of BeamShadowSteps / BeamShadowStrength /
-	// BeamShadowBias / BeamShadowDebug as they exist on the MID right now (so the operator
-	// can confirm `RefreshBeamShadowParams` is winning the push race against any portal /
-	// scene-property override), plus the CURRENT global CVar values for diff against. Called
-	// by `Rebus.DumpBeamShadow` (registered in RebusVisualiser.cpp). Public + const so the
-	// console handler can iterate fixtures via `TActorIterator<ARebusFixtureActor>`.
-	void DumpBeamShadowStateForDebug() const;
-
 	// v1.0.74: dump THIS fixture's gobo runtime state -- whether a gobo is bound, RT size +
 	// pointer, current rotation angle, combined spin rate, MegaLights opt-out flag, light-
 	// function material pointer, and last frame the RT was redrawn. Called by the new
@@ -531,22 +517,20 @@ public:
 	void RefreshBeamConeRadiusScaleFromCVar(float NewScale);
 	float GetBeamConeRadiusScale() const { return BeamConeRadiusScale; }
 
-	// v1.0.106 -- prefer the procedural `M_RebusBeam` cone (which carries the v1.0.96 / v1.0.99
-	// screen-space self-shadow trace) over Epic's `MI_Beam` canvas. Mirror the per-fixture-knob
-	// shape of `RefreshBeamConeRadiusScaleFromCVar`: the CVar `Rebus.PreferProceduralBeam`
-	// refresh sink walks every Rebus fixture and forwards the new value here; the call also
-	// performs a live no-respawn flip on the visible shaft (hide the Epic canvas, unhide the
-	// procedural cone, re-push `RefreshBeamShadowParams` so the trace scalars are bound to
-	// the now-visible MID -- and vice versa on flip to 0). On flip to 0 ("prefer Epic"), if
-	// the per-fixture EpicBeamComp was never built (the original Path the v1.0.43 wiring took
-	// when DMX content loaded), `TryBuildEpicBeam` is invoked lazily so the same toggle that
-	// hid the canvas earlier can re-show it later. Returns true when the visible beam path
-	// changed (so a caller can throttle re-logs); the per-fixture `bPreferProceduralBeam`
-	// UPROPERTY mirrors the resolved state for the Details panel + the next `BuildBeamCone`.
-	//
-	// The v1.0.106 stale-master Warning that pairs with the master toggle lives in the CVar
-	// refresh sink itself (RebusFixtureActor.cpp), not here -- per-fixture this call is
-	// idempotent and silent when nothing transitioned.
+	// v1.0.106 -- prefer the procedural `M_RebusBeam` cone over Epic's `MI_Beam` canvas as the
+	// visible shaft. The v1.0.108 cone-mesh half-intensity geometry + radial-attenuation tuning
+	// lives on the procedural cone, so the default stays ON in v1.0.110 even though the v1.0.96
+	// .. v1.0.109 screen-space self-shadow trace that originally motivated the default-flip has
+	// been removed. Mirrors the per-fixture-knob shape of `RefreshBeamConeRadiusScaleFromCVar`:
+	// the CVar `Rebus.PreferProceduralBeam` refresh sink walks every Rebus fixture and forwards
+	// the new value here; the call also performs a live no-respawn flip on the visible shaft
+	// (hide the Epic canvas, unhide the procedural cone -- and vice versa on flip to 0). On flip
+	// to 0 ("prefer Epic"), if the per-fixture EpicBeamComp was never built (the original Path
+	// the v1.0.43 wiring took when DMX content loaded), `TryBuildEpicBeam` is invoked lazily so
+	// the same toggle that hid the canvas earlier can re-show it later. Returns true when the
+	// visible beam path changed (so a caller can throttle re-logs); the per-fixture
+	// `bPreferProceduralBeam` UPROPERTY mirrors the resolved state for the Details panel + the
+	// next `BuildBeamCone`.
 	bool RefreshPreferProceduralBeamFromCVar(bool bNewPrefer);
 	bool IsPreferringProceduralBeam() const { return bPreferProceduralBeam; }
 	bool IsUsingEpicBeam() const { return bUsingEpicBeam; }

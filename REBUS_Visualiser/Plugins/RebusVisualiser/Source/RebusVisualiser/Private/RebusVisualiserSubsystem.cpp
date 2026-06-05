@@ -103,30 +103,12 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	TickHandle = FTSTicker::GetCoreTicker().AddTicker(
 		FTickerDelegate::CreateUObject(this, &URebusVisualiserSubsystem::Tick), 0.f);
 
-	// v1.0.103 -- startup probe for the on-disk M_RebusBeam master. The user reported the
-	// v1.0.99 LWC-projection fix didn't materialise: the shaft still ran straight through
-	// occluders even though the v1.0.99 Custom-HLSL fix had landed in the Python source +
-	// the v1.0.99 master self-heal probe (`_beam_master_has_shadow_debug`) had landed in
-	// `ensure_beam_material()`. Investigation showed the self-heal ONLY fires when the
-	// Python script is invoked (Tools > Execute Python Script > `build_rebus_base_level.
-	// build()` / `ensure_beam_material()`) -- it does NOT run automatically at editor /
-	// visualiser-subsystem startup. So an operator who pulls v1.0.99 .. v1.0.102 and opens
-	// the editor without re-running the Python script keeps the v1.0.96 cooked
-	// `M_RebusBeam`. The C++ side then dutifully pushes BeamShadowStrength=1 onto a MID
-	// whose master never declared the parameter, `SetScalarParameterValue` silently
-	// no-ops, and the per-pixel shader runs the v1.0.96 broken HLSL with the LWC
-	// projection bug -- "always unoccluded" ships and the user's "beams still going
-	// straight through objects" report stands.
-	//
-	// v1.0.103 surfaces the stale master ONCE at startup with a Warning that names the
-	// operator-recovery commands (mirrors v1.0.91's IES-Warning style). This catches BOTH
-	// the no-Python-script-ever-run case and the never-restarted-since-pull case
-	// (the v1.0.99 self-heal only commits the regenerated master when invoked, not on
-	// engine load). The probe + Warning is one-shot per session; the runtime
-	// `Rebus.RebuildBeamMaterial` console command (editor-only) regenerates the master
-	// in-place via the same Python entry point so the operator never has to restart the
-	// editor in the v1.0.103+ flow.
-	ProbeBeamMasterAtStartup();
+	// v1.0.103 startup beam-master probe REMOVED in v1.0.110 -- it specifically warned about
+	// the v1.0.99 / v1.0.109 `BeamShadow*` parameter contract that the v1.0.110 rollback
+	// just deleted. With the screen-space shadow trace gone there is no longer a stale-
+	// master failure mode worth a startup Warning; the runtime `Rebus.RebuildBeamMaterial`
+	// console command stays as the generic operator escape hatch for any future material
+	// graph changes.
 
 	// v1.0.107 -- compose the watermark display string ONCE from the plugin
 	// descriptor's VersionName (the engine-blessed source-of-truth that always
@@ -166,104 +148,6 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	UE_LOG(LogRebusVisualiser, Log, TEXT("Visualiser subsystem initialised (streamer='%s', project='%s', model='%s')."),
 		*StreamerId, *ProjectId, *ModelId);
-}
-
-void URebusVisualiserSubsystem::ProbeBeamMasterAtStartup()
-{
-	// v1.0.103 -- check the on-disk `M_RebusBeam` master for the v1.0.99 parameter
-	// contract (`BeamShadowStrength` + `BeamShadowDebug` scalars present). When either is
-	// missing we know the master predates the v1.0.99 LWC projection fix and the per-
-	// pixel screen-space shadow trace will silently no-op on every step. We log a single
-	// Warning at startup that names the operator-recovery action so a future "beams go
-	// straight through objects" report can be diagnosed in one log grep without the
-	// operator having to discover `Rebus.DumpBeamShadow` first.
-	//
-	// The probe is best-effort: if the asset isn't loadable yet (cooked package not
-	// mounted, /Game scan still in progress on a fresh editor launch) we just bail
-	// silently -- the next `Rebus.DumpBeamShadow` run will surface the per-fixture MID
-	// MISSING flags directly, and the v1.0.99 `_beam_master_has_shadow_debug` self-heal
-	// in `ensure_beam_material()` is still authoritative when the Python script runs.
-	UMaterialInterface* BeamMaster = LoadObject<UMaterialInterface>(nullptr,
-		TEXT("/Game/REBUS/Materials/M_RebusBeam.M_RebusBeam"));
-	if (!BeamMaster)
-	{
-		UE_LOG(LogRebusVisualiser, Warning,
-			TEXT("v1.0.103 startup probe: M_RebusBeam not found at /Game/REBUS/Materials/. "
-				 "The cone-mesh beam shaft will fall back to the procedural geometry only -- "
-				 "the v1.0.99 screen-space shadow trace will not render until the master is "
-				 "generated. Operator action: in editor, run Tools > Execute Python Script > "
-				 "`build_rebus_base_level.ensure_beam_material(force=True)` (or "
-				 "`Rebus.RebuildBeamMaterial` -- editor-only runtime regen)."));
-		return;
-	}
-
-	float V = 0.f;
-	const bool bHasStrength = BeamMaster->GetScalarParameterValue(
-		FMaterialParameterInfo(TEXT("BeamShadowStrength")), V);
-	const bool bHasDebug = BeamMaster->GetScalarParameterValue(
-		FMaterialParameterInfo(TEXT("BeamShadowDebug")), V);
-	// v1.0.109 -- also probe for the pan-edge guard scalar contract. A master that carries
-	// the v1.0.99 trace but is missing the v1.0.109 guards is the case the user reported
-	// against v1.0.106 ("the beam vs object shadowing is cutting the side of the beams when
-	// we pan left or right"). Naming the v1.0.109 fix directly in the warning beats forcing
-	// the operator to discover the symptom by trial and error.
-	const bool bHasEdgeGuard = BeamMaster->GetScalarParameterValue(
-		FMaterialParameterInfo(TEXT("BeamShadowEdgeGuard")), V);
-	if (!bHasStrength || !bHasDebug)
-	{
-		UE_LOG(LogRebusVisualiser, Warning,
-			TEXT("v1.0.103 STALE BEAM MASTER detected: M_RebusBeam is missing %s%s%s -- this is "
-				 "the v1.0.99 LWC-projection / first-step-bias fix, and the per-pixel screen-"
-				 "space shadow trace WILL NOT WORK against this master (every shadow step "
-				 "lands off-screen, the trace concludes 'always unoccluded', and the cone-mesh "
-				 "shaft visibly runs straight through every occluder -- exactly the symptom "
-				 "the user reported against v1.0.99/v1.0.102). Operator action: in editor, "
-				 "run `Rebus.RebuildBeamMaterial` (v1.0.103 -- editor-only runtime regen via "
-				 "PythonScriptPlugin) AND THEN ClearScene+LoadScene from the portal (or "
-				 "restart the editor) so the per-fixture BeamMID picks up the new master. "
-				 "Verify with `Rebus.DumpBeamShadow` (every MID scalar should now show "
-				 "EXISTS) and `Rebus.BeamShadowDebug 1` (a cube placed between fixture + "
-				 "floor should appear RED inside the beam)."),
-			bHasStrength ? TEXT("") : TEXT("BeamShadowStrength "),
-			(!bHasStrength && !bHasDebug) ? TEXT("+ ") : TEXT(""),
-			bHasDebug ? TEXT("") : TEXT("BeamShadowDebug"));
-	}
-	else if (!bHasEdgeGuard)
-	{
-		// v1.0.109 -- master is v1.0.99-compatible but predates the pan-edge guard set. The
-		// shadow trace works on the cube-in-middle-of-beam case (the v1.0.99 contract is
-		// intact) but pan-edge clipping returns the moment the operator pans a fixture
-		// laterally across the camera FOV. Different log line so the operator can distinguish
-		// the two stale-master regimes in one grep.
-		UE_LOG(LogRebusVisualiser, Warning,
-			TEXT("v1.0.109 STALE BEAM MASTER detected: M_RebusBeam carries the v1.0.99 trace "
-				 "(BeamShadowStrength + BeamShadowDebug both EXIST) but is MISSING the "
-				 "v1.0.109 pan-edge guard scalar contract (BeamShadowEdgeGuard / FarCullCm / "
-				 "BiasScale). The screen-space shadow trace WILL WORK on cube-in-middle-of-"
-				 "beam occluders (the v1.0.99 contract is intact) but the pan-edge beam "
-				 "clipping the user reported against v1.0.106 ('the beam vs object shadowing "
-				 "is cutting the side of the beams when we pan left or right') WILL RETURN. "
-				 "Operator action: in editor, run `Rebus.RebuildBeamMaterial` (v1.0.103 "
-				 "editor-only runtime regen via PythonScriptPlugin) AND THEN ClearScene+"
-				 "LoadScene from the portal (or restart the editor) so the per-fixture "
-				 "BeamMID picks up the new master with the v1.0.109 sky / far-cull / edge-"
-				 "toggle / distance-scaled-bias guards. Verify with `Rebus.DumpBeamShadow` "
-				 "(every MID scalar including FarCullCm + EdgeGuard + BiasScale should now "
-				 "show EXISTS) and `Rebus.BeamShadowDebug 2` (pan-edge regions should paint "
-				 "GREEN -- the off-screen guard catching the false-occlusion that previously "
-				 "clipped the beam shaft)."));
-	}
-	else
-	{
-		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("v1.0.103 + v1.0.109 startup probe: M_RebusBeam carries the v1.0.99 + v1.0.109 "
-				 "parameter contracts (BeamShadowStrength + BeamShadowDebug + BeamShadowEdge"
-				 "Guard all EXIST). Screen-space shadow trace is wired correctly and the "
-				 "v1.0.109 pan-edge guards are live; verify visually with `Rebus.BeamShadow"
-				 "Debug 1` (cube-in-beam should be RED) and `Rebus.BeamShadowDebug 2` (pan-"
-				 "edge regions should paint GREEN -- the off-screen guard catching what would "
-				 "have been false-occlusion under v1.0.99)."));
-	}
 }
 
 void URebusVisualiserSubsystem::Deinitialize()
