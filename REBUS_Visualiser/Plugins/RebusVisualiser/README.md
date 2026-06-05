@@ -593,6 +593,34 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Rebus.* prefix tolerance on the fixture-channel ConsoleCommand path (v1.0.72).** Portal
+> sent `{ "type":"ConsoleCommand", "command":"ShowOrbitFixtures 0" }` and the log line read
+> `Fixture-channel ConsoleCommand: 'ShowOrbitFixtures 0' (success=0)`. Our IConsoleCommand
+> objects (every `Rebus.*` command we register in `FRebusVisualiserModule::StartupModule`)
+> live under the `Rebus.` namespace prefix -- `Rebus.ShowOrbitFixtures`, `Rebus.ShowOrbit`,
+> `Rebus.OverrideFixtureMaterials`, `Rebus.DriveOrbitModels`, `Rebus.MeshBeams`, etc. --
+> so `GEngine->Exec` on the bare name returns false (unknown command) and the toggle
+> silently no-ops, just like the user observed.
+>
+> v1.0.72 makes the dispatcher prefix-tolerant: it tries `Exec` as-given first; if that
+> returns false AND the first token (everything before the first space) has no `.` in it
+> (so it can't already be a namespaced command), it retries once with `Rebus.` prepended.
+> Either-path success counts as success. The log line reports which variant actually ran:
+>
+> ```
+> LogRebusVisualiser: Fixture-channel ConsoleCommand: 'ShowOrbitFixtures 0' -> retried as 'Rebus.ShowOrbitFixtures 0' (success=1)
+> LogRebusVisualiser: Fixture-channel ConsoleCommand: 'Rebus.ShowOrbitFixtures 0' (success=1)
+> LogRebusVisualiser: Fixture-channel ConsoleCommand: 'stat fps' (success=1)
+> ```
+>
+> Scope is intentionally narrow: ONE retry, ONE prefix (`Rebus.`), no token-by-token
+> rewriting, no allowlist. Engine and other-plugin commands with a `.` in the name (e.g.
+> `r.ScreenPercentage`, `t.MaxFPS`, `PixelStreaming2.AllowPixelStreamingCommands`) fall
+> through the retry guard and behave exactly as before. The portal contract is unchanged
+> -- `Rebus.<Name>` keeps working -- but the slightly looser form (`<Name>` only) now
+> works too, which removes a class of "the toggle didn't fire" surprises across every
+> future Rebus.* command we add.
+
 > **Fixture body + lens material override: black satin plastic + mirrored glass (v1.0.71).**
 > User asked *"can all fixtures have their texture/material overridden and can UE make a
 > Fixture Material that we use. This will be a black satin plastic material. If there is a

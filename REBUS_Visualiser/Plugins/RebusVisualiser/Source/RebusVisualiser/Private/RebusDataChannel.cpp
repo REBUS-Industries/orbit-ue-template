@@ -292,12 +292,44 @@ void FRebusDataChannel::HandleDescriptor(const FString& Descriptor)
 			}
 		}
 
-		const bool bOk = GEngine ? GEngine->Exec(ExecWorld, *Cmd, *GLog) : false;
+		// v1.0.72: Rebus.* prefix tolerance. Portal logs show payloads like
+		//   { "command": "ShowOrbitFixtures 0" }
+		// arriving without the `Rebus.` namespace prefix that our IConsoleCommand objects are
+		// actually registered under (`Rebus.ShowOrbitFixtures`, `Rebus.OverrideFixtureMaterials`,
+		// `Rebus.DriveOrbitModels`, `Rebus.MeshBeams`, ...). GEngine->Exec on the bare name
+		// returns false (unknown command) and the user sees the previous "success=0" line.
+		//
+		// To keep the contract loose for the portal (and any future Rebus.* command we add) we
+		// try Exec as-given first; if that fails AND the first token has no '.' (so it can't
+		// already be a namespaced command), retry once with `Rebus.` prepended. Either-path
+		// success counts as success and we log which variant actually ran -- empty PrefixedCmd
+		// when the original path succeeded, so existing telemetry stays clean.
+		FString PrefixedCmd;
+		bool bOk = GEngine ? GEngine->Exec(ExecWorld, *Cmd, *GLog) : false;
+		if (!bOk && GEngine)
+		{
+			FString FirstToken, Rest;
+			if (!Cmd.Split(TEXT(" "), &FirstToken, &Rest)) { FirstToken = Cmd; }
+			if (!FirstToken.Contains(TEXT(".")))
+			{
+				PrefixedCmd = FString::Printf(TEXT("Rebus.%s"), *Cmd);
+				bOk = GEngine->Exec(ExecWorld, *PrefixedCmd, *GLog);
+			}
+		}
 		if (!bSilent)
 		{
-			UE_LOG(LogRebusVisualiser, Log,
-				TEXT("Fixture-channel ConsoleCommand: '%s' (success=%d)"),
-				*Cmd, bOk ? 1 : 0);
+			if (!PrefixedCmd.IsEmpty())
+			{
+				UE_LOG(LogRebusVisualiser, Log,
+					TEXT("Fixture-channel ConsoleCommand: '%s' -> retried as '%s' (success=%d)"),
+					*Cmd, *PrefixedCmd, bOk ? 1 : 0);
+			}
+			else
+			{
+				UE_LOG(LogRebusVisualiser, Log,
+					TEXT("Fixture-channel ConsoleCommand: '%s' (success=%d)"),
+					*Cmd, bOk ? 1 : 0);
+			}
 		}
 		return;
 	}
