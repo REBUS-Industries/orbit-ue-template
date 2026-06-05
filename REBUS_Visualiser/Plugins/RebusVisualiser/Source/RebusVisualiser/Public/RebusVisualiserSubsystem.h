@@ -19,6 +19,7 @@
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Containers/Ticker.h"
 #include "RebusSceneTypes.h"
+#include "RebusFixtureActor.h" // FRebusFixtureStateSnapshot
 #include "RebusVisualiserSubsystem.generated.h"
 
 class FRebusRestClient;
@@ -97,6 +98,22 @@ private:
 	//   RequestCameraState   { }                -- triggers a one-shot CameraState broadcast
 	// Returns true if the descriptor matched (so the data channel knows to stop routing it).
 	bool HandleCameraDescriptor(const FString& Type, const TSharedPtr<FJsonObject>& Msg);
+
+	// v1.0.80: handle the live-state pull descriptors. Recognised types:
+	//   RequestFixtureStates  { }   -- one-shot full broadcast of every spawned fixture
+	//   RequestSelectionState { }   -- one-shot selection broadcast
+	// Returns true if matched. Used by the data channel router so the portal can resync any
+	// individual surface without round-tripping a full handshake.
+	bool HandleStateSyncDescriptor(const FString& Type, const TSharedPtr<FJsonObject>& Msg);
+
+	// v1.0.80: subsystems / control paths call these after they apply a mutation so the live
+	// stream catches it on the next periodic tick (fixtures) or immediately (selection /
+	// scene). The fixture path is intentionally batched -- a single descriptor like
+	// SetFixtureDimmer triggers a long fade that only the periodic stream can report
+	// frame-by-frame, so flagging here is harmless duplicate work and the dead zone rejects it.
+	void NotifyFixtureControlMutated();
+	void NotifySelectionChanged();
+	void NotifySceneSettingsChanged();
 
 private:
 	// Config / launch tokens.
@@ -178,6 +195,14 @@ private:
 	FCameraStateSnapshot LastSentCameraState;
 
 	void BroadcastCameraStateIfChanged(bool bForce);
+
+	// v1.0.80 fixture-state live stream. Per-fixture last-sent snapshot cache; the periodic
+	// tick diffs against this and only sends fixtures whose values moved beyond a dead zone
+	// (zero traffic from a static rig). bForce sends every spawned fixture with full=true so
+	// a reconnecting portal paints the live state instead of waiting for the first change.
+	float FixtureStreamTimer = 0.f;
+	TMap<FString, FRebusFixtureStateSnapshot> LastSentFixtureStates;
+	void BroadcastFixtureStatesIfChanged(bool bForce);
 
 	FTSTicker::FDelegateHandle TickHandle;
 

@@ -594,6 +594,118 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Live state stream for every portal-exposed control (v1.0.80).**
+> User asked: *"all the controls we expose to our portal, can these live stream their state, so
+> all the fixture settings are streamed so everything is always in sync"*. Yes. v1.0.80
+> introduces a full read-back surface so the portal always agrees with UE -- including across
+> multiple simultaneously-connected portal clients (operator + producer + tablet at FOH).
+>
+> **Why this was needed.** Pre-v1.0.80 the data channel was write-mostly: portal -> UE
+> `SetFixture*` / `SetScene*` / `SelectFixtures` worked, but UE -> portal echoes only
+> happened at three moments: (a) `Ready` + `FixtureRegistered` on initial handshake, (b)
+> `SceneState` on explicit `RequestSceneState`, (c) the per-fixture selection re-apply at
+> handshake. So:
+>
+> - Two portal clients controlling the same UE drifted apart -- client B never saw client
+>   A's dimmer change.
+> - Reconnecting was a tabula rasa for the live values: the portal had to remember its last
+>   send and hope UE had nothing else going on.
+> - Long fades (e.g. `SetFixtureDimmer 0.5 fade=3s`) were invisible to the portal until the
+>   operator pinged something else.
+>
+> **What's added.** Three live read-back streams + two pull descriptors:
+>
+> - **`FixtureStates`** (UE -> portal, batched). Periodic ~10Hz with per-field per-fixture
+>   dead-zone gating. Carries every live-faded value the portal can set (dimmer / pan / tilt /
+>   zoom / iris / frost / focus / RGB / colour temp / shutter mode + rate / gobo index / gobo
+>   wheel / gobo rotation speed / animation-wheel speed / selected / primary). A static rig
+>   produces **zero traffic**. A fading rig produces one batched message every ~100ms with
+>   only the fixtures whose values actually moved.
+> - **`SelectionState`** (UE -> portal, one-shot). Pushed any time `SelectFixtures` lands so
+>   every other portal client sees the operator's selection immediately, and on every
+>   reconnect so a late-joining portal paints the right highlight.
+> - **`SceneState`** (UE -> portal, already existed). Now also auto-pushed after every
+>   inbound `SetScene*` descriptor, so multi-client portals stay in sync on environment
+>   settings (volumetric fog, ground material, render quality, drive-orbit toggle, etc.)
+>   without anyone having to call `RequestSceneState`.
+> - **`RequestFixtureStates`** (portal -> UE). One-shot full broadcast of every spawned
+>   fixture (`full: true`). Use when the portal just opened and wants a snapshot before the
+>   first delta arrives, or as a "resync" button.
+> - **`RequestSelectionState`** (portal -> UE). One-shot selection push.
+>
+> **Message shapes.**
+>
+> ```jsonc
+> // UE -> portal, periodic. full=true => every spawned fixture is in this batch (handshake or
+> // explicit RequestFixtureStates); full=false => delta only, absent ids are unchanged.
+> { "type": "FixtureStates",
+>   "full": false,
+>   "fixtures": [
+>     { "id": "abc",
+>       "dimmer":  0.5,         // 0..1 live-faded value (not target)
+>       "panDeg":  12.3,
+>       "tiltDeg": -45.0,
+>       "zoomDeg": 15.2,        // half-angle deg, matches SetFixtureZoom + SpotLight outer cone
+>       "iris":    1.0,
+>       "frost":   0.0,
+>       "focus":   0.5,
+>       "color":   [1.0, 0.5, 0.2],     // linear RGB
+>       "ctK":     5600,                // optional -- only emitted when colour-temp mode is on
+>       "shutter": { "mode": 2, "rateHz": 5.0 },   // 0=Open 1=Closed 2=Strobe
+>       "gobo":    { "index": 3, "wheel": 0, "rotSpeed": 0.4, "animSpeed": 0.0 },
+>       "selected": true,
+>       "primary":  false }
+>   ] }
+>
+> // UE -> portal, on selection change + on reconnect.
+> { "type": "SelectionState",
+>   "ids":       ["abc", "def"],
+>   "primaryId": "abc" }
+>
+> // portal -> UE, one-shot resync requests.
+> { "type": "RequestFixtureStates" }
+> { "type": "RequestSelectionState" }
+> ```
+>
+> **Dead-zone thresholds (per-field).** Tuned so a smooth fade (~0.01/frame at 100ms tick)
+> always goes out, but rounding jitter from `FInterpEaseInOut` does not:
+>
+> ```
+> dimmer / iris / frost / focus / color.{R,G,B} / goboRotSpeed / animWheelSpeed  : 0.002
+> panDeg / tiltDeg / zoomDeg                                                     : 0.05 deg
+> shutterRateHz                                                                  : 0.01 Hz
+> colorTempK                                                                     : 1 K
+> shutterMode / goboIndex / goboWheelIndex / selected / primary                  : strict !=
+> ```
+>
+> Any one field crossing its threshold flags the whole fixture (the full struct ships
+> either way; per-field deltas wouldn't shrink the payload meaningfully). A typical
+> 50-fixture rig with one channel fading sends ~100B/tick -> ~1KB/s; the same rig fully
+> idle sends 0B/s.
+>
+> **Lifecycle hooks.**
+>
+> - Periodic tick `(1/10)s` runs once `Ready` has been sent. Each tick rebuilds the cache
+>   from `SpawnedFixtures`, prunes stale ids (so `ClearScene` -> reload doesn't leak), and
+>   diffs each live snapshot against `LastSentFixtureStates`. Forwards only the changed
+>   fixtures with `full:false`.
+> - `BroadcastHandshake()` (fires on initial `Ready` and on every viewer reconnect) now also
+>   force-pushes `FixtureStates {full:true}` + `SelectionState` after the existing
+>   `FixtureRegistered` loop so the portal can index by id before state arrives.
+> - `URebusFixtureControlSubsystem::SelectFixtures` lands -> the data-channel router calls
+>   `NotifySelectionChanged()` -> immediate `SelectionState` push + cache refresh.
+> - `URebusSceneSettingsSubsystem::HandleSceneDescriptor` returns true -> the router calls
+>   `NotifySceneSettingsChanged()` -> immediate `SceneState` push.
+> - `ClearScene` resets `LastSentFixtureStates` so the next scene's fixtures emit a fresh
+>   first-broadcast for every id (even if the id happens to collide with the previous scene).
+>
+> **What's NOT streamed.** The cinematic-camera stream from v1.0.79 (`CameraState`) is
+> already covered. The scene properties surface (`SceneState`) was already a thing; v1.0.80
+> just adds the auto-push trigger. Console-command toggles that aren't routed via
+> `SetScene*` (e.g. `Rebus.OverrideFixtureMaterials`, `Rebus.LumenFastResponse`) don't
+> stream -- those are diagnostic, not user-control. If you want any of those exposed to the
+> portal, add a `SetScene*` descriptor for them and the auto-push falls into place.
+
 > **Cinematic camera + portal-driven lens / exposure / transform stream (v1.0.79).**
 > User asked for:
 > *"We want to change the default camera to a Cinematic Camera which is controllable. We want

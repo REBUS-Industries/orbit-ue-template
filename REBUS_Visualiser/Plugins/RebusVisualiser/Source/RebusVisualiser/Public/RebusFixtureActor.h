@@ -36,6 +36,35 @@ enum class ERebusShutterMode : uint8
 };
 
 // A single scalar channel that can either snap or ease-in-out over fadeMs.
+// v1.0.80: per-fixture state snapshot used by the live `FixtureStates` data-channel stream.
+// Each subsystem tick (~10Hz) snapshots every spawned fixture into one of these, compares to
+// the per-fixture last-sent snapshot, and includes the fixture in the outbound batch only if
+// any field changed beyond a dead zone (so multi-client portals stay in sync without idle
+// fixtures producing traffic). The snapshot is intentionally flat + small so per-fixture JSON
+// serialisation is cheap; field names mirror the inbound SetFixture* descriptors so the
+// portal can hold ONE state object and use the same field names in both directions.
+struct REBUSVISUALISER_API FRebusFixtureStateSnapshot
+{
+	FString FixtureId;
+	float   Dimmer = 0.f;          // 0..1 (live faded value, not target)
+	float   PanDeg = 0.f;
+	float   TiltDeg = 0.f;
+	float   ZoomDeg = 0.f;         // half-angle deg (matches SetFixtureZoom + SpotLight outer cone)
+	float   Iris = 1.f;
+	float   Frost = 0.f;
+	float   Focus = 0.f;
+	FLinearColor Color = FLinearColor::White; // RGB (alpha unused)
+	float   ColorTempK = -1.f;     // <0 => not in colour-temp mode (untouched)
+	int32   ShutterMode = 0;       // 0=Open, 1=Closed, 2=Strobe (mirrors ERebusShutterMode)
+	float   ShutterRateHz = 0.f;
+	int32   GoboIndex = -1;        // -1 = none
+	int32   GoboWheelIndex = -1;
+	float   GoboRotSpeed = 0.f;    // -1..1 (combined wheel speed currently driving the MID)
+	float   AnimWheelSpeed = 0.f;  // -1..1 (animation-wheel input, separate from gobo wheel)
+	bool    bSelected = false;
+	bool    bPrimarySelected = false;
+};
+
 struct FRebusScalarFade
 {
 	float Current = 0.f;
@@ -183,6 +212,13 @@ public:
 	// Diagnostics: how many motion axes the rig has, and how many mesh proxies were built.
 	int32 GetMotionAxisCount() const { return Profile.MotionRig.Axes.Num(); }
 	int32 GetMeshComponentCount() const { return MeshComponents.Num(); }
+
+	// v1.0.80: read every live control value into a flat snapshot for the FixtureStates
+	// outbound stream. Reads the CURRENT (live-faded) fade values, not the target -- so the
+	// portal sees the fixture moving through the fade rather than snapping to the endpoint.
+	// Selection state is filled in by the caller (URebusVisualiserSubsystem) because that
+	// lives in URebusFixtureControlSubsystem, not on the actor.
+	FRebusFixtureStateSnapshot GetFixtureStateSnapshot() const;
 
 	// Reset the per-batch "hero beam" volumetric-shadow budget. Called by the session subsystem
 	// before each (re)spawn so the first N fixtures of every fresh scene get volumetric shadows

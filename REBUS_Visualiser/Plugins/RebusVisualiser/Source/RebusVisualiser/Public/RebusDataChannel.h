@@ -24,6 +24,7 @@ class URebusSceneSettingsSubsystem;
 class URebusVisualiserSubsystem;
 class FJsonObject;
 struct FRebusCameraState;
+struct FRebusFixtureStateSnapshot;
 
 DECLARE_DELEGATE(FRebusOnChannelReady); // fired once when the data channel first opens
 DECLARE_DELEGATE(FRebusOnViewerConnected); // fired each time a viewer's data track opens
@@ -82,6 +83,17 @@ public:
 	// preview the current viewport pose, EV, focal length, etc. Sent at ~30Hz (gated by the
 	// subsystem) but only when something actually changed beyond a dead zone.
 	void SendCameraState(const FRebusCameraState& State);
+
+	// v1.0.80: live per-fixture control stream. Batched -- one event carries N fixtures'
+	// snapshots so the portal can update its UI in one update tick without flooding the data
+	// channel. The subsystem only includes fixtures whose values changed beyond a per-field
+	// dead zone since the last broadcast (so a static rig produces zero traffic).
+	void SendFixtureStates(const TArray<FRebusFixtureStateSnapshot>& States, bool bIsFullSnapshot);
+
+	// v1.0.80: selection-set readback (mirrors what the portal can send via SelectFixtures).
+	// Pushed any time the selection changes + on every viewer reconnect so multiple portal
+	// clients always agree on what the current operator is targeting.
+	void SendSelectionState(const TArray<FString>& Ids, const FString& PrimaryId);
 
 private:
 	void HandleDescriptor(const FString& Descriptor);

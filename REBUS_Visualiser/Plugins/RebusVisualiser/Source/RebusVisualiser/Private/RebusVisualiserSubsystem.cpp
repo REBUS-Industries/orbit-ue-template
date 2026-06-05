@@ -249,6 +249,20 @@ bool URebusVisualiserSubsystem::Tick(float DeltaSeconds)
 		}
 	}
 
+	// v1.0.80: ~10Hz FixtureStates delta stream. Lower rate than the camera (one cine pawn vs
+	// potentially 100+ fixtures) and per-fixture dead-zone-gated -- a static rig produces
+	// zero traffic, an actively-fading rig produces one batched message every ~100ms with
+	// only the fixtures whose values moved.
+	if (bReadySent && Channel.IsValid())
+	{
+		FixtureStreamTimer += DeltaSeconds;
+		if (FixtureStreamTimer >= (1.f / 10.f))
+		{
+			FixtureStreamTimer = 0.f;
+			BroadcastFixtureStatesIfChanged(/*bForce*/ false);
+		}
+	}
+
 	return true; // keep ticking
 }
 
@@ -469,6 +483,10 @@ void URebusVisualiserSubsystem::ClearSpawnedFixtures()
 		Ctl->Reset();
 	}
 	bFixturesSpawned = false;
+	// v1.0.80: drop the per-fixture state-stream cache so the next scene's fixtures don't
+	// get diffed against the previous scene's last-sent values (could suppress the first
+	// state broadcast for an identical-id reload).
+	LastSentFixtureStates.Reset();
 }
 
 void URebusVisualiserSubsystem::HandleSceneDefinition(const FString& Type, const TSharedPtr<FJsonObject>& Msg)
@@ -1063,6 +1081,16 @@ void URebusVisualiserSubsystem::BroadcastHandshake()
 	// v1.0.79: push a fresh CameraState so the reconnecting viewer's portal UI paints the
 	// current pose + lens immediately instead of waiting for the first dead-zone delta.
 	BroadcastCameraStateIfChanged(/*bForce*/ true);
+
+	// v1.0.80: same for the live fixture stream + selection. Forces a FULL snapshot (every
+	// spawned fixture, full=true) and a SelectionState push so a late/reconnecting portal
+	// paints the live rig immediately. Sent AFTER the per-fixture SendFixtureRegistered
+	// loop above so the portal can index by id before the state arrives.
+	BroadcastFixtureStatesIfChanged(/*bForce*/ true);
+	if (URebusFixtureControlSubsystem* Ctl = GetControl())
+	{
+		Channel->SendSelectionState(Ctl->GetCurrentSelection(), Ctl->GetPrimarySelection());
+	}
 }
 
 void URebusVisualiserSubsystem::OnViewerConnected()
@@ -1301,6 +1329,135 @@ bool URebusVisualiserSubsystem::HandleCameraDescriptor(const FString& Type, cons
 	}
 
 	return false;
+}
+
+bool URebusVisualiserSubsystem::HandleStateSyncDescriptor(const FString& Type, const TSharedPtr<FJsonObject>& Msg)
+{
+	if (Type == TEXT("RequestFixtureStates"))
+	{
+		BroadcastFixtureStatesIfChanged(/*bForce*/ true);
+		return true;
+	}
+	if (Type == TEXT("RequestSelectionState"))
+	{
+		NotifySelectionChanged();
+		return true;
+	}
+	return false;
+}
+
+void URebusVisualiserSubsystem::NotifyFixtureControlMutated()
+{
+	// The periodic tick (~10Hz) already catches fades as they progress -- this is a no-op for
+	// fade-style commands. For instantaneous changes (shutter mode, gobo index) it still
+	// arrives at most ~100ms later, which is below the perceptual threshold for "did my UI
+	// update". Left as a stub so the data channel routing layer has a forward-compat hook;
+	// if a future control type needs <100ms-latency state echo, this is where it lands.
+}
+
+void URebusVisualiserSubsystem::NotifySelectionChanged()
+{
+	if (!Channel.IsValid()) return;
+	if (URebusFixtureControlSubsystem* Ctl = GetControl())
+	{
+		Channel->SendSelectionState(Ctl->GetCurrentSelection(), Ctl->GetPrimarySelection());
+		// Selection is also a per-fixture state field; refresh the per-fixture cache so the
+		// next periodic fixture-state tick doesn't push stale selected/primary flags.
+		BroadcastFixtureStatesIfChanged(/*bForce*/ true);
+	}
+}
+
+void URebusVisualiserSubsystem::NotifySceneSettingsChanged()
+{
+	if (!Channel.IsValid()) return;
+	if (URebusSceneSettingsSubsystem* Sce = GetSceneSettings())
+	{
+		Channel->SendSceneState(Sce->GetSceneState());
+	}
+}
+
+void URebusVisualiserSubsystem::BroadcastFixtureStatesIfChanged(bool bForce)
+{
+	if (!Channel.IsValid()) return;
+	URebusFixtureControlSubsystem* Ctl = GetControl();
+	if (!Ctl) return;
+
+	const TArray<FString>& SelectedIds = Ctl->GetCurrentSelection();
+	const FString& PrimaryId = Ctl->GetPrimarySelection();
+	const TSet<FString> SelectedSet(SelectedIds);
+
+	// Per-field dead zones. Tuned so a smooth fade tick (~0.01/frame) goes out, but tiny
+	// numerical jitter from FInterp easing rounding does not.
+	auto Approx = [](float A, float B, float Tol) { return FMath::Abs(A - B) <= Tol; };
+
+	TArray<FRebusFixtureStateSnapshot> Batch;
+	Batch.Reserve(SpawnedFixtures.Num());
+
+	// Cull stale ids from the cache (fixtures destroyed since the last broadcast). Without
+	// this the cache grows unbounded across ClearScene -> reload cycles.
+	if (LastSentFixtureStates.Num() > 0)
+	{
+		TSet<FString> LiveIds;
+		LiveIds.Reserve(SpawnedFixtures.Num());
+		for (ARebusFixtureActor* F : SpawnedFixtures) if (F) LiveIds.Add(F->GetFixtureId());
+		for (auto It = LastSentFixtureStates.CreateIterator(); It; ++It)
+		{
+			if (!LiveIds.Contains(It.Key())) It.RemoveCurrent();
+		}
+	}
+
+	for (ARebusFixtureActor* F : SpawnedFixtures)
+	{
+		if (!F) continue;
+		FRebusFixtureStateSnapshot S = F->GetFixtureStateSnapshot();
+		S.bSelected = SelectedSet.Contains(S.FixtureId);
+		S.bPrimarySelected = (PrimaryId == S.FixtureId);
+
+		bool bChanged = bForce;
+		if (!bChanged)
+		{
+			const FRebusFixtureStateSnapshot* Last = LastSentFixtureStates.Find(S.FixtureId);
+			if (!Last)
+			{
+				bChanged = true; // first time seeing this fixture -- emit
+			}
+			else
+			{
+				// Single dead-zone block: any field over its threshold flags the whole
+				// fixture for re-send. The full struct ships either way, so we don't gain
+				// anything by tracking per-field changes.
+				bChanged =
+					!Approx(S.Dimmer,         Last->Dimmer,         0.002f) ||
+					!Approx(S.PanDeg,         Last->PanDeg,         0.05f)  ||
+					!Approx(S.TiltDeg,        Last->TiltDeg,        0.05f)  ||
+					!Approx(S.ZoomDeg,        Last->ZoomDeg,        0.05f)  ||
+					!Approx(S.Iris,           Last->Iris,           0.002f) ||
+					!Approx(S.Frost,          Last->Frost,          0.002f) ||
+					!Approx(S.Focus,          Last->Focus,          0.002f) ||
+					!Approx(S.Color.R,        Last->Color.R,        0.002f) ||
+					!Approx(S.Color.G,        Last->Color.G,        0.002f) ||
+					!Approx(S.Color.B,        Last->Color.B,        0.002f) ||
+					!Approx(S.ColorTempK,     Last->ColorTempK,     1.f)    ||
+					!Approx(S.ShutterRateHz,  Last->ShutterRateHz,  0.01f)  ||
+					!Approx(S.GoboRotSpeed,   Last->GoboRotSpeed,   0.002f) ||
+					!Approx(S.AnimWheelSpeed, Last->AnimWheelSpeed, 0.002f) ||
+					S.ShutterMode    != Last->ShutterMode    ||
+					S.GoboIndex      != Last->GoboIndex      ||
+					S.GoboWheelIndex != Last->GoboWheelIndex ||
+					S.bSelected      != Last->bSelected      ||
+					S.bPrimarySelected != Last->bPrimarySelected;
+			}
+		}
+
+		if (bChanged)
+		{
+			Batch.Add(S);
+			LastSentFixtureStates.Add(S.FixtureId, S);
+		}
+	}
+
+	if (Batch.Num() == 0) return;
+	Channel->SendFixtureStates(Batch, /*bIsFullSnapshot*/ bForce);
 }
 
 void URebusVisualiserSubsystem::BroadcastCameraStateIfChanged(bool bForce)

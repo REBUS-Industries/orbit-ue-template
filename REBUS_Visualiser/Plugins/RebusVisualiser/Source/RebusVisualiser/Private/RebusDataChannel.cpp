@@ -4,6 +4,7 @@
 #include "RebusSceneSettingsSubsystem.h"
 #include "RebusVisualiserSubsystem.h"
 #include "RebusCineCameraPawn.h"
+#include "RebusFixtureActor.h"
 #include "RebusJson.h"
 #include "RebusVisualiserLog.h"
 
@@ -215,6 +216,22 @@ void FRebusDataChannel::HandleDescriptor(const FString& Descriptor)
 	{
 		if (Ctl->HandleControlDescriptor(Type, Msg))
 		{
+			// v1.0.80: schedule outbound live-state echo so multi-client portals stay in
+			// sync. SetFixture* mutations feed the periodic FixtureStates stream (the
+			// notify is a forward-compat hook; the periodic tick already catches the
+			// fade in <=100ms). SelectFixtures pushes SelectionState immediately because
+			// selection is one-shot (not faded).
+			if (URebusVisualiserSubsystem* Viz = Visualiser.Get())
+			{
+				if (Type.StartsWith(TEXT("SetFixture")))
+				{
+					Viz->NotifyFixtureControlMutated();
+				}
+				else if (Type == TEXT("SelectFixtures"))
+				{
+					Viz->NotifySelectionChanged();
+				}
+			}
 			return;
 		}
 	}
@@ -224,6 +241,13 @@ void FRebusDataChannel::HandleDescriptor(const FString& Descriptor)
 	{
 		if (Sce->HandleSceneDescriptor(Type, Msg))
 		{
+			// v1.0.80: push the full scene state so the OTHER connected portals see the
+			// change. SceneState is small and changes infrequently, so we send the whole
+			// snapshot every time rather than delta-diffing.
+			if (URebusVisualiserSubsystem* Viz = Visualiser.Get())
+			{
+				Viz->NotifySceneSettingsChanged();
+			}
 			return;
 		}
 	}
@@ -234,6 +258,13 @@ void FRebusDataChannel::HandleDescriptor(const FString& Descriptor)
 	if (URebusVisualiserSubsystem* Viz = Visualiser.Get())
 	{
 		if (Viz->HandleCameraDescriptor(Type, Msg))
+		{
+			return;
+		}
+		// v1.0.80: live-state pull descriptors (RequestFixtureStates / RequestSelectionState).
+		// Kept separate from the camera path so a future split into a dedicated handler is
+		// a one-line move.
+		if (Viz->HandleStateSyncDescriptor(Type, Msg))
 		{
 			return;
 		}
@@ -473,6 +504,81 @@ void FRebusDataChannel::SendPong(double Ts)
 	E->SetNumberField(TEXT("ts"), Ts);
 	E->SetNumberField(TEXT("ueClockMs"), FPlatformTime::Seconds() * 1000.0);
 	UE_LOG(LogRebusVisualiser, Log, TEXT("Sending Pong (ts=%.0f)."), Ts);
+	SendEvent(E);
+}
+
+void FRebusDataChannel::SendFixtureStates(const TArray<FRebusFixtureStateSnapshot>& States, bool bIsFullSnapshot)
+{
+	if (States.Num() == 0) return; // batcher is responsible for dropping empty deltas
+
+	// Schema: { type:"FixtureStates", full:bool, fixtures:[ { id, dimmer, pan, tilt, zoom,
+	//   iris, frost, focus, color:[r,g,b], ctK?, shutter:{mode,rateHz}, gobo:{index,wheel,
+	//   rotSpeed,animSpeed}, selected, primary } ] }
+	// `full` is true when this is a fresh handshake / RequestFixtureStates response (every
+	// known fixture is in the array); false for the periodic delta stream (only changed
+	// fixtures are in the array). The portal uses `full` to decide whether absent ids should
+	// be cleared (full=true: clear what's missing) or left alone (full=false: it's a delta).
+	TSharedRef<FJsonObject> E = MakeShared<FJsonObject>();
+	E->SetStringField(TEXT("type"), TEXT("FixtureStates"));
+	E->SetBoolField(TEXT("full"), bIsFullSnapshot);
+
+	TArray<TSharedPtr<FJsonValue>> Arr;
+	Arr.Reserve(States.Num());
+	for (const FRebusFixtureStateSnapshot& S : States)
+	{
+		TSharedRef<FJsonObject> F = MakeShared<FJsonObject>();
+		F->SetStringField(TEXT("id"),       S.FixtureId);
+		F->SetNumberField(TEXT("dimmer"),   S.Dimmer);
+		F->SetNumberField(TEXT("panDeg"),   S.PanDeg);
+		F->SetNumberField(TEXT("tiltDeg"),  S.TiltDeg);
+		F->SetNumberField(TEXT("zoomDeg"),  S.ZoomDeg);
+		F->SetNumberField(TEXT("iris"),     S.Iris);
+		F->SetNumberField(TEXT("frost"),    S.Frost);
+		F->SetNumberField(TEXT("focus"),    S.Focus);
+
+		TArray<TSharedPtr<FJsonValue>> ColorArr;
+		ColorArr.Add(MakeShared<FJsonValueNumber>(S.Color.R));
+		ColorArr.Add(MakeShared<FJsonValueNumber>(S.Color.G));
+		ColorArr.Add(MakeShared<FJsonValueNumber>(S.Color.B));
+		F->SetArrayField(TEXT("color"), ColorArr);
+
+		// Only emit colour-temp when it's active (>=0). Saves a few bytes per fixture per
+		// tick AND signals "I'm in RGB mode, ignore my colour-temp slider".
+		if (S.ColorTempK >= 0.f)
+		{
+			F->SetNumberField(TEXT("ctK"), S.ColorTempK);
+		}
+
+		TSharedRef<FJsonObject> Shutter = MakeShared<FJsonObject>();
+		Shutter->SetNumberField(TEXT("mode"),   S.ShutterMode);
+		Shutter->SetNumberField(TEXT("rateHz"), S.ShutterRateHz);
+		F->SetObjectField(TEXT("shutter"), Shutter);
+
+		TSharedRef<FJsonObject> Gobo = MakeShared<FJsonObject>();
+		Gobo->SetNumberField(TEXT("index"),     S.GoboIndex);
+		Gobo->SetNumberField(TEXT("wheel"),     S.GoboWheelIndex);
+		Gobo->SetNumberField(TEXT("rotSpeed"),  S.GoboRotSpeed);
+		Gobo->SetNumberField(TEXT("animSpeed"), S.AnimWheelSpeed);
+		F->SetObjectField(TEXT("gobo"), Gobo);
+
+		F->SetBoolField(TEXT("selected"), S.bSelected);
+		F->SetBoolField(TEXT("primary"),  S.bPrimarySelected);
+
+		Arr.Add(MakeShared<FJsonValueObject>(F));
+	}
+	E->SetArrayField(TEXT("fixtures"), Arr);
+	SendEvent(E);
+}
+
+void FRebusDataChannel::SendSelectionState(const TArray<FString>& Ids, const FString& PrimaryId)
+{
+	TSharedRef<FJsonObject> E = MakeShared<FJsonObject>();
+	E->SetStringField(TEXT("type"), TEXT("SelectionState"));
+	TArray<TSharedPtr<FJsonValue>> IdArr;
+	IdArr.Reserve(Ids.Num());
+	for (const FString& Id : Ids) IdArr.Add(MakeShared<FJsonValueString>(Id));
+	E->SetArrayField(TEXT("ids"), IdArr);
+	E->SetStringField(TEXT("primaryId"), PrimaryId);
 	SendEvent(E);
 }
 

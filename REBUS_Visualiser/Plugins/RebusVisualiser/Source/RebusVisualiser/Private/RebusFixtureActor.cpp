@@ -3512,6 +3512,41 @@ void ARebusFixtureActor::SetSelected(bool bSelected, bool bPrimary)
 	}
 }
 
+// ---- v1.0.80 live state snapshot for the FixtureStates outbound stream ----------------
+
+FRebusFixtureStateSnapshot ARebusFixtureActor::GetFixtureStateSnapshot() const
+{
+	FRebusFixtureStateSnapshot S;
+	S.FixtureId      = FixtureId;
+	// Read the LIVE faded values (.Current), not the .Target -- the portal then sees the
+	// dimmer / pan / tilt / zoom / iris / frost / focus / colour MOVING through the fade
+	// rather than snapping to the endpoint.
+	S.Dimmer         = Dimmer.Current;
+	S.PanDeg         = PanDeg.Current;
+	S.TiltDeg        = TiltDeg.Current;
+	S.ZoomDeg        = ZoomDeg.Current;
+	S.Iris           = Iris.Current;
+	S.Frost          = Frost.Current;
+	S.Focus          = Focus.Current;
+	S.Color          = FLinearColor(ColorR.Current, ColorG.Current, ColorB.Current, 1.f);
+	// SpotLight->Temperature is only meaningful when bUseTemperature is true; otherwise we
+	// report -1 so the portal knows the colour-temp slider is currently inactive.
+	if (SpotLight && SpotLight->bUseTemperature)
+	{
+		S.ColorTempK = SpotLight->Temperature;
+	}
+	S.ShutterMode    = static_cast<int32>(ShutterMode);
+	S.ShutterRateHz  = ShutterRateHz;
+	S.GoboIndex      = CurrentGoboIndex;
+	S.GoboWheelIndex = CurrentGoboWheelIndex;
+	// CurrentGoboRotationSpeed already folds the gobo + animation wheel inputs the way Epic's
+	// reference materials do (single rotation param); AnimWheelSpeed is the standalone
+	// animation-wheel input so the portal can show both sliders rather than one combined.
+	S.GoboRotSpeed   = CurrentGoboRotationSpeed;
+	S.AnimWheelSpeed = CurrentAnimationWheelSpeed;
+	return S;
+}
+
 // ---- Tick (fades + strobe + gobo spin) ------------------------------------------------
 
 void ARebusFixtureActor::Tick(float DeltaSeconds)
