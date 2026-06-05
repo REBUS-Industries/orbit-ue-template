@@ -593,6 +593,81 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Gobo resolution 512 -> 1024 + mipmaps + DLSS scaffolding (v1.0.75).** User asked
+> *"can we increase the resolution of the gobos, they look pixelated. Can we enable NVIDIA
+> DLSS"*. Two unrelated requests, both addressed here.
+>
+> **Gobo resolution.** Pre-v1.0.75 the per-fixture `GoboRT` was hard-coded **512x512**, with
+> no mipmaps and the default sampler filter. At a typical 60-degree stage throw at 8m, 512
+> across the cookie gives ~3 cm/texel on the floor -- that's the pixelation. We now:
+>
+> - Default to **1024x1024** (4x area). Cost is ~6 MiB / fixture (RGBA8 + mip chain) and
+>   the canvas redraw is bandwidth-bound rather than fill-bound at this size, so no
+>   measurable per-frame cost on a 4080-class GPU.
+> - Enable **`bAutoGenerateMips = true`** and **`Filter = TF_Trilinear`** on the canvas RT
+>   so the LF sampler picks the right LOD by screen footprint. Pre-v1.0.75, a 1024 RT
+>   projected onto a tiny floor patch aliased hard (every other texel skipped); mip-LOD
+>   picks a 256 or 128 sample for tiny footprints and the small-on-screen lights stay
+>   crisp.
+> - New console knob `Rebus.GoboRTSize <pixels>` rebuilds every fixture's RT at a new
+>   square pow2 size (clamped to `[128, 8192]`). Useful presets:
+>
+>   | Size  | VRAM / fixture | When                                                  |
+>   |-------|---------------:|-------------------------------------------------------|
+>   | 512   | ~1.5 MiB       | pre-v1.0.75 default; lowest cost, alias on close throws |
+>   | 1024  | ~6 MiB         | v1.0.75 default; crisp at typical throws              |
+>   | 2048  | ~25 MiB        | hero shows; virtually no aliasing even up close       |
+>   | 4096  | ~100 MiB       | max useful; mip-pyramid bandwidth becomes noticeable  |
+>
+> - `Rebus.DumpGoboState` now reports the RT size + mip + filter state too, so the resize
+>   is provable from one log line.
+>
+> Per-actor API: `ARebusFixtureActor::RebuildGoboRTAtSize(int32 RequestedSizePixels)`
+> returns the resolved pow2 size. Caller is responsible for re-pushing the RT into the
+> cookie + cone MIDs (the function tail-calls `ApplyCurrentGoboToEpicBeam` which does
+> exactly that).
+>
+> **NVIDIA DLSS scaffolding.** The DLSS plugin is **not bundled** with this project (the
+> .uproject has no DLSS entry, and `Plugins/` has no `DLSS*`/`NGX*` directory). v1.0.75
+> adds the runtime plumbing so DLSS works the moment the plugin is dropped in:
+>
+> 1. Download the **NVIDIA DLSS Unreal plugin** from
+>    https://developer.nvidia.com/rtx/dlss/get-started (or the UE Marketplace "DLSS"
+>    listing).
+> 2. Extract to `REBUS_Visualiser/Plugins/DLSS/`.
+> 3. Add `{ "Name": "DLSS", "Enabled": true }` to the `Plugins` array in
+>    `REBUS_Visualiser/REBUS_Visualiser.uproject`.
+> 4. Restart UE.
+> 5. From the portal console (or in-editor): `Rebus.DLSS quality`.
+>
+> The new console command `Rebus.DLSS [off|quality|balanced|performance|ultraperformance|dlaa]`
+> detects the plugin by probing `r.NGX.DLSS.Enable` / `r.NGX.DLAA.Enable` -- if the CVar
+> isn't registered, the plugin isn't loaded and the command logs the install instructions
+> instead of failing silently. When present, the preset maps to `r.NGX.DLSS.Quality`:
+>
+> | Preset             | Internal scale | r.NGX.DLSS.Quality |
+> |--------------------|---------------:|-------------------:|
+> | `off`              | n/a            | DLSS disabled, TSR fallback |
+> | `quality`          | 67%            | 2 (default if no arg)       |
+> | `balanced`         | 58%            | 1                           |
+> | `performance`      | 50%            | 0                           |
+> | `ultraperformance` | 33%            | 3 (4K+ output only)         |
+> | `dlaa`             | 100% (no upscale) | DLAA enabled instead     |
+>
+> Requires NVIDIA RTX hardware (RTX 20-series or newer).
+>
+> **DLSS + rotating gobo: the trade-off.** DLSS uses temporal accumulation (same family as
+> TSR), so the rotating-gobo ghost-trail symptom v1.0.73/74 fixed for TSR can re-appear
+> under DLSS. The `Rebus.GoboAntiGhost` CVars stay on -- they're TSR-specific and don't
+> touch DLSS's internal accumulator. Practical mitigations:
+>
+> - **`Rebus.DLSS dlaa`** -- deep-learning AA at native resolution. No upscale = less
+>   accumulation pressure. Closest DLSS preset to a "clean rotating gobo".
+> - **`Rebus.DLSS off`** -- fall back to TSR. The `r.TSR.*` knobs in GoboAntiGhost apply
+>   again and the v1.0.74 tuning takes effect.
+> - **Per-show**: run gobo-light shows on TSR; switch to DLSS-quality for static / less
+>   gobo-heavy scenes where the perf headroom matters more.
+
 > **Rotating-gobo ghosting fix v2 -- TSR history weight + LightFunctionAtlas + explicit RT clear (v1.0.74).**
 > User reported v1.0.73's TSR flicker-rejection push *"doesn't change the issue, we are seeing
 > the gobo ghosting on the floor as it spins"*. That fix was correct (TSR's flicker rejection

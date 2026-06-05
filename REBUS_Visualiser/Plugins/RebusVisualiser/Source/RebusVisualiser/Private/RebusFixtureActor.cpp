@@ -309,14 +309,18 @@ void ARebusFixtureActor::DumpGoboStateForDebug() const
 	//   * LightFunctionMaterial: must be GoboLightFnMID, not nullptr -- nullptr means the LF
 	//     never bound and the floor wouldn't see any pattern, ghosting or otherwise
 	const float CombinedSpin = CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed;
+	const int32 SrcW = CurrentGoboTexture ? CurrentGoboTexture->GetSizeX() : 0;
+	const int32 SrcH = CurrentGoboTexture ? CurrentGoboTexture->GetSizeY() : 0;
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("DumpGoboState '%s': bGoboActive=%d srcTex=%s GoboRT=%p (%dx%d clearOnUpdate=%d) GoboAngle=%.1fdeg goboSpd=%.3f animSpd=%.3f combined=%.3f -- SpotLight: allowMega=%d LightFn=%s LensFn-MID=%p EpicBeamMID=%p"),
+		TEXT("DumpGoboState '%s': bGoboActive=%d srcTex=%s(%dx%d) GoboRT=%p (%dx%d clearOnUpdate=%d mips=%d filter=%d) GoboAngle=%.1fdeg goboSpd=%.3f animSpd=%.3f combined=%.3f -- SpotLight: allowMega=%d LightFn=%s LensFn-MID=%p EpicBeamMID=%p"),
 		*FixtureId,
 		bGoboActive ? 1 : 0,
-		CurrentGoboTexture ? *CurrentGoboTexture->GetName() : TEXT("<null>"),
+		CurrentGoboTexture ? *CurrentGoboTexture->GetName() : TEXT("<null>"), SrcW, SrcH,
 		GoboRT.Get(),
 		GoboRT ? GoboRT->SizeX : 0, GoboRT ? GoboRT->SizeY : 0,
 		GoboRT ? (GoboRT->bShouldClearRenderTargetOnReceiveUpdate ? 1 : 0) : -1,
+		GoboRT ? (GoboRT->bAutoGenerateMips ? 1 : 0) : -1,
+		GoboRT ? (int32)GoboRT->Filter : -1,
 		GoboAngle,
 		CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed, CombinedSpin,
 		SpotLight ? (SpotLight->bAllowMegaLights ? 1 : 0) : -1,
@@ -2776,21 +2780,39 @@ bool ARebusFixtureActor::ApplyGoboTextureFromBytes(const TArray<uint8>& Bytes)
 	return true;
 }
 
+// v1.0.75: configurable per-actor gobo RT resolution.
+//   * Pre-v1.0.75 default was 512 (a balance for cost vs. cookie clarity). User reported the
+//     projected pattern looks pixelated -- expected, because 512 across a typical 60-degree
+//     stage throw at 8m gives ~3cm/texel on the floor. Bumping the default to 1024 (4x area)
+//     halves the texel footprint and the cookie reads crisp at typical throws with no
+//     measurable perf impact (canvas redraw of 8 textured quads is bandwidth-bound, not fill-
+//     bound, at this size). Hero shows can push to 2048/4096 via Rebus.GoboRTSize.
+//   * Mipmaps NOT generated pre-v1.0.75 -- so distant footprints aliased hard. We now enable
+//     bAutoGenerateMips + TF_Trilinear so the LF sampler picks the right LOD by screen
+//     footprint and the small-on-screen lights stay clean.
+namespace
+{
+	constexpr int32 GRebusGoboRTDefaultSize = 1024;
+	constexpr int32 GRebusGoboRTMinSize = 128;
+	constexpr int32 GRebusGoboRTMaxSize = 8192;
+
+	int32 ClampAndPow2(int32 N)
+	{
+		N = FMath::Clamp(N, GRebusGoboRTMinSize, GRebusGoboRTMaxSize);
+		int32 Pow2 = 1; while (Pow2 < N) Pow2 <<= 1; return Pow2;
+	}
+}
+
 void ARebusFixtureActor::EnsureGoboRT()
 {
 	// v1.0.53: lazy per-fixture RT used to redraw the source gobo texture rotated by GoboAngle.
-	// 512x512 is a balance: large enough to look crisp through Epic's MF_DMXGobo sampling, small
-	// enough to UpdateResource each tick without measurable cost. ClearColor = transparent so a
-	// rotated quad doesn't smear into the previous frame (UCanvasRenderTarget2D::UpdateResource
-	// clears to ClearColor BEFORE firing OnCanvasRenderTargetUpdate when
-	// bShouldClearRenderTargetOnReceiveUpdate is true, which is the default). Bind our UFUNCTION
-	// to the OnCanvasRenderTargetUpdate dynamic delegate; UE marshals the canvas-draw to the
-	// render thread internally, so the bound function runs on the game thread with a UCanvas
-	// proxy and writes are safe. Immediately UpdateResource() once so the first material param
-	// push (in the caller) doesn't bind a blank RT.
+	// v1.0.75: default size bumped from 512 -> 1024 + auto-mips + trilinear filter (see the
+	// namespace comment above for the cost/quality reasoning). The 1024 default lives in
+	// GRebusGoboRTDefaultSize; per-fixture/per-call overrides use RebuildGoboRTAtSize.
 	if (GoboRT) return;
 
-	GoboRT = UCanvasRenderTarget2D::CreateCanvasRenderTarget2D(this, UCanvasRenderTarget2D::StaticClass(), 512, 512);
+	GoboRT = UCanvasRenderTarget2D::CreateCanvasRenderTarget2D(this, UCanvasRenderTarget2D::StaticClass(),
+		GRebusGoboRTDefaultSize, GRebusGoboRTDefaultSize);
 	if (!GoboRT)
 	{
 		UE_LOG(LogRebusVisualiser, Warning,
@@ -2807,13 +2829,79 @@ void ARebusFixtureActor::EnsureGoboRT()
 	// looking exactly like ghosting on the floor projection. Setting explicit removes that
 	// failure mode.
 	GoboRT->bShouldClearRenderTargetOnReceiveUpdate = true;
+	// v1.0.75: mipmap chain + trilinear filtering. Without these the LF sampler reads a single
+	// LOD regardless of screen footprint, so a 1024 RT projected onto a tiny floor patch alias
+	// hard (every other texel skipped). bAutoGenerateMips defers chain generation to the GPU
+	// each UpdateResource(), which is essentially free at our sizes (1k-2k); the cost is one
+	// mip-pyramid blit per redraw, negligible compared to the per-frame ApplyCurrentGobo path.
+	GoboRT->bAutoGenerateMips = true;
+	GoboRT->Filter = TF_Trilinear;
 	GoboRT->OnCanvasRenderTargetUpdate.AddDynamic(this, &ARebusFixtureActor::OnGoboRTUpdate);
 	GoboRT->UpdateResource(); // first redraw so the param push isn't blank
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s gobo RT allocated %dx%d at %p (src=%s GoboAngle=%.1fdeg)"),
-		*FixtureId, GoboRT->SizeX, GoboRT->SizeY, GoboRT.Get(),
+		TEXT("Fixture %s gobo RT allocated %dx%d (mips=%d filter=Trilinear) at %p (src=%s GoboAngle=%.1fdeg)"),
+		*FixtureId, GoboRT->SizeX, GoboRT->SizeY,
+		GoboRT->bAutoGenerateMips ? 1 : 0,
+		GoboRT.Get(),
 		CurrentGoboTexture ? *CurrentGoboTexture->GetName() : TEXT("<null>"),
 		GoboAngle);
+}
+
+int32 ARebusFixtureActor::RebuildGoboRTAtSize(int32 RequestedSizePixels)
+{
+	// v1.0.75: rebuild GoboRT at a new pow2 size. If we already have one at the requested
+	// size, no-op (still pushes through the MIDs in case a re-bind is wanted -- cheap). If
+	// not, drop the old, allocate fresh via EnsureGoboRT after nulling, then re-bind through
+	// the same ApplyCurrentGoboToEpicBeam tail-call that the normal gobo-load path uses so
+	// EpicBeamMID + GoboLightFnMID pick up the new RT pointer.
+	const int32 Size = ClampAndPow2(RequestedSizePixels);
+
+	if (GoboRT && GoboRT->SizeX == Size && GoboRT->SizeY == Size)
+	{
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Fixture %s RebuildGoboRTAtSize: already %dx%d; no-op (re-binding MIDs anyway)."),
+			*FixtureId, Size, Size);
+		ApplyCurrentGoboToEpicBeam();
+		return Size;
+	}
+
+	// Drop the old RT. UE GC will collect it; the delegate binding was on the OLD object so
+	// nothing leaks from us. (No explicit RemoveDynamic needed -- the old object dying takes
+	// the delegate entry with it.)
+	if (GoboRT)
+	{
+		GoboRT->OnCanvasRenderTargetUpdate.RemoveDynamic(this, &ARebusFixtureActor::OnGoboRTUpdate);
+		GoboRT = nullptr;
+		LastGoboRTUpdateTex = nullptr; // force a fresh draw on the new RT
+	}
+
+	// Allocate at the requested size by temporarily overriding the const-default path. We
+	// duplicate the EnsureGoboRT body here instead of parameterising it because callers of
+	// the normal path always want the default size; the override is a per-actor explicit ask.
+	GoboRT = UCanvasRenderTarget2D::CreateCanvasRenderTarget2D(this, UCanvasRenderTarget2D::StaticClass(),
+		Size, Size);
+	if (!GoboRT)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("Fixture %s RebuildGoboRTAtSize: CreateCanvasRenderTarget2D returned null at %dx%d."),
+			*FixtureId, Size, Size);
+		return 0;
+	}
+	GoboRT->ClearColor = FLinearColor::Transparent;
+	GoboRT->bShouldClearRenderTargetOnReceiveUpdate = true;
+	GoboRT->bAutoGenerateMips = true;
+	GoboRT->Filter = TF_Trilinear;
+	GoboRT->OnCanvasRenderTargetUpdate.AddDynamic(this, &ARebusFixtureActor::OnGoboRTUpdate);
+	GoboRT->UpdateResource();
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Fixture %s RebuildGoboRTAtSize: rebuilt at %dx%d (mips=1 filter=Trilinear) at %p; re-binding MIDs."),
+		*FixtureId, Size, Size, GoboRT.Get());
+
+	// Re-push the new RT pointer into the cookie + cone MIDs so the new frame's
+	// LightFunctionMaterial / DMX Gobo Disk Frosted slot points at it.
+	ApplyCurrentGoboToEpicBeam();
+	return Size;
 }
 
 void ARebusFixtureActor::OnGoboRTUpdate(UCanvas* Canvas, int32 Width, int32 Height)

@@ -335,6 +335,15 @@ public:
 	// and whether the MegaLights opt-out is in force -- all the ingredients of the v1.0.73/74
 	// anti-ghost diagnosis.
 	void DumpGoboStateForDebug() const;
+
+	// v1.0.75: rebuild the gobo render target at a new square pixel size + re-bind it on the
+	// cookie/light-function MIDs. Called by Rebus.GoboRTSize. Size is clamped to [128, 8192]
+	// and rounded up to a power of two (mipmap generation requires it for tight LOD chains).
+	// Per-actor so a future portal-side "this hero fixture wants 2048 gobos" descriptor can
+	// target a single fixture without globally bumping VRAM; the console command iterates
+	// every fixture in every Game/PIE world. Returns the resolved size in pixels (0 on no-op
+	// when the fixture isn't ready yet or has no active gobo path).
+	int32 RebuildGoboRTAtSize(int32 RequestedSizePixels);
 private:
 	void FetchAndAssignGobo(int32 GoboIndex);            // existing profile-wheel URL path
 	void FetchAndAssignGoboFromUrl(const FString& ImageUrl);

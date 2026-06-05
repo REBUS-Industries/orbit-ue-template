@@ -30,6 +30,8 @@ namespace
 	IConsoleCommand* GOverrideFixtureMaterialsCommand = nullptr;
 	IConsoleCommand* GGoboAntiGhostCommand = nullptr;
 	IConsoleCommand* GDumpGoboStateCommand = nullptr;
+	IConsoleCommand* GGoboRTSizeCommand = nullptr;
+	IConsoleCommand* GDLSSCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -174,6 +176,122 @@ namespace
 			}
 		}
 		UE_LOG(LogRebusVisualiser, Log, TEXT("Rebus.DumpGoboState: dumped %d fixture(s)."), Total);
+	}
+
+	// v1.0.75: `Rebus.GoboRTSize <pixels>` -- rebuild every fixture's gobo render target at a
+	// new square pixel size + enable mipmaps + trilinear filtering. Default since v1.0.75 is
+	// 1024 (was 512). User asked for "increase the resolution of the gobos, they look
+	// pixelated" -- this is the knob. Useful sizes:
+	//   * 512  -- old default; lowest VRAM, alias on close throws / small fixtures
+	//   * 1024 -- new default; 4x area, crisp at typical throws, ~6 MiB VRAM/fixture (RGBA8 + mips)
+	//   * 2048 -- hero shows; ~25 MiB/fixture, virtually no aliasing even up close
+	//   * 4096 -- max useful; ~100 MiB/fixture, mip-pyramid bandwidth becomes noticeable
+	// Sizes are clamped to [128, 8192] and rounded up to the next pow2 (mip-chain alignment).
+	void HandleGoboRTSizeCommand(const TArray<FString>& Args)
+	{
+		if (!GEngine) return;
+		int32 Requested = 1024;
+		if (Args.Num() > 0)
+		{
+			Requested = FCString::Atoi(*Args[0]);
+		}
+		int32 Total = 0, Resolved = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+			for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					const int32 R = F->RebuildGoboRTAtSize(Requested);
+					if (R > 0) { Resolved = R; ++Total; }
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.GoboRTSize %d -> resolved=%d (pow2 clamp [128, 8192]); rebuilt %d fixture(s)."),
+			Requested, Resolved, Total);
+	}
+
+	// v1.0.75: `Rebus.DLSS [off|quality|balanced|performance|ultraperformance|dlaa]` -- enable
+	// the NVIDIA DLSS upscaler if the DLSS Streamline plugin is installed in this project.
+	// Detection is by CVar presence (r.NGX.DLSS.Enable) -- if the plugin's module isn't
+	// loaded, the CVar isn't registered and we log a friendly "DLSS plugin not installed"
+	// note with install instructions. When present, the requested quality preset maps to
+	// r.NGX.DLSS.Quality:
+	//   off              -- r.NGX.DLSS.Enable 0 (falls back to TSR)
+	//   quality          -- 2  (67% internal render scale; visually closest to native)
+	//   balanced         -- 1  (58% scale)
+	//   performance      -- 0  (50% scale)
+	//   ultraperformance -- 3  (33% scale; aggressive, prefer for 4K+ output only)
+	//   dlaa             -- enables DLAA (Deep Learning AA at native resolution, no upscaling)
+	//                       via r.NGX.DLAA.Enable=1 instead of r.NGX.DLSS.Enable.
+	// WARNING: DLSS uses temporal accumulation (same family as TSR), so the rotating-gobo
+	// ghost-trail symptom v1.0.73/74 fixed for TSR can re-appear under DLSS. The GoboAntiGhost
+	// pack stays on, but its r.TSR.* CVars don't affect DLSS's internal accumulator. If gobo
+	// ghosting returns under DLSS, the practical mitigation is to drop DLAA (no upscale, less
+	// accumulation) or fall back to TSR for gobo-heavy scenes.
+	void HandleDLSSCommand(const TArray<FString>& Args)
+	{
+		const FString Preset = (Args.Num() > 0) ? Args[0].ToLower() : FString(TEXT("quality"));
+
+		IConsoleVariable* DLSSEnable    = IConsoleManager::Get().FindConsoleVariable(TEXT("r.NGX.DLSS.Enable"));
+		IConsoleVariable* DLSSQuality   = IConsoleManager::Get().FindConsoleVariable(TEXT("r.NGX.DLSS.Quality"));
+		IConsoleVariable* DLAAEnable    = IConsoleManager::Get().FindConsoleVariable(TEXT("r.NGX.DLAA.Enable"));
+		IConsoleVariable* NGXEnable     = IConsoleManager::Get().FindConsoleVariable(TEXT("r.NGX.Enable"));
+
+		if (!DLSSEnable && !DLAAEnable)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.DLSS '%s' -- DLSS plugin not installed (r.NGX.* CVars not registered). "
+					 "To install: 1) Download the 'NVIDIA DLSS' plugin from https://developer.nvidia.com/rtx/dlss/get-started "
+					 "(or the UE Marketplace 'DLSS' listing), 2) extract to REBUS_Visualiser/Plugins/DLSS, "
+					 "3) add { \"Name\": \"DLSS\", \"Enabled\": true } to REBUS_Visualiser.uproject's Plugins array, "
+					 "4) restart UE, 5) re-run this command. Requires NVIDIA RTX hardware (RTX 20-series or newer)."),
+				*Preset);
+			return;
+		}
+
+		if (NGXEnable) NGXEnable->Set(1, ECVF_SetByGameOverride); // master gate
+
+		if (Preset == TEXT("off") || Preset == TEXT("0") || Preset == TEXT("disable"))
+		{
+			if (DLSSEnable) DLSSEnable->Set(0, ECVF_SetByGameOverride);
+			if (DLAAEnable) DLAAEnable->Set(0, ECVF_SetByGameOverride);
+			UE_LOG(LogRebusVisualiser, Log, TEXT("Rebus.DLSS off -- DLSS/DLAA disabled, falling back to engine upscaler (TSR if r.AntiAliasingMethod=4)."));
+			return;
+		}
+
+		if (Preset == TEXT("dlaa"))
+		{
+			if (DLSSEnable) DLSSEnable->Set(0, ECVF_SetByGameOverride);
+			if (DLAAEnable) DLAAEnable->Set(1, ECVF_SetByGameOverride);
+			UE_LOG(LogRebusVisualiser, Log, TEXT("Rebus.DLSS dlaa -- DLAA enabled (deep-learning AA at native resolution, no upscale)."));
+			return;
+		}
+
+		int32 QualityVal = 2; // default to "quality" mapping
+		if      (Preset == TEXT("performance")      || Preset == TEXT("perf"))   QualityVal = 0;
+		else if (Preset == TEXT("balanced")         || Preset == TEXT("bal"))    QualityVal = 1;
+		else if (Preset == TEXT("quality")          || Preset == TEXT("qual"))   QualityVal = 2;
+		else if (Preset == TEXT("ultraperformance") || Preset == TEXT("ultra")
+			  || Preset == TEXT("ultra-performance")|| Preset == TEXT("up"))     QualityVal = 3;
+		else
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.DLSS: unknown preset '%s'. Valid: off|quality|balanced|performance|ultraperformance|dlaa."),
+				*Preset);
+			return;
+		}
+
+		if (DLSSEnable)  DLSSEnable->Set(1, ECVF_SetByGameOverride);
+		if (DLAAEnable)  DLAAEnable->Set(0, ECVF_SetByGameOverride);
+		if (DLSSQuality) DLSSQuality->Set(QualityVal, ECVF_SetByGameOverride);
+
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.DLSS '%s' -- DLSS enabled (r.NGX.DLSS.Quality=%d). NOTE: DLSS uses temporal accumulation; if rotating-gobo ghosting returns try Rebus.DLSS dlaa (no upscale) or Rebus.DLSS off (TSR fallback, where the GoboAntiGhost pack applies)."),
+			*Preset, QualityVal);
 	}
 
 	// v1.0.73: `Rebus.GoboAntiGhost [0|1]` -- toggle the rotating-gobo ghosting mitigation
@@ -582,6 +700,29 @@ void FRebusVisualiserModule::StartupModule()
 			 "is bound. Any one of those failing produces the wrong symptom."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpGoboStateCommand),
 		ECVF_Default);
+
+	// v1.0.75 gobo resolution + DLSS.
+	GGoboRTSizeCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.GoboRTSize"),
+		TEXT("Rebuild every fixture's gobo render target at the requested square pixel size. "
+			 "Default since v1.0.75 is 1024 (was 512). Sizes are clamped to [128, 8192] and "
+			 "rounded up to the next pow2. Cost: ~6 MiB/fixture at 1024, ~25 MiB at 2048, "
+			 "~100 MiB at 4096 (RGBA8 + mip chain). Mipmaps and trilinear filtering are auto-"
+			 "enabled so distant footprints don't alias. Usage: Rebus.GoboRTSize <pixels>"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleGoboRTSizeCommand),
+		ECVF_Default);
+
+	GDLSSCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.DLSS"),
+		TEXT("Enable NVIDIA DLSS upscaling (requires the NVIDIA DLSS plugin installed in this "
+			 "project; if not installed the command logs install instructions). "
+			 "Presets: off|quality|balanced|performance|ultraperformance|dlaa. Default preset "
+			 "if no arg is 'quality'. 'dlaa' is no-upscale deep-learning AA. WARNING: DLSS "
+			 "uses temporal accumulation, so the rotating-gobo ghost-trail symptom can "
+			 "re-appear under DLSS -- the GoboAntiGhost CVars don't affect DLSS's internal "
+			 "accumulator. If ghosting returns, try 'dlaa' or 'off'."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDLSSCommand),
+		ECVF_Default);
 }
 
 void FRebusVisualiserModule::ShutdownModule()
@@ -625,6 +766,16 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GDumpGoboStateCommand);
 		GDumpGoboStateCommand = nullptr;
+	}
+	if (GGoboRTSizeCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GGoboRTSizeCommand);
+		GGoboRTSizeCommand = nullptr;
+	}
+	if (GDLSSCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GDLSSCommand);
+		GDLSSCommand = nullptr;
 	}
 	// v1.0.73: restore the anti-ghost CVars to their snapshotted values so a hot-reload of
 	// the module doesn't leak a permanent override into the engine session.
