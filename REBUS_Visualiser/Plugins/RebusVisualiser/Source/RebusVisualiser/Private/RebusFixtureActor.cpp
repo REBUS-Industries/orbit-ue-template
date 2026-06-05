@@ -294,6 +294,37 @@ void ARebusFixtureActor::DumpLightStateForDebug() const
 		*FixtureId, AllScene.Num());
 }
 
+void ARebusFixtureActor::DumpGoboStateForDebug() const
+{
+	// v1.0.74 per-fixture gobo dump for the Rebus.DumpGoboState console command. Surfaces the
+	// ingredients that determine whether the rotating-cookie pipeline can ghost on the floor:
+	//   * CurrentGoboTexture: source bitmap (path printed so it's grep-friendly)
+	//   * GoboRT: size + pointer + the clear-flag we re-assert in EnsureGoboRT (v1.0.74)
+	//   * GoboAngle / spin speeds: integration is in Tick(), so a non-zero CombinedSpin with
+	//     a static GoboAngle proves Tick isn't running (the gobo would look frozen, not ghosty)
+	//   * SpotLight.bAllowMegaLights: must be 0 while a gobo is active so the LF flows through
+	//     the legacy deferred path (the gobo-active branch of ApplyCurrentGoboToCookie sets
+	//     this; a 1 here proves the per-light opt-out regressed and MegaLights' temporal
+	//     denoiser is now in the path)
+	//   * LightFunctionMaterial: must be GoboLightFnMID, not nullptr -- nullptr means the LF
+	//     never bound and the floor wouldn't see any pattern, ghosting or otherwise
+	const float CombinedSpin = CurrentGoboRotationSpeed + CurrentAnimationWheelSpeed;
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("DumpGoboState '%s': bGoboActive=%d srcTex=%s GoboRT=%p (%dx%d clearOnUpdate=%d) GoboAngle=%.1fdeg goboSpd=%.3f animSpd=%.3f combined=%.3f -- SpotLight: allowMega=%d LightFn=%s LensFn-MID=%p EpicBeamMID=%p"),
+		*FixtureId,
+		bGoboActive ? 1 : 0,
+		CurrentGoboTexture ? *CurrentGoboTexture->GetName() : TEXT("<null>"),
+		GoboRT.Get(),
+		GoboRT ? GoboRT->SizeX : 0, GoboRT ? GoboRT->SizeY : 0,
+		GoboRT ? (GoboRT->bShouldClearRenderTargetOnReceiveUpdate ? 1 : 0) : -1,
+		GoboAngle,
+		CurrentGoboRotationSpeed, CurrentAnimationWheelSpeed, CombinedSpin,
+		SpotLight ? (SpotLight->bAllowMegaLights ? 1 : 0) : -1,
+		(SpotLight && SpotLight->LightFunctionMaterial) ? *SpotLight->LightFunctionMaterial->GetName() : TEXT("<null>"),
+		GoboLightFnMID.Get(),
+		EpicBeamMID.Get());
+}
+
 ARebusFixtureActor::ARebusFixtureActor()
 {
 	PrimaryActorTick.bCanEverTick = true;
@@ -2768,6 +2799,14 @@ void ARebusFixtureActor::EnsureGoboRT()
 		return;
 	}
 	GoboRT->ClearColor = FLinearColor::Transparent;
+	// v1.0.74: ASSERT the clear-before-update flag explicitly. UCanvasRenderTarget2D defaults
+	// this to true in 5.7, but a future engine default flip OR an external write (one of the
+	// editor utility callbacks does set it false on some assets) would silently turn the RT
+	// into an accumulator -- successive K2_DrawTexture calls with BLEND_Translucent on top of
+	// the unCLEARED prior frame would build up a smear of every recent gobo orientation,
+	// looking exactly like ghosting on the floor projection. Setting explicit removes that
+	// failure mode.
+	GoboRT->bShouldClearRenderTargetOnReceiveUpdate = true;
 	GoboRT->OnCanvasRenderTargetUpdate.AddDynamic(this, &ARebusFixtureActor::OnGoboRTUpdate);
 	GoboRT->UpdateResource(); // first redraw so the param push isn't blank
 	UE_LOG(LogRebusVisualiser, Log,

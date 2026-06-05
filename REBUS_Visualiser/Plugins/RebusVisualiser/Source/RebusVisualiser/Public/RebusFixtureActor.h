@@ -326,6 +326,15 @@ public:
 	// v1.0.51: dump THIS fixture's SpotLight + any sibling light components for cookie debugging.
 	// Called by the Rebus.DumpFixtureLights console command (registered in RebusVisualiser.cpp).
 	void DumpLightStateForDebug() const;
+
+	// v1.0.74: dump THIS fixture's gobo runtime state -- whether a gobo is bound, RT size +
+	// pointer, current rotation angle, combined spin rate, MegaLights opt-out flag, light-
+	// function material pointer, and last frame the RT was redrawn. Called by the new
+	// Rebus.DumpGoboState console command so the user can paste a single block and we can
+	// tell whether the RT is actually being refreshed each frame, whether the LF is bound,
+	// and whether the MegaLights opt-out is in force -- all the ingredients of the v1.0.73/74
+	// anti-ghost diagnosis.
+	void DumpGoboStateForDebug() const;
 private:
 	void FetchAndAssignGobo(int32 GoboIndex);            // existing profile-wheel URL path
 	void FetchAndAssignGoboFromUrl(const FString& ImageUrl);

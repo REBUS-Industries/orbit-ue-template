@@ -593,6 +593,71 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Rotating-gobo ghosting fix v2 -- TSR history weight + LightFunctionAtlas + explicit RT clear (v1.0.74).**
+> User reported v1.0.73's TSR flicker-rejection push *"doesn't change the issue, we are seeing
+> the gobo ghosting on the floor as it spins"*. That fix was correct (TSR's flicker rejection
+> IS necessary for animated light functions on opaque surfaces) but insufficient -- biasing
+> TSR to reject flickering pixels still leaves the underlying history weight at its default,
+> so the rejected sample blends with the prior frame and a trail still smears.
+>
+> **What v1.0.74 adds to the pack.** Two more CVars in the same `ApplyGoboAntiGhost` push,
+> applied on the same `PostEngineInit` boundary and tracked in the same snapshot/restore
+> machinery:
+>
+> ```
+> r.TSR.History.UpdateRate 0.6           // was 0.4 default -- new frames stand more on their own
+> r.LightFunctionAtlas.Enabled 0         // bypass the atlas -- no chance of a stale cached LF sample
+> ```
+>
+> `r.TSR.History.UpdateRate` is the dominant lever for "fast-moving on-screen content trails
+> behind itself". 0.4 means the new frame contributes only ~40% to the temporal accumulator
+> and prior frames contribute the rest -- great for static scenes (perfect AA from accumulated
+> sub-pixel jitter) but exactly the wrong response for a fast-rotating cookie. 0.6 keeps
+> enough history for clean static AA on truss / set / floor surfaces but cuts the visible
+> trail noticeably. Higher than 0.7 starts to introduce sub-pixel shimmer on real static
+> high-frequency detail, so 0.6 is the safer ceiling for the global default.
+>
+> `r.LightFunctionAtlas.Enabled 0` is defensive. UE 5.5+ caches LF samples into a single
+> atlas to reduce shader permutations and improve perf; great for STATIC LFs but for a
+> per-frame-changing cookie (our rotating GoboRT) any stale atlas entry reads as the gobo
+> "lagging" its true rotation. `RebusFixtureActor.cpp:3063` already notes M_Light_Master
+> isn't atlas-compatible AND the LF is forced through the legacy deferred path while a gobo
+> is active (`bAllowMegaLights=0`), but disabling the atlas globally removes any chance the
+> engine ever decides to route the LF through it for some future-version atlas-compat
+> heuristic. Cost: per-pixel LF eval for any other LF in the scene is slightly higher.
+>
+> **Explicit RT clear assertion in `EnsureGoboRT` (v1.0.74).** We now set
+> `GoboRT->bShouldClearRenderTargetOnReceiveUpdate = true` explicitly. UCanvasRenderTarget2D
+> defaults this to true in 5.7, but a future engine default flip OR an external write would
+> silently turn the RT into an accumulator -- successive `K2_DrawTexture` calls with
+> `BLEND_Translucent` on top of the uncleared prior frame would build up a smear of every
+> recent gobo orientation, looking exactly like the floor-projection ghosting the user
+> reports. Explicit-set removes that failure mode regardless of any future default change.
+>
+> **New: `Rebus.DumpGoboState` diagnostic.** Per-fixture dump of every ingredient that
+> determines whether the rotating-cookie pipeline can ghost on the floor. Prove or disprove
+> each one from a single grep:
+>
+> ```
+> DumpGoboState '54E648DF...': bGoboActive=1 srcTex=GoboRT_5 GoboRT=0x... (512x512 clearOnUpdate=1) GoboAngle=237.4deg goboSpd=0.800 animSpd=0.000 combined=0.800 -- SpotLight: allowMega=0 LightFn=GoboLightFnMID_2 LensFn-MID=0x... EpicBeamMID=0x...
+> ```
+>
+> Reading the dump: `bGoboActive=1` + non-zero `combined` + `clearOnUpdate=1` + `allowMega=0`
+> + non-null `LightFn` means the pipeline is wired correctly and any remaining ghost is in
+> the temporal AA chain (i.e. the GoboAntiGhost CVars are doing the work). If `allowMega=1`
+> ever shows up while `bGoboActive=1`, the MegaLights opt-out regressed and MegaLights'
+> temporal denoiser is in the loop -- THAT is the canonical "rotating gobo ghosts on the
+> floor" symptom and the fix is to repair the opt-out in `ApplyCurrentGoboTo*`. If
+> `clearOnUpdate=0`, the RT itself is accumulating and v1.0.74's explicit-set didn't take
+> (asset override, editor utility script, etc.).
+>
+> **Nuclear-option escalation** (not pushed by default -- prove the diagnosis first):
+> ```
+> r.AntiAliasingMethod 1         // FXAA -- zero temporal accumulation; if THIS fixes it, the issue is 100% TSR-side
+> r.MegaLights.Volume 0          // disable MegaLights volumetric path -- if THIS fixes it, the ghost is in fog scatter, not floor projection
+> r.TSR.History.UpdateRate 1.0   // no temporal blending at all -- prove TSR is the source
+> ```
+
 > **Rotating-gobo ghosting fix: TSR flicker rejection + full-res light functions (v1.0.73).**
 > User reported *"When the gobo is rotating fast we are getting ghosting. Is it a historyweight?"*.
 > Yes -- it's exactly that, and TSR's purpose-built mitigation for it has shipped since 5.3.

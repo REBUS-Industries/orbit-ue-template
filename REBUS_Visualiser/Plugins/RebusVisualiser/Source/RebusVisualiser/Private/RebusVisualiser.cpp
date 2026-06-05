@@ -29,6 +29,7 @@ namespace
 	IConsoleCommand* GShowOrbitCommand = nullptr;
 	IConsoleCommand* GOverrideFixtureMaterialsCommand = nullptr;
 	IConsoleCommand* GGoboAntiGhostCommand = nullptr;
+	IConsoleCommand* GDumpGoboStateCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -65,11 +66,37 @@ namespace
 	TArray<FCVarSnapshot> GGoboAntiGhostPrior;
 	bool GGoboAntiGhostEnabled = false; // tracks the LIVE state, not the requested state
 
-	struct FAntiGhostCVarDef { const TCHAR* Name; int32 OnValue; };
+	// CVar definitions for the anti-ghost pack. Each entry has a name and an "on" value; some
+	// are int, some are float (kept as float here so the int-snapshot path is just the int
+	// truncation of the prior float -- restore-via-Set on a float CVar accepts a stringified
+	// value with no precision drama for our 1-decimal settings). v1.0.74 expands the v1.0.73
+	// pack with three additions; see comments alongside each entry below.
+	struct FAntiGhostCVarDef { const TCHAR* Name; float OnValue; };
 	const FAntiGhostCVarDef GAntiGhostCVars[] = {
-		{ TEXT("r.TSR.ShadingRejection.Flickering"),                  1 },
-		{ TEXT("r.TSR.ShadingRejection.Flickering.AdjustToFrameRate"),1 },
-		{ TEXT("r.LightFunctionQuality"),                             2 },
+		// v1.0.73 baseline: TSR flicker-rejection mode + full-res light functions. Necessary
+		// but not sufficient -- biases TSR to reject flickering pixels, but the underlying
+		// temporal history weight is still high enough to leave a trail behind a fast cookie.
+		{ TEXT("r.TSR.ShadingRejection.Flickering"),                  1.f },
+		{ TEXT("r.TSR.ShadingRejection.Flickering.AdjustToFrameRate"),1.f },
+		{ TEXT("r.LightFunctionQuality"),                             2.f },
+		// v1.0.74 ADD: increase TSR history update rate so new frames stand more on their own
+		// (less weight to historical samples). Default in UE 5.4-5.7 is 0.4 (history weighted
+		// ~60% in the blend). 0.6 keeps enough history for clean static AA but cuts the trail
+		// length on a fast-rotating cookie noticeably. Higher than 0.7 starts to introduce
+		// sub-pixel shimmer on static high-frequency detail (truss meshes, set pieces).
+		{ TEXT("r.TSR.History.UpdateRate"),                           0.6f },
+		// v1.0.74 ADD: disable the LightFunctionAtlas global path. UE 5.5+ caches LF samples
+		// into a single atlas to reduce shader permutations and improve perf -- great for
+		// STATIC light functions, but for a dynamic per-frame-changing cookie (our rotating
+		// GoboRT) the atlas refresh path has caused stale-sample artefacts that read as the
+		// gobo "lagging" its true rotation. The comment in RebusFixtureActor.cpp:3063 notes
+		// M_Light_Master isn't atlas-compatible AND the LF is forced through the legacy
+		// deferred path when a gobo is active (bAllowMegaLights=0), but disabling the atlas
+		// globally removes any chance the engine ever decides to route the LF through it for
+		// some future-version atlas-compat heuristic. Cost: per-pixel LF eval cost for any
+		// other (non-fixture) LF in the scene is slightly higher; acceptable, we don't have
+		// other LFs in a stage scene.
+		{ TEXT("r.LightFunctionAtlas.Enabled"),                       0.f },
 	};
 
 	void ApplyGoboAntiGhost(bool bEnable, const TCHAR* Phase)
@@ -86,12 +113,15 @@ namespace
 				Snap.Name = Def.Name;
 				if (CVar)
 				{
+					// Snapshot via int (truncation is fine for restore since we only push 1
+					// fractional digit at most -- 0.6 etc. -- and the int round-trip preserves
+					// any prior int CVars exactly).
 					Snap.PriorInt = CVar->GetInt();
 					Snap.bValid = true;
-					CVar->Set(Def.OnValue, ECVF_SetByGameOverride);
+					CVar->Set(*FString::SanitizeFloat(Def.OnValue), ECVF_SetByGameOverride);
 					UE_LOG(LogRebusVisualiser, Log,
-						TEXT("GoboAntiGhost ON [%s]: %s was=%d now=%d"),
-						Phase, Def.Name, Snap.PriorInt, CVar->GetInt());
+						TEXT("GoboAntiGhost ON [%s]: %s was=%d now=%s"),
+						Phase, Def.Name, Snap.PriorInt, *CVar->GetString());
 				}
 				else
 				{
@@ -109,15 +139,41 @@ namespace
 				if (!Snap.bValid) continue;
 				IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(*Snap.Name);
 				if (!CVar) continue;
-				const int32 BeforeRestore = CVar->GetInt();
+				const FString BeforeRestore = CVar->GetString();
 				CVar->Set(Snap.PriorInt, ECVF_SetByGameOverride);
 				UE_LOG(LogRebusVisualiser, Log,
-					TEXT("GoboAntiGhost OFF [%s]: %s was=%d restored=%d"),
-					Phase, *Snap.Name, BeforeRestore, CVar->GetInt());
+					TEXT("GoboAntiGhost OFF [%s]: %s was=%s restored=%s"),
+					Phase, *Snap.Name, *BeforeRestore, *CVar->GetString());
 			}
 			GGoboAntiGhostPrior.Reset();
 		}
 		GGoboAntiGhostEnabled = bEnable;
+	}
+
+	// v1.0.74: `Rebus.DumpGoboState` -- per-fixture gobo runtime dump. Useful to confirm:
+	//   * the GoboRT exists and bShouldClearRenderTargetOnReceiveUpdate is on
+	//   * CombinedSpin matches the requested rotation speed (proves Tick is running)
+	//   * SpotLight.bAllowMegaLights is 0 while the gobo is up (proves the LF flows through
+	//     the legacy non-MegaLights path -- if 1, MegaLights' temporal denoiser is in the
+	//     loop and would cause exactly the ghost trail symptom)
+	void HandleDumpGoboStateCommand(const TArray<FString>& /*Args*/)
+	{
+		if (!GEngine) return;
+		int32 Total = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE && Ctx.WorldType != EWorldType::Editor)) continue;
+			for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+			{
+				if (const ARebusFixtureActor* F = *It)
+				{
+					F->DumpGoboStateForDebug();
+					++Total;
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log, TEXT("Rebus.DumpGoboState: dumped %d fixture(s)."), Total);
 	}
 
 	// v1.0.73: `Rebus.GoboAntiGhost [0|1]` -- toggle the rotating-gobo ghosting mitigation
@@ -500,16 +556,31 @@ void FRebusVisualiserModule::StartupModule()
 		ECVF_Default);
 
 	// v1.0.73 rotating-gobo ghosting toggle (TSR flicker rejection + full-res light functions).
+	// v1.0.74 expanded the pack with r.TSR.History.UpdateRate 0.6 + r.LightFunctionAtlas.Enabled 0.
 	GGoboAntiGhostCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Rebus.GoboAntiGhost"),
-		TEXT("Toggle the v1.0.73 rotating-gobo ghosting mitigation. ON (default since v1.0.73, "
-			 "auto-applied at PostEngineInit) pushes r.TSR.ShadingRejection.Flickering=1, "
-			 "r.TSR.ShadingRejection.Flickering.AdjustToFrameRate=1, r.LightFunctionQuality=2 "
-			 "-- TSR's purpose-built rejection mode for animated light functions on opaque "
-			 "surfaces (eliminates the trail behind a fast-rotating cookie projection). "
-			 "OFF restores each CVar to its pre-push value byte-exact (snapshot taken on first "
-			 "ON). Usage: Rebus.GoboAntiGhost [0|1]"),
+		TEXT("Toggle the rotating-gobo ghosting mitigation. ON (default since v1.0.73, expanded "
+			 "v1.0.74, auto-applied at PostEngineInit) pushes: "
+			 "r.TSR.ShadingRejection.Flickering=1, "
+			 "r.TSR.ShadingRejection.Flickering.AdjustToFrameRate=1, "
+			 "r.LightFunctionQuality=2, "
+			 "r.TSR.History.UpdateRate=0.6 (was 0.4 default -- less history weight, less trail), "
+			 "r.LightFunctionAtlas.Enabled=0 (defensive -- bypass any stale-atlas path). "
+			 "OFF restores each CVar to its pre-push value byte-exact. "
+			 "Usage: Rebus.GoboAntiGhost [0|1]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleGoboAntiGhostCommand),
+		ECVF_Default);
+
+	// v1.0.74 per-fixture gobo runtime dump.
+	GDumpGoboStateCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.DumpGoboState"),
+		TEXT("Dump every fixture's gobo runtime state (bGoboActive, RT pointer + clear flag, "
+			 "GoboAngle + spin speeds, SpotLight.bAllowMegaLights + LightFunctionMaterial) to "
+			 "LogRebusVisualiser. Use when ghosting persists -- the dump proves whether the "
+			 "RT is allocated, the clear-on-update flag is on (v1.0.74 explicit), the spin "
+			 "rate is non-zero, the SpotLight is opted OUT of MegaLights, and the LF material "
+			 "is bound. Any one of those failing produces the wrong symptom."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpGoboStateCommand),
 		ECVF_Default);
 }
 
@@ -549,6 +620,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GGoboAntiGhostCommand);
 		GGoboAntiGhostCommand = nullptr;
+	}
+	if (GDumpGoboStateCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GDumpGoboStateCommand);
+		GDumpGoboStateCommand = nullptr;
 	}
 	// v1.0.73: restore the anti-ghost CVars to their snapshotted values so a hot-reload of
 	// the module doesn't leak a permanent override into the engine session.
