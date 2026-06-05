@@ -594,6 +594,56 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Zoom wire convention fix -- `zoomDeg` is now FULL beam angle (v1.0.84).**
+> User: *"the zoom range from 23ish to 45 makes no change to the beam."*
+>
+> **Root cause.** `URebusFixtureControlSubsystem::SetFixtureZoom` was forwarding the
+> portal-supplied `zoomDeg` straight to `ARebusFixtureActor::ApplyZoom`, which interprets its
+> argument as a HALF beam angle (matching `SpotLight->OuterConeAngle` semantics). The portal --
+> like GDTF, every fixture spec sheet, and every DMX desk on earth -- treats the slider value as
+> the FULL beam angle. The on-actor clamp inside `ResolveOuterHalfDeg`:
+>
+> ```cpp
+> OuterHalf = FMath::Clamp(OuterHalf,
+>     (float)(Profile.Zoom.MinDeg * 0.5),   // profile is FULL angle from GDTF
+>     (float)(Profile.Zoom.MaxDeg * 0.5));  // half it for half-angle clamp
+> ```
+>
+> ... meant that for a fixture documented as e.g. **8 to 45 deg full** (Mac Encore Wash, Sharpy
+> Plus, Mac Aura PXL, etc.), the on-the-wire value was being silently clamped to **the 4 to
+> 22.5 deg HALF range**. Portal slider values 4..22.5 worked (but described a cone twice as wide
+> as the user expected -- 8..45 deg full, perfectly matching the profile range, just labelled
+> wrong). Portal slider values 22.5..45 all saturated at the upper clamp -- producing the user-
+> visible **"23 to 45 makes no change"**.
+>
+> **Fix.** Treat the wire field as FULL angle (the convention every other tool uses) and
+> convert at the boundary:
+>
+> 1. `URebusFixtureControlSubsystem::SetFixtureZoom(Id, ZoomFullDeg, Fade)` -- parameter
+>    renamed; body now does `ApplyZoom(ZoomFullDeg * 0.5f, Fade)`.
+> 2. `FRebusFixtureStateSnapshot::ZoomDeg` -- outbound `FixtureStates.zoomDeg` snapshot field
+>    now emits `ZoomDeg.Current * 2.f` so the portal's live-stream echo agrees with what it
+>    sent. The internal `ZoomDeg.Current` storage stays half-angle (the geometry math, IES
+>    selection, beam-cone build, and `SpotLight->OuterConeAngle` push are all simpler in
+>    half-angle and don't need to flip).
+> 3. Header comment on `SetFixtureZoom` documents the convention.
+> 4. README field doc for `FixtureStates.zoomDeg` updated.
+>
+> **What this means for the portal.**
+>
+> | Wire field                              | Pre-v1.0.84 (broken)                          | v1.0.84+ (correct)            |
+> |-----------------------------------------|-----------------------------------------------|-------------------------------|
+> | `SetFixtureZoom.zoomDeg` (inbound)      | Half-angle (silently)                         | FULL beam angle               |
+> | `FixtureStates.fixtures[].zoomDeg` (outbound) | Half-angle (silently)                   | FULL beam angle               |
+>
+> No portal-side code change is required -- portals already send and render full-angle values,
+> they were just being misinterpreted by UE. After updating to a v1.0.84 binary the slider's
+> full advertised range works on every fixture without any portal-side adjustment.
+>
+> **Compatibility note.** Any caller talking to the old binary that genuinely wanted "16 deg
+> full" was sending `zoomDeg=8` (because the binary treated that as half-angle). On v1.0.84
+> they should send `zoomDeg=16`. Same number a fixture spec sheet shows.
+
 > **Fresh approach to rotating-gobo ghosting -- per-light Lumen isolation + operator-picked AA mode (v1.0.83).**
 > User: *"Since we made the render setting changes to improve the gobo rotate ghosting, we are getting noise/flickering.
 > The ghosting isnt fixed though. can we reset these render settings and come up with a fresh approach to solve the ghosting.
@@ -803,7 +853,7 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >       "dimmer":  0.5,         // 0..1 live-faded value (not target)
 >       "panDeg":  12.3,
 >       "tiltDeg": -45.0,
->       "zoomDeg": 15.2,        // half-angle deg, matches SetFixtureZoom + SpotLight outer cone
+>       "zoomDeg": 30.4,        // FULL beam angle deg (v1.0.84 -- matches the inbound SetFixtureZoom wire field; portal renders the slider value directly)
 >       "iris":    1.0,
 >       "frost":   0.0,
 >       "focus":   0.5,

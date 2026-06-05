@@ -3558,7 +3558,12 @@ FRebusFixtureStateSnapshot ARebusFixtureActor::GetFixtureStateSnapshot() const
 	S.Dimmer         = Dimmer.Current;
 	S.PanDeg         = PanDeg.Current;
 	S.TiltDeg        = TiltDeg.Current;
-	S.ZoomDeg        = ZoomDeg.Current;
+	// v1.0.84: ZoomDeg.Current is the INTERNAL half-angle (matches SpotLight->OuterConeAngle
+	// semantics). The wire convention -- both `SetFixtureZoom`'s inbound `zoomDeg` field and
+	// this outbound `FixtureStates.zoomDeg` -- is FULL beam angle so the portal can use the
+	// same number it ships with no conversion. Multiply by 2 here mirrors the * 0.5 conversion
+	// in URebusFixtureControlSubsystem::SetFixtureZoom.
+	S.ZoomDeg        = ZoomDeg.Current * 2.f;
 	S.Iris           = Iris.Current;
 	S.Frost          = Frost.Current;
 	S.Focus          = Focus.Current;

@@ -49,7 +49,7 @@ struct REBUSVISUALISER_API FRebusFixtureStateSnapshot
 	float   Dimmer = 0.f;          // 0..1 (live faded value, not target)
 	float   PanDeg = 0.f;
 	float   TiltDeg = 0.f;
-	float   ZoomDeg = 0.f;         // half-angle deg (matches SetFixtureZoom + SpotLight outer cone)
+	float   ZoomDeg = 0.f;         // FULL beam angle deg (v1.0.84 -- matches the wire SetFixtureZoom convention; portal can render the slider value directly)
 	float   Iris = 1.f;
 	float   Frost = 0.f;
 	float   Focus = 0.f;

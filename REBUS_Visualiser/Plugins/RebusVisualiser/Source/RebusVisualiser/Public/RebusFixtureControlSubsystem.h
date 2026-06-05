@@ -30,7 +30,14 @@ public:
 	void SetFixtureDimmer(const FString& Id, float Intensity01, float FadeSeconds = 0.f);
 	void SetFixtureColor(const FString& Id, const FLinearColor& Srgb, float FadeSeconds = 0.f);
 	void SetFixturePanTilt(const FString& Id, float PanDeg, float TiltDeg, float FadeSeconds = 0.f);
-	void SetFixtureZoom(const FString& Id, float ZoomDeg, float FadeSeconds = 0.f);
+	// v1.0.84: the wire `zoomDeg` field is FULL beam angle (matches GDTF + every fixture
+	// spec sheet + every DMX desk's slider). Converted to internal half-angle inside this
+	// setter before `ApplyZoom` (which accepts half-angle to match SpotLight->OuterConeAngle).
+	// Was effectively half-angle pre-v1.0.84, which silently clamped any portal value beyond
+	// half the fixture's documented zoom range -- e.g. a fixture documented as 8 to 45 deg
+	// FULL was being clamped to a 4 to 22.5 wire range, so portal sliders above 22.5 had no
+	// visible effect. See the v1.0.84 README block for the full diagnosis.
+	void SetFixtureZoom(const FString& Id, float ZoomFullDeg, float FadeSeconds = 0.f);
 	void SetFixtureGobo(const FString& Id, int32 GoboIndex, bool bHasIndex, int32 WheelIndex = INDEX_NONE, const FString& Wheel = FString(), float FadeSeconds = 0.f);
 	void SetFixtureIris(const FString& Id, float Iris01, float FadeSeconds = 0.f);
 	void SetFixtureFocus(const FString& Id, float Focus01, float FadeSeconds = 0.f);

@@ -67,9 +67,15 @@ void URebusFixtureControlSubsystem::SetFixturePanTilt(const FString& Id, float P
 {
 	if (ARebusFixtureActor* F = FindFixture(Id)) F->ApplyPanTilt(PanDeg, TiltDeg, FadeSeconds);
 }
-void URebusFixtureControlSubsystem::SetFixtureZoom(const FString& Id, float ZoomDeg, float FadeSeconds)
+void URebusFixtureControlSubsystem::SetFixtureZoom(const FString& Id, float ZoomFullDeg, float FadeSeconds)
 {
-	if (ARebusFixtureActor* F = FindFixture(Id)) F->ApplyZoom(ZoomDeg, FadeSeconds);
+	// v1.0.84: wire value is FULL beam angle. ApplyZoom expects HALF (matches
+	// SpotLight->OuterConeAngle semantics + the per-actor clamp against
+	// Profile.Zoom.{Min,Max}Deg which the actor already divides by 2). Single division here is
+	// the boundary -- ApplyZoom's signature and all internal math stay half-angle, only the
+	// wire convention flips. Negative or zero values fall through to ApplyZoom's clamp.
+	const float ZoomHalfDeg = ZoomFullDeg * 0.5f;
+	if (ARebusFixtureActor* F = FindFixture(Id)) F->ApplyZoom(ZoomHalfDeg, FadeSeconds);
 }
 void URebusFixtureControlSubsystem::SetFixtureGobo(const FString& Id, int32 GoboIndex, bool bHasIndex, int32 WheelIndex, const FString& Wheel, float FadeSeconds)
 {
