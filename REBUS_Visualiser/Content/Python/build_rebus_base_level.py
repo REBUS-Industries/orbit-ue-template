@@ -892,22 +892,51 @@ def ensure_beam_material(force=False):
 # polished-mirror lens the first time without the "missing asset" runtime fallback path.
 
 def _build_fixture_lens_master(mat):
-    """Mirror/glass for the GDTF <Beam> lens disc (v1.0.93 -- Python-authored).
+    """Mirror/glass for the GDTF <Beam> lens disc (v1.0.93 -- Python-authored,
+    v1.0.102 -- emissive layer follows the fixture's live dimmer x colour x gobo).
 
-    Metallic=1.0, Roughness=0.0, BaseColor=white. Approximates a polished chrome lens
-    (true dielectric translucent glass is beyond the surface/lit domain; the dark fixture
-    interior absorbs the back so the metallic-mirror approximation reads visually correct
-    against the chrome accents on a moving head). Parameters live alongside the runtime
-    MID's parameter names (`Color` / `Metallic` / `Roughness`) so a future C++ push could
-    drive them on the asset MID identically to the runtime MID.
+    BaseColor / Metallic / Roughness stay as v1.0.93: Metallic=1.0, Roughness=0.0,
+    BaseColor=white -- approximates a polished chrome lens (true dielectric translucent
+    glass is beyond the surface/lit domain; the dark fixture interior absorbs the back
+    so the metallic-mirror approximation reads visually correct against the chrome
+    accents on a moving head). The PBR layer is unchanged so a fixture with dimmer=0
+    reads identical to pre-v1.0.102 -- chrome mirror, no glow.
 
-    v1.0.97: double-sided ("make every Rebus-authored Python master double-sided" -- see
-    README v1.0.97). The procedural <Beam> lens disc is a thin two-faced ring sitting at
-    the cone apex; once the camera passes inside the head shell (or the fixture is
-    physically wide enough that the lens reads from a glancing angle) the lens read as a
-    black hole because the back face was culled. Double-siding makes the chrome mirror
-    visible from inside the head, matching the v1.0.95 deliverable's intent that the lens
-    object is "always visible" in Epic-beam mode.
+    v1.0.102 -- additive EMISSIVE chain. User request (verbatim, v1.0.102):
+        "can the lens material be emiissive as well and follow the dimmer, colour and
+        gobo of the fixture its part of."
+    The lens is now ALSO emissive: a fixture at full intensity with a red colour reads
+    as a glowing red disc, and with a leaf gobo loaded the gobo silhouette is visible
+    directly on the lens face. The emissive layer is ADDITIVE on top of the existing
+    chrome PBR so dimmer=0 still reads as chrome (the emissive output is `Emissive *
+    EmissiveIntensity * GoboMix`, and `EmissiveIntensity` defaults to 0.0 so an editor
+    preview reads as chrome mirror; the live C++ MID push from
+    `ARebusFixtureActor::RefreshLensEmissive` overrides at runtime).
+    The four new parameters and their combine formula:
+        * `Emissive` (vector, default white) -- the fixture's CURRENT live colour
+          (`ColorR/G/B.Current`).
+        * `EmissiveIntensity` (scalar, default 0.0) -- live dimmer x shutter-gate x
+          `Rebus.LensEmissiveScale`. Default 0 so the asset's editor preview reads as
+          a chrome mirror with no glow.
+        * `GoboTexture` (Texture2D, default `/Engine/EngineResources/WhiteSquareTexture`
+          -- same default the v1.0.86 ground BaseColorTexture uses so an untextured MI
+          no-ops to white) -- the per-fixture cookie render-target so the lens face
+          shows the gobo pattern.
+        * `bUseGobo` (scalar, default 0.0) -- 0 = lens glows UNIFORM colour (gobo
+          sample ignored, GoboMix == 1.0), 1 = lens face is masked by the gobo sample.
+          Driven from the per-fixture `bGoboActive` flag in C++.
+    Combine formula (matches the v1.0.102 task spec):
+        GoboSample = TextureSample(GoboTexture, TexCoord0)
+        GoboMix    = Lerp(One, GoboSample.rgb, bUseGobo)
+        EmissiveOut = Emissive * EmissiveIntensity * GoboMix -> MP_EMISSIVE_COLOR
+
+    v1.0.97: double-sided ("make every Rebus-authored Python master double-sided" --
+    see README v1.0.97). The procedural <Beam> lens disc is a thin two-faced ring
+    sitting at the cone apex; once the camera passes inside the head shell (or the
+    fixture is physically wide enough that the lens reads from a glancing angle) the
+    lens read as a black hole because the back face was culled. Double-siding makes
+    the chrome mirror visible from inside the head, matching the v1.0.95 deliverable's
+    intent that the lens object is "always visible" in Epic-beam mode.
     """
     mel = unreal.MaterialEditingLibrary
 
@@ -917,6 +946,7 @@ def _build_fixture_lens_master(mat):
     # v1.0.97: see docstring + README v1.0.97.
     _set(mat, "two_sided", True)
 
+    # ---- v1.0.93 PBR chain (unchanged) ----
     color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -600, -150)
     color.set_editor_property("parameter_name", "Color")
     color.set_editor_property("default_value", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
@@ -931,6 +961,62 @@ def _build_fixture_lens_master(mat):
     rough.set_editor_property("parameter_name", "Roughness")
     rough.set_editor_property("default_value", 0.0)
     mel.connect_material_property(rough, "", unreal.MaterialProperty.MP_ROUGHNESS)
+
+    # ---- v1.0.102 EMISSIVE chain (additive on top of the chrome PBR) ----
+    # Emissive vector + EmissiveIntensity scalar carry the live dimmer x colour from
+    # `ARebusFixtureActor::RefreshLensEmissive` (the C++ MID push). Default 0 intensity
+    # so the editor preview reads as chrome mirror only.
+    emissive = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1200, 420)
+    emissive.set_editor_property("parameter_name", "Emissive")
+    emissive.set_editor_property("default_value", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
+
+    emissive_intensity = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -1200, 580)
+    emissive_intensity.set_editor_property("parameter_name", "EmissiveIntensity")
+    emissive_intensity.set_editor_property("default_value", 0.0)
+
+    # GoboTexture: per-fixture cookie render-target so the gobo silhouette shows on the
+    # lens face. Default `/Engine/EngineResources/WhiteSquareTexture` matches the v1.0.86
+    # ground BaseColorTexture pattern -- a white default sampler so an untextured MI
+    # no-ops to 1.0 and the lens glows uniform colour (matching bUseGobo=0).
+    gobo_tex = mel.create_material_expression(mat, unreal.MaterialExpressionTextureSampleParameter2D, -1200, 740)
+    gobo_tex.set_editor_property("parameter_name", "GoboTexture")
+    _white = unreal.EditorAssetLibrary.load_asset("/Engine/EngineResources/WhiteSquareTexture")
+    if _white is not None:
+        _set(gobo_tex, "texture", _white)
+    # Sample the gobo across the disc's UV0 -- both the real <Beam> procedural-mesh
+    # lens disc (`MeshComponents` built from `/meshes`) and the synthetic LensDisc
+    # (engine `/Engine/BasicShapes/Plane`) carry sensible 0..1 disc UVs, so the gobo
+    # sample lands on the lens face exactly the way the cookie projects onto the floor.
+    tc = mel.create_material_expression(mat, unreal.MaterialExpressionTextureCoordinate, -1500, 740)
+    _set(tc, "coordinate_index", 0)
+    mel.connect_material_expressions(tc, "", gobo_tex, "Coordinates")
+
+    # bUseGobo: 0 -> ignore the gobo sample (lens glows uniform colour), 1 -> mask the
+    # emissive by the gobo. Combined via Lerp(One, GoboSample, bUseGobo) so bUseGobo=0
+    # passes Emissive * EmissiveIntensity through unchanged, bUseGobo=1 multiplies by
+    # the gobo RGB. C++ drives this from `bGoboActive` -- 1.0 while a gobo is live,
+    # 0.0 when cleared to Open.
+    use_gobo = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -1200, 900)
+    use_gobo.set_editor_property("parameter_name", "bUseGobo")
+    use_gobo.set_editor_property("default_value", 0.0)
+
+    one = mel.create_material_expression(mat, unreal.MaterialExpressionConstant3Vector, -900, 740)
+    _set(one, "constant", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
+
+    gobo_mix = mel.create_material_expression(mat, unreal.MaterialExpressionLinearInterpolate, -700, 800)
+    mel.connect_material_expressions(one, "", gobo_mix, "A")
+    mel.connect_material_expressions(gobo_tex, "", gobo_mix, "B")  # default "" pin is RGB
+    mel.connect_material_expressions(use_gobo, "", gobo_mix, "Alpha")
+
+    # EmissiveOut = Emissive * EmissiveIntensity * GoboMix
+    em_x_int = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -500, 500)
+    mel.connect_material_expressions(emissive, "", em_x_int, "A")
+    mel.connect_material_expressions(emissive_intensity, "", em_x_int, "B")
+
+    em_out = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -300, 600)
+    mel.connect_material_expressions(em_x_int, "", em_out, "A")
+    mel.connect_material_expressions(gobo_mix, "", em_out, "B")
+    mel.connect_material_property(em_out, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
 
     mel.recompile_material(mat)
 
@@ -952,6 +1038,36 @@ def _fixture_lens_master_is_current(master):
             and "Roughness" in scalar_names)
 
 
+def _fixture_lens_master_has_emissive(master):
+    """v1.0.102 self-heal probe -- True when the master exposes the v1.0.102 emissive
+    parameter set (`Emissive` vector + `EmissiveIntensity` / `bUseGobo` scalars +
+    `GoboTexture` texture param). Mirrors v1.0.97's `_master_is_two_sided` /
+    v1.0.93's `_fixture_lens_master_is_current` self-heal pattern: a False here
+    promotes the non-force `ensure_fixture_lens_material` path to a force-regen so the
+    operator picks up the v1.0.102 chain on the next editor launch without manual
+    action. The C++ MID push from `ARebusFixtureActor::RefreshLensEmissive` is a
+    silent no-op against a master that lacks these params (UMaterialInstanceDynamic
+    setters skip missing parameter names) -- the probe is the only guard against the
+    "operator booted on a pre-v1.0.102 baked master, lens stays chrome" failure mode.
+    Best-effort: any reflection-API exception (engine-version rename of the texture-
+    param enumerator, etc.) yields False so the self-heal treats the master as "needs
+    regen". False-negatives are cheap (one redundant rebake on next launch);
+    false-positives would leave the operator on the OLD chrome-only master
+    indefinitely, which is the failure mode this probe exists to prevent.
+    """
+    try:
+        mel = unreal.MaterialEditingLibrary
+        vector_names = [str(n) for n in mel.get_vector_parameter_names(master)]
+        scalar_names = [str(n) for n in mel.get_scalar_parameter_names(master)]
+        texture_names = [str(n) for n in mel.get_texture_parameter_names(master)]
+    except Exception:  # noqa: BLE001
+        return False
+    return ("Emissive" in vector_names
+            and "EmissiveIntensity" in scalar_names
+            and "bUseGobo" in scalar_names
+            and "GoboTexture" in texture_names)
+
+
 def ensure_fixture_lens_material(force=False):
     """Generate the mirror/glass lens master material. Idempotent (only creates when
     missing) unless force=True (delete + regenerate, e.g. during a full build()).
@@ -965,16 +1081,27 @@ def ensure_fixture_lens_material(force=False):
     and promotes to a force-regen so the new double-sided master ships on the next
     launch. Combined via OR with the v1.0.93 contract check so EITHER upgrade triggers a
     single regen.
+
+    v1.0.102 self-heal: same path ALSO detects a pre-v1.0.102 master (missing the new
+    `Emissive` / `EmissiveIntensity` / `bUseGobo` / `GoboTexture` params) and promotes
+    to a force-regen so the new emissive chain ships on the next launch. Without this
+    probe an operator who booted on a v1.0.93-v1.0.101 baked master would silently keep
+    a chrome-only lens because the C++ MID push from `ARebusFixtureActor::
+    RefreshLensEmissive` no-ops against missing parameter names. The three probes
+    combine via OR so any one upgrade triggers a single regen (no triple-bake on a
+    project that pre-dates v1.0.93 + v1.0.97 + v1.0.102 simultaneously).
     """
     tools = unreal.AssetToolsHelpers.get_asset_tools()
 
     if not force and unreal.EditorAssetLibrary.does_asset_exist(FIXTURE_LENS_PATH):
         existing = unreal.EditorAssetLibrary.load_asset(FIXTURE_LENS_PATH)
         if existing is not None and (not _fixture_lens_master_is_current(existing)
-                                     or not _master_is_two_sided(existing)):
-            unreal.log_warning("RebusBaseLevel: pre-v1.0.97 M_RebusFixtureLens detected "
+                                     or not _master_is_two_sided(existing)
+                                     or not _fixture_lens_master_has_emissive(existing)):
+            unreal.log_warning("RebusBaseLevel: pre-v1.0.102 M_RebusFixtureLens detected "
                                "(missing Color/Metallic/Roughness parameter contract, "
-                               "or single-sided); regenerating.")
+                               "single-sided, or missing v1.0.102 Emissive/EmissiveIntensity/"
+                               "bUseGobo/GoboTexture); regenerating.")
             force = True
 
     if force and unreal.EditorAssetLibrary.does_asset_exist(FIXTURE_LENS_PATH):

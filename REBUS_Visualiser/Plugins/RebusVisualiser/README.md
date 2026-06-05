@@ -594,6 +594,215 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Lens material now also emits visible light following the fixture's live dimmer / colour / gobo (v1.0.102).**
+> User request (verbatim):
+>
+> > "can the lens material be emiissive as well and follow the dimmer, colour and gobo of the fixture its part of."
+>
+> Pre-v1.0.102 the `M_RebusFixtureLens` master (Python-baked since v1.0.93, double-
+> sided since v1.0.97, fully-reflective since v1.0.89) was a CHROME MIRROR ONLY: a
+> polished metallic-mirror lens disc applied to every real `<Beam>` `IsBeamLens
+> Components` PMC plus the synthetic `LensDisc` fallback. A fixture at full dimmer
+> with a red colour reflected the surrounding rig but the LENS ITSELF didn't glow --
+> the only "glow" was the v1.0.49 `M_RebusLensFlare` soft-halo disc co-located in
+> front of each lens, which is a separate additive plane (good for soft bloom, but
+> the lens disc's surface stayed cold-chrome regardless of dimmer).
+>
+> v1.0.102 adds an ADDITIVE emissive layer to the SAME chrome material so the lens
+> face itself glows. At Dimmer=0 the lens reads identical to pre-v1.0.102 (chrome
+> mirror, no glow); at Dimmer=1 the lens glows in the live fixture colour, modulated
+> by the gobo silhouette when a cookie is loaded. So a fixture at full intensity
+> with a red colour reads as a glowing red disc; with a leaf gobo loaded the leaf
+> silhouette is visible directly ON the lens face.
+>
+> **Material graph extension (`M_RebusFixtureLens`, Python-authored).** Four new
+> parameters added to `_build_fixture_lens_master` in
+> `REBUS_Visualiser/Content/Python/build_rebus_base_level.py`. The v1.0.93 PBR chain
+> (BaseColor / Metallic / Roughness) is preserved verbatim:
+>
+> | Parameter | Type | Default | Role |
+> | --- | --- | --- | --- |
+> | `Color` (v1.0.93) | Vector | (1,1,1,1) | BaseColor -- unchanged. |
+> | `Metallic` (v1.0.93) | Scalar | 1.0 | -- unchanged. |
+> | `Roughness` (v1.0.93) | Scalar | 0.0 | -- unchanged. |
+> | **`Emissive`** | Vector | (1,1,1,1) | The fixture's live colour (`ColorR/G/B.Current`). |
+> | **`EmissiveIntensity`** | Scalar | **0.0** | Live `Dimmer.Current` × shutter-gate × `RebusLensEmissiveBaseScale` (5.0) × `Rebus.LensEmissiveScale` (CVar, default 1.0). Default 0.0 on the master so the editor preview reads as chrome mirror with no glow -- runtime push overrides. |
+> | **`GoboTexture`** | Texture2D | `/Engine/EngineResources/WhiteSquareTexture` | Per-fixture cookie render-target (`GoboRT`, the `UCanvasRenderTarget2D` driving the cone + cookie). White default so an unbound MI no-ops to 1.0 (matches the v1.0.86 ground `BaseColorTexture` default pattern). |
+> | **`bUseGobo`** | Scalar | **0.0** | 0 = ignore gobo (lens glows uniform colour); 1 = mask lens face by the gobo sample. Driven from the per-fixture `bGoboActive` flag in C++. |
+>
+> **Combine formula** (matches the v1.0.102 task spec, expressed as material nodes):
+>
+> ```
+> GoboSample = TextureSample(GoboTexture, TexCoord0)
+> GoboMix    = Lerp(One, GoboSample.rgb, bUseGobo)   // bUseGobo=0 -> 1.0; bUseGobo=1 -> gobo
+> EmissiveOut = Emissive * EmissiveIntensity * GoboMix
+> EmissiveOut -> MP_EMISSIVE_COLOR
+> ```
+>
+> Sampled with `TextureCoordinate(index=0)` -- both the real procedural-mesh lens
+> disc (built from `/meshes` in `BuildMeshes`) and the synthetic engine `Plane`
+> carry sensible 0..1 disc UVs, so the gobo lands on the lens face just like the
+> cookie projects onto the floor pool. `two_sided = True` (v1.0.97) preserved.
+>
+> **Python self-heal** -- `_fixture_lens_master_has_emissive(master)` probe added
+> next to v1.0.93's `_fixture_lens_master_is_current` + v1.0.97's
+> `_master_is_two_sided`. It enumerates the master's vector / scalar / texture
+> parameter names (via `MaterialEditingLibrary.get_vector_parameter_names` /
+> `get_scalar_parameter_names` / `get_texture_parameter_names`) and asserts the
+> v1.0.102 quartet (`Emissive`, `EmissiveIntensity`, `bUseGobo`, `GoboTexture`) is
+> present. The non-force `ensure_fixture_lens_material()` path now ORs the three
+> probes (v1.0.93 contract + v1.0.97 two-sided + v1.0.102 emissive); ANY one
+> failing promotes the call to a force-regen and logs a Warning naming v1.0.102 so
+> the change is auditable. Operators who booted on a pre-v1.0.102 baked master
+> pick up the new chain on the next editor launch without manual action.
+>
+> **C++ push (`ARebusFixtureActor::RefreshLensEmissive`).** New helper builds the
+> live state and pushes it onto every per-fixture lens MID:
+>
+> * `Emissive` = clamped (`ColorR.Current`, `ColorG.Current`, `ColorB.Current`,
+>   0..1) -- the same live linear colour `RefreshIntensity` writes to
+>   `SpotLight->SetLightColor`.
+> * `EmissiveIntensity` = `clamp(Dimmer.Current, 0..1) * Gate(shutter) *
+>   RebusLensEmissiveBaseScale * Rebus.LensEmissiveScale`, clamped to
+>   `[0, RebusLensEmissiveIntensityCap=100]`. `RebusLensEmissiveBaseScale = 5.0`
+>   is the venue-empirical "a fixture at full dimmer reads ~5x ambient" default;
+>   `Rebus.LensEmissiveScale` is the live show-tuning CVar (see below); the cap
+>   is a guard against runaway exposure from an accidental `1e6` CVar push.
+> * `GoboTexture` = `GoboRT` (the per-fixture cookie render-target, cast
+>   `UCanvasRenderTarget2D` -> `UTexture` -- the implicit upcast through
+>   `UTextureRenderTarget2D` is legal and verified). Null when no cookie has been
+>   bound; `SetTextureParameterValue(nullptr)` is silently no-op'd.
+> * `bUseGobo` = 1.0 when (`bGoboActive` && `Rebus.LensFollowGobo != 0` &&
+>   `GoboRT` is bound), else 0.0.
+>
+> **Per-component MID wrapping (`EnsurePerLensMIDs`).** Pre-v1.0.102 every isBeam
+> mesh's slot-0 lens material pointed at the SHARED project-wide chrome master
+> (or the user's `FixtureLensMaterialOverride.uasset` if present), so live dimmer/
+> colour/gobo pushes could only address ONE lens at a time across the entire
+> scene. v1.0.102 wraps each PMC's slot-0 material in its OWN `UMaterialInstance
+> Dynamic` via `UPrimitiveComponent::CreateAndSetMaterialInstanceDynamic(0)`, and
+> caches the weak handle in a new `IsBeamLensMIDs` array (index-aligned to
+> `IsBeamLensComponents`). The synthetic `LensDisc` MID (`LensDiscMID`) was
+> already per-fixture and is re-used as-is; `RefreshLensEmissive` pushes to BOTH
+> arrays so the rare respawn race where both paths are momentarily active still
+> drives the same live state on both surfaces. Idempotent: `CreateAndSet
+> MaterialInstanceDynamic` returns the existing MID when the slot already has one.
+>
+> **Where the push hooks in.** `RefreshLensEmissive` is called from every
+> existing intensity / colour / gobo update path so the lens stays in lockstep
+> with the SpotLight without a new tick driver:
+>
+> | Existing call site | What it already did | v1.0.102 addition |
+> | --- | --- | --- |
+> | `RefreshIntensity` | drives `SpotLight->SetIntensity` + `SetLightColor` + calls `RefreshLensDisc` + `RefreshBeamEmissive` | `RefreshLensDisc` now tail-calls `RefreshLensEmissive` (single entry-point; folds in `ApplyDimmer` / `ApplyColor` / `ApplyShutter` / `RefreshIesAfterZoom` automatically). |
+> | `BuildMeshes` end | builds + tags every isBeam PMC | now also calls `EnsurePerLensMIDs` so the per-component MIDs exist before the Setup-end `RefreshIntensity` push lands. |
+> | `ApplyGoboTextureFromBytes` | decodes bytes -> `CurrentGoboTexture`, sets `bGoboActive=true`, pushes cone + cookie | now also pushes the new GoboRT + `bUseGobo=1` onto every lens MID. |
+> | `ClearGoboToOpen` | clears `CurrentGoboTexture`, sets `bGoboActive=false`, blanks RT | now also pushes `bUseGobo=0` so the lens face stops showing the (cleared) silhouette. |
+> | `OnGoboRTUpdate` | redraws gobo rotation + iris mask into GoboRT each spin tick | calls `RefreshLensEmissive` after the iris pass so dimmer / colour fades concurrent with the spin land on the lens immediately. |
+>
+> Verbose-level log line per push (gated to `LogRebusVisualiser` Verbose so steady
+> state isn't spammy): `Fixture <id> lens emissive: color=(R,G,B) intensity=X
+> goboActive=Y useGobo=Z scale=S pushedReal=A/B syntheticMID=<set|absent>`.
+>
+> **Multi-beam fixtures (LED matrices) -- equal-intensity per lens, future work
+> noted.** A multi-beam fixture (MAC Aura / Robe Esprite-class LED arrays) has
+> multiple `IsBeamLensComponents`, each pixel a separate isBeam mesh. v1.0.102
+> treats them all as equally lit by the master fixture state -- the SAME
+> Emissive / EmissiveIntensity / GoboTexture / bUseGobo are pushed onto every
+> pixel-lens's MID. Per-pixel emission (e.g. a wide-angle wash where the rim
+> pixels are dimmer than the centre, or a chase that animates across the matrix)
+> is a FUTURE enhancement: the per-pixel slot + intensity descriptor would need
+> to arrive on the data channel and feed an additional per-MID push inside the
+> `RefreshLensEmissive` loop. The `IsBeamLensMIDs` array + the parallel
+> `RebusIsBeamLens` ComponentTag list make that trivial when the wire surface
+> exists -- v1.0.102 ships the equal-intensity baseline.
+>
+> **New CVars.**
+>
+> | CVar | Default | Effect |
+> | --- | --- | --- |
+> | `Rebus.LensEmissiveScale` (`float`) | 1.0 | Multiplier on the lens-material `EmissiveIntensity` push, independent of the actual SpotLight intensity. Operators tweak per-show to balance the lens glow against the lit floor pool ("lens blows out the sensor at full dimmer" -> drop to 0.5; "lens barely visible against the beam" -> push to 2.0). The hard cap at 100 in `RefreshLensEmissive` still applies. Live -- changing this walks every Rebus fixture and re-pushes the lens MIDs. |
+> | `Rebus.LensFollowGobo` (`0\|1`) | 1 | When 1 (default), the lens face shows the gobo silhouette while a cookie is active (the v1.0.102 user request). When 0, the lens always glows uniform colour regardless of gobo state (some shows prefer the cleaner "lens-as-eye" look over the "projector-port" look). Live -- refresh sink walks every fixture and re-pushes. |
+>
+> **Operator caveats.**
+>
+> * **Hand-authored lens material won't glow until the operator either adds the
+>   four v1.0.102 params themselves, or deletes their custom asset and lets the
+>   Python rebake re-create it.** A user-authored
+>   `/Game/REBUS/Materials/M_RebusFixtureLens.uasset` takes precedence over the
+>   Python-baked master (`FixtureLensMaterialOverride` resolves the user's
+>   asset; `EnsureFixtureMIDs` doesn't touch it). If that custom asset lacks the
+>   `Emissive` / `EmissiveIntensity` / `GoboTexture` / `bUseGobo` params, every
+>   `MID->SetVectorParameterValue` / `SetScalarParameterValue` / `SetTexture
+>   ParameterValue` call inside `RefreshLensEmissive` silently no-ops (UE MID
+>   setters skip unknown parameter names), so the lens stays chrome-only. The
+>   `_fixture_lens_master_has_emissive` Python probe handles the AUTO-baked
+>   master upgrade path, but it cannot mutate a hand-authored asset. The fix is
+>   either to add the four params to the custom asset by hand (matching the
+>   combine formula above) OR delete it (so the C++ FObjectFinder misses
+>   `FixtureLensMaterialOverride` and falls back to the runtime `FixtureLensMID`
+>   built off `BasicShapeMaterial` -- which DOES carry the params because it's
+>   built fresh every spawn). On delete the `build_rebus_base_level.py` startup
+>   hook can re-bake the proper v1.0.102 master into the same slot.
+> * **Intensity-scaling sweet spot.** `RebusLensEmissiveBaseScale = 5.0` (in
+>   `RebusFixtureActor.cpp`) is the venue-empirical default. Lower (`3.0`-`4.0`)
+>   reads more "matte glowing optic"; higher (`6.0`-`8.0`) reads more "incandescent
+>   bulb". Operators tune via the `Rebus.LensEmissiveScale` CVar at runtime
+>   without an engine rebuild. If the lens reads oversaturated after a fresh
+>   regen, drop `Rebus.LensEmissiveScale` to `0.5` first; if that's still too
+>   bright, edit the C++ constant and rebuild.
+> * **Material regen on first v1.0.102 launch.** The
+>   `_fixture_lens_master_has_emissive` self-heal logs a Warning the first time
+>   it triggers ("pre-v1.0.102 M_RebusFixtureLens detected ... regenerating") --
+>   that's expected on the first editor restart after pulling v1.0.102 onto a
+>   project that had v1.0.93 / v1.0.97 / v1.0.101 baked. Subsequent launches
+>   pick up the new master verbatim and the Warning doesn't recur.
+>
+> **Files touched (v1.0.102).**
+>
+> * `REBUS_Visualiser/Content/Python/build_rebus_base_level.py` -- extended
+>   `_build_fixture_lens_master` with the v1.0.102 emissive chain (4 new params
+>   + combine formula); added `_fixture_lens_master_has_emissive(master)` probe;
+>   wired it into the `ensure_fixture_lens_material(force=False)` self-heal OR
+>   chain.
+> * `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Public/RebusFixtureActor.h`
+>   -- new `IsBeamLensMIDs` array (weak parallel to `IsBeamLensComponents`); new
+>   `RefreshLensEmissive` public helper + `EnsurePerLensMIDs` private helper.
+> * `REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusFixtureActor.cpp`
+>   -- new `GRebusLensEmissiveScale` + `GRebusLensFollowGobo` CVars + refresh
+>   sinks; new `RebusLensEmissiveBaseScale` / `RebusLensEmissiveIntensityCap`
+>   constants; new `EnsurePerLensMIDs` / `RefreshLensEmissive` definitions;
+>   `RefreshLensDisc` now tail-calls `RefreshLensEmissive`; `BuildMeshes` end now
+>   calls `EnsurePerLensMIDs`; `ApplyGoboTextureFromBytes`, `ClearGoboToOpen`,
+>   `OnGoboRTUpdate` now also call `RefreshLensEmissive`.
+> * `REBUS_Visualiser/Plugins/RebusVisualiser/README.md` -- this release block.
+>
+> No engine / OrbitConnector / Epic-DMX-Fixtures asset is touched. The v1.0.93
+> chrome PBR layer is preserved verbatim under the new additive emissive layer;
+> v1.0.97 two-sided is preserved; v1.0.99 / v1.0.100 / v1.0.101 (shadow trace +
+> camera-pose default + cone-mesh radius scale) are all orthogonal.
+>
+> **Operator checklist after rebuilding to v1.0.102.**
+>
+> 1. Launch the editor; confirm one Warning fires on startup:
+>    `RebusBaseLevel: pre-v1.0.102 M_RebusFixtureLens detected ...
+>    regenerating.` -- the v1.0.102 master replaces the v1.0.93 / v1.0.97 baked
+>    one. Subsequent launches don't log this.
+> 2. Spawn a fixture, dial dimmer to FULL (1.0). The lens disc on the fixture
+>    body should glow visibly in the current colour (default white).
+> 3. Push `SetFixtureColor` red. The lens glow shifts red in lockstep with the
+>    beam shaft + lit floor pool.
+> 4. Push `SetFixtureGobo` to a slot with a recognisable silhouette (a star, a
+>    leaf, etc.). The gobo pattern should be visible directly on the lens face,
+>    rotating in lockstep with the cone + cookie projection.
+> 5. Run `Rebus.LensFollowGobo 0` from the portal console. The lens glow goes
+>    back to UNIFORM colour (no silhouette on the lens face) while the gobo
+>    cookie still projects on the floor. Run `Rebus.LensFollowGobo 1` to restore.
+> 6. Run `Rebus.LensEmissiveScale 0.5` -- the lens glow drops to half-bright;
+>    `Rebus.LensEmissiveScale 2.0` doubles. `1.0` returns to the default.
+> 7. Dial dimmer to ZERO -- the lens reads as a chrome MIRROR identical to
+>    pre-v1.0.102 (no glow, just the v1.0.93 polished-metallic reflection).
+
 > **Cone-mesh + SpotLight outer-cone in sync via single-source-of-truth zoom half-angle (v1.0.101).**
 > User report (verbatim):
 >

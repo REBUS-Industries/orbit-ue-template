@@ -540,6 +540,99 @@ FAutoConsoleVariableRef CVarRebusForceSyntheticLensFallback(
 	}),
 	ECVF_Default);
 
+// v1.0.102 -- live A/B multiplier on the LENS-MATERIAL emissive intensity, independent
+// of the actual SpotLight intensity. Default 1.0 (no scaling). Operators tweak when the
+// lens reads too bright/dim relative to the lit floor pool -- "the lens is blowing out
+// the sensor at full dimmer" -> drop to 0.5; "the lens is barely visible against the
+// beam" -> push to 2.0. Refresh sink walks every Rebus fixture in every Game/PIE world
+// and re-pushes `RefreshLensEmissive()` so the new value lands without a respawn. See
+// the v1.0.102 README release block for the operator checklist + clamps (the per-MID
+// EmissiveIntensity is hard-capped at 100 in `RefreshLensEmissive` regardless of CVar
+// value -- a guard against an accidental `Rebus.LensEmissiveScale 1e6`).
+float GRebusLensEmissiveScale = 1.0f;
+FAutoConsoleVariableRef CVarRebusLensEmissiveScale(
+	TEXT("Rebus.LensEmissiveScale"),
+	GRebusLensEmissiveScale,
+	TEXT("v1.0.102 -- multiplier on the lens-material EmissiveIntensity push (default 1.0). "
+		 "Operators tweak per-show to balance the lens glow against the lit floor pool; the "
+		 "live SpotLight intensity is unchanged. Hard-capped at 100 inside RefreshLensEmissive "
+		 "to prevent runaway exposure on a portal mis-push. Live -- changing this walks every "
+		 "Rebus fixture and re-pushes the lens MIDs."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		if (!GEngine) return;
+		int32 Refreshed = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					F->RefreshLensEmissive();
+					++Refreshed;
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.LensEmissiveScale -> %.3f, refreshed %d fixture(s) (lens MIDs re-pushed)."),
+			CVar->GetFloat(), Refreshed);
+	}),
+	ECVF_Default);
+
+// v1.0.102 -- whether the lens-material emissive layer samples the per-fixture cookie
+// `GoboRT` to show the gobo silhouette on the lens face. Default 1 (lens face shows the
+// gobo while a cookie is active -- matches the v1.0.102 user request). Some shows
+// prefer the lens to glow UNIFORM colour regardless of gobo state (the "lens-as-eye"
+// look rather than the "projector-port" look); flipping to 0 forces `bUseGobo = 0` on
+// every per-fixture lens MID so the emissive output is `Emissive * EmissiveIntensity`
+// alone, regardless of `bGoboActive`. Live -- refresh sink walks every fixture.
+int32 GRebusLensFollowGobo = 1;
+FAutoConsoleVariableRef CVarRebusLensFollowGobo(
+	TEXT("Rebus.LensFollowGobo"),
+	GRebusLensFollowGobo,
+	TEXT("v1.0.102 -- 0|1 (default 1). When 1, the lens-material emissive samples the live "
+		 "GoboRT cookie texture so the gobo silhouette shows on the lens face while a gobo "
+		 "is active (the v1.0.102 user request). When 0, the lens always glows UNIFORM colour "
+		 "regardless of gobo state -- some shows prefer the cleaner 'lens-as-eye' look. Live -- "
+		 "changing this walks every Rebus fixture and re-pushes the lens MIDs."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		if (!GEngine) return;
+		int32 Refreshed = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					F->RefreshLensEmissive();
+					++Refreshed;
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.LensFollowGobo -> %d, refreshed %d fixture(s) (lens MIDs re-pushed)."),
+			CVar->GetInt(), Refreshed);
+	}),
+	ECVF_Default);
+
+// v1.0.102 -- base intensity scale folded into the EmissiveIntensity push so a typical
+// "full dimmer" lens reads as ~5x the ambient surrounding glow at the dimmer ceiling.
+// Stage venue empirical default; tweak if the lens reads too bright or too dim after
+// material regen. NOT a CVar (operators tune via `Rebus.LensEmissiveScale` instead --
+// this is the "physical baseline" knob, while the CVar is the live "what does this
+// show want" knob).
+static constexpr float RebusLensEmissiveBaseScale = 5.0f;
+// Hard cap on the EmissiveIntensity scalar pushed onto the lens MID, regardless of
+// dimmer / CVar / base-scale product. Guards against an accidental
+// `Rebus.LensEmissiveScale 1e6` exposing the post-process auto-exposure to a runaway
+// value that blows the rest of the scene to white.
+static constexpr float RebusLensEmissiveIntensityCap = 100.0f;
+
 void ARebusFixtureActor::ResetVolumetricShadowBudget()
 {
 	VolumetricShadowBeamCount = 0;
@@ -1504,6 +1597,15 @@ void ARebusFixtureActor::BuildMeshes(const FRebusMeshBundle& Meshes)
 		IsBeamLensComponents.Num() > 0
 			? TEXT("real <Beam> geometry will be the lens disc; synthetic disc hidden")
 			: TEXT("no isBeam meshes; synthetic lens disc fallback in force"));
+
+	// v1.0.102: wrap each isBeam mesh's slot-0 lens material in a per-component MID so
+	// `RefreshLensEmissive` can drive THIS fixture's lens independently of every other
+	// fixture's lens. Must run AFTER the isBeam-mesh loop above has stamped the shared
+	// chrome material onto slot 0 of every PMC -- CreateAndSetMaterialInstanceDynamic
+	// inherits from the slot's current parent. RefreshLensEmissive is also called from
+	// Setup() after BuildMeshes (via the unified RefreshIntensity entry-point at the end
+	// of Setup) so the initial dimmer / colour / shutter state lands on the new MIDs.
+	EnsurePerLensMIDs();
 }
 
 void ARebusFixtureActor::BuildSpotLight()
@@ -1837,6 +1939,13 @@ void ARebusFixtureActor::RefreshLensDisc()
 	// EmissiveColor / EmissiveStrength formula, driven by the same live dimmer + colour +
 	// shutter-gate state). Cheap when IsBeamFlareMIDs is empty (legacy v2-blob fixtures).
 	RefreshIsBeamFlareEmissive();
+
+	// v1.0.102: also push the live dimmer x colour x gobo onto the lens-MATERIAL
+	// emissive chain (M_RebusFixtureLens). This drives the GLOW directly ON the lens
+	// face -- different from the soft halo discs above, which sit IN FRONT of the lens.
+	// User request (v1.0.102): "can the lens material be emissive ... follow the dimmer,
+	// colour and gobo of the fixture its part of."
+	RefreshLensEmissive();
 }
 
 // ---- v1.0.88 real <Beam> (isBeam) per-mesh emissive flares + synthetic-fallback toggle -----
@@ -1992,6 +2101,155 @@ void ARebusFixtureActor::RefreshIsBeamFlareEmissive()
 		MID->SetVectorParameterValue(TEXT("EmissiveColor"), Linear);
 		MID->SetScalarParameterValue(TEXT("EmissiveStrength"), Strength);
 	}
+}
+
+// v1.0.102 -- wrap the lens material (slot 0) of every real <Beam> isBeam mesh in a
+// per-component UMaterialInstanceDynamic so live state pushes from RefreshLensEmissive
+// address THIS fixture only, not the shared project-wide chrome master. Also wraps
+// the synthetic LensDisc (which already MIDs the lens-flare material in BuildLensDisc;
+// the same plane mesh ALSO carries the chrome lens material when the v1.0.71 override
+// pipeline routes it, depending on the asset stack). Idempotent: skips entries whose
+// MID is already populated. Called from the END of BuildMeshes after every isBeam
+// PMC has been recorded in IsBeamLensComponents.
+//
+// CreateAndSetMaterialInstanceDynamic returns the existing MID when the slot already
+// has a dynamic instance (idempotent on re-call). When the lens material resolves to
+// null (the missing-asset deployment path that v1.0.95 already logs a Warning for) we
+// silently skip the MID creation -- RefreshLensEmissive then no-ops on the slot.
+void ARebusFixtureActor::EnsurePerLensMIDs()
+{
+	IsBeamLensMIDs.Reset();
+	IsBeamLensMIDs.Reserve(IsBeamLensComponents.Num());
+	int32 Wrapped = 0;
+	for (int32 i = 0; i < IsBeamLensComponents.Num(); ++i)
+	{
+		UPrimitiveComponent* Beam = IsBeamLensComponents[i].Get();
+		if (!Beam)
+		{
+			IsBeamLensMIDs.Add(nullptr);
+			continue;
+		}
+		// CreateAndSetMaterialInstanceDynamic uses the CURRENT slot-0 material as the
+		// MID's parent. BuildMeshes already assigned the mirror/glass LensMat to slot 0
+		// of every isBeam PMC (lines around the `if (Mesh.bIsBeam)` block) so this MID
+		// inherits the v1.0.102 emissive parameter contract from the Python-baked
+		// `M_RebusFixtureLens` master verbatim.
+		UMaterialInstanceDynamic* MID = Beam->CreateAndSetMaterialInstanceDynamic(0);
+		IsBeamLensMIDs.Add(MID);
+		if (MID) { ++Wrapped; }
+	}
+	UE_LOG(LogRebusVisualiser, Verbose,
+		TEXT("Fixture %s lens MIDs: wrapped %d/%d isBeam PMC slot-0 materials in per-component MIDs (v1.0.102; RefreshLensEmissive will drive these)."),
+		*FixtureId, Wrapped, IsBeamLensComponents.Num());
+}
+
+// v1.0.102 -- user request (verbatim): "can the lens material be emiissive as well
+// and follow the dimmer, colour and gobo of the fixture its part of."
+//
+// Push the live fixture state onto the v1.0.102 emissive parameter contract of the
+// `M_RebusFixtureLens` master (Emissive vector + EmissiveIntensity scalar + GoboTexture
+// sampler + bUseGobo scalar). The material's emissive chain is ADDITIVE on top of the
+// existing chrome PBR: at Dimmer.Current=0 the lens reads identical to pre-v1.0.102
+// (chrome mirror), at Dimmer.Current=1 the lens glows in the live colour modulated by
+// the cookie when a gobo is active. Pushes to BOTH the synthetic LensDisc material-
+// override pipeline (when its slot-0 material is the chrome lens MID, NOT the lens-
+// flare material the v1.0.49 path normally builds it with) and EVERY per-beam lens MID
+// in IsBeamLensMIDs (one push per multi-beam pixel for LED matrices; per-pixel
+// emission is a future enhancement -- see README v1.0.102 "Multi-beam fixtures").
+//
+// IMPORTANT: this is INDEPENDENT of `RefreshLensDisc` / `RefreshIsBeamFlareEmissive`
+// which drive the v1.0.49 `M_RebusLensFlare` material's EmissiveColor / EmissiveStrength
+// params on the per-beam flare DISCS (the additive lens-flare planes co-located with
+// each lens). The flare discs are the SOFT halo around the lens; this push is the
+// HARD glow ON the lens face itself. Both layers compose to the final lens visual.
+//
+// Called from EVERY existing intensity/colour/gobo update path so the lens stays in
+// lockstep with the SpotLight:
+//   * Tail-called from `RefreshLensDisc` (unified emissive entry-point reached by
+//     `RefreshIntensity` -> the same path called by `ApplyDimmer` / `ApplyColor` /
+//     the shutter strobe tick / `RefreshIesAfterZoom`).
+//   * Called from gobo-state apply paths: `ApplyGoboTextureFromBytes` (after
+//     bGoboActive=true), `ClearGoboToOpen` (after bGoboActive=false), `OnGoboRTUpdate`
+//     (every RT redraw so the lens face animates with the cookie rotation).
+//   * Called once from `BuildMeshes` (via the seed at the end of `Setup`) after
+//     `EnsurePerLensMIDs` so the initial state matches even if Dimmer.Current > 0 at
+//     spawn time (rare but possible via inline state push).
+void ARebusFixtureActor::RefreshLensEmissive()
+{
+	float Gate = 1.f;
+	switch (ShutterMode)
+	{
+	case ERebusShutterMode::Closed: Gate = 0.f; break;
+	case ERebusShutterMode::Strobe: Gate = (ShutterPhase < 0.5f) ? 1.f : 0.f; break;
+	default: break;
+	}
+
+	const FLinearColor LiveColour(
+		FMath::Clamp(ColorR.Current, 0.f, 1.f),
+		FMath::Clamp(ColorG.Current, 0.f, 1.f),
+		FMath::Clamp(ColorB.Current, 0.f, 1.f), 1.f);
+
+	const float DimmerNorm = FMath::Clamp(Dimmer.Current, 0.f, 1.f);
+	const float CVarScale = FMath::Max(GRebusLensEmissiveScale, 0.f);
+	const float RawIntensity = DimmerNorm * Gate * RebusLensEmissiveBaseScale * CVarScale;
+	const float ClampedIntensity = FMath::Clamp(RawIntensity, 0.f, RebusLensEmissiveIntensityCap);
+
+	// v1.0.102: GoboRT is a UCanvasRenderTarget2D -> UTextureRenderTarget2D -> UTexture, so
+	// the implicit upcast is legal. SetTextureParameterValue accepts UTexture* and silently
+	// no-ops when the parameter name doesn't exist on the underlying master (e.g.
+	// operator-authored M_RebusFixtureLens that hasn't picked up the v1.0.102 contract
+	// yet -- see the _fixture_lens_master_has_emissive Python self-heal).
+	UTexture* GoboPattern = Cast<UTexture>(GoboRT.Get());
+	const float UseGoboScalar = (bGoboActive && GRebusLensFollowGobo != 0 && GoboPattern != nullptr) ? 1.f : 0.f;
+
+	auto PushOnMID = [&](UMaterialInstanceDynamic* MID)
+	{
+		if (!MID) return;
+		MID->SetVectorParameterValue(TEXT("Emissive"), LiveColour);
+		MID->SetScalarParameterValue(TEXT("EmissiveIntensity"), ClampedIntensity);
+		if (GoboPattern)
+		{
+			MID->SetTextureParameterValue(TEXT("GoboTexture"), GoboPattern);
+		}
+		MID->SetScalarParameterValue(TEXT("bUseGobo"), UseGoboScalar);
+	};
+
+	// Push onto every real <Beam> isBeam mesh's per-component MID. Multi-beam LED-matrix
+	// fixtures get the SAME fixture-master state on every pixel-lens (per-pixel emission
+	// is a future enhancement -- README v1.0.102 "Multi-beam fixtures" notes this).
+	int32 PushedReal = 0;
+	for (const TWeakObjectPtr<UMaterialInstanceDynamic>& WeakMID : IsBeamLensMIDs)
+	{
+		UMaterialInstanceDynamic* MID = WeakMID.Get();
+		if (MID)
+		{
+			PushOnMID(MID);
+			++PushedReal;
+		}
+	}
+
+	// Synthetic LensDisc also gets the push: pre-v1.0.102 the disc's MID is built from
+	// the lens-FLARE material (M_RebusLensFlare -- the soft halo with its own
+	// EmissiveColor/EmissiveStrength chain), so the new Emissive/EmissiveIntensity
+	// params silently no-op there. But the v1.0.71 lens-override pipeline can ALSO
+	// route the chrome M_RebusFixtureLens onto the synthetic plane in some
+	// configurations, in which case the push lands and the synthetic disc glows in
+	// lockstep with the real-beam lenses. The double-push is intentional and cheap
+	// (UMaterialInstanceDynamic parameter setters skip unknown names). The
+	// ApplyLensEmissive-to-both-arrays rule in the v1.0.102 task spec covers the rare
+	// respawn-race where BOTH paths are live simultaneously.
+	if (LensDiscMID)
+	{
+		PushOnMID(LensDiscMID);
+	}
+
+	UE_LOG(LogRebusVisualiser, Verbose,
+		TEXT("Fixture %s lens emissive: color=(%.2f,%.2f,%.2f) intensity=%.3f goboActive=%d useGobo=%.0f scale=%.2f pushedReal=%d/%d syntheticMID=%s"),
+		*FixtureId,
+		LiveColour.R, LiveColour.G, LiveColour.B, ClampedIntensity,
+		bGoboActive ? 1 : 0, UseGoboScalar, CVarScale,
+		PushedReal, IsBeamLensMIDs.Num(),
+		LensDiscMID ? TEXT("set") : TEXT("absent"));
 }
 
 void ARebusFixtureActor::RefreshIsBeamLensVisuals()
@@ -4036,6 +4294,10 @@ bool ARebusFixtureActor::ApplyGoboTextureFromBytes(const TArray<uint8>& Bytes)
 	RefreshGoboLumenIsolation();  // v1.0.83: removes the spotlight from Lumen GI while the
 	                              //          cookie is animating -- kills the GI ghost layer
 	                              //          without touching global Lumen CVars.
+	// v1.0.102: push the new GoboRT + bGoboActive=1 onto every per-fixture lens MID so the
+	// lens face starts showing the gobo silhouette immediately (alongside the cookie footprint
+	// landing on the floor). Cheap when IsBeamLensMIDs is empty.
+	RefreshLensEmissive();
 	return true;
 }
 
@@ -4262,6 +4524,16 @@ void ARebusFixtureActor::OnGoboRTUpdate(UCanvas* Canvas, int32 Width, int32 Heig
 				FVector2D(0.5f, 0.5f));
 		}
 	}
+
+	// v1.0.102: keep the lens-material emissive in lockstep with the cookie redraw.
+	// SetTextureParameterValue cached the GoboRT pointer once; the lens material samples
+	// the RT's current contents automatically, so the gobo silhouette on the lens face
+	// rotates in lockstep with the cone/cookie without an explicit re-push. We still
+	// call RefreshLensEmissive here to keep bUseGobo / EmissiveIntensity in sync with
+	// any dimmer/colour/shutter changes that happened during the same Tick frame the RT
+	// got redrawn -- cheap (few SetParameter calls) and removes a class of "lens drifts
+	// behind the cone by 1 frame" failure modes.
+	RefreshLensEmissive();
 }
 
 void ARebusFixtureActor::EnsureIrisMaskTexture(float Iris01)
@@ -4613,6 +4885,10 @@ void ARebusFixtureActor::ClearGoboToOpen(const TCHAR* Reason)
 	RefreshBeamShadowMode();
 	RefreshGoboLumenIsolation(); // v1.0.83: re-enable Lumen GI contribution now that the cookie
 	                             //          is no longer animating.
+	// v1.0.102: push bGoboActive=false (=> bUseGobo=0) onto every per-fixture lens MID so the
+	// lens face stops showing the (now cleared) gobo silhouette and reverts to uniform colour
+	// glow modulated by dimmer x intensity. Cheap when IsBeamLensMIDs is empty.
+	RefreshLensEmissive();
 }
 
 void ARebusFixtureActor::RefreshGoboLumenIsolation()

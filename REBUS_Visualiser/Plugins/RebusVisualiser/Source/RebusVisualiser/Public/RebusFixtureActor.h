@@ -640,6 +640,21 @@ private:
 	TArray<TWeakObjectPtr<UPrimitiveComponent>> IsBeamLensComponents;
 	UPROPERTY() TArray<TObjectPtr<UStaticMeshComponent>> IsBeamFlareDiscs;
 	UPROPERTY() TArray<TObjectPtr<class UMaterialInstanceDynamic>> IsBeamFlareMIDs;
+	// v1.0.102 -- per-component MID wrap of every IsBeamLensComponents entry. Pre-v1.0.102
+	// `BuildMeshes` assigned the SHARED FixtureLensMaterialOverride / FixtureLensMID
+	// (one material instance for the whole project, owned by the actor's lens-material
+	// override pipeline) onto every isBeam mesh, so live dimmer/colour/gobo pushes could
+	// only address ONE lens at a time across the entire scene. v1.0.102 wraps each isBeam
+	// mesh PMC in its OWN UMaterialInstanceDynamic (created via
+	// `UPrimitiveComponent::CreateAndSetMaterialInstanceDynamic(0)` against the lens master),
+	// caches the weak handle here so `RefreshLensEmissive` can push the per-fixture live
+	// state onto each lens without bleeding into sibling fixtures' lenses. Index-aligned
+	// to IsBeamLensComponents (entry [i] is the MID for IsBeamLensComponents[i]'s lens
+	// material slot 0). Weak so a GC'd MID after a respawn race is tolerated as a no-op.
+	// Multi-beam LED-matrix fixtures (MAC Aura, etc.) get one MID per pixel-lens; v1.0.102
+	// pushes the SAME fixture-master state onto every entry (per-pixel emission is future
+	// work, noted in README v1.0.102).
+	TArray<TWeakObjectPtr<class UMaterialInstanceDynamic>> IsBeamLensMIDs;
 	bool bUseSyntheticLensFallback = false;
 
 	// One-time emissive lens-flare build for every IsBeamLensComponents entry, called from
@@ -656,6 +671,47 @@ private:
 	// dimmer x colour x shutter-gate onto every per-beam flare MID. Called from the same call
 	// sites RefreshLensDisc is called from.
 	void RefreshIsBeamFlareEmissive();
+
+	// v1.0.102 -- push the live fixture state onto the lens MATERIAL itself
+	// (`M_RebusFixtureLens` -- the mirror/glass material applied to every real <Beam>
+	// `IsBeamLensComponents` PMC, and to the synthetic LensDisc when the v1.0.71 lens-
+	// material override pipeline routes the chrome lens material onto its plane). The
+	// material's v1.0.102 emissive chain (Emissive vector + EmissiveIntensity scalar +
+	// GoboTexture sampler + bUseGobo scalar) is ADDITIVE on top of the existing chrome
+	// PBR: at Dimmer=0 the lens reads identical to pre-v1.0.102 (chrome mirror), at
+	// Dimmer=1 the lens glows in the live colour, modulated by the cookie texture when
+	// `bGoboActive` is true. User request (verbatim, v1.0.102): "can the lens material
+	// be emiissive as well and follow the dimmer, colour and gobo of the fixture its
+	// part of." Push path:
+	//   * `Emissive` = clamped (ColorR/G/B.Current, 0..1).
+	//   * `EmissiveIntensity` = clamped(Dimmer.Current, 0..1) * Gate(shutter) *
+	//     `Rebus.LensEmissiveScale` (default 1.0), capped at `100` to prevent runaway
+	//     exposure on a portal mis-push.
+	//   * `GoboTexture` = `GoboRT` (the per-fixture cookie render-target -- a
+	//     `UCanvasRenderTarget2D` which inherits from UTexture). Null when no cookie
+	//     has been bound (early in spawn, or fixtures without a gobo path); a null push
+	//     is silently no-op'd by `SetTextureParameterValue`.
+	//   * `bUseGobo` = 1.0 when (`bGoboActive` && `Rebus.LensFollowGobo` != 0), else 0.0.
+	// Called from EVERY existing intensity / colour / gobo update path so the lens stays
+	// in lockstep with the SpotLight: tail-called from `RefreshLensDisc` (the unified
+	// emissive entry-point already called by `RefreshIntensity` / `ApplyColor`), from
+	// every gobo-state apply path (`ApplyGoboTextureFromBytes`, `ClearGoboToOpen`,
+	// `OnGoboRTUpdate`), and from `BuildMeshes` after the per-component MIDs are
+	// created so the initial state matches even when Dimmer.Current > 0 at spawn.
+	// Public so the `Rebus.LensEmissiveScale` / `Rebus.LensFollowGobo` CVar refresh
+	// sinks can iterate every Rebus fixture and re-push.
+public:
+	void RefreshLensEmissive();
+private:
+	// v1.0.102 -- wrap the lens-MATERIAL slot 0 of every IsBeamLensComponents entry +
+	// the synthetic LensDisc in a per-component UMaterialInstanceDynamic so live state
+	// pushes (`RefreshLensEmissive`) address THIS fixture's lens only, not the shared
+	// project-wide lens material. Idempotent: skips entries already MID-wrapped. Called
+	// once at the end of `BuildMeshes` (after every isBeam mesh has been recorded into
+	// IsBeamLensComponents) and again as the seed in `Setup` after the synthetic
+	// LensDisc is built. The wrap is a no-op when the lens material is null (the
+	// missing-asset deployment path that v1.0.95 already logs a Warning for).
+	void EnsurePerLensMIDs();
 
 	// v1.0.71 fixture body/lens material override -- the user-facing "make every fixture look
 	// like a black satin plastic moving head, with mirrored-glass lenses" pass.
@@ -758,7 +814,11 @@ private:
 	// IES sampling, and 1/r^2 falloff are STILL anchored to the GDTF zoom-range
 	// specification verbatim -- only the visible cone-mesh tightens. SpotLight outer
 	// cone + cone-mesh radius diverge by exactly this scalar, no other coupling.
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rebus|Beam")
+	// NOTE: kept `EditAnywhere` only (no `BlueprintReadWrite`) because this UPROPERTY lives in
+	// the `private:` block — UHT rejects BP-write on private members. The runtime knob is
+	// `Rebus.BeamConeRadiusScale <float>` (RebusVisualiser.cpp CVar sink walks every fixture),
+	// the editor-property exposure is purely for per-instance overrides in the Details panel.
+	UPROPERTY(EditAnywhere, Category = "Rebus|Beam")
 	float BeamConeRadiusScale = 1.0f;
 
 	// bMeshBeams runtime toggle (default true = mesh beam on, fog scattering suppressed). When the
