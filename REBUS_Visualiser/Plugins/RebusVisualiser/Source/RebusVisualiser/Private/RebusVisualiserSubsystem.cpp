@@ -37,10 +37,15 @@
 
 static const TCHAR* RebusProjectVersion = TEXT("rebus-visualiser-1.0.0");
 
-// Default streamed-view start pose. Authored in metres (0,-20,2) looking at (0,0,2); Unreal is
-// centimetres, so x100. The look is horizontal along +Y (yaw 90). Tweak here if the stage moves.
-static const FVector RebusViewStartLocation(0.f, -2000.f, 200.f);
-static const FVector RebusViewLookAtLocation(0.f, 0.f, 200.f);
+// v1.0.100 -- default streamed-view spawn pose now lives in RebusCineCameraDefaults
+// (RebusCineCameraPawn.h) so URebusVisualiserSubsystem::TryPositionPlayerView (spawn) and
+// ARebusCineCameraPawn::ResetToDefaults (Rebus.CameraReset) share one source of truth. The
+// landing pose is location (0,-20,2) m looking at (0,0,5) m; aim is derived from
+// `(target - location).GetSafeNormal()` via FRotationMatrix::MakeFromX so any future tweak
+// to the metres triples re-derives the rotator cleanly. Today that resolves to pitch ~+8.53°
+// (gentle look-up), yaw 90° (camera facing +Y), roll 0°. The portal can still override the
+// live camera pose at any time via SetCameraTransform -- these constants are JUST the
+// construction-time / reset landing pose.
 
 void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -1205,8 +1210,15 @@ bool URebusVisualiserSubsystem::TryPositionPlayerView()
 	APlayerController* PC = World->GetFirstPlayerController();
 	if (!PC) return false; // controller not spawned yet -> retry next tick
 
-	// Forward (actor +X / control-rotation forward) points from the eye to the look-at target.
-	const FRotator ViewRotation = (RebusViewLookAtLocation - RebusViewStartLocation).Rotation();
+	// v1.0.100 -- spawn pose comes from the shared RebusCineCameraDefaults namespace
+	// (RebusCineCameraPawn.h). Location/target are authored in metres (operator framing
+	// convention) and converted to cm in the header. The rotator is DERIVED from
+	// (target - location) via FRotationMatrix::MakeFromX so any future tweak to the metres
+	// triples re-derives the aim cleanly (no manual yaw/pitch trig in this file). The
+	// ApplyTransform call below mirrors what ARebusCineCameraPawn::ResetToDefaults does, so
+	// the spawn-time pose and the Rebus.CameraReset pose are byte-for-byte identical.
+	const FVector&  SpawnLocation = RebusCineCameraDefaults::kDefaultCameraLocation_cm;
+	const FRotator& SpawnRotation = RebusCineCameraDefaults::kDefaultCameraRotation;
 
 	// v1.0.79: ensure the player is possessing a cinematic camera pawn (replaces UE's stock
 	// ADefaultPawn UCameraComponent with a UCineCameraComponent + manual exposure). If the PC
@@ -1219,8 +1231,8 @@ bool URebusVisualiserSubsystem::TryPositionPlayerView()
 		Spawn.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 		ARebusCineCameraPawn* NewPawn = World->SpawnActor<ARebusCineCameraPawn>(
 			ARebusCineCameraPawn::StaticClass(),
-			RebusViewStartLocation,
-			ViewRotation,
+			SpawnLocation,
+			SpawnRotation,
 			Spawn);
 		if (!NewPawn) return false; // try again next tick (world may not be fully ready yet)
 
@@ -1247,11 +1259,11 @@ bool URebusVisualiserSubsystem::TryPositionPlayerView()
 
 	if (ARebusCineCameraPawn* Cam = CineCameraPawn.Get())
 	{
-		Cam->ApplyTransform(RebusViewStartLocation, ViewRotation);
+		Cam->ApplyTransform(SpawnLocation, SpawnRotation);
 	}
 
-	UE_LOG(LogRebusVisualiser, Log, TEXT("Player view positioned at %s facing %s."),
-		*RebusViewStartLocation.ToString(), *ViewRotation.ToString());
+	UE_LOG(LogRebusVisualiser, Log, TEXT("Player view positioned at %s facing %s (v1.0.100 default)."),
+		*SpawnLocation.ToString(), *SpawnRotation.ToString());
 	return true;
 }
 

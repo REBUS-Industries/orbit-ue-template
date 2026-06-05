@@ -594,6 +594,108 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Default cinematic-camera landing pose at (0,-20,2) m looking at (0,0,5) m (v1.0.100).**
+> User request (verbatim):
+>
+> > "can we set the default position of the camera to 0,-20,2 and keep the target
+> > at 0,0,5"
+>
+> Tiny contained change to the construction-time camera pose. The visualiser's pre-v1.0.100
+> spawn helper (`URebusVisualiserSubsystem::TryPositionPlayerView`) placed the cinematic
+> camera at `(0, -20, 2) m` looking at `(0, 0, 2) m` -- the eye height was right but the
+> look-at was at the camera's OWN eye height, so the aim came out flat (0° pitch) and
+> framed an empty floor strip rather than the centre of the stage. The user asked for the
+> eye position to stay, with the look-at lifted to `(0, 0, 5) m` (roughly performer-head
+> height on a small riser), which derives a gentle look-up.
+>
+> **New defaults (in both metre and UE-world cm so a future operator doesn't have to do the math).**
+>
+> | Quantity | Metres (operator framing convention) | Centimetres (UE world units) |
+> | --- | --- | --- |
+> | Camera location | `(0, -20, 2)` | `(0, -2000, 200)` |
+> | Look-at target  | `(0, 0, 5)`   | `(0, 0, 500)`     |
+> | Forward (target - location) | `(0, 20, 3)` | `(0, 2000, 300)` |
+> | Derived rotator (`FRotationMatrix::MakeFromX(forward.GetSafeNormal()).Rotator()`) | pitch `+8.53°` (gentle look-up), yaw `90°` (facing +Y), roll `0°` | — |
+>
+> The aim math (so it can be re-checked by hand against any future operator request):
+>
+> | Term | Formula | Value |
+> | --- | --- | --- |
+> | yaw   | `atan2(delta.Y, delta.X)` = `atan2(2000, 0)` | `90°` |
+> | pitch | `atan2(delta.Z, sqrt(delta.X² + delta.Y²))` = `atan2(300, 2000)` | `+8.53°` |
+> | roll  | (FRotationMatrix::MakeFromX uses a sensible default up; no roll fed in) | `0°` |
+>
+> Crucially the rotator is **derived in code** (not hard-coded). The shared header
+> exposes both metre-triples and the derived rotator together:
+>
+> ```cpp
+> // RebusVisualiser/Source/RebusVisualiser/Public/RebusCineCameraPawn.h
+> namespace RebusCineCameraDefaults
+> {
+>     inline const FVector  kDefaultCameraLocation_cm = FVector( 0.f, -2000.f, 200.f); // (0,-20,2) m
+>     inline const FVector  kDefaultCameraTarget_cm   = FVector( 0.f,     0.f, 500.f); // (0, 0, 5) m
+>     inline const FRotator kDefaultCameraRotation    = FRotationMatrix::MakeFromX(
+>         (kDefaultCameraTarget_cm - kDefaultCameraLocation_cm).GetSafeNormal()).Rotator();
+> }
+> ```
+>
+> So any future request like "move the eye 1 m higher" or "look at the upstage banner at
+> (0, 5, 6) m" is a one-line edit to one of the two metre triples; the rotator updates
+> automatically on the next program start (lazy-initialised function-local static, one
+> trig call ever -- not a per-frame cost).
+>
+> **Single source of truth across the two consumers.** Two methods read this pose:
+>
+> | Caller | Pre-v1.0.100 source | v1.0.100 source |
+> | --- | --- | --- |
+> | `URebusVisualiserSubsystem::TryPositionPlayerView` (SpawnActor + ApplyTransform) | file-local `static const FVector RebusViewStartLocation/LookAtLocation` (literal `(0,-2000,200)` / `(0,0,200)`) | `RebusCineCameraDefaults::kDefaultCameraLocation_cm` / `kDefaultCameraRotation` from the shared header |
+> | `ARebusCineCameraPawn::ResetToDefaults` (Rebus.CameraReset console command) | left the actor transform alone -- reset only touched the lens / sensor / EV | `SetActorLocationAndRotation(kDefaultCameraLocation_cm, kDefaultCameraRotation)` + `SetControlRotation(...)` on the controller |
+>
+> **`ResetToDefaults` now returns to the same landing pose.** Pre-v1.0.100 the reset
+> only touched the cine settings (focal length / aperture / focus / sensor / EV) and left
+> the actor wherever the operator had last parked it. Operators reporting "I hit reset
+> and the framing is still wrong" pushed the change. v1.0.100 `ResetToDefaults` now
+> snaps the actor transform back to the shared `kDefaultCameraLocation_cm` /
+> `kDefaultCameraRotation` AND writes the same rotation onto the
+> `APlayerController::ControlRotation` (so the next mouse delta doesn't yank the view
+> back to a stale yaw -- mirrors `ApplyTransform`). The next
+> `BroadcastCameraStateIfChanged` read-back ships the new pose to the portal in the
+> same tick, so the portal's transform readout updates immediately. The lens / sensor /
+> EV reset behaviour from v1.0.96 / v1.0.98 is unchanged.
+>
+> **`FRebusCameraState` defaults: deliberately NOT touched.** The struct's
+> default-constructed `Location = ZeroVector` / `Rotation = ZeroRotator` is the
+> documented "no cine pawn yet" sentinel used by `HandleCameraDescriptor`'s
+> early-`RequestCameraState` reply (line 1284 of `RebusVisualiserSubsystem.cpp`).
+> Bumping it to the new spawn pose would have made the portal think the camera was
+> already at `(0,-2000,200)` BEFORE the pawn was actually alive, contradicting the
+> existing "answer with a zero snapshot so the UI doesn't freeze" semantics. Once the
+> pawn does spawn, `GetCameraState()` reads the LIVE actor transform (already at the
+> v1.0.100 pose because the spawn just put it there), so the first real read-back
+> already carries the correct numbers. So `FRebusCameraState`'s defaults are a no-op
+> for this version.
+>
+> **Portal override still works exactly as before.** This is JUST the construction-time
+> / `Rebus.CameraReset` landing pose. The portal can still drive the live camera pose
+> at any time via `SetCameraTransform` (handled by `HandleCameraDescriptor` →
+> `ARebusCineCameraPawn::ApplyTransform`), and the next `CameraState` read-back through
+> the existing per-tick stream broadcasts the override back to the portal. The
+> v1.0.79 / v1.0.82 / v1.0.96 / v1.0.98 camera-state pipeline is untouched -- v1.0.100
+> only changes the numbers the operator sees on first launch (and on reset).
+>
+> **Files touched (v1.0.100).**
+>
+> | File | What changed |
+> | --- | --- |
+> | `Source/RebusVisualiser/Public/RebusCineCameraPawn.h` | Added the `RebusCineCameraDefaults` namespace with `inline const` `kDefaultCameraLocation_cm` / `kDefaultCameraTarget_cm` / `kDefaultCameraRotation` (derived). Added `#include "Math/RotationMatrix.h"` for the rotator derivation. Updated `ResetToDefaults` doc-comment to mention the new transform-reset behaviour. |
+> | `Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp` | Removed the file-local `RebusViewStartLocation` / `RebusViewLookAtLocation` literals. `TryPositionPlayerView` now reads `RebusCineCameraDefaults::kDefaultCameraLocation_cm` / `kDefaultCameraRotation` and passes them to `World->SpawnActor<ARebusCineCameraPawn>` + `ApplyTransform`. Log line bumped to "(v1.0.100 default)". |
+> | `Source/RebusVisualiser/Private/RebusCineCameraPawn.cpp` | `ResetToDefaults` now also calls `SetActorLocationAndRotation(kDefaultCameraLocation_cm, kDefaultCameraRotation)` + `GetController()->SetControlRotation(...)` (mirrors `ApplyTransform`). Log line bumped to "v1.0.100 defaults (..., transform=... facing ...)". |
+> | `README.md` | This release block. |
+>
+> No engine / OrbitConnector / Epic-DMX-Fixtures asset is touched. The v1.0.99 shadow
+> trace + Orbit cast-shadows defaults remain untouched -- v1.0.100 is orthogonal (just
+> the camera spawn / reset pose).
+
 > **Beam shadows actually carve the cone-mesh shaft + force-cast-shadows on every imported primitive (v1.0.99).**
 > User report (verbatim, against v1.0.96/98):
 >

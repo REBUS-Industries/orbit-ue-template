@@ -24,9 +24,49 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/DefaultPawn.h"
+#include "Math/RotationMatrix.h"
 #include "RebusCineCameraPawn.generated.h"
 
 class UCineCameraComponent;
+
+// v1.0.100 -- shared construction-time landing pose for the cinematic camera. Authored in
+// metres (operator framing convention) and converted to UE world units (cm) by the literals
+// below. Two files consume these (URebusVisualiserSubsystem::TryPositionPlayerView spawn +
+// ARebusCineCameraPawn::ResetToDefaults), so they live in the header as `inline const` to
+// keep one storage instance across TUs (C++17 inline variables; UE 5.7 compiles C++20).
+//
+// Aim is DERIVED at runtime from `(target - location).GetSafeNormal()` via
+// FRotationMatrix::MakeFromX (UE's standard "build a rotation from a forward vector"
+// helper) so any future tweak to the metres triples re-derives pitch/yaw/roll cleanly --
+// nobody has to redo the trig by hand.
+//
+// Current values (v1.0.100): location (0, -20, 2) m = (0, -2000, 200) cm; target (0, 0, 5) m
+// = (0, 0, 500) cm; derived rotator (pitch +8.53°, yaw 90°, roll 0°) -- a 20 m back-off
+// looking gently up at the centre of stage 5 m above the deck.
+//
+// Portal control: this is JUST the construction-time / Rebus.CameraReset landing pose. The
+// portal can still drive the live camera transform via SetCameraTransform at any time --
+// the snapshot the portal reads back through SceneState always reflects the LIVE pawn pose,
+// not these constants.
+namespace RebusCineCameraDefaults
+{
+	// (0, -20, 2) m in cm -- 20 m back along -Y, 2 m up. Operator-tested neutral framing
+	// position behind a centred stage.
+	inline const FVector kDefaultCameraLocation_cm = FVector(0.f, -2000.f, 200.f);
+
+	// (0, 0, 5) m in cm -- centre of stage, 5 m above the deck. Roughly the height of a
+	// performer's head on a small riser; gives the derived aim a gentle look-up.
+	inline const FVector kDefaultCameraTarget_cm = FVector(0.f, 0.f, 500.f);
+
+	// Derived forward-vector rotation. `FRotationMatrix::MakeFromX` builds a basis whose +X
+	// is the supplied forward (UE convention: actor +X = control-rotation forward), with a
+	// sensible up. `.Rotator()` extracts pitch/yaw/roll in degrees. Today the math comes out
+	// to (pitch +8.53°, yaw 90°, roll 0°); if the metres triples change above this updates
+	// automatically on the next program start (function-local static, lazy-initialised on
+	// first read; cheap -- one trig call ever).
+	inline const FRotator kDefaultCameraRotation = FRotationMatrix::MakeFromX(
+		(kDefaultCameraTarget_cm - kDefaultCameraLocation_cm).GetSafeNormal()).Rotator();
+}
 
 // Snapshot of every camera property the portal can read / write. Lives outside the actor so
 // the subsystem can build it in one shot for outbound events without exposing the pawn
@@ -72,8 +112,11 @@ public:
 	FRebusCameraState GetCameraState() const;
 
 	// Reset all cine settings to the construction-time defaults (35mm f/2.8 focus@5m,
-	// 16:9 DSLR sensor [v1.0.98], manual exposure +10 EV [v1.0.96]). Used by the
-	// Rebus.CameraReset console command.
+	// 16:9 DSLR sensor [v1.0.98], manual exposure +10 EV [v1.0.96]). v1.0.100 also resets
+	// the actor transform to the shared RebusCineCameraDefaults::kDefaultCameraLocation_cm
+	// / kDefaultCameraRotation landing pose so the operator-side reset returns to the same
+	// place TryPositionPlayerView spawned us at. Used by the Rebus.CameraReset console
+	// command.
 	void ResetToDefaults();
 
 private:

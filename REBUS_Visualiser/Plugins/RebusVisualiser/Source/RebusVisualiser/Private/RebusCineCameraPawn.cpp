@@ -164,5 +164,24 @@ void ARebusCineCameraPawn::ResetToDefaults()
 	// v1.0.96 -- ResetToDefaults now lands on +10 EV to match the construction-time default.
 	// See the ctor doc-comment for the rationale (live-previs pixel-streaming brightness).
 	CineCamera->PostProcessSettings.AutoExposureBias = 10.f;
-	UE_LOG(LogRebusVisualiser, Log, TEXT("RebusCineCameraPawn: reset to v1.0.98 defaults (35mm f/2.8 focus@5m 16:9 DSLR manual EV+10)."));
+
+	// v1.0.100 -- also snap the ACTOR TRANSFORM back to the shared construction-time landing
+	// pose (location (0,-20,2) m looking at (0,0,5) m, aim derived in
+	// RebusCineCameraDefaults). Pre-v1.0.100 the reset only touched cine settings, so a
+	// portal-side Rebus.CameraReset after the operator dollied the camera left it sitting
+	// wherever they last parked it -- the reset matched the lens but not the framing, which
+	// confused operators expecting "reset = back to spawn pose". We also drive the
+	// controller's control rotation to the same yaw/pitch (mirrors ApplyTransform) so the
+	// next mouse delta doesn't yank the view back to a stale yaw, and the next
+	// BroadcastCameraStateIfChanged read-back ships the new pose to the portal.
+	const FVector&  ResetLocation = RebusCineCameraDefaults::kDefaultCameraLocation_cm;
+	const FRotator& ResetRotation = RebusCineCameraDefaults::kDefaultCameraRotation;
+	SetActorLocationAndRotation(ResetLocation, ResetRotation);
+	if (AController* C = GetController())
+	{
+		C->SetControlRotation(ResetRotation);
+	}
+
+	UE_LOG(LogRebusVisualiser, Log, TEXT("RebusCineCameraPawn: reset to v1.0.100 defaults (35mm f/2.8 focus@5m 16:9 DSLR manual EV+10, transform=%s facing %s)."),
+		*ResetLocation.ToString(), *ResetRotation.ToString());
 }
