@@ -59,6 +59,23 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// as false on first SceneState query and could re-disable the feature.
 	Values.Add(TEXT("bDriveOrbitModels"), FRebusPropertyValue::MakeBool(true));
 
+	// v1.0.90: post-process Bloom / Lens Flare / Vignette exposed as portal scene properties.
+	// Seeded with UE 5.7's stock FPostProcessSettings defaults so SceneState round-trips them
+	// before the portal pushes its first value, and the v1.0.89 ReapplyAll re-asserts the
+	// operator's live values on every (re)spawn of the unbound PostProcessVolume. The handlers
+	// below set the matching `bOverride_<Field>` flag on the volume so the values actually take
+	// effect (a PP volume with bOverride=false ignores the field entirely). BloomThreshold is
+	// signed -- -1.0 disables thresholding (UE convention) and is preserved verbatim. The
+	// LensFlareTint default is pure white so flares carry the source colour by default;
+	// operators tint via the existing {r,g,b,a} JSON colour wire path.
+	Values.Add(TEXT("BloomIntensity"), FRebusPropertyValue::MakeNumber(0.675));
+	Values.Add(TEXT("BloomThreshold"), FRebusPropertyValue::MakeNumber(-1.0));
+	Values.Add(TEXT("LensFlareIntensity"), FRebusPropertyValue::MakeNumber(1.0));
+	Values.Add(TEXT("LensFlareTint"), FRebusPropertyValue::MakeColor(FLinearColor::White));
+	Values.Add(TEXT("LensFlareBokehSize"), FRebusPropertyValue::MakeNumber(3.0));
+	Values.Add(TEXT("LensFlareThreshold"), FRebusPropertyValue::MakeNumber(8.0));
+	Values.Add(TEXT("VignetteIntensity"), FRebusPropertyValue::MakeNumber(0.4));
+
 	// Seed the lightest tier as the runtime default (live previs streaming). This overrides the
 	// heavier [SystemSettings] baseline from DefaultEngine.ini for the live stream; the portal
 	// can push "previs"/"final" via the RenderQuality scene property. SetRenderQuality stores
@@ -615,6 +632,71 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 	else if (Name == TEXT("TextureQuality"))      { SetScalabilityBucket(TEXT("sg.TextureQuality"), Value.AsInt()); }
 	else if (Name == TEXT("ViewDistanceQuality")) { SetScalabilityBucket(TEXT("sg.ViewDistanceQuality"), Value.AsInt()); }
 	else if (Name == TEXT("FoliageQuality"))      { SetScalabilityBucket(TEXT("sg.FoliageQuality"), Value.AsInt()); }
+	// --- v1.0.90 Post-process: Bloom / Lens Flare / Vignette pushed onto the unbound
+	//     PostProcessVolume's FPostProcessSettings. Each branch flips the matching
+	//     bOverride_<Field> flag to true BEFORE writing the value -- a PP volume ignores the
+	//     field entirely when its override flag is false (UE 5.7 PostProcessVolume.cpp
+	//     OverridePostProcessSettings), so the override is mandatory for the push to render.
+	else if (Name == TEXT("BloomIntensity"))
+	{
+		if (APostProcessVolume* PP = GetPostProcess())
+		{
+			PP->Settings.bOverride_BloomIntensity = true;
+			PP->Settings.BloomIntensity = Value.AsFloat();
+		}
+	}
+	else if (Name == TEXT("BloomThreshold"))
+	{
+		// Signed: -1.0 disables thresholding (UE convention). Do NOT clamp >= 0 here -- the
+		// portal can legitimately push -1 to restore the no-threshold default.
+		if (APostProcessVolume* PP = GetPostProcess())
+		{
+			PP->Settings.bOverride_BloomThreshold = true;
+			PP->Settings.BloomThreshold = Value.AsFloat();
+		}
+	}
+	else if (Name == TEXT("LensFlareIntensity"))
+	{
+		if (APostProcessVolume* PP = GetPostProcess())
+		{
+			PP->Settings.bOverride_LensFlareIntensity = true;
+			PP->Settings.LensFlareIntensity = Value.AsFloat();
+		}
+	}
+	else if (Name == TEXT("LensFlareTint"))
+	{
+		// FLinearColor on the wire (the existing {r,g,b,a} JSON colour path). White (default)
+		// means the flares carry the source colour; pushing a colour tints the entire flare.
+		if (APostProcessVolume* PP = GetPostProcess())
+		{
+			PP->Settings.bOverride_LensFlareTint = true;
+			PP->Settings.LensFlareTint = Value.Color;
+		}
+	}
+	else if (Name == TEXT("LensFlareBokehSize"))
+	{
+		if (APostProcessVolume* PP = GetPostProcess())
+		{
+			PP->Settings.bOverride_LensFlareBokehSize = true;
+			PP->Settings.LensFlareBokehSize = Value.AsFloat();
+		}
+	}
+	else if (Name == TEXT("LensFlareThreshold"))
+	{
+		if (APostProcessVolume* PP = GetPostProcess())
+		{
+			PP->Settings.bOverride_LensFlareThreshold = true;
+			PP->Settings.LensFlareThreshold = Value.AsFloat();
+		}
+	}
+	else if (Name == TEXT("VignetteIntensity"))
+	{
+		if (APostProcessVolume* PP = GetPostProcess())
+		{
+			PP->Settings.bOverride_VignetteIntensity = true;
+			PP->Settings.VignetteIntensity = Value.AsFloat();
+		}
+	}
 	else
 	{
 		// Ground (Surface), Cine Camera, post-fx etc. land here. We still store the value so

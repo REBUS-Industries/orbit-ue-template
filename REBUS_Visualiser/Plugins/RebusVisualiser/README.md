@@ -594,6 +594,98 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Post-process Bloom / Lens Flare / Vignette exposed as portal scene properties (v1.0.90).**
+> User: *"can we expose post processing - Lens Flare, Bloom and Vignette so we can control these via the portal."*
+>
+> v1.0.90 wires seven new portal-controllable post-process scalars onto the unbound
+> `APostProcessVolume` that the v1.0.x BaseLevel ships (and the `EnsureSceneEnvironment`
+> backstop spawns when one is missing). They follow the existing `URebusSceneSettingsSubsystem`
+> catalogue pattern verbatim -- each name is seeded in `Initialize` so SceneState round-trips
+> the control before the portal pushes anything, each is dispatched through
+> `ApplySceneProperty` so `ReapplyAll` re-asserts the operator's live values on every
+> environment / fixture (re)spawn, and each rides the same `SetSceneProperty` /
+> `SetSceneProperties` JSON descriptor wire route.
+>
+> **Properties.**
+>
+> | Name (wire)          | Type   | Default                | What it does (operator-facing)                                                  |
+> | -------------------- | ------ | ---------------------- | ------------------------------------------------------------------------------- |
+> | `BloomIntensity`     | number | `0.675` (UE default)   | Overall bloom strength on bright pixels. `0` = bloom off; `>1` = blown-out halo |
+> | `BloomThreshold`     | number | `-1.0` (UE default)    | Luminance cutoff before bloom starts. `-1` disables thresholding (UE convention) -- pushing `0..N` only blooms pixels brighter than that value |
+> | `LensFlareIntensity` | number | `1.0` (UE default)     | Master scale on the flare network. `0` = flares off; `>1` = brighter flares      |
+> | `LensFlareTint`      | color  | `FLinearColor::White`  | RGBA tint multiplied onto every flare. White (default) = source colour passes through; push a colour to gel the flares (warm/cool/etc.)         |
+> | `LensFlareBokehSize` | number | `3.0` (UE default)     | Diameter of the bokeh shape behind each flare element (in normalised screen units). Larger = chunkier flare highlights                          |
+> | `LensFlareThreshold` | number | `8.0` (UE default)     | Brightness above which a pixel produces a flare. Higher = only the brightest highlights flare; lower = more aggressive flaring                  |
+> | `VignetteIntensity`  | number | `0.4` (UE default)     | Edge darkening strength. `0` = no vignette; higher = more pronounced corner falloff                                                              |
+>
+> **Each property auto-sets its `bOverride_<Field>` flag.** A UE `APostProcessVolume` only
+> applies a setting whose paired `bOverride_<Field>` is `true`; with the flag `false` the
+> volume ignores the value entirely no matter what you write into `Settings.<Field>`. The
+> v1.0.90 handlers therefore set `PP->Settings.bOverride_<Field> = true` BEFORE writing the
+> value, so the portal push is guaranteed to render without the operator needing to author a
+> custom volume in the level. (Source: `Engine/Source/Runtime/Engine/Classes/Engine/Scene.h` --
+> the `bOverride_*` bits gate every override-able field, no exceptions.)
+>
+> **Lens-flare tint default = white means flares carry the source colour by default.** The
+> seed is `FLinearColor::White` (opaque white, alpha=1) so the v1.0.90 push is visually
+> indistinguishable from the unset / no-tint baseline -- operators only see a difference once
+> they push a coloured tint via the JSON `{r,g,b,a}` path (`FRebusPropertyValue::MakeColor`,
+> the same wire used by `SkyLightColor` / `InscatteringColor`).
+>
+> **Worked examples.** Send each of these as a normal `UIInteraction` descriptor (the same
+> envelope as `SetFixturePanTilt` / `Ping`):
+>
+> ```json
+> { "type": "SetSceneProperty", "name": "BloomIntensity",     "value": 1.5 }
+> { "type": "SetSceneProperty", "name": "BloomThreshold",     "value": 1.0 }
+> { "type": "SetSceneProperty", "name": "LensFlareIntensity", "value": 2.0 }
+> { "type": "SetSceneProperty", "name": "LensFlareTint",      "value": { "r": 1.0, "g": 0.7, "b": 0.4, "a": 1.0 } }
+> { "type": "SetSceneProperty", "name": "LensFlareBokehSize", "value": 4.5 }
+> { "type": "SetSceneProperty", "name": "LensFlareThreshold", "value": 4.0 }
+> { "type": "SetSceneProperty", "name": "VignetteIntensity",  "value": 0.8 }
+> ```
+>
+> Or in a single batched `SetSceneProperties` push:
+>
+> ```json
+> {
+>   "type": "SetSceneProperties",
+>   "properties": [
+>     { "name": "BloomIntensity",     "value": 1.5 },
+>     { "name": "BloomThreshold",     "value": 1.0 },
+>     { "name": "LensFlareIntensity", "value": 2.0 },
+>     { "name": "LensFlareTint",      "value": { "r": 1.0, "g": 0.7, "b": 0.4, "a": 1.0 } },
+>     { "name": "LensFlareBokehSize", "value": 4.5 },
+>     { "name": "LensFlareThreshold", "value": 4.0 },
+>     { "name": "VignetteIntensity",  "value": 0.8 }
+>   ]
+> }
+> ```
+>
+> Resetting back to the UE defaults -- the v1.0.90 seed values listed above -- is just another
+> push (e.g. `{"name": "VignetteIntensity", "value": 0.4}`), since the override flag stays
+> latched once written.
+>
+> **Pre-existing PP volumes are untouched until first push.** The seven `bOverride_<Field>`
+> flags are ONLY raised when the operator (or the SceneState round-trip) actually pushes the
+> property -- a stock BaseLevel that hasn't received any v1.0.90 push behaves byte-exact to
+> v1.0.89. Once any one is pushed, that field's override stays on for the rest of the session
+> (no in-protocol way to clear it; the value can always be restored to the UE default
+> verbatim).
+>
+> **Files touched.**
+>
+> ```
+> REBUS_Visualiser/Plugins/RebusVisualiser/Source/RebusVisualiser/Private/RebusSceneSettingsSubsystem.cpp
+> REBUS_Visualiser/Plugins/RebusVisualiser/README.md
+> ```
+>
+> No header changes required: `URebusSceneSettingsSubsystem::GetPostProcess()` and the
+> `CachedPostProcess` weak handle were already in place from the original v1.0.x scaffold,
+> and the seven new branches reuse them verbatim. ReapplyAll, SceneState read-back and the
+> JSON descriptor pipeline pick up the new properties automatically through the existing
+> catalogue / `Values` map.
+
 > **InternalBeam fixes -- offset direction, gobo on shaft, volumetric shadows, lens shadow opt-out (v1.0.89).**
 > User report (verbatim, four issues in one message):
 > *"the beam offset is in the wrong direction. Its infront of the lens, not behind it.*
