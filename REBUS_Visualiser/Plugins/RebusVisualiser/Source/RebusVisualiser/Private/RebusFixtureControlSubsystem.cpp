@@ -10,6 +10,7 @@
 #include "EngineUtils.h"
 #include "Components/SceneComponent.h"
 #include "GameFramework/Actor.h"
+#include "Internationalization/Regex.h"
 
 void URebusFixtureControlSubsystem::RegisterFixture(const FString& NodeId, ARebusFixtureActor* Actor)
 {
@@ -494,35 +495,84 @@ void URebusFixtureControlSubsystem::RebindOrbitModels()
 		return;
 	}
 
+	// v1.0.67: position-fallback prep -- group Orbit tags that LOOK like fixture-instance ids
+	// (8-4-4-4-12 hex UUID, with or without an `mvr-symdef-instance-` / arbitrary wrapper prefix)
+	// and compute each group's world-position centroid. The user's field log proved that the
+	// Speckle node id used on the control channel is NOT derivable from the MVR UUID by any
+	// transformation (md5/sha1 of every casing/dash variant tested zero hits) because Speckle
+	// hashes the full fixture *content*, not the UUID alone. But BOTH sides position fixtures
+	// from the SAME MVR coordinates, so world position is the universal ground truth we can
+	// always bridge through. Tags that look like layer / category names (no UUID anywhere)
+	// are excluded so e.g. "Design Layer-1" doesn't pull every component into one giant centroid.
+	static const FRegexPattern UuidPattern(
+		TEXT("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"));
+	auto LooksLikeInstanceTag = [](const FString& T) -> bool
+	{
+		FRegexMatcher M(UuidPattern, T);
+		return M.FindNext();
+	};
+	TMap<FString, FVector> InstanceCentroids;
+	for (const TPair<FString, TArray<USceneComponent*>>& OPair : OrbitIndex)
+	{
+		if (!LooksLikeInstanceTag(OPair.Key)) continue;
+		FVector Sum = FVector::ZeroVector;
+		int32 N = 0;
+		for (USceneComponent* C : OPair.Value)
+		{
+			if (!C) continue;
+			Sum += C->GetComponentLocation();
+			++N;
+		}
+		if (N > 0) InstanceCentroids.Add(OPair.Key, Sum / (float)N);
+	}
+
+	// Per-fixture matching pipeline (tries exact -> substring -> position, in order). Each Orbit
+	// instance key can be bound to AT MOST ONE fixture per pass -- once UsedKeys has it, later
+	// fixtures fall through to the next strategy. This is necessary because the position pass
+	// would otherwise let two fixtures with overlapping centroids both bind to the same group.
+	TSet<FString> UsedKeys;
 	int32 Matched = 0, Unmatched = 0;
-	int32 SubstringMatched = 0; // v1.0.66: tolerant matches via "tag contains FixtureId"
+	int32 ExactMatched = 0, SubstringMatched = 0, PositionMatched = 0;
 	TArray<FString> UnmatchedIds;
-	TArray<FString> SubstringHits; // "fixtureId<-orbitTag" pairs that fired the fallback
+	TArray<FString> SubstringHits;
+	TArray<FString> PositionHits;
+	// Tolerance for the position-fallback: the orbit-cli + the portal both ingest MVR positions
+	// so an exact-zero distance is expected when the rig is centred. 5 m (500 cm) tolerates a
+	// modest pivot offset between the MVR coordinate origin and Unreal's world origin without
+	// allowing accidental cross-fixture matches in a typical truss layout. Tune with the user
+	// if a large rig shows false negatives or false positives.
+	constexpr float kPosToleranceCm = 500.f;
+	const float kPosToleranceSq = kPosToleranceCm * kPosToleranceCm;
+
 	for (const TPair<FString, TObjectPtr<ARebusFixtureActor>>& Pair : Fixtures)
 	{
 		ARebusFixtureActor* Actor = Pair.Value.Get();
 		if (!Actor) continue;
 		const FString& FixtureId = Pair.Key;
 
-		// First try the canonical match (Orbit tag == FixtureId exactly).
-		TArray<USceneComponent*>* Found = OrbitIndex.Find(FixtureId);
-		FString MatchedKey = FixtureId;
+		TArray<USceneComponent*>* Found = nullptr;
+		FString MatchedKey;
+		const TCHAR* Strategy = TEXT("none");
 
-		// v1.0.66: fallback -- some glb exports tag components with a PATH or PREFIXED string
-		// that embeds the Speckle node id (e.g. "Light_001/090be834..." or
-		// "MovingHead.090be834..."), so exact equality misses but the fixture id still appears
-		// as a substring of one of the tag strings. We accept the FIRST tag containing it,
-		// preferring exact when both exist (handled by the Find above). Matching is case-
-		// sensitive on purpose -- Speckle node ids are hex digests, so casing is stable; only
-		// surrounding wrapper characters vary across exports.
-		if (!Found && FixtureId.Len() >= 8) // 8-char floor avoids accidental matches on short ids
+		// 1. Canonical exact match: Orbit tag == FixtureId.
+		if (TArray<USceneComponent*>* Hit = OrbitIndex.Find(FixtureId))
+		{
+			if (!UsedKeys.Contains(FixtureId))
+			{
+				Found = Hit; MatchedKey = FixtureId; Strategy = TEXT("exact");
+				++ExactMatched;
+			}
+		}
+
+		// 2. Substring match: tag CONTAINS the fixture id (catches path/prefix wrappers).
+		if (!Found && FixtureId.Len() >= 8)
 		{
 			for (TPair<FString, TArray<USceneComponent*>>& OPair : OrbitIndex)
 			{
+				if (UsedKeys.Contains(OPair.Key)) continue;
 				if (OPair.Key.Contains(FixtureId, ESearchCase::CaseSensitive))
 				{
-					Found = &OPair.Value;
-					MatchedKey = OPair.Key;
+					Found = &OPair.Value; MatchedKey = OPair.Key; Strategy = TEXT("substring");
 					++SubstringMatched;
 					if (SubstringHits.Num() < 4)
 					{
@@ -533,17 +583,51 @@ void URebusFixtureControlSubsystem::RebindOrbitModels()
 			}
 		}
 
+		// 3. Position-fallback: nearest unbound instance-centroid within tolerance.
+		if (!Found && InstanceCentroids.Num() > 0)
+		{
+			const FVector FixturePos = Actor->GetActorLocation();
+			FString BestKey;
+			float BestDistSq = kPosToleranceSq;
+			for (const TPair<FString, FVector>& GPair : InstanceCentroids)
+			{
+				if (UsedKeys.Contains(GPair.Key)) continue;
+				const float DSq = (float)FVector::DistSquared(FixturePos, GPair.Value);
+				if (DSq < BestDistSq)
+				{
+					BestDistSq = DSq;
+					BestKey = GPair.Key;
+				}
+			}
+			if (!BestKey.IsEmpty())
+			{
+				Found = OrbitIndex.Find(BestKey);
+				if (Found)
+				{
+					MatchedKey = BestKey; Strategy = TEXT("position");
+					++PositionMatched;
+					if (PositionHits.Num() < 4)
+					{
+						const float DistM = FMath::Sqrt(BestDistSq) * 0.01f;
+						PositionHits.Add(FString::Printf(TEXT("%s<-'%s' (%.2fm)"), *FixtureId, *MatchedKey, DistM));
+					}
+				}
+			}
+		}
+
 		if (Found)
 		{
-			// (Re)bind only when not already bound to this MATCHED KEY (canonical or substring)
-			// with live components -- re-binding would otherwise re-capture the currently-driven
-			// pose as the new "rest" and drift.
+			// (Re)bind only when not already bound to this MATCHED KEY with live components --
+			// re-binding would otherwise re-capture the currently-driven pose as the new "rest"
+			// and drift.
 			if (Actor->GetBoundOrbitObjectId() != MatchedKey || !Actor->HasOrbitBinding())
 			{
 				Actor->BindOrbitComponents(*Found, MatchedKey);
 			}
 			Actor->SetDriveOrbitModel(bDriveOrbitModels);
+			UsedKeys.Add(MatchedKey);
 			++Matched;
+			(void)Strategy; // Strategy held only for the per-hit lists above; counts go into the summary.
 		}
 		else
 		{
@@ -558,15 +642,16 @@ void URebusFixtureControlSubsystem::RebindOrbitModels()
 	{
 		LastOrbitMatchLogged = Matched;
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("Orbit bind: roots=%d taggedComps=%d distinctObjectIds=%d | fixtures matched=%d (substring=%d) unmatched=%d%s%s"),
-			RootCount, TaggedComps, OrbitIndex.Num(), Matched, SubstringMatched, Unmatched,
+			TEXT("Orbit bind: roots=%d taggedComps=%d distinctObjectIds=%d instanceCentroids=%d | fixtures matched=%d (exact=%d substring=%d position=%d) unmatched=%d%s%s"),
+			RootCount, TaggedComps, OrbitIndex.Num(), InstanceCentroids.Num(),
+			Matched, ExactMatched, SubstringMatched, PositionMatched, Unmatched,
 			UnmatchedIds.Num() > 0 ? TEXT(" unmatchedFixtureIds=") : TEXT(""),
 			UnmatchedIds.Num() > 0 ? *FString::Join(UnmatchedIds, TEXT(",")) : TEXT(""));
 
 		// v1.0.66: when at least one fixture is unmatched, dump a sample of the Orbit-side ids
-		// so the user can see WHY exact + substring both missed (likely an id-shape mismatch the
-		// data-pipeline emits -- hashing, base64-vs-hex, completely different namespace, etc.).
-		// Kept on a separate line so the throttled summary above stays grep-friendly.
+		// so the user can see WHY exact + substring + position all missed (likely an id-shape
+		// mismatch the data-pipeline emits OR the fixture is positioned outside the 5 m tolerance
+		// from any instance centroid).
 		if (Unmatched > 0 && OrbitIndex.Num() > 0)
 		{
 			TArray<FString> Keys; Keys.Reserve(OrbitIndex.Num());
@@ -585,6 +670,12 @@ void URebusFixtureControlSubsystem::RebindOrbitModels()
 			UE_LOG(LogRebusVisualiser, Log,
 				TEXT("Orbit bind substring-fallback hits (first %d): %s"),
 				SubstringHits.Num(), *FString::Join(SubstringHits, TEXT(" ; ")));
+		}
+		if (PositionHits.Num() > 0)
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Orbit bind position-fallback hits (first %d, tolerance=%.1fm): %s"),
+				PositionHits.Num(), kPosToleranceCm * 0.01f, *FString::Join(PositionHits, TEXT(" ; ")));
 		}
 	}
 }

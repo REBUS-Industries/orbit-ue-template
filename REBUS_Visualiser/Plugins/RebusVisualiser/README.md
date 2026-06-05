@@ -593,6 +593,83 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Position-based Orbit match: bridge the MVR-UUID vs Speckle-id namespace gap (v1.0.67).**
+> The v1.0.66 id-shape diagnostic answered "why doesn't substring match work" -- the two sides
+> are in totally different id namespaces:
+>
+> ```
+> matched=0 (substring=0) unmatched=4 unmatchedFixtureIds=090be834..., 0bfe4640..., ...
+> Orbit bind sample orbit-side ids (first 12/25): 01354FAB-15FC-4481-... | 053DA726-... |
+>   465FFBF2-... | 54E648DF-... | Design Layer-1 |
+>   mvr-symdef-instance-08AE2F2B-E78F-... | mvr-symdef-instance-394E793C-... |
+>   mvr-symdef-instance-9A066770-... | node10 | node11 | node12 | node13
+> ```
+>
+> Control-channel ids are 32-char lowercase hex Speckle node ids; Orbit-side tags are MVR
+> instance UUIDs (8-4-4-4-12 uppercase, with or without `mvr-symdef-instance-` prefix). The
+> Speckle id is content-hashed -- not derivable from the MVR UUID alone (verified offline: every
+> casing/dash variant md5/sha1 we tried gave zero hits against the four portal ids). So no
+> string transformation can bridge them.
+>
+> **But world POSITION can.** Both the portal and `orbit-cli` ingest the SAME MVR file, so both
+> place each fixture at the same MVR-coordinate location. Position is the universal ground
+> truth we can always bridge through.
+>
+> **What v1.0.67 changes in `RebindOrbitModels`.** The match loop is restructured into a
+> three-strategy pipeline tried in order per fixture, with each Orbit instance bindable to AT
+> MOST ONE fixture per pass:
+>
+> 1. **Exact** -- canonical: `OrbitIndex.Find(FixtureId)` (unchanged from v1.0.35).
+> 2. **Substring** -- tag *contains* the fixture id (unchanged from v1.0.66; catches
+>    `Light_001/090be834...`-style wrappers).
+> 3. **Position (NEW)** -- nearest unbound instance-centroid within a 5 m tolerance.
+>    Implementation:
+>
+>    - Build `InstanceCentroids` once per rebind: scan all Orbit tag groups, keep only the ones
+>      whose key matches a UUID pattern (8-4-4-4-12 hex, anywhere in the string; catches both
+>      bare `54E648DF-...` and prefixed `mvr-symdef-instance-08AE2F2B-...` shapes). Skip
+>      "Design Layer-1"-style category tags so they don't pull every component into one giant
+>      centroid. For each kept group, centroid = mean of bound components'
+>      `GetComponentLocation()`.
+>    - Per unmatched fixture, query `GetActorLocation()` (the actor was already spawned at the
+>      MVR-derived world position from the scene matrix) and pick the nearest unbound centroid
+>      within `kPosToleranceCm = 500` (5 m). Tolerance is generous enough for modest origin
+>      offsets between MVR space and Unreal world space, tight enough that adjacent fixtures
+>      in a typical truss don't cross-bind.
+> 4. **`UsedKeys` tracking** -- across all three strategies, each Orbit instance can only be
+>    consumed by ONE fixture per pass. Necessary because the position fallback would otherwise
+>    let two fixtures with overlapping centroids both bind to the same group.
+>
+> **Diagnostics.** The summary line now reports per-strategy counts:
+>
+> ```
+> Orbit bind: roots=1 taggedComps=23 distinctObjectIds=25 instanceCentroids=N
+>   | fixtures matched=4 (exact=0 substring=0 position=4) unmatched=0
+> ```
+>
+> A new `position-fallback hits` line names which fixture matched which Orbit key and at what
+> distance (first 4 hits):
+>
+> ```
+> Orbit bind position-fallback hits (first 4, tolerance=5.0m):
+>   090be834...<-'mvr-symdef-instance-08AE2F2B-...' (0.00m) ;
+>   0bfe4640...<-'mvr-symdef-instance-394E793C-...' (0.00m) ;
+>   ...
+> ```
+>
+> If a fixture still doesn't match after all three strategies, the existing
+> `sample orbit-side ids` line dumps the actual format mismatch and the unmatched-ids list
+> tells you which fixtures fell through -- either the fixture has no Orbit twin (legitimately
+> orphaned) OR it's positioned > 5 m from any Orbit instance (mismatch tolerance, or a coordinate
+> origin offset; tell us and we'll widen the tolerance or fix the origin transform).
+>
+> **No portal-contract change.** The portal still sends Speckle node ids; OrbitConnector still
+> tags components with MVR UUIDs; v1.0.67 just bridges them through world position when ids
+> don't line up. If a future portal release adds an explicit `orbitNodeId`/`mvrInstanceId`
+> alias to the scene-fixture descriptor we can wire it into a new "alias" strategy ahead of
+> position in the pipeline -- the substring + position fallbacks would then only fire when the
+> alias is absent.
+
 > **Orbit id-shape diagnostic + substring fallback (v1.0.66).** First v1.0.65 boot in the
 > field surfaced the next-layer-down issue: the matching plumbing works, but the IDs on the two
 > sides don't line up. Log line from the test scene with 4 control-channel fixtures + a populated
