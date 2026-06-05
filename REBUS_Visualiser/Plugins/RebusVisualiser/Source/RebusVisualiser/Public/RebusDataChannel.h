@@ -21,7 +21,9 @@
 
 class URebusFixtureControlSubsystem;
 class URebusSceneSettingsSubsystem;
+class URebusVisualiserSubsystem;
 class FJsonObject;
+struct FRebusCameraState;
 
 DECLARE_DELEGATE(FRebusOnChannelReady); // fired once when the data channel first opens
 DECLARE_DELEGATE(FRebusOnViewerConnected); // fired each time a viewer's data track opens
@@ -41,6 +43,11 @@ public:
 	// The scene-settings subsystem is world-scoped and may not exist yet at Initialize time;
 	// the session wires it in once a game world is live.
 	void SetSceneSettings(URebusSceneSettingsSubsystem* InScene);
+
+	// v1.0.79: the URebusVisualiserSubsystem owns the cine camera pawn + camera descriptor
+	// handler, so we forward SetCamera* / RequestCameraState descriptors to it. Wired by the
+	// subsystem at Initialize.
+	void SetVisualiserSubsystem(URebusVisualiserSubsystem* InViz) { Visualiser = InViz; }
 
 	// Poll for the streamer + input handler and bind the UIInteraction handler. Safe to call
 	// repeatedly; returns true once bound.
@@ -71,6 +78,11 @@ public:
 	void SendNotice(const FString& Code, const FString& Message, const FString& FixtureId = FString());
 	void SendFrameStats(float Fps, float BitrateKbps, float PacketLossPct, float LatencyMs);
 
+	// v1.0.79: live cinematic-camera transform + lens settings stream so the portal can
+	// preview the current viewport pose, EV, focal length, etc. Sent at ~30Hz (gated by the
+	// subsystem) but only when something actually changed beyond a dead zone.
+	void SendCameraState(const FRebusCameraState& State);
+
 private:
 	void HandleDescriptor(const FString& Descriptor);
 	void SendEvent(const TSharedRef<FJsonObject>& Event);
@@ -81,6 +93,7 @@ private:
 	FString StreamerId;
 	TWeakObjectPtr<URebusFixtureControlSubsystem> Control;
 	TWeakObjectPtr<URebusSceneSettingsSubsystem> Scene;
+	TWeakObjectPtr<URebusVisualiserSubsystem> Visualiser;
 	FDelegateHandle DataTrackOpenHandle;
 	bool bBound = false;
 	bool bReadyFired = false;

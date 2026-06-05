@@ -5,6 +5,7 @@
 #include "RebusFixtureControlSubsystem.h"
 #include "RebusSceneSettingsSubsystem.h"
 #include "RebusFixtureActor.h"
+#include "RebusCineCameraPawn.h"
 #include "RebusJson.h"
 #include "RebusVisualiserLog.h"
 
@@ -53,6 +54,7 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	Channel = MakeShared<FRebusDataChannel>();
 	Channel->Initialize(StreamerId, GetControl(), GetSceneSettings());
+	Channel->SetVisualiserSubsystem(this); // v1.0.79: route SetCamera* descriptors here
 	Channel->OnChannelReady.BindUObject(this, &URebusVisualiserSubsystem::OnChannelReady);
 	Channel->OnViewerConnected.BindUObject(this, &URebusVisualiserSubsystem::OnViewerConnected);
 	Channel->OnSceneDefinition.BindUObject(this, &URebusVisualiserSubsystem::HandleSceneDefinition);
@@ -232,6 +234,18 @@ bool URebusVisualiserSubsystem::Tick(float DeltaSeconds)
 			const float Dt = FApp::GetDeltaTime();
 			const float Fps = Dt > 0.f ? (1.f / Dt) : 0.f;
 			Channel->SendFrameStats(FMath::Clamp(Fps, 0.f, 240.f), 0.f, 0.f, 0.f);
+		}
+	}
+
+	// v1.0.79: ~30Hz CameraState stream. Gated by Channel + a live cine pawn; the helper
+	// itself dead-zone-rejects unchanged frames so a stationary camera never broadcasts.
+	if (bReadySent && Channel.IsValid() && CineCameraPawn.Get())
+	{
+		CameraStateTimer += DeltaSeconds;
+		if (CameraStateTimer >= (1.f / 30.f))
+		{
+			CameraStateTimer = 0.f;
+			BroadcastCameraStateIfChanged(/*bForce*/ false);
 		}
 	}
 
@@ -1045,6 +1059,10 @@ void URebusVisualiserSubsystem::BroadcastHandshake()
 	{
 		Ctl->SelectFixtures(Ctl->GetCurrentSelection(), Ctl->GetPrimarySelection());
 	}
+
+	// v1.0.79: push a fresh CameraState so the reconnecting viewer's portal UI paints the
+	// current pose + lens immediately instead of waiting for the first dead-zone delta.
+	BroadcastCameraStateIfChanged(/*bForce*/ true);
 }
 
 void URebusVisualiserSubsystem::OnViewerConnected()
@@ -1144,20 +1162,175 @@ bool URebusVisualiserSubsystem::TryPositionPlayerView()
 	// Forward (actor +X / control-rotation forward) points from the eye to the look-at target.
 	const FRotator ViewRotation = (RebusViewLookAtLocation - RebusViewStartLocation).Rotation();
 
-	if (APawn* Pawn = PC->GetPawn())
+	// v1.0.79: ensure the player is possessing a cinematic camera pawn (replaces UE's stock
+	// ADefaultPawn UCameraComponent with a UCineCameraComponent + manual exposure). If the PC
+	// is currently possessing the engine default pawn, spawn ours, possess it, then destroy
+	// the old pawn. Done here (rather than via a custom GameMode) so the existing
+	// retry-until-PC-exists pattern of TryPositionPlayerView is preserved.
+	if (!CineCameraPawn.Get() || CineCameraPawn->IsActorBeingDestroyed())
 	{
-		Pawn->SetActorLocationAndRotation(RebusViewStartLocation, ViewRotation);
-	}
-	else
-	{
-		return false; // pawn not spawned yet -> retry next tick
+		FActorSpawnParameters Spawn;
+		Spawn.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		ARebusCineCameraPawn* NewPawn = World->SpawnActor<ARebusCineCameraPawn>(
+			ARebusCineCameraPawn::StaticClass(),
+			RebusViewStartLocation,
+			ViewRotation,
+			Spawn);
+		if (!NewPawn) return false; // try again next tick (world may not be fully ready yet)
+
+		APawn* OldPawn = PC->GetPawn();
+		if (OldPawn != NewPawn)
+		{
+			PC->UnPossess();
+			PC->Possess(NewPawn);
+			if (OldPawn) OldPawn->Destroy();
+		}
+		CineCameraPawn = NewPawn;
+		UE_LOG(LogRebusVisualiser, Log, TEXT("RebusCineCameraPawn spawned + possessed (replacing default pawn)."));
 	}
 
-	// DefaultPawn's camera follows the controller's control rotation; set it so the view faces
-	// the target immediately (not just the pawn's actor rotation).
-	PC->SetControlRotation(ViewRotation);
+	if (ARebusCineCameraPawn* Cam = CineCameraPawn.Get())
+	{
+		Cam->ApplyTransform(RebusViewStartLocation, ViewRotation);
+	}
 
 	UE_LOG(LogRebusVisualiser, Log, TEXT("Player view positioned at %s facing %s."),
 		*RebusViewStartLocation.ToString(), *ViewRotation.ToString());
 	return true;
+}
+
+bool URebusVisualiserSubsystem::HandleCameraDescriptor(const FString& Type, const TSharedPtr<FJsonObject>& Msg)
+{
+	if (!Msg.IsValid()) return false;
+
+	// RequestCameraState is handled even if the pawn isn't ready yet -- we just answer with
+	// a zero snapshot so the portal's UI doesn't freeze waiting for a response that depends
+	// on a still-pending world spawn.
+	if (Type == TEXT("RequestCameraState"))
+	{
+		if (Channel.IsValid())
+		{
+			ARebusCineCameraPawn* Cam = CineCameraPawn.Get();
+			Channel->SendCameraState(Cam ? Cam->GetCameraState() : FRebusCameraState());
+		}
+		return true;
+	}
+
+	// Everything else needs a live pawn.
+	ARebusCineCameraPawn* Cam = CineCameraPawn.Get();
+	if (Type == TEXT("SetCameraTransform"))
+	{
+		const TArray<TSharedPtr<FJsonValue>>* LocArr = nullptr;
+		const TArray<TSharedPtr<FJsonValue>>* RotArr = nullptr;
+		FVector  Loc = Cam ? Cam->GetActorLocation() : FVector::ZeroVector;
+		FRotator Rot = Cam ? Cam->GetActorRotation() : FRotator::ZeroRotator;
+		if (Msg->TryGetArrayField(TEXT("loc"), LocArr) && LocArr && LocArr->Num() == 3)
+		{
+			Loc = FVector((*LocArr)[0]->AsNumber(), (*LocArr)[1]->AsNumber(), (*LocArr)[2]->AsNumber());
+		}
+		if (Msg->TryGetArrayField(TEXT("rot"), RotArr) && RotArr && RotArr->Num() == 3)
+		{
+			Rot = FRotator((*RotArr)[0]->AsNumber(), (*RotArr)[1]->AsNumber(), (*RotArr)[2]->AsNumber());
+		}
+		if (Cam)
+		{
+			Cam->ApplyTransform(Loc, Rot);
+			BroadcastCameraStateIfChanged(/*bForce*/ true);
+		}
+		return true;
+	}
+	if (Type == TEXT("SetCameraFocalLength"))
+	{
+		double Mm = 35.0;
+		if (RebusJson::TryGetNumber(Msg, TEXT("mm"), Mm) && Cam)
+		{
+			Cam->SetFocalLengthMm((float)Mm);
+			BroadcastCameraStateIfChanged(true);
+		}
+		return true;
+	}
+	if (Type == TEXT("SetCameraAperture"))
+	{
+		double FStop = 2.8;
+		if (RebusJson::TryGetNumber(Msg, TEXT("fStop"), FStop) && Cam)
+		{
+			Cam->SetAperture((float)FStop);
+			BroadcastCameraStateIfChanged(true);
+		}
+		return true;
+	}
+	if (Type == TEXT("SetCameraFocusDistance"))
+	{
+		// Two shapes: { "cm": 500 } sets manual focus; { "auto": true } enables tracking-AF.
+		bool bAuto = false;
+		if (RebusJson::TryGetBool(Msg, TEXT("auto"), bAuto) && bAuto)
+		{
+			if (Cam) { Cam->SetManualFocus(false); BroadcastCameraStateIfChanged(true); }
+			return true;
+		}
+		double Cm = 500.0;
+		if (RebusJson::TryGetNumber(Msg, TEXT("cm"), Cm) && Cam)
+		{
+			Cam->SetManualFocus(true);
+			Cam->SetFocusDistanceCm((float)Cm);
+			BroadcastCameraStateIfChanged(true);
+		}
+		return true;
+	}
+	if (Type == TEXT("SetCameraExposure"))
+	{
+		double Ev = 0.0;
+		if (RebusJson::TryGetNumber(Msg, TEXT("ev"), Ev) && Cam)
+		{
+			Cam->SetExposureBiasEv((float)Ev);
+			BroadcastCameraStateIfChanged(true);
+		}
+		return true;
+	}
+	if (Type == TEXT("SetCameraSensor"))
+	{
+		double WMm = 24.89, HMm = 18.66;
+		RebusJson::TryGetNumber(Msg, TEXT("widthMm"),  WMm);
+		RebusJson::TryGetNumber(Msg, TEXT("heightMm"), HMm);
+		if (Cam)
+		{
+			Cam->SetSensorSizeMm((float)WMm, (float)HMm);
+			BroadcastCameraStateIfChanged(true);
+		}
+		return true;
+	}
+
+	return false;
+}
+
+void URebusVisualiserSubsystem::BroadcastCameraStateIfChanged(bool bForce)
+{
+	if (!Channel.IsValid()) return;
+	ARebusCineCameraPawn* Cam = CineCameraPawn.Get();
+	if (!Cam) return;
+
+	const FRebusCameraState S = Cam->GetCameraState();
+
+	// Dead zone (cm / deg / mm / f-stop / cm / EV) so a stationary camera doesn't push 30
+	// identical messages/sec. Loose enough to avoid jitter spam but tight enough that any
+	// user-perceptible change goes out within one broadcast slot.
+	const bool bMoved =
+		!S.Location.Equals(LastSentCameraState.Location, 0.1f) ||
+		!S.Rotation.Equals(LastSentCameraState.Rotation, 0.05f) ||
+		!FMath::IsNearlyEqual(S.FocalLengthMm,  LastSentCameraState.FocalMm,    0.1f) ||
+		!FMath::IsNearlyEqual(S.Aperture,        LastSentCameraState.Aperture,   0.01f) ||
+		!FMath::IsNearlyEqual(S.FocusDistanceCm, LastSentCameraState.FocusCm,    0.5f) ||
+		!FMath::IsNearlyEqual(S.ExposureBiasEv,  LastSentCameraState.ExposureEv, 0.005f) ||
+		(S.bManualFocus != LastSentCameraState.bManualFocus);
+
+	if (!bForce && !bMoved) return;
+
+	Channel->SendCameraState(S);
+	LastSentCameraState.Location     = S.Location;
+	LastSentCameraState.Rotation     = S.Rotation;
+	LastSentCameraState.FocalMm      = S.FocalLengthMm;
+	LastSentCameraState.Aperture     = S.Aperture;
+	LastSentCameraState.FocusCm      = S.FocusDistanceCm;
+	LastSentCameraState.ExposureEv   = S.ExposureBiasEv;
+	LastSentCameraState.bManualFocus = S.bManualFocus;
 }

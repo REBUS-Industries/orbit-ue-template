@@ -26,6 +26,7 @@ class FRebusDataChannel;
 class URebusFixtureControlSubsystem;
 class URebusSceneSettingsSubsystem;
 class ARebusFixtureActor;
+class ARebusCineCameraPawn;
 class FJsonObject;
 
 UCLASS()
@@ -81,6 +82,21 @@ private:
 	URebusFixtureControlSubsystem* GetControl() const;
 	URebusSceneSettingsSubsystem* GetSceneSettings() const;
 	UWorld* GetActiveWorld() const;
+
+	// v1.0.79: live cine-camera pawn accessor for console commands + the DataChannel periodic
+	// CameraState broadcast. May be null until TryPositionPlayerView spawns and possesses it.
+	ARebusCineCameraPawn* GetCineCameraPawn() const { return CineCameraPawn.Get(); }
+
+	// Apply one of the SetCamera* descriptors to the live cine pawn. Recognised types:
+	//   SetCameraTransform   { "loc": [x,y,z], "rot": [pitch, yaw, roll] }
+	//   SetCameraFocalLength { "mm": 35 }
+	//   SetCameraAperture    { "fStop": 2.8 }
+	//   SetCameraFocusDistance { "cm": 500 }    OR    { "auto": true }
+	//   SetCameraExposure    { "ev": 0.0 }
+	//   SetCameraSensor      { "widthMm": 24.89, "heightMm": 18.66 }
+	//   RequestCameraState   { }                -- triggers a one-shot CameraState broadcast
+	// Returns true if the descriptor matched (so the data channel knows to stop routing it).
+	bool HandleCameraDescriptor(const FString& Type, const TSharedPtr<FJsonObject>& Msg);
 
 private:
 	// Config / launch tokens.
@@ -139,6 +155,29 @@ private:
 	TMap<FString, int32> PendingGoboChunksSeen;
 
 	UPROPERTY() TArray<TObjectPtr<ARebusFixtureActor>> SpawnedFixtures;
+
+	// v1.0.79: live cine-camera pawn (spawned + possessed in TryPositionPlayerView). The
+	// PlayerController auto-uses the pawn's CineCameraComponent as the view target because
+	// bFindCameraComponentWhenViewTarget defaults to true.
+	UPROPERTY() TObjectPtr<ARebusCineCameraPawn> CineCameraPawn = nullptr;
+
+	// Periodic CameraState outbound throttle (~30Hz) + dead-zone tracking. We only broadcast
+	// when the camera moved beyond a small threshold OR a cine setting changed, so a
+	// stationary camera doesn't flood the data channel with 30 identical messages/sec.
+	float CameraStateTimer = 0.f;
+	struct FCameraStateSnapshot
+	{
+		FVector  Location = FVector::ZeroVector;
+		FRotator Rotation = FRotator::ZeroRotator;
+		float    FocalMm = -1.f;
+		float    Aperture = -1.f;
+		float    FocusCm = -1.f;
+		float    ExposureEv = -1.f;
+		bool     bManualFocus = true;
+	};
+	FCameraStateSnapshot LastSentCameraState;
+
+	void BroadcastCameraStateIfChanged(bool bForce);
 
 	FTSTicker::FDelegateHandle TickHandle;
 

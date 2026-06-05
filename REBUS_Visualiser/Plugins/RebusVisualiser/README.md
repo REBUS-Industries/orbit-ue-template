@@ -27,6 +27,7 @@ in-context with the project's other plugins.
 | `RebusRestClient.*` | Async HTTP w/ `x-api-key`, redirect-following byte fetch | §4.0–§4.6 |
 | `RebusMotionSolver.*` | Pan/tilt parity: parent-first compose, tilt-under-pan +90°, pivotOffset | §7 |
 | `RebusFixtureActor.*` | Per-fixture actor: geometry proxies, SpotLight, cone/IES/source, fades | §7, §8, §11 |
+| `RebusCineCameraPawn.*` | v1.0.79 cinematic camera pawn (manual exposure, portal-driven focal/aperture/focus/EV/sensor/transform) | §6 |
 | `RebusIes.*` | Runtime IESNA → `UTextureLightProfile` (brightness authority stays portal-side) | §8.2 |
 | `RebusFixtureControlSubsystem.*` | `FixtureId → actor` registry + all `SetFixture*` + `SelectFixtures` | §3, §5.2/§5.3 |
 | `RebusSceneSettingsSubsystem.*` | `SetSceneProperty`/`SetSceneProperties` catalogue + `SceneState` | §5.4, §9, §6.3 |
@@ -592,6 +593,131 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   as ~the half-angle, so feeding the doubled value made the cone ~2× too wide; the beam edge now
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
+
+> **Cinematic camera + portal-driven lens / exposure / transform stream (v1.0.79).**
+> User asked for:
+> *"We want to change the default camera to a Cinematic Camera which is controllable. We want
+> to make it Manual Exposure. We want to expose basic settings like focal length, Aperture
+> etc. We want to send our portal real time transform information that then allows us to
+> change and see live updates."*
+>
+> All four landed in one pass: a new `ARebusCineCameraPawn` replaces UE's default `ADefaultPawn`,
+> exposes manual exposure + cinematic lens, accepts six `SetCamera*` data-channel descriptors,
+> and broadcasts a `CameraState` event back at ~30Hz (dead-zone-gated, so a stationary camera
+> stays quiet).
+>
+> **Why a cine camera (not just style the default one).** `UCineCameraComponent` is the cinema
+> camera UE ships for sequencer + virtual production work. Three concrete reasons it had to
+> replace the default:
+>
+> - **Focal length / aperture / focus distance are first-class UPROPERTYs** with the right
+>   units (mm, f-stop, cm) and physically-accurate cone math. Trying to map "focal length" onto
+>   `UCameraComponent::FieldOfView` (the DefaultPawn camera) loses the sensor-size dependency
+>   -- you can't say "I want this look on a 50mm S35 lens" with just FOV, because the same FOV
+>   means a different shot on different sensor sizes. The portal sliders that already speak
+>   mm + f-stop now drive the camera in its native units.
+> - **`FCameraFocusSettings` provides real depth-of-field** out of the box (manual or
+>   tracking AF) so f-stop changes actually change the blur, not just the exposure (which
+>   matters because the DMX rig changes f-stop to "stop down" highlights).
+> - **Post-process settings on the cine component are scoped to the camera**, so the manual-
+>   exposure override doesn't fight an unbound PostProcessVolume (the visualiser's default
+>   environment includes one for fog/colour grading).
+>
+> **Why manual exposure.** Auto-exposure was rebalancing the viewport every time the DMX rig
+> cut lights, which read to the audience as the **camera** adapting rather than the **show**
+> changing. Three concrete failure modes:
+>
+> - **Blackouts looked like fades.** Auto-exposure ramped the gain up over ~0.5s of darkness,
+>   so the intended dramatic cut lost its punch.
+> - **EV sliders on the portal had no effect.** Operators tried to grade by pushing the EV
+>   slider; auto-exposure compensated in the opposite direction. v1.0.79 forces
+>   `AutoExposureMethod = AEM_Manual` + `AutoExposureBias = 0` by default, so the EV slider
+>   maps 1:1 to a perceptible change.
+> - **Lumen fast response (v1.0.78) was being masked.** GI now cuts instantly when lights
+>   toggle, but auto-exposure would then slowly re-expose, so the audience still saw a fade.
+>   Manual exposure + the v1.0.78 Lumen pack now combine into instant on/off.
+>
+> **Data-channel surface (portal -> UE).** All six descriptors are routed in
+> `URebusVisualiserSubsystem::HandleCameraDescriptor` and reach the camera through
+> `ARebusCineCameraPawn::Set*`:
+>
+> ```jsonc
+> // 6-DoF pose -- cm + degrees, UE world frame.
+> { "type": "SetCameraTransform",
+>   "loc": [0, -2000, 200], "rot": [0, 90, 0] }
+>
+> // Lens focal length (mm). Clamped to [4, 1000].
+> { "type": "SetCameraFocalLength", "mm": 35 }
+>
+> // Iris (f-stop). Clamped to [1, 32]. Changes the depth-of-field, not just exposure.
+> { "type": "SetCameraAperture", "fStop": 2.8 }
+>
+> // Manual focus (cm) -- enables manual focus and sets the focus plane distance.
+> { "type": "SetCameraFocusDistance", "cm": 500 }
+>
+> // Tracking AF -- bypasses manual focus until next SetCameraFocusDistance.
+> { "type": "SetCameraFocusDistance", "auto": true }
+>
+> // Manual exposure bias (EV stops, ±10). Forces manual mode if it wasn't already.
+> { "type": "SetCameraExposure", "ev": 0.0 }
+>
+> // Sensor size (mm). Defaults Super35 24.89x18.66. Changes how focal length reads as FOV.
+> { "type": "SetCameraSensor", "widthMm": 24.89, "heightMm": 18.66 }
+>
+> // One-shot CameraState push (e.g. portal just opened and wants the current state).
+> { "type": "RequestCameraState" }
+> ```
+>
+> **Outbound `CameraState` (UE -> portal).** Identical struct shape so the portal can hold one
+> `CameraState` object and call either direction with the same fields. The subsystem ticks at
+> ~30Hz, samples the live pawn, and only sends when something moved beyond a dead zone (0.1cm
+> pos / 0.05° rot / 0.1mm focal / 0.01 f-stop / 0.5cm focus / 0.005 EV). A stationary,
+> untouched camera produces **zero** messages -- there's no idle traffic. Re-sends are also
+> forced (a) on every viewer reconnect (so a late-joining portal paints the live pose
+> immediately, not after the first wiggle) and (b) right after any inbound `SetCamera*` lands
+> (so the portal sees its own change confirmed). Shape:
+>
+> ```jsonc
+> { "type": "CameraState",
+>   "loc":   [0, -2000, 200],          // cm, UE world space
+>   "rot":   [0, 90, 0],               // pitch / yaw / roll, deg
+>   "focalMm": 35.0,                   // current lens focal length
+>   "fStop":   2.8,                    // current aperture
+>   "focusCm": 500.0,                  // manual focus distance (cm)
+>   "manualFocus": true,               // false -> tracking AF active
+>   "ev":      0.0,                    // current manual EV bias
+>   "sensor":  { "wMm": 24.89, "hMm": 18.66 } }
+> ```
+>
+> **Spawn / possess plumbing.** The visualiser subsystem's existing
+> `TryPositionPlayerView()` (already retried each tick until the PlayerController exists) now
+> also spawns + possesses an `ARebusCineCameraPawn` and destroys the default pawn. Done at
+> runtime instead of via a custom `AGameModeBase` so the existing "wait for PC, then place
+> the view" pattern is reused as-is and packaged builds don't need a GameMode redirect (which
+> is also brittle when a level was authored against the engine default). The cine pawn is a
+> subclass of `ADefaultPawn` -- this is intentional: we inherit `UFloatingPawnMovement` +
+> mouse-look + WASD bindings for free. `ADefaultPawn` in UE 5.7 has NO `UCameraComponent`
+> (the stock pawn drives its view straight from the controller's control rotation), so we
+> just `CreateDefaultSubobject<UCineCameraComponent>` in the cine pawn's ctor, attach it to
+> the inherited sphere, and set `bUsePawnControlRotation = true` so mouse-look writes through.
+> The camera manager auto-finds the cine component via `APawn::bFindCameraComponentWhenViewTarget`
+> (defaults to `true`) -- no `SetViewTarget` call needed.
+>
+> **Defaults baked in v1.0.79.** 35mm focal, f/2.8 aperture, manual focus @ 5m, Super35
+> sensor (24.89x18.66mm), manual exposure +0 EV. Picked to look like a neutral cinema prime
+> on a S35 body framing a typical mid-stage subject without bokeh-blurring the back of the
+> set at f/2.8. `Rebus.CameraReset` restores these without moving the camera; the operator
+> can then re-frame from the portal with `SetCameraTransform`.
+>
+> **Console aids.**
+>
+> ```
+> Rebus.CameraSnapshot   # one-line dump of the live state (loc/rot/lens/EV/sensor)
+> Rebus.CameraReset      # restore the v1.0.79 lens + exposure defaults (does NOT move)
+> ```
+>
+> **Module dependency.** Adds `CinematicCamera` to `RebusVisualiser.Build.cs`
+> `PrivateDependencyModuleNames`. Nothing else moved.
 
 > **Lumen GI fast-response: disable temporal filters so lights respond instantly (v1.0.78).**
 > User identified the actual root cause: *"the ghosting is to do with Global illumination and

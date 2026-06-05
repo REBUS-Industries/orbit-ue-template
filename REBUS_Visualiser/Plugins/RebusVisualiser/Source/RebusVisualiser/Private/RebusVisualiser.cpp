@@ -4,7 +4,10 @@
 #include "RebusFixtureControlSubsystem.h"
 #include "RebusFixtureActor.h"
 #include "RebusSceneSettingsSubsystem.h"
+#include "RebusVisualiserSubsystem.h"
+#include "RebusCineCameraPawn.h"
 
+#include "CineCameraComponent.h"
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
@@ -33,6 +36,8 @@ namespace
 	IConsoleCommand* GGoboRTSizeCommand = nullptr;
 	IConsoleCommand* GDLSSCommand = nullptr;
 	IConsoleCommand* GLumenFastResponseCommand = nullptr;
+	IConsoleCommand* GCameraSnapshotCommand = nullptr;
+	IConsoleCommand* GCameraResetCommand = nullptr;
 
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
@@ -252,6 +257,63 @@ namespace
 			}
 		}
 		UE_LOG(LogRebusVisualiser, Log, TEXT("Rebus.DumpGoboState: dumped %d fixture(s)."), Total);
+	}
+
+	// v1.0.79 helpers: pluck the live cinematic camera pawn from any game/PIE world. There's
+	// only ever one (the visualiser subsystem spawns + possesses it in TryPositionPlayerView)
+	// but iterating worlds makes the console commands work the same in PIE and packaged.
+	ARebusCineCameraPawn* FindLiveCineCameraPawn()
+	{
+		if (!GEngine) return nullptr;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+			for (TActorIterator<ARebusCineCameraPawn> It(World); It; ++It)
+			{
+				if (ARebusCineCameraPawn* Cam = *It) return Cam;
+			}
+		}
+		return nullptr;
+	}
+
+	// v1.0.79 `Rebus.CameraSnapshot` -- log the live cine camera state in one line. Useful
+	// when the portal stream is choked (CameraState events not arriving) and the operator
+	// wants a quick "where am I and what is the lens" sanity check without firing up a
+	// proper debugger overlay.
+	void HandleCameraSnapshotCommand(const TArray<FString>& /*Args*/)
+	{
+		ARebusCineCameraPawn* Cam = FindLiveCineCameraPawn();
+		if (!Cam)
+		{
+			UE_LOG(LogRebusVisualiser, Warning, TEXT("Rebus.CameraSnapshot: no live RebusCineCameraPawn found (subsystem hasn't possessed yet?)."));
+			return;
+		}
+		const FRebusCameraState S = Cam->GetCameraState();
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.CameraSnapshot: loc=(%.1f,%.1f,%.1f)cm rot=(P%.2f,Y%.2f,R%.2f)deg "
+				 "focal=%.1fmm fStop=%.2f focus=%.1fcm (%s) EV=%.2f sensor=%.2fx%.2fmm"),
+			S.Location.X, S.Location.Y, S.Location.Z,
+			S.Rotation.Pitch, S.Rotation.Yaw, S.Rotation.Roll,
+			S.FocalLengthMm, S.Aperture, S.FocusDistanceCm,
+			S.bManualFocus ? TEXT("manual") : TEXT("auto"),
+			S.ExposureBiasEv,
+			S.SensorWidthMm, S.SensorHeightMm);
+	}
+
+	// v1.0.79 `Rebus.CameraReset` -- restore the cine pawn to factory defaults. Doesn't move
+	// the camera (operators don't want to lose their framing); only re-applies the lens +
+	// exposure defaults. To reset the framing too the operator can send SetCameraTransform
+	// from the portal (or relaunch the stream).
+	void HandleCameraResetCommand(const TArray<FString>& /*Args*/)
+	{
+		ARebusCineCameraPawn* Cam = FindLiveCineCameraPawn();
+		if (!Cam)
+		{
+			UE_LOG(LogRebusVisualiser, Warning, TEXT("Rebus.CameraReset: no live RebusCineCameraPawn found."));
+			return;
+		}
+		Cam->ResetToDefaults();
 	}
 
 	// v1.0.75: `Rebus.GoboRTSize <pixels>` -- rebuild every fixture's gobo render target at a
@@ -820,6 +882,28 @@ void FRebusVisualiserModule::StartupModule()
 			 "accumulator. If ghosting returns, try 'dlaa' or 'off'."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDLSSCommand),
 		ECVF_Default);
+
+	// v1.0.79 cinematic-camera console aids. The portal drives the camera over the data
+	// channel (SetCamera*) but these are useful when the operator is in PIE or wants a
+	// quick state dump without the portal in the loop.
+	GCameraSnapshotCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.CameraSnapshot"),
+		TEXT("Log the live cinematic camera state -- loc/rot/focal length/aperture/focus "
+			 "distance/EV/sensor -- in one line. Use to verify the portal's SetCamera* "
+			 "descriptors are landing (the same struct is what gets broadcast as CameraState). "
+			 "Returns a warning if the RebusCineCameraPawn isn't possessed yet (happens "
+			 "before the streamer has connected)."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleCameraSnapshotCommand),
+		ECVF_Default);
+
+	GCameraResetCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.CameraReset"),
+		TEXT("Reset the live cinematic camera to v1.0.79 defaults: 35mm focal, f/2.8 aperture, "
+			 "manual focus @ 5m, Super35 sensor (24.89x18.66mm), manual exposure +0 EV. "
+			 "Does NOT move the camera -- only resets the lens + exposure. To re-frame, send "
+			 "SetCameraTransform from the portal."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleCameraResetCommand),
+		ECVF_Default);
 }
 
 void FRebusVisualiserModule::ShutdownModule()
@@ -878,6 +962,16 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GLumenFastResponseCommand);
 		GLumenFastResponseCommand = nullptr;
+	}
+	if (GCameraSnapshotCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GCameraSnapshotCommand);
+		GCameraSnapshotCommand = nullptr;
+	}
+	if (GCameraResetCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GCameraResetCommand);
+		GCameraResetCommand = nullptr;
 	}
 	// v1.0.73 / v1.0.78: restore both CVar packs to their snapshotted values so a hot-reload
 	// of the module doesn't leak a permanent override into the engine session.

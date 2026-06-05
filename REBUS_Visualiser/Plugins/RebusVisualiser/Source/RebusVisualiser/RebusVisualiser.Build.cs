@@ -31,6 +31,9 @@ public class RebusVisualiser : ModuleRules
 			// Runtime fixture geometry proxies built from /api/ue/fixtures/{id}/meshes.
 			"ProceduralMeshComponent",
 
+			// v1.0.79 cinematic camera pawn (UCineCameraComponent + manual exposure).
+			"CinematicCamera",
+
 			// Pixel Streaming 2 (UE 5.5+). The streamer + input handler live in these modules;
 			// names may need a tweak per exact 5.7 layout (see Plugins/RebusVisualiser/README.md).
 			"PixelStreaming2",

@@ -2,6 +2,8 @@
 #include "RebusDataChannel.h"
 #include "RebusFixtureControlSubsystem.h"
 #include "RebusSceneSettingsSubsystem.h"
+#include "RebusVisualiserSubsystem.h"
+#include "RebusCineCameraPawn.h"
 #include "RebusJson.h"
 #include "RebusVisualiserLog.h"
 
@@ -221,6 +223,17 @@ void FRebusDataChannel::HandleDescriptor(const FString& Descriptor)
 	if (URebusSceneSettingsSubsystem* Sce = Scene.Get())
 	{
 		if (Sce->HandleSceneDescriptor(Type, Msg))
+		{
+			return;
+		}
+	}
+
+	// v1.0.79: cinematic-camera control (SetCameraTransform / SetCameraFocalLength / ...).
+	// Routed before the generic console-command bypass so the portal can address the camera
+	// without colliding with a CVar of the same prefix.
+	if (URebusVisualiserSubsystem* Viz = Visualiser.Get())
+	{
+		if (Viz->HandleCameraDescriptor(Type, Msg))
 		{
 			return;
 		}
@@ -460,5 +473,39 @@ void FRebusDataChannel::SendPong(double Ts)
 	E->SetNumberField(TEXT("ts"), Ts);
 	E->SetNumberField(TEXT("ueClockMs"), FPlatformTime::Seconds() * 1000.0);
 	UE_LOG(LogRebusVisualiser, Log, TEXT("Sending Pong (ts=%.0f)."), Ts);
+	SendEvent(E);
+}
+
+void FRebusDataChannel::SendCameraState(const FRebusCameraState& State)
+{
+	// Schema: { type:"CameraState", loc:[x,y,z]cm, rot:[pitch,yaw,roll]deg,
+	//           focalMm, fStop, focusCm, manualFocus, ev, sensor:{wMm,hMm} }
+	// All numbers in UE world units (cm) / degrees so the portal doesn't have to know about
+	// UE's coordinate scale -- it just echoes the values it would send back via SetCamera*.
+	TSharedRef<FJsonObject> E = MakeShared<FJsonObject>();
+	E->SetStringField(TEXT("type"), TEXT("CameraState"));
+
+	auto MakeArr3 = [](double A, double B, double C)
+	{
+		TArray<TSharedPtr<FJsonValue>> Out;
+		Out.Add(MakeShared<FJsonValueNumber>(A));
+		Out.Add(MakeShared<FJsonValueNumber>(B));
+		Out.Add(MakeShared<FJsonValueNumber>(C));
+		return Out;
+	};
+
+	E->SetArrayField(TEXT("loc"), MakeArr3(State.Location.X, State.Location.Y, State.Location.Z));
+	E->SetArrayField(TEXT("rot"), MakeArr3(State.Rotation.Pitch, State.Rotation.Yaw, State.Rotation.Roll));
+	E->SetNumberField(TEXT("focalMm"), State.FocalLengthMm);
+	E->SetNumberField(TEXT("fStop"), State.Aperture);
+	E->SetNumberField(TEXT("focusCm"), State.FocusDistanceCm);
+	E->SetBoolField(TEXT("manualFocus"), State.bManualFocus);
+	E->SetNumberField(TEXT("ev"), State.ExposureBiasEv);
+
+	TSharedRef<FJsonObject> Sensor = MakeShared<FJsonObject>();
+	Sensor->SetNumberField(TEXT("wMm"), State.SensorWidthMm);
+	Sensor->SetNumberField(TEXT("hMm"), State.SensorHeightMm);
+	E->SetObjectField(TEXT("sensor"), Sensor);
+
 	SendEvent(E);
 }
