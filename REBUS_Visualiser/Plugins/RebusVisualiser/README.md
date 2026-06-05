@@ -594,6 +594,134 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **InternalBeam retired + lens visibility restored + volumetric shadow plumbing on the Epic-beam SpotLight (v1.0.95).**
+> User report (verbatim):
+>
+> > "Can we remove the internal beam, we are not going to use this. Lens is hidden with the epic beam, can we add the lens object.
+> >
+> > Can we work out a way to make volumetric shadowing work with the Epic Beam, thats the only thing that isnt."
+>
+> Three coupled deliverables, shipped together because all three sit in the same fixture path:
+>
+> **1. InternalBeam A/B mode retired end-to-end.** The v1.0.87 → v1.0.93 InternalBeam path
+> (hide Epic / cone, promote the SpotLight INSIDE the head, push it back by
+> `lensRadius / tan(maxZoomHalfAngle)`, force volumetrics on, opt body meshes out of
+> shadow casting, install the v1.0.93 cone-mesh shaft + v1.0.93 volumetric-fog-aware
+> light-function MID) is GONE. The Epic DMX-Fixtures beam (raymarched `M_RebusBeam`) is
+> now the **only** beam path. Removed:
+>
+> | Surface | What went | Note |
+> | --- | --- | --- |
+> | `ARebusFixtureActor` | `bInternalBeamEnabled`, `InternalBeamShadowCache`, the entire `Apply`/`Restore`/`Compute`InternalBeam*` family, `SetBodyMeshesCastShadow`, `OptPrimitiveOutOfInternalBeamShadow`, `Push`/`RestoreInternalBeamMegaLights`, the cone-mesh shaft component + its 4 helper funcs, `EnsureFixtureInternalBeamMIDs`, the `GoboLightFunctionMaterial` + `InternalBeamShaftMaterial` UPROPERTY refs + `FObjectFinder`s, the back-offset post-step in `RefreshMotion` (both rig + synthetic-aim branches), the InternalBeam-pose re-apply in `ApplyZoom`, `PushGoboRTToInternalBeamMaterials` from `ApplyCurrentGoboToLightFn` | The lens-disc lifecycle, the gobo cookie path, and the IES wiring are SHARED with Epic-beam and remain functional. |
+> | `URebusSceneSettingsSubsystem` | `bInternalBeam` scene-property seed + dispatcher branch, `SetInternalBeamEnabled`, `PushLightFunctionAtlasForInternalBeam`, `PushVolumetricFogLightFunctionForInternalBeam`, the `r.LightFunctionAtlas.Enabled` / `r.VolumetricFog.LightFunction` / `r.LightFunctionQuality` cached-prior fields + idempotency latches | `Rebus.AllowMegaLights` (v1.0.94) stays. |
+> | `RebusVisualiser.cpp` console | `Rebus.InternalBeam` (the only InternalBeam console command in the build, since `Rebus.InternalBeamScatter` / `Rebus.InternalBeamOffsetSign` / `Rebus.InternalBeamForceLegacy` / `Rebus.InternalBeamCookieCone` were CVars not commands and went with the actor CVar block). Renamed: `Rebus.DumpFixtureIes`'s help text references InternalBeam removed. | Every other Rebus.* command is untouched. |
+> | `RebusFixtureActor.cpp` CVar block | `Rebus.InternalBeamScatter`, `Rebus.InternalBeamOffsetSign`, `Rebus.InternalBeamForceLegacy`, `Rebus.InternalBeamCookieCone` + their refresh sinks. Replaced by a single new `Rebus.SpotLightScatter <float>` (default 0.5) -- the per-light volumetric scattering for Epic-beam mode (see deliverable 3 below). | `Rebus.AllowMegaLights` + `Rebus.HeroShadowScatter` untouched. |
+> | `build_rebus_base_level.py` | `_build_gobo_lf_master`, `ensure_gobo_light_function_material`, `_gobo_lf_master_is_current`, `_INTERNAL_BEAM_SHAFT_HLSL`, `_build_internal_beam_shaft_master`, `ensure_internal_beam_shaft_material`, `_internal_beam_shaft_master_is_current` + their call-sites in `build()` / `ensure_base_level()`. **NEW** `_cleanup_internal_beam_assets()` deletes the on-disk masters from any existing project drop on next launch (idempotent, logs a Warning the first time it deletes anything). | `ensure_fixture_lens_material` (`M_RebusFixtureLens`) STAYS -- it now drives every Epic-beam lens disc. |
+> | `RebusSceneSettingsSubsystem.h` | `SetInternalBeamEnabled`, both `Push*ForInternalBeam` helpers + 5 cached-prior int fields + 2 idempotency latch bools | Subsystem surface shrank by ~80 lines. |
+>
+> `Grep` for `InternalBeam` after the removal returns only README-historical hits (the v1.0.87
+> → v1.0.94 release blocks preserved verbatim above this one) + the explanatory v1.0.95
+> comments in source documenting the retirement. **Old scene saves that still push
+> `bInternalBeam=true` are silently ignored**: `ApplySceneProperty` falls through to the
+> unknown-name branch (already returns `bKnown=false`), no crash, no migration needed.
+>
+> **2. Lens visibility in Epic-beam mode.** User reported "Lens is hidden with the epic
+> beam, can we add the lens object." Root cause was a coupling between the v1.0.93
+> InternalBeam cone-mesh shaft (parented at the lens plane) and the lens visibility
+> assertion -- the InternalBeam OFF transition was the only path that re-asserted
+> `IsBeamLensComponents` visibility, so in some scene-load orderings (where the v1.0.93
+> shaft never ran because InternalBeam mode was never engaged) the freshly-built lens PMC
+> could end up at construction-default visibility but `bHiddenInGame=true` (procedural
+> mesh defaults flicker between editor + cooked builds). The v1.0.95 fix:
+>
+> - **`BuildMeshes` now explicitly calls `PMC->SetVisibility(true)` + `PMC->SetHiddenInGame(false)`**
+>   on every real `<Beam>` `IsBeamLensComponents` mesh AT construction, so the lens object
+>   the operator asked to see is ALWAYS visible on first spawn in Epic-beam mode.
+> - **`RefreshIsBeamLensVisuals` also drives `Beam->SetHiddenInGame(!bShowReal)` in lockstep**
+>   with the `SetVisibility` push so the cooked / packaged path can't silently override
+>   the editor-path visibility. The synthetic `LensDisc` had this paired pattern since
+>   v1.0.88; the real-`<Beam>` branch was missing the `bHiddenInGame` half.
+> - **Construction-time Warning if `M_RebusFixtureLens` fails to load**: the Epic-beam lens
+>   (synthetic `LensDisc` + every real `<Beam>` `IsBeamLensComponents` PMC) drives off this
+>   Python-baked master. Pre-v1.0.95 the missing-material case silently fell back to the
+>   runtime `BasicShapeMaterial` MID (a flat untextured disc). v1.0.95 logs at Warning:
+>   *"M_RebusFixtureLens not found ... Run Tools > Execute Python Script > build_rebus_base_level.py"*
+>   so the self-heal action is in the operator's log.
+> - **Verbose lens-visibility diagnostic per fixture**: `Fixture %s lens visibility:
+>   synthetic=%d isBeamMeshes=%d (fallbackForced=%d, syntheticVisible=%d, realLensVisible=%d).`
+>   Flip the category with `LogRebusVisualiser.SetVerbosity Verbose` to read it.
+>
+> **3. Volumetric shadowing on the Epic-beam SpotLight.** User reported: *"Can we work out
+> a way to make volumetric shadowing work with the Epic Beam, thats the only thing that
+> isnt."* The Epic Beam's visible shaft (cone-mesh raymarch, `M_RebusBeam`) was already
+> shadow-occluded against `SceneDepth` -- that's the crisp dense shaft. The thing that
+> wasn't carving was the **separate** per-light volumetric fog interaction (the soft halo
+> the SpotLight contributes to the volumetric fog froxels). Pre-v1.0.95 in Epic-beam mode:
+>
+> - `SpotLight->VolumetricScatteringIntensity = 0` (the cone-mesh was the only intended
+>   visible contribution -- but that meant the engine had nothing to compose into the
+>   fog, so occluders had nothing to carve).
+> - `SpotLight->bCastVolumetricShadow = false` (hero-beam-only opt-in -- only the first N
+>   spotlights of the spawn batch were CastVolumetricShadow=true, the rest were stuck at
+>   the engine default of `false`).
+>
+> The v1.0.95 fix layers BOTH visual contributions:
+>
+> ```text
+>   visible shaft  =  cone-mesh raymarch (M_RebusBeam, dense, crisp, SceneDepth-occluded)
+>                  +  per-light scattering (SpotLight, soft halo, fog-volume occluder-carved)
+> ```
+>
+> Implementation in `BuildSpotLight`:
+>
+> - **`SpotLight->VolumetricScatteringIntensity = max(Rebus.SpotLightScatter, 0)`** (new
+>   CVar, default 0.5). Modest by design -- it's a SOFT layer around the crisp cone-mesh
+>   shaft, not a competing dense shaft. Live-tunable; the CVar refresh sink walks every
+>   Rebus fixture and re-pushes via `RefreshBeamShadowMode`.
+> - **`SpotLight->bCastVolumetricShadow = true`** (unconditionally, ALWAYS). Pre-v1.0.95 this
+>   was a hero-beam-only opt-in; v1.0.95 drops the gate so every fixture's per-light
+>   volumetric layer is occluder-carvable. The fog-volume shadow pass is cheap relative
+>   to the lit-pool cost; the per-batch `bGrantedShadowHero` budget is kept for the
+>   higher `Rebus.HeroShadowScatter` value, not for `CastVolumetricShadow` itself.
+> - **`SpotLight->SetCastShadows(true)`** (kept from v1.0.94 -- needed for the cookie LF
+>   path and for solid shadow casting onto the floor footprint, which is unchanged).
+> - **One-shot Warning at fixture spawn if the scene has no `AExponentialHeightFog` with
+>   `bEnableVolumetricFog=true`**: *"Fixture %s SpotLight volumetric scattering=%.2f
+>   bCastVolumetricShadow=1, but no AExponentialHeightFog with bEnableVolumetricFog=true
+>   was found in the world. Volumetric shadows / fog-occlusion will be invisible until
+>   volumetric fog is enabled."* Failure mode is self-diagnosing on first launch.
+>
+> The cone-mesh raymarch shader (`M_RebusBeam`'s `_BEAM_RAYMARCH_HLSL`) is untouched --
+> it already handles its own SceneDepth occlusion. The per-light scattering is a
+> SEPARATE pass the engine renders into the volumetric fog buffer; the two compose
+> additively in the volumetric-fog integrator. Operators get a crisp visible shaft AND
+> a soft fog-occluded halo, which is what they asked for.
+>
+> **Migration note.** No portal-side action required. Old scene saves that still push
+> `bInternalBeam=true` are silently ignored (the unknown-property dispatcher already
+> returns `bKnown=false`). On the FIRST v1.0.95 launch of an existing project,
+> `_cleanup_internal_beam_assets()` deletes `/Game/REBUS/Materials/M_RebusGoboLightFunction`
+> + `/Game/REBUS/Materials/M_RebusInternalBeamShaft` and logs a Warning naming the
+> deletion -- idempotent / safe to re-run.
+>
+> **Operator checklist after rebuilding to v1.0.95.**
+>
+> 1. **Spawn a fixture.** Lens should be visible at the head of the beam (mirror-like
+>    disc with the v1.0.93 `M_RebusFixtureLens` material; falls back to the synthetic
+>    emissive disc only if the GDTF profile has no `<Beam>` lens geometry).
+> 2. **Place an occluder between the fixture and the floor.** Solid shadow on the floor
+>    (v1.0.94's job, still works); the volumetric fog around the beam should now ALSO
+>    carve through the occluder -- a visible "shadow tube" in the fog beside the beam.
+> 3. **If no fog occlusion is visible**, check the log for the v1.0.95 Warning naming
+>    the missing `AExponentialHeightFog` or its `bEnableVolumetricFog=true` flag.
+> 4. **Tune the per-light scatter contribution** live: `Rebus.SpotLightScatter 0.5` (default).
+>    Raise to ~1.0 for a softer halo around the cone-mesh; drop to 0 to disable the soft
+>    layer entirely (cone-mesh only, no fog interaction).
+> 5. **Verify InternalBeam removal**: `Rebus.InternalBeam` should no longer auto-complete
+>    in the console; `bInternalBeam` scene-property pushes return `Unknown property name`.
+>
+> ---
+>
 > **Dynamic shadows in the Epic-beam footprint -- force-disable MegaLights on every Rebus SpotLight (v1.0.94).**
 > User report (verbatim, against v1.0.93):
 >

@@ -83,46 +83,7 @@ private:
 	// Public so the v1.0.47 `Rebus.MeshBeams [0|1]` console command can drive the same path.
 public:
 	void SetMeshBeamsEnabled(bool bEnabled);
-
-	// v1.0.87 InternalBeam A/B mode. When ON, every fixture hides its Epic / cone-mesh beam and
-	// promotes its SpotLight to the visible volumetric shaft, applying the back-offset that places
-	// the cone exit at the lens diameter and opting the body meshes out of self-shadowing. When OFF
-	// the Epic beam returns intact + every per-fixture cached state restores byte-exact. Public so
-	// the v1.0.87 `Rebus.InternalBeam [0|1]` console command can drive the same path the
-	// SetSceneProperty bInternalBeam wire route uses.
-	//
-	// v1.0.89: the toggle ALSO drives a single global push of `r.LightFunctionAtlas.Enabled 1`
-	// while the mode is ON, so each SpotLight's gobo light-function modulates the volumetric
-	// shaft (UE 5.7 only routes light functions through the volumetric scattering integrator
-	// when the atlas path is on). Cached prior value + restored byte-exact on the OFF transition;
-	// see PushLightFunctionAtlasForInternalBeam in the .cpp.
-	void SetInternalBeamEnabled(bool bEnabled);
 private:
-	// v1.0.89 InternalBeam <-> r.LightFunctionAtlas.Enabled push helper. bOn=true caches the
-	// CVar's current int value into LightFunctionAtlasPriorValue and forces it to 1 (so the
-	// gobo cookie modulates the volumetric shaft, not just the lit floor pool); bOn=false
-	// restores the cached prior value byte-exact. Idempotent via bLightFunctionAtlasPushActive
-	// so a double-true / double-false call is safe (the SetInternalBeamEnabled wire route is
-	// hit on EVERY scene-property push, which can fire repeatedly on ReapplyAll).
-	void PushLightFunctionAtlasForInternalBeam(bool bOn);
-
-	// v1.0.92 InternalBeam <-> volumetric-fog light-function CVar push helper. v1.0.89's
-	// `r.LightFunctionAtlas.Enabled 1` push got light functions onto the volumetric integrator
-	// for atlas-compatible materials, but two more engine CVars gate the path:
-	//   * `r.VolumetricFog.LightFunction` -- the actual gate that determines whether ANY light
-	//     function modulates the volumetric scattering integrator. Defaults to 1 in UE 5.5+,
-	//     but a prior anti-ghost / scalability CVar pack can have driven it to 0; force back
-	//     to 1 while InternalBeam mode is on (and restore byte-exact on disable).
-	//   * `r.LightFunctionQuality` -- 0 disables light functions entirely (LF -> floor footprint
-	//     AND -> volumetric shaft both vanish). v1.0.74's GoboAntiGhost pack pushes this to 2;
-	//     defensive force-to-2 here makes the InternalBeam path independent of whether that
-	//     pack is currently latched. Same cached-prior + restore semantics.
-	// The two are pushed together because they're a paired set ("LF on volumetrics, at the
-	// quality the renderer evaluates them at"). Idempotent via bVolumetricFogLightFunctionPush
-	// Active. Defensive against the CVars not being registered (renamed in a future engine
-	// drop, or the renderer module not yet loaded) -- the helper logs a warning and no-ops
-	// rather than crashing.
-	void PushVolumetricFogLightFunctionForInternalBeam(bool bOn);
 
 	// Enable/disable driving Orbit-imported fixture models from fixture motion (bDriveOrbitModels
 	// scene property, default false). Routes to the fixture control subsystem, which binds the
@@ -151,19 +112,4 @@ private:
 	// when SetGroundSurface swaps the underlying material so the next push wraps the new MI.
 	TWeakObjectPtr<UMaterialInstanceDynamic> CachedFloorMID;
 
-	// v1.0.89: cached prior-value of `r.LightFunctionAtlas.Enabled` captured at the OFF -> ON
-	// transition, restored on ON -> OFF. Sentinel int (negative implies "no snapshot taken")
-	// guards against a double-restore landing the engine default 1 onto a deployment that
-	// expected 0 (e.g. anti-ghost pack still in force). Idempotency latch below.
-	int32 LightFunctionAtlasPriorValue = -1;
-	bool bLightFunctionAtlasPushActive = false;
-
-	// v1.0.92: cached prior-values of `r.VolumetricFog.LightFunction` + `r.LightFunctionQuality`
-	// captured at the OFF -> ON transition and restored byte-exact on ON -> OFF. Mirror of the
-	// v1.0.89 atlas latch above. Sentinel int (-1 = "no snapshot taken") so a double-restore
-	// can never land the engine default onto a deployment that explicitly pushed a different
-	// value pre-InternalBeam.
-	int32 VolumetricFogLightFunctionPriorValue = -1;
-	int32 LightFunctionQualityPriorValue = -1;
-	bool  bVolumetricFogLightFunctionPushActive = false;
 };

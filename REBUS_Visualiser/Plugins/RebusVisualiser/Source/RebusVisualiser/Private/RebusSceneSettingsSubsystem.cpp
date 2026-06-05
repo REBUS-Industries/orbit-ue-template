@@ -44,14 +44,9 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// Hybrid cone-mesh volumetric beam is the default beam mode (v1.0.31); seed it so SceneState
 	// round-trips the control and a respawn re-asserts it via ReapplyAll.
 	Values.Add(TEXT("bMeshBeams"), FRebusPropertyValue::MakeBool(true));
-	// v1.0.87 InternalBeam A/B mode. Default OFF (the Epic / cone-mesh beam stays the visible
-	// shaft on first load). When the portal flips it ON, every fixture hides its Epic beam,
-	// promotes its SpotLight to a volumetric shaft pushed back inside the head by
-	// lensRadius / tan(maxZoomHalfAngle), and opts its own body meshes out of shadow casting so
-	// the head can't extinguish the internal spot. Seeded here so SceneState round-trips the
-	// control and the v1.0.87 ReapplyAll re-asserts the operator's choice on every fixture (re)
-	// spawn (so a freshly spawned fixture inherits the live mode without needing a manual recycle).
-	Values.Add(TEXT("bInternalBeam"), FRebusPropertyValue::MakeBool(false));
+	// v1.0.95: legacy scene properties are silently ignored by ApplySceneProperty when their
+	// dispatcher branches are removed (the unknown-name branch returns bKnown=false). See the
+	// README v1.0.95 release block for the list of properties this release retired.
 	// Drive Orbit-imported fixture models from each fixture's pan/tilt solve. v1.0.35 introduced
 	// this as a Phase-1 A/B test (default OFF). v1.0.65 flipped the SceneState seed to TRUE so
 	// the SceneState round-trip reports the new default consistently with the control subsystem's
@@ -278,192 +273,6 @@ void URebusSceneSettingsSubsystem::SetMeshBeamsEnabled(bool bEnabled)
 		bEnabled ? TEXT("cone-mesh beam") : TEXT("fog beam restored"));
 }
 
-void URebusSceneSettingsSubsystem::SetInternalBeamEnabled(bool bEnabled)
-{
-	UWorld* World = GetWorld();
-	if (!World) return;
-
-	// v1.0.89: push `r.LightFunctionAtlas.Enabled 1` BEFORE walking the fixtures so the very
-	// first SpotLight->SetCastVolumetricShadow call inside ApplyInternalBeamPose sees the
-	// atlas path enabled when its render proxy is rebuilt. Symmetric on the OFF transition --
-	// restore is the LAST step (after every fixture's RestoreInternalBeamPose) so the atlas
-	// stays on for the duration of the byte-exact restore walk. Idempotent: the helper below
-	// short-circuits when the live latch already matches the requested state.
-	PushLightFunctionAtlasForInternalBeam(bEnabled);
-
-	// v1.0.92: push the paired volumetric-fog light-function gate (`r.VolumetricFog.Light
-	// Function = 1`) AND the light-function quality (`r.LightFunctionQuality = 2`, high) so
-	// the InternalBeam-mode SpotLight's `LightFunctionMaterial` (gobo cookie) AND its
-	// `IESTexture` reach the volumetric scattering integrator at the highest quality the
-	// renderer evaluates them at. Without these pushes, a prior anti-ghost CVar pack
-	// (`Rebus.GoboAntiGhost`) or a scalability bucket can have driven either CVar to a value
-	// that silently disables LF -> volumetric integration, defeating both the v1.0.89 atlas
-	// push AND the v1.0.92 per-fixture MegaLights opt-out. Idempotency + restore semantics
-	// mirror the v1.0.89 atlas push exactly.
-	PushVolumetricFogLightFunctionForInternalBeam(bEnabled);
-
-	int32 Count = 0;
-	for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
-	{
-		if (ARebusFixtureActor* Fixture = *It)
-		{
-			Fixture->SetInternalBeamModeEnabled(bEnabled);
-			++Count;
-		}
-	}
-	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("bInternalBeam=%d applied to %d fixture(s) (%s)."),
-		bEnabled ? 1 : 0, Count,
-		bEnabled
-			? TEXT("Epic beam hidden, SpotLight promoted to visible volumetric shaft + back-offset applied + body meshes opted out of shadow casting + per-fixture bAllowMegaLights forced to 0 (v1.0.92, gated by Rebus.InternalBeamForceLegacy) + r.LightFunctionAtlas.Enabled / r.VolumetricFog.LightFunction / r.LightFunctionQuality pushed so gobo cookies AND IES profile modulate the volumetric beam shaft")
-			: TEXT("Epic beam restored, SpotLight pose + body shadow flags reverted byte-exact + bAllowMegaLights restored from cache + r.LightFunctionAtlas.Enabled / r.VolumetricFog.LightFunction / r.LightFunctionQuality restored to their pre-push values"));
-
-	// v1.0.89: promoted from Verbose to Warning. The user explicitly reported "Can we make sure
-	// volumetric shadows are on" -- if the scene has no active volumetric fog, NO amount of
-	// SpotLight->SetCastVolumetricShadow(true) inside the actor will make the shaft carve
-	// through anything (there is no scattering medium for the rays to be occluded against), so
-	// the operator gets ONE obvious warning per InternalBeam-on toggle when the prerequisite is
-	// missing. We deliberately do NOT force bVolumetricFog on -- that's a separate scene
-	// property the operator owns -- but the warning makes the failure mode self-diagnosing.
-	if (bEnabled)
-	{
-		if (AExponentialHeightFog* Fog = GetFog())
-		{
-			if (UExponentialHeightFogComponent* FogComp = Fog->GetComponent())
-			{
-				if (!FogComp->bEnableVolumetricFog)
-				{
-					UE_LOG(LogRebusVisualiser, Warning,
-						TEXT("bInternalBeam=1 but bVolumetricFog=0 on the scene fog -- the SpotLight's volumetric shaft will be invisible until you enable volumetric fog (SetSceneProperty bVolumetricFog true, or set r.VolumetricFog 1 in console). Cast-volumetric-shadow needs a scattering medium to render the carve."));
-				}
-			}
-		}
-		else
-		{
-			UE_LOG(LogRebusVisualiser, Warning,
-				TEXT("bInternalBeam=1 but no AExponentialHeightFog actor in the scene -- the SpotLight's volumetric shaft will be invisible until you spawn a fog actor with bVolumetricFog enabled (BaseLevel ships with one; check the scene was loaded from a v1.0.x BaseLevel preset)."));
-		}
-	}
-}
-
-void URebusSceneSettingsSubsystem::PushLightFunctionAtlasForInternalBeam(bool bOn)
-{
-	if (bOn == bLightFunctionAtlasPushActive)
-	{
-		// Idempotent: the wire path can re-enter (ReapplyAll, double-push of the same scene
-		// property) and we MUST NOT overwrite our cached prior value with the value we just
-		// installed. A second false after a single true would otherwise flip the engine to 0.
-		return;
-	}
-	IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.LightFunctionAtlas.Enabled"));
-	if (!CVar)
-	{
-		UE_LOG(LogRebusVisualiser, Warning,
-			TEXT("v1.0.89 InternalBeam: r.LightFunctionAtlas.Enabled NOT REGISTERED -- the renderer module is not loaded or the CVar was renamed in this engine version. The gobo cookie may not modulate the volumetric shaft until this CVar is forced to 1."));
-		return;
-	}
-
-	if (bOn)
-	{
-		LightFunctionAtlasPriorValue = CVar->GetInt();
-		CVar->Set(1, ECVF_SetByGameOverride);
-		bLightFunctionAtlasPushActive = true;
-		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("v1.0.89 InternalBeam: r.LightFunctionAtlas.Enabled was=%d now=1 (push so SpotLight LightFunctionMaterial modulates the volumetric shaft, not just the lit floor)."),
-			LightFunctionAtlasPriorValue);
-	}
-	else
-	{
-		const FString Before = CVar->GetString();
-		// Restore to the prior int value byte-exact. If the snapshot was never taken (sentinel
-		// negative), fall back to 1 (the engine default in UE 5.5+; safer than 0 because any
-		// other gobo wiring expects the atlas path live).
-		const int32 Restore = (LightFunctionAtlasPriorValue >= 0) ? LightFunctionAtlasPriorValue : 1;
-		CVar->Set(Restore, ECVF_SetByGameOverride);
-		bLightFunctionAtlasPushActive = false;
-		LightFunctionAtlasPriorValue = -1;
-		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("v1.0.89 InternalBeam: r.LightFunctionAtlas.Enabled was=%s restored=%d (InternalBeam OFF -> released the v1.0.89 force-1 push)."),
-			*Before, Restore);
-	}
-}
-
-void URebusSceneSettingsSubsystem::PushVolumetricFogLightFunctionForInternalBeam(bool bOn)
-{
-	if (bOn == bVolumetricFogLightFunctionPushActive)
-	{
-		// Idempotent (mirror of the v1.0.89 atlas latch). The wire path can re-enter on every
-		// ReapplyAll / scene-property push, and we MUST NOT overwrite our cached prior values
-		// with the values we just installed.
-		return;
-	}
-
-	IConsoleManager& Manager = IConsoleManager::Get();
-	IConsoleVariable* CVarVF = Manager.FindConsoleVariable(TEXT("r.VolumetricFog.LightFunction"));
-	IConsoleVariable* CVarLFQ = Manager.FindConsoleVariable(TEXT("r.LightFunctionQuality"));
-
-	// Defensive: log a warning when either CVar isn't registered (renderer module not loaded
-	// yet, or the engine drop renamed it). The push then no-ops for the missing CVar but the
-	// other half still runs -- a half-push is strictly better than crashing on a null
-	// dereference. The cached-prior + idempotency latch only flips when AT LEAST one of the
-	// CVars was found (otherwise the OFF restore would still try to land a sentinel "restore"
-	// onto a CVar that was never snapshotted).
-	if (!CVarVF)
-	{
-		UE_LOG(LogRebusVisualiser, Warning,
-			TEXT("v1.0.92 InternalBeam: r.VolumetricFog.LightFunction NOT REGISTERED -- the renderer module is not loaded or the CVar was renamed in this engine version. Light functions may not modulate the volumetric scattering integrator until this CVar is forced to 1."));
-	}
-	if (!CVarLFQ)
-	{
-		UE_LOG(LogRebusVisualiser, Warning,
-			TEXT("v1.0.92 InternalBeam: r.LightFunctionQuality NOT REGISTERED -- the renderer module is not loaded or the CVar was renamed in this engine version. The light function quality bias to 2 (high) is being skipped."));
-	}
-	if (!CVarVF && !CVarLFQ)
-	{
-		// Nothing to push at all; don't flip the latch so a later call (after the renderer
-		// module is loaded) will re-attempt the push instead of being short-circuited by
-		// the idempotency guard above.
-		return;
-	}
-
-	if (bOn)
-	{
-		if (CVarVF)
-		{
-			VolumetricFogLightFunctionPriorValue = CVarVF->GetInt();
-			CVarVF->Set(1, ECVF_SetByGameOverride);
-		}
-		if (CVarLFQ)
-		{
-			LightFunctionQualityPriorValue = CVarLFQ->GetInt();
-			// 2 = "High" in UE 5.7's r.LightFunctionQuality scale (0=off, 1=default, 2=high).
-			// We force high while InternalBeam is on so the volumetric LF samples are evaluated
-			// at the same quality as the lit-floor LF samples -- otherwise a deployment that's
-			// running at LFQuality=1 (default) gets a noticeably softer cookie pattern on the
-			// volumetric shaft than on the floor.
-			CVarLFQ->Set(2, ECVF_SetByGameOverride);
-		}
-		bVolumetricFogLightFunctionPushActive = true;
-		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("v1.0.92 InternalBeam: r.VolumetricFog.LightFunction was=%d now=1, r.LightFunctionQuality was=%d now=2 (push so SpotLight LightFunctionMaterial + IESTexture modulate the volumetric beam shaft)."),
-			VolumetricFogLightFunctionPriorValue, LightFunctionQualityPriorValue);
-	}
-	else
-	{
-		const int32 RestoreVF = (VolumetricFogLightFunctionPriorValue >= 0) ? VolumetricFogLightFunctionPriorValue : 1;
-		const int32 RestoreLFQ = (LightFunctionQualityPriorValue >= 0) ? LightFunctionQualityPriorValue : 1;
-		FString BeforeVF, BeforeLFQ;
-		if (CVarVF)  { BeforeVF  = CVarVF->GetString();  CVarVF->Set(RestoreVF, ECVF_SetByGameOverride); }
-		if (CVarLFQ) { BeforeLFQ = CVarLFQ->GetString(); CVarLFQ->Set(RestoreLFQ, ECVF_SetByGameOverride); }
-		bVolumetricFogLightFunctionPushActive = false;
-		VolumetricFogLightFunctionPriorValue = -1;
-		LightFunctionQualityPriorValue = -1;
-		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("v1.0.92 InternalBeam: r.VolumetricFog.LightFunction was=%s restored=%d, r.LightFunctionQuality was=%s restored=%d (InternalBeam OFF -> released the v1.0.92 force pushes)."),
-			*BeforeVF, RestoreVF, *BeforeLFQ, RestoreLFQ);
-	}
-}
-
 void URebusSceneSettingsSubsystem::SetDriveOrbitModelsEnabled(bool bEnabled)
 {
 	// Delegate to the fixture control subsystem (GameInstance-scoped), which owns the fixture
@@ -667,11 +476,6 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 	else if (Name == TEXT("bMeshBeams"))
 	{
 		SetMeshBeamsEnabled(Value.bBool);
-	}
-	// --- v1.0.87 InternalBeam A/B mode: hide Epic / cone beam and use SpotLight for the shaft ---
-	else if (Name == TEXT("bInternalBeam"))
-	{
-		SetInternalBeamEnabled(Value.bBool);
 	}
 	// --- Phase-1 sync test: drive Orbit-imported fixture models from fixture motion ---
 	else if (Name == TEXT("bDriveOrbitModels"))
