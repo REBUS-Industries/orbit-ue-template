@@ -653,7 +653,7 @@ namespace
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("Rebus.ForceBeamMasterRegen: probed %d world(s), %d regen+verify call(s) "
 				 "returned success. NEXT-STEP: run `Rebus.DumpBeamCulling` to confirm "
-				 "BeamMaterialRevision=119 (NOT MISSING) for every fixture, AND "
+				 "BeamMaterialRevision=120 (NOT MISSING) for every fixture, AND "
 				 "`Rebus.DumpBeamMaterialHealth` to confirm every cone's MaterialSlot0 "
 				 "is a `UMaterialInstanceDynamic` parented to `M_RebusBeam`. If verify "
 				 "FAILED (LOUD `Error` log one line above), check the OutputLog for a "
@@ -704,7 +704,10 @@ namespace
 				 "`Material` instead of MID, or slot0Asset=`WorldGridMaterial`/`DefaultMaterial`, "
 				 "or midRevision<expected) is a v1.0.117 grey-cone fallback case -- run "
 				 "`Rebus.ForceBeamMasterRegen` to recover."),
-			Worlds, TotalFixtures, 119, 119);
+			// v1.0.120 -- bumped 119, 119 -> 120, 120 in lockstep with
+			// `RebusExpectedBeamMaterialRevision` (`RebusVisualiserSubsystem.cpp`)
+			// + `REBUS_BEAM_MATERIAL_REVISION` (`build_rebus_base_level.py`).
+			Worlds, TotalFixtures, 120, 120);
 	}
 
 	// v1.0.79 helpers: pluck the live cinematic camera pawn from any game/PIE world. There's
@@ -2248,7 +2251,7 @@ void FRebusVisualiserModule::StartupModule()
 			 "created from -- MISSING / older-than-expected means the v1.0.117 grey-cone "
 			 "fallback case), and the subsystem-wide cached-master pointer state. Healthy "
 			 "shape: slot0Class=`MaterialInstanceDynamic`, midParentName=`M_RebusBeam`, "
-			 "midRevision=119. Anything else -- run `Rebus.ForceBeamMasterRegen` to recover. "
+			 "midRevision=120. Anything else -- run `Rebus.ForceBeamMasterRegen` to recover. "
 			 "Walks every Game/PIE/Editor world. Usage: Rebus.DumpBeamMaterialHealth"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpBeamMaterialHealthCommand),
 		ECVF_Default);

@@ -27,6 +27,49 @@ After it runs, point GameDefaultMap / EditorStartupMap at /Game/REBUS/Maps/BaseL
 
 import unreal
 
+
+# v1.0.120 STOP-THE-BLEEDING editor-runtime guard. Every public entry point in
+# this module (ensure_beam_material, ensure_ground_materials, ensure_lens_material,
+# ensure_fixture_lens_material, ensure_orbit_imported_material, build,
+# ensure_base_level) calls editor-only Unreal Python APIs that live in the
+# `EditorScriptingUtilities` module (unreal.EditorAssetLibrary.*,
+# unreal.MaterialEditingLibrary.*, unreal.AssetToolsHelpers.get_asset_tools()).
+# These APIs ONLY function inside a real editor session. When the editor binary
+# is launched in -game mode (the standard PRISM Pixel Streaming orchestrator
+# command line: `UnrealEditor-Cmd.exe ... -game -PixelStreamingURL=...`), the
+# editor subsystems are NOT initialised; calling EditorAssetLibrary in this
+# mode dereferences uninitialised state and CRASHES the process with
+# EXCEPTION_ACCESS_VIOLATION on the `EditorScriptingUtilities.dll` frame.
+# Exactly the v1.0.119 user-reported crash, stack trace verbatim:
+#     UnrealEditor-Engine.dll
+#     UnrealEditor-EditorScriptingUtilities.dll  <-- editor-only API
+#     UnrealEditor-CoreUObject.dll
+#     UnrealEditor-PythonScriptPlugin.dll
+#     python311.dll
+# `unreal.SystemLibrary.is_editor()` is a UFUNCTION that delegates to the C++
+# `GIsEditor` global -- the engine-authoritative flag for "this process is
+# the editor and editor subsystems are initialised". When -game is on the
+# command line, GIsEditor flips to false and this returns false too, so the
+# guard correctly bails before any EditorAssetLibrary call.
+#
+# Pairs with the C++-side gate in `URebusVisualiserSubsystem::CanRegen
+# BeamMasterInProcess()` (`RebusVisualiserSubsystem.cpp`, anonymous namespace
+# file scope) -- belt-and-braces so even if a future call path accidentally
+# fires `py ensure_beam_material(...)` from -game mode the Python returns
+# cleanly with a `log_warning` instead of crashing.
+def _is_editor_runtime():
+    try:
+        # unreal.SystemLibrary.is_editor() reads C++ GIsEditor. Returns False
+        # under -game / -server / commandlet modes even when launched against
+        # the editor binary; True only in a real editor session.
+        return bool(unreal.SystemLibrary.is_editor())
+    except Exception:  # noqa: BLE001
+        # Best-effort -- if the SystemLibrary symbol moves in a future engine
+        # version, treat as "not editor" so we never crash. The caller logs a
+        # warning + returns the same way as the explicit-False path.
+        return False
+
+
 LEVEL_PACKAGE_PATH = "/Game/REBUS/Maps/BaseLevel"
 
 MATERIALS_DIR = "/Game/REBUS/Materials"
@@ -877,7 +920,11 @@ def _build_beam_master(mat):
     # C++ mirror `RebusExpectedBeamMaterialRevision` in `RebusVisualiserSubsystem.cpp`.
     rev = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -1100, -340)
     rev.set_editor_property("parameter_name", "BeamMaterialRevision")
-    rev.set_editor_property("default_value", 119.0)
+    # v1.0.120 -- bumped 119.0 -> 120.0 in lockstep with REBUS_BEAM_MATERIAL_REVISION
+    # above + the C++ mirror `RebusExpectedBeamMaterialRevision` in
+    # RebusVisualiserSubsystem.cpp. See the REBUS_BEAM_MATERIAL_REVISION docstring
+    # for the v1.0.120 stop-the-bleeding -game-mode crash diagnosis.
+    rev.set_editor_property("default_value", float(REBUS_BEAM_MATERIAL_REVISION))
 
     # ---- Driveable parameters (per-fixture MID) ----
     color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, -260)
@@ -1032,7 +1079,7 @@ def _build_beam_master(mat):
     mel.recompile_material(mat)
 
 
-REBUS_BEAM_MATERIAL_REVISION = 119
+REBUS_BEAM_MATERIAL_REVISION = 120
 """v1.0.117 -- sentinel revision baked into the on-disk M_RebusBeam master via the
 `BeamMaterialRevision` scalar parameter. Bumped by every release that touches the
 master so the v1.0.112 auto-purge probe in
@@ -1056,6 +1103,25 @@ so the auto-purge will recognise any v1.0.117/v1.0.118 baked master (revision
 v1.0.117 master graph itself is unchanged in v1.0.119 (no shader / parameter
 changes); the revision bump exists purely to invalidate cached masters cooked
 during the broken window.
+
+v1.0.120 -- bumped 119 -> 120 as part of the stop-the-bleeding release. v1.0.119
+shipped an auto-regen path that CRASHED the editor binary when launched with
+`-game` (the standard PRISM Pixel Streaming orchestrator command line:
+`UnrealEditor-Cmd.exe ... -game -PixelStreamingURL=...`), because this Python
+function calls `unreal.EditorAssetLibrary.*` / `unreal.MaterialEditingLibrary.*`
+/ `unreal.AssetToolsHelpers.get_asset_tools()` -- ALL editor-only APIs that
+dereference uninitialised editor subsystem state in `-game` mode and raise
+EXCEPTION_ACCESS_VIOLATION on the `EditorScriptingUtilities.dll` frame.
+v1.0.120 gates the regen at TWO chokepoints (C++ `URebusVisualiserSubsystem::
+CanRegenBeamMasterInProcess()` and Python `_is_editor_runtime()`) so the crash
+is impossible regardless of which entry point is taken. The revision bump
+itself ensures the v1.0.112 auto-purge probe correctly recognises pre-v1.0.120
+cooked masters as stale when a developer next opens the project in a real
+editor session and re-bakes (the operator workflow documented in README
+v1.0.120 release block). The master graph itself is UNCHANGED in v1.0.120
+(no shader / parameter changes); the bump exists purely to invalidate cached
+masters from the broken v1.0.119 window so the next editor-session bake re-
+stamps them at the new revision.
 """
 
 
@@ -1131,7 +1197,37 @@ def ensure_beam_material(force=False):
     no-op-against-unknown-name and the new v1.0.111 occlusion never engages. Matches the
     v1.0.104 (`_orbit_imported_master_has_two_sided`) / v1.0.97 (`_master_is_two_sided`)
     cascade shape -- one probe -> one promotion -> one regen log line.
+
+    v1.0.120 STOP-THE-BLEEDING: hard guard at the top -- returns False without touching
+    any editor-only API when `_is_editor_runtime()` is false. v1.0.119 crashed the user's
+    UE session because the C++ auto-purge invoked this function via `GEngine->Exec("py
+    import build_rebus_base_level; build_rebus_base_level.ensure_beam_material(force=True)")`
+    from a `-game` mode session. `unreal.EditorAssetLibrary.does_asset_exist(BEAM_PATH)`
+    (the FIRST editor-only call below) dereferences uninitialised editor subsystem state
+    in `-game` mode and raises EXCEPTION_ACCESS_VIOLATION on the `EditorScriptingUtilities
+    .dll` frame, taking the entire UE process down. The C++ side now also gates this
+    (see `URebusVisualiserSubsystem::CanRegenBeamMasterInProcess()`); this guard is the
+    belt-and-braces complement so even an out-of-band `py` invocation can't crash.
+    Returns False (caller-observable signal that nothing happened) instead of raising,
+    consistent with the early-return shape of the other self-heal probes in this module.
     """
+    if not _is_editor_runtime():
+        unreal.log_warning(
+            "RebusBaseLevel: ensure_beam_material(force={}) ABORTING -- not in an editor "
+            "runtime (unreal.SystemLibrary.is_editor() == False; likely -game / -server "
+            "/ commandlet mode). Editor-only asset APIs (EditorAssetLibrary / "
+            "MaterialEditingLibrary / AssetToolsHelpers) would crash the process with "
+            "EXCEPTION_ACCESS_VIOLATION here -- exactly the v1.0.119 user-reported "
+            "crash. The on-disk /Game/REBUS/Materials/M_RebusBeam.uasset (if present) "
+            "will be used as-is by the runtime. To regenerate: launch the editor "
+            "manually (no -game flag), open REBUS_Visualiser.uproject, run Tools > "
+            "Execute Python Script > build_rebus_base_level.ensure_beam_material(force"
+            "=True) OR `Rebus.ForceBeamMasterRegen` in the editor console, then Save "
+            "All and commit the regenerated .uasset (+ .uexp) to source control. "
+            "Future -game sessions will then load the pre-baked master without needing "
+            "this rebuild.".format(force))
+        return False
+
     tools = unreal.AssetToolsHelpers.get_asset_tools()
 
     # v1.0.111 non-force self-heal: pre-v1.0.111 master missing the light-space depth-mask
@@ -1155,6 +1251,7 @@ def ensure_beam_material(force=False):
         unreal.EditorAssetLibrary.save_loaded_asset(mat)
 
     unreal.log("RebusBaseLevel: beam material ensured.")
+    return True
 
 
 # ---------------------------------------------------------------------------------------

@@ -3840,13 +3840,13 @@ void ARebusFixtureActor::DumpBeamCullingStateForDebug() const
 		// needing a separate `Rebus.DumpBeamMasterVersion` run.
 		URebusVisualiserSubsystem::GetCachedBeamMasterDisplayName(),
 		URebusVisualiserSubsystem::GetBeamMasterLoadCount(),
-		// 119 -- the v1.0.119 floor. Hard-coded here intentionally so the
+		// 120 -- the v1.0.120 floor. Hard-coded here intentionally so the
 		// dump remains a pure read with no subsystem-instance round-trip;
 		// must be bumped in lockstep with `RebusExpectedBeamMaterialRevision`
 		// (in `RebusVisualiserSubsystem.cpp`) and `REBUS_BEAM_MATERIAL_REVISION`
-		// (in `Content/Python/build_rebus_base_level.py`). The v1.0.119
+		// (in `Content/Python/build_rebus_base_level.py`). The v1.0.120
 		// release block in README documents the bump cadence.
-		119);
+		120);
 }
 
 void ARebusFixtureActor::DumpBeamMaterialHealthForDebug(int32 ExpectedRevision,
@@ -3925,6 +3925,31 @@ void ARebusFixtureActor::SelfHealBeamMaterialRevisionIfMismatched()
 	// for the contract. Cheap when MID is null (no-op) or revision matches
 	// (single scalar read).
 	if (!BeamMID) return;
+
+	// v1.0.120 STOP-THE-BLEEDING editor-runtime gate. The self-heal trigger
+	// calls into `URebusVisualiserSubsystem::RebuildAndVerifyBeamMaster`,
+	// which invokes editor-only Python (`unreal.EditorAssetLibrary.*` etc).
+	// In `-game` mode (the standard PRISM Pixel Streaming orchestrator: the
+	// editor binary launched with `-game -PixelStreamingURL=...`), `GIsEditor`
+	// is false and the editor subsystems aren't initialised; the Python call
+	// crashes the process with EXCEPTION_ACCESS_VIOLATION on the
+	// `EditorScriptingUtilities.dll` frame (user-reported v1.0.119 crash).
+	// Skip silently here -- the subsystem-level `ProbeAndAutoPurgeStaleBeam
+	// Master` already logged the once-per-session stale-master warning, so a
+	// per-fixture warning here would be spam (one log line per spawned
+	// fixture). The cone still renders off whatever master is on disk via
+	// `BuildBeamCone`'s existing path (just without the v1.0.111 depth-mask
+	// shadowing the stale master may pre-date). See README v1.0.120 release
+	// block for the operator offline-bake workflow.
+#if WITH_EDITOR
+	const bool bCanRegenInProcess = GIsEditor && !IsRunningGame() && !IsRunningCommandlet();
+#else
+	const bool bCanRegenInProcess = false;
+#endif
+	if (!bCanRegenInProcess)
+	{
+		return;
+	}
 
 	float RevAsFloat = 0.f;
 	const bool bHas = BeamMID->GetScalarParameterValue(

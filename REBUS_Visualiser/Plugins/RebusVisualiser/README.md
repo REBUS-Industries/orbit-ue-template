@@ -594,6 +594,135 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **v1.0.120 — EMERGENCY STOP-THE-BLEEDING. v1.0.119's auto-regen path CRASHED the user's UE session at launch with `EXCEPTION_ACCESS_VIOLATION` because the regen invoked editor-only Python (`unreal.EditorAssetLibrary.*` / `unreal.MaterialEditingLibrary.*` / `unreal.AssetToolsHelpers.*` — all hosted in `EditorScriptingUtilities.dll`) from a `-game` mode session, where the editor subsystems aren't initialised. v1.0.120 gates the regen at TWO chokepoints (C++ + Python) so the crash is impossible regardless of entry point, leaves the stale on-disk `M_RebusBeam.uasset` in place for the session (cone still renders via `BuildBeamCone`'s existing fallback path, just without the v1.0.111 depth-mask shadowing), and documents the operator offline-bake workflow for restoring the freshly-baked master in a real editor session.**
+>
+> ### What was broken (honest diagnosis)
+>
+> User-reported stack trace at session start (the v1.0.119 banner appeared, then immediately):
+>
+> ```
+> LogWindows: Error: Fatal error!
+> LogWindows: Error: Unhandled Exception: EXCEPTION_ACCESS_VIOLATION reading address 0x0000000000002668
+> LogWindows: Error: [Callstack] UnrealEditor-Engine.dll
+> LogWindows: Error: [Callstack] UnrealEditor-EditorScriptingUtilities.dll     <-- editor-only API
+> LogWindows: Error: [Callstack] UnrealEditor-CoreUObject.dll
+> LogWindows: Error: [Callstack] UnrealEditor-PythonScriptPlugin.dll           <-- our py call
+> LogWindows: Error: [Callstack] python311.dll
+> LogWindows: Error: [Callstack] UnrealEditor-PythonScriptPlugin.dll
+> ```
+>
+> Orchestrator command line (the standard PRISM Pixel Streaming launch):
+>
+> ```
+> UnrealEditor-Cmd.exe ... REBUS_Visualiser.uproject ... -game -windowed -ResX=1280 -ResY=720 -PixelStreamingURL=... -NoSplash -NoPause ...
+> ```
+>
+> Key observation: **`-game` mode (not editor)**. The editor binary is launched with `-game`, so `GIsEditor` is `false` and `IsRunningGame()` is `true`. Calling `EditorScriptingUtilities` / `EditorAssetLibrary` / `MaterialEditingLibrary` / `AssetToolsHelpers` in this mode dereferences uninitialised editor subsystem state and crashes.
+>
+> The same log also reported, just before the crash:
+>
+> ```
+> LogRebusVisualiser: Error: [Rebus] v1.0.119 RebuildAndVerifyBeamMaster FAILED -- py Exec returned OK but post-regen probe STILL reports the master as stale (verdict=v1.0.110 ... detectedRev=-1 expectedRev=119)
+> LogRebusVisualiser: ===== REBUS Visualiser v1.0.119 (binary built Jun 7 2026 23:39:45) -- beamMasterVerdict=v1.0.110 (clean slate, no shadow path) beamMasterRev=-1/119 ... beamMasterRegen={attempts=1 lastResult=fail-post-verify lastDetectedAfter=-1} =====
+> ```
+>
+> So v1.0.119 had TWO compounding failures: (1) the regen **crashed** when invoked in `-game` mode, and (2) even when it returned "OK" the on-disk asset was never saved (the regen was effectively a silent no-op against the wrong runtime context). v1.0.120 fixes #1 conclusively with the editor-runtime gate; #2 is a known follow-up to be investigated in a real editor session — the gate makes the failure mode non-fatal.
+>
+> ### Suspected crash source in Python (best-effort from reading; the gate stops the crash regardless of which exact line is at fault)
+>
+> The first editor-only API call inside `build_rebus_base_level.py::ensure_beam_material(force=True)` is:
+>
+> ```
+> tools = unreal.AssetToolsHelpers.get_asset_tools()         # AssetTools module — editor-only
+> ...
+> if not force and unreal.EditorAssetLibrary.does_asset_exist(BEAM_PATH):    # EditorScriptingUtilities — editor-only
+>     existing = unreal.EditorAssetLibrary.load_asset(BEAM_PATH)              # EditorScriptingUtilities — editor-only
+> ```
+>
+> `unreal.AssetToolsHelpers.get_asset_tools()`, `unreal.EditorAssetLibrary.does_asset_exist(...)`, `unreal.EditorAssetLibrary.load_asset(...)`, `unreal.EditorAssetLibrary.delete_asset(...)`, `unreal.EditorAssetLibrary.save_loaded_asset(...)`, and `unreal.MaterialEditingLibrary.*` all live in the editor-only `EditorScriptingUtilities` module. Any of them called in `-game` mode (where `GIsEditor=false` and the editor subsystems haven't been initialised) dereferences an uninitialised editor singleton and produces exactly the `EXCEPTION_ACCESS_VIOLATION reading address 0x...0002668` stack trace the user reported. The most likely specific culprit is the FIRST such call — `unreal.EditorAssetLibrary.does_asset_exist(BEAM_PATH)` in `ensure_beam_material` at line ~1139, or `unreal.AssetToolsHelpers.get_asset_tools()` immediately above it at line ~1135. We cannot conclusively identify the exact line by reading alone (the stack trace doesn't include Python frame info), but the GATE makes that identification moot: every Python entry point now bails before touching any editor-only API in `-game` mode, so no matter which specific line was crashing, the crash is gone.
+>
+> ### Suspected reason v1.0.119's regen was a no-op even when it did run (best-effort from reading)
+>
+> The `_build_beam_master` graph correctly creates a `MaterialExpressionScalarParameter` with `parameter_name = "BeamMaterialRevision"` and `default_value = 119.0` (at lines ~878–880 of v1.0.119 `build_rebus_base_level.py`), and `ensure_beam_material` correctly calls `_build_beam_master(mat)` followed by `unreal.EditorAssetLibrary.save_loaded_asset(mat)` (at lines ~1153–1155). The parameter contract IS authored as a `ScalarParameter` (not a constant), the name IS exact, the save call IS unconditional. The `unreal.MaterialEditingLibrary.recompile_material(mat)` call IS present (the final line of `_build_beam_master`, line ~1032). On paper this should work.
+>
+> One concrete suspect: `tools.create_asset("M_RebusBeam", MATERIALS_DIR, unreal.Material, unreal.MaterialFactoryNew())` returns the freshly-created asset, but if the asset registry is in an inconsistent state (e.g. the previous `delete_asset` left a stale reference, or the package wasn't fully unloaded), the returned `mat` might be a soft handle the rest of the script mutates but `save_loaded_asset` can't see. The user's log explicitly shows the post-regen probe reading `verdict=v1.0.110 ... detectedRev=-1` — the master was either NOT saved, was saved to a different package path than `ProbeBeamMasterVersion` reads from, or the in-memory mutation was discarded before the save call landed. Confirming the exact failure mode requires running the Python in a real editor session and stepping through with `print` instrumentation; we cannot do that from inside the C++ build alone. **Filed as a follow-up for v1.0.121+**; v1.0.120 ships the gate so the user can at least launch the visualiser and use the stale master as-is.
+>
+> ### What v1.0.120 changes — exact list
+>
+> 1. **`URebusVisualiserSubsystem::CanRegenBeamMasterInProcess()`** — new file-scope helper in the anonymous namespace of `RebusVisualiserSubsystem.cpp`. Returns `GIsEditor && !IsRunningGame() && !IsRunningCommandlet()` under `WITH_EDITOR` and `false` otherwise. The single source of truth for "is it safe to invoke editor-only Python from this C++ context".
+> 2. **`URebusVisualiserSubsystem::RebuildAndVerifyBeamMaster(bool bForceEvenIfCurrent)`** — gated at the top of the `#if WITH_EDITOR` block. When `CanRegenBeamMasterInProcess()` is false: records `LastBeamMasterRegenResult = "fail-non-editor-runtime"`, logs a Warning naming the live flag values (`GIsEditor`, `IsRunningGame`, `IsRunningCommandlet`, `bForceEvenIfCurrent`) and the operator offline-bake workflow, returns `false`. Pre-empts every downstream `GEngine->Exec("py ...")` call before any editor-only API is touched.
+> 3. **`URebusVisualiserSubsystem::ProbeAndAutoPurgeStaleBeamMaster()`** — gated near the top (after the existing `bBeamMasterAutoPurgeRun` one-shot guard) with the same `CanRegenBeamMasterInProcess()` check. When false: logs the Warning ONCE per session (static-bool gate, no spam across `PostLoadMapWithWorld` re-fires) and returns. The stale-master verdict is honoured (`bBeamMasterAutoPurgeRun` stays latched true) so subsequent level reloads don't re-log.
+> 4. **`ARebusFixtureActor::SelfHealBeamMaterialRevisionIfMismatched()`** — gated at the top with the inline `GIsEditor && !IsRunningGame() && !IsRunningCommandlet()` (no helper call — the per-fixture path lives in a different TU). When false: silent return (no per-fixture log to avoid spam; the subsystem-level Warning is enough). The per-fixture trigger no longer drives the now-gated `RebuildAndVerifyBeamMaster` from `-game`.
+> 5. **`build_rebus_base_level.py::_is_editor_runtime()`** — new module-level helper. Returns `bool(unreal.SystemLibrary.is_editor())` (the Python kismet binding of `GIsEditor`) inside a try/except so the import never fails on a future engine version. Best-effort returns `False` on any exception so the caller bails safely.
+> 6. **`build_rebus_base_level.py::ensure_beam_material(force=False)`** — guarded at the top. When `_is_editor_runtime()` is false: emits `unreal.log_warning(...)` describing the v1.0.119 crash and the operator offline-bake workflow, returns `False`. Belt-and-braces with the C++-side gate so a direct `py ensure_beam_material(...)` invocation from a `-game` console can't crash either. The function now also returns `True` on success so callers can distinguish "did the work" vs "bailed".
+> 7. **`REBUS_BEAM_MATERIAL_REVISION`** bumped 119 → 120 in both Python (`build_rebus_base_level.py`) and C++ (`RebusVisualiserSubsystem.cpp::RebusExpectedBeamMaterialRevision`). When a developer next opens the project in a real editor session, the v1.0.112 auto-purge probe will recognise pre-v1.0.120 cooked masters as stale and the (now-safely-gated) regen will fire under correct conditions. The master graph itself is UNCHANGED — only the revision sentinel bumps. The `_build_beam_master` default-value seed for `BeamMaterialRevision` now reads `float(REBUS_BEAM_MATERIAL_REVISION)` instead of a hardcoded literal so future bumps need only edit the constant.
+> 8. **`RebusVisualiser.uplugin`** `VersionName` 1.0.119 → 1.0.120. Top-centre watermark + `[Rebus] STARTUP BANNER` will read `v1.0.120 (binary built ...)` on the next launch.
+> 9. **Startup banner triage text** updated to describe the v1.0.120 gate behaviour — operators see the new `[Rebus] v1.0.120 SKIPPING beam-master stale-probe auto-purge` warning in `-game` mode and know it's expected, not a regression. The banner's prescriptive next-step now points at the editor offline-bake workflow.
+> 10. **`BeamMasterVersionLabel(EBeamMasterVersion::V117Plus)`** — label updated from `"v1.0.119+ (current expected revision)"` to `"v1.0.120+ (current expected revision)"`. `V111Plus` label updated to span `v1.0.111..v1.0.119` and reference the v1.0.120 gate.
+> 11. **`HandleDumpBeamMaterialHealthCommand`** + the `Rebus.DumpBeamCulling` per-fixture cached-master expected-rev field + the `Rebus.DumpBeamMaterialHealth` help-text `midRevision=119` example — all bumped 119 → 120 to match the new sentinel.
+>
+> ### Specifier-vs-arg verification table for NEW v1.0.120 log lines
+>
+> | File / function | Format-string slots (left-to-right) | Args (left-to-right) | Type-match? |
+> | --- | --- | --- | --- |
+> | `RebusVisualiserSubsystem.cpp::RebuildAndVerifyBeamMaster` (gate-abort Warning) | `GIsEditor=%d IsRunningGame=%d IsRunningCommandlet=%d bForceEvenIfCurrent=%d` — 4× `%d` | `GIsEditor ? 1 : 0`, `IsRunningGame() ? 1 : 0`, `IsRunningCommandlet() ? 1 : 0`, `bForceEvenIfCurrent ? 1 : 0` — 4× `int` | ✓ each `%d` ↔ `int` |
+> | `RebusVisualiserSubsystem.cpp::ProbeAndAutoPurgeStaleBeamMaster` (gate-abort Warning) | `GIsEditor=%d IsRunningGame=%d IsRunningCommandlet=%d` — 3× `%d` | `GIsEditor ? 1 : 0`, `IsRunningGame() ? 1 : 0`, `IsRunningCommandlet() ? 1 : 0` — 3× `int` | ✓ each `%d` ↔ `int` |
+> | `RebusFixtureActor.cpp::SelfHealBeamMaterialRevisionIfMismatched` (gate early-return) | _no log on gate path — silent return_ | _N/A_ | ✓ (no logging avoids per-fixture spam) |
+>
+> All three new log lines use **only `%d` slots paired with explicit `bool ? 1 : 0` int args** (the safest pairing UE 5.7's variadic format sanitiser accepts — `bool` itself promotes integrally but the explicit ternary makes the int-ness obvious to both readers and the C7595 sanitiser). The v1.0.118 build-break (C7595 against `'%d' expects integral arg` when an `int` was promoted to `float` upstream) cannot recur here — every arg is a hand-built `int`.
+>
+> ### Cross-TU access-specifier check
+>
+> v1.0.120 adds NO new public-header symbols. `CanRegenBeamMasterInProcess()` lives in the anonymous namespace of `RebusVisualiserSubsystem.cpp` — internal-linkage only, called by the two methods in the same TU. `_is_editor_runtime()` is a module-level Python helper. The `SelfHealBeamMaterialRevisionIfMismatched` gate is inline using the existing `GIsEditor` / `IsRunningGame()` / `IsRunningCommandlet()` globals (all declared in `CoreMinimal.h` transitively, no extra include needed). No risk of C2248 cross-TU access violations.
+>
+> ### UE 5.7 API verification
+>
+> All three APIs the gate reads are standard engine globals/helpers declared in `Engine/Source/Runtime/Core/Public/`:
+>
+> - `GIsEditor` — global `bool`, `CoreGlobals.h`. Authoritative flag for "this process is the editor and editor subsystems are initialised".
+> - `IsRunningGame()` — inline helper, `Misc/CoreMiscDefines.h`. Returns `FApp::IsGame()`. True under `-game`.
+> - `IsRunningCommandlet()` — inline helper, `Misc/CoreMiscDefines.h`. True under `-run=...`.
+>
+> All three are part of the public Core API and have been stable since pre-UE 5.0. Available in every WITH_EDITOR build path the visualiser ships against.
+>
+> ### Operator checklist — TWO-STEP RECOVERY SEQUENCE
+>
+> #### Step 1 — pull the v1.0.120 binary (stops the crash, restores visualiser visibility immediately)
+>
+> 1. Pull v1.0.120, close the editor, rebuild the `REBUS_VisualiserEditor` target.
+> 2. Launch the project the normal PRISM way (`UnrealEditor-Cmd.exe ... -game -PixelStreamingURL=...`).
+> 3. The session no longer crashes at launch. Expect a Warning in the log shortly after the startup banner:
+>    ```
+>    [Rebus] v1.0.120 SKIPPING beam-master stale-probe auto-purge: this UE session is in -game / -server / commandlet mode (GIsEditor=0 IsRunningGame=1 IsRunningCommandlet=0), so editor-only Python ... cannot run without crashing the process (v1.0.119 hit EXCEPTION_ACCESS_VIOLATION here). The on-disk M_RebusBeam.uasset will be used as-is for this session. ...
+>    ```
+> 4. The visualiser runs against whatever `M_RebusBeam.uasset` is currently on disk (the v1.0.110-era stale master if you were hit by the v1.0.119 silent regen failure). The cone is still visible — the v1.0.117 `bRenderInDepthPass=false` primitive flag on `BeamCone` still applies regardless of material revision (it's a C++ primitive-side flag, independent of the master). The cone may sometimes z-clip against adjacent sibling translucent cones at pan-cross moments (the depth-test issue the v1.0.117 master-side `disable_depth_test=true` would fix) — not catastrophic, the visualiser is watchable.
+>
+> #### Step 2 — pre-bake the master once in editor mode (restores the full v1.0.111 depth-mask shadowing for future sessions)
+>
+> 1. Launch the editor manually (no `-game` flag): `UnrealEditor.exe REBUS_Visualiser.uproject` (no extra command-line args).
+> 2. Wait for the editor to fully open.
+> 3. In the editor's OutputLog (or the cmd console), run: `Rebus.ForceBeamMasterRegen`.
+> 4. Confirm the OutputLog says:
+>    ```
+>    [Rebus] v1.0.119 RebuildAndVerifyBeamMaster SUCCESS -- py Exec returned OK, post-regen probe reports revision 120 (expected 120). Refreshing all spawned-fixture BeamMIDs against the freshly-baked master.
+>    ```
+>    If it does NOT (LOUD `Error` log instead), Python regen itself is still broken — see Fix 4 in the v1.0.120 brief; that's the open follow-up for v1.0.121+.
+> 5. `File > Save All` in the editor (or `Ctrl+Shift+S`).
+> 6. Commit the regenerated `REBUS_Visualiser/Content/REBUS/Materials/M_RebusBeam.uasset` (and the matching `.uexp` if your project tracks them) to git.
+> 7. Future `-game` sessions then load the pre-baked v1.0.120 master without needing any rebuild — the v1.0.120 gate skips the auto-regen silently (because the on-disk master is current), and the v1.0.111 depth-mask shadowing works on day one.
+>
+> ### What v1.0.120 does NOT change
+>
+> - The v1.0.117 PRIMARY ROOT-CAUSE FIX (`BeamCone->bRenderInDepthPass = false` on the primitive + `disable_depth_test = true` on `M_RebusBeam`) is fully preserved. The primitive-side flag is in C++ (`RebusFixtureActor::RefreshBeamConeCullingFlags`), independent of material revision; it still applies even when the on-disk master is stale.
+> - The v1.0.119 cache + post-regen verification plumbing (`GetCachedBeamMaster()`, `InvalidateBeamMasterCache()`, `RebuildAndVerifyBeamMaster`'s sequence of pre-probe → exec → flush-compile → re-probe → fixture-rebind) is unchanged. The gate sits ABOVE this plumbing — when the gate aborts, the plumbing never runs; when the gate allows (real editor session), the v1.0.119 plumbing runs verbatim.
+> - The `M_RebusBeam` master graph is unchanged. The revision sentinel bumps 119 → 120 to invalidate masters baked under the broken v1.0.119 regen window, but `_build_beam_master`'s Custom HLSL node, scalar / vector / texture parameter set, and connection wiring are all byte-identical to v1.0.119.
+> - The v1.0.118 / v1.0.117 / v1.0.116 / v1.0.107 watermark, the v1.0.105 Nanite walker, the v1.0.104 double-sided pass, the v1.0.99 cast-shadows pass — every other plugin subsystem is untouched.
+>
+> ### Known follow-ups (NOT in v1.0.120)
+>
+> - **Why v1.0.119's regen was a no-op when it DID run in editor mode** (Fix 4 in the v1.0.120 brief). The post-regen probe read `revision=-1` despite `py Exec returned OK`. Read of `_build_beam_master` + `ensure_beam_material` couldn't conclusively identify the failed step by static analysis; needs runtime instrumentation in a real editor session. Filed for v1.0.121+.
+> - **Pre-baked v1.0.120 master shipped in the repo**. v1.0.120 ships the regen gate + the bumped sentinel; an operator with editor access still has to run the offline-bake workflow above to actually produce a current `M_RebusBeam.uasset`. Once the v1.0.121+ runtime-regen investigation lands, future releases should also ship a pre-baked master in the repo so a fresh checkout works in `-game` mode without the manual editor step.
+
 > **v1.0.119 — ROOT-CAUSE FIX for v1.0.117/v1.0.118 stale-master + per-frame `FlushAsyncLoading` spam. The v1.0.117 PRIMARY ROOT-CAUSE FIX (`bRenderInDepthPass=false` on `BeamCone` + `disable_depth_test=true` on `M_RebusBeam`) only landed on the COMPONENT side in v1.0.117/v1.0.118 because the MATERIAL side regen path was non-functional. v1.0.119 fixes the regen path, hardens it with post-regen verification + LOUD failure logging + a per-fixture self-heal trigger, AND eliminates the per-frame `LogStreaming: Display: FlushAsyncLoading(...)` spam by hoisting all `M_RebusBeam` `LoadObject` calls to a session-wide cache.**
 >
 > ### What was broken (honest diagnosis)

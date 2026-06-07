@@ -454,23 +454,26 @@ public:
 		// the three `BeamLight*` vectors). The v1.0.111-era state but with NO
 		// `BeamMaterialRevision` sentinel scalar OR with a sentinel that
 		// reports a value OLDER than `RebusExpectedBeamMaterialRevision`
-		// (currently 119 -- v1.0.119 bumped from 117 to invalidate every
-		// v1.0.117/v1.0.118-era baked master, see the constexpr doc-comment
-		// in `RebusVisualiserSubsystem.cpp` for the regen-failed-silently
-		// root-cause analysis). Stale wrt v1.0.119+ -- the master is missing
-		// either the v1.0.117 `disable_depth_test=true` flag (so the cone is
-		// still writing to the depth pass, the v1.0.117 root-cause symptom
-		// shape) AND/OR was baked through the broken v1.0.117/v1.0.118
-		// Python import path (which silently no-opped, leaving the master
-		// at whatever revision was on disk before).
+		// (currently 120 -- v1.0.120 bumped from 119 as part of the stop-
+		// the-bleeding release that gates the auto-regen behind an editor-
+		// runtime check, see the constexpr doc-comment in
+		// `RebusVisualiserSubsystem.cpp` for the v1.0.119 `-game` mode
+		// crash diagnosis the v1.0.120 gate fixes). Stale wrt v1.0.120+ --
+		// the master is missing either the v1.0.117 `disable_depth_test=true`
+		// flag (so the cone is still writing to the depth pass) AND/OR was
+		// baked through the broken v1.0.117/v1.0.118 Python import path
+		// AND/OR was last baked under v1.0.119 (revision 119) before the
+		// v1.0.120 bump. In `-game` mode the v1.0.120 gate skips auto-regen
+		// (would crash), so the stale master is used as-is until an editor-
+		// session offline bake re-stamps it.
 		V111Plus,
-		// v1.0.119+ -- has the full v1.0.111 contract AND the
+		// v1.0.120+ -- has the full v1.0.111 contract AND the
 		// `BeamMaterialRevision` scalar reads the current expected revision
 		// (`RebusExpectedBeamMaterialRevision` in
-		// `RebusVisualiserSubsystem.cpp`, currently 119). Current; no
+		// `RebusVisualiserSubsystem.cpp`, currently 120). Current; no
 		// migration needed. (Enum value name preserved as `V117Plus` for
 		// backwards compatibility with any code paths that reference it by
-		// name; the LABEL string is now "v1.0.119+" -- see `BeamMasterVersionLabel`.)
+		// name; the LABEL string is now "v1.0.120+" -- see `BeamMasterVersionLabel`.)
 		V117Plus,
 	};
 
