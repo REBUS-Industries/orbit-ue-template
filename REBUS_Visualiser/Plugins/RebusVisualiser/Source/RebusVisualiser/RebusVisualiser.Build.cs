@@ -40,5 +40,14 @@ public class RebusVisualiser : ModuleRules
 			"PixelStreaming2Core",
 			"PixelStreaming2Input",
 		});
+
+		// v1.0.119 -- `FAssetCompilingManager::Get().FinishAllCompilation()` for
+		// the post-regen flush in `RebuildAndVerifyBeamMaster` ships INSIDE the
+		// engine module (header at `Engine/Source/Runtime/Engine/Public/Asset
+		// CompilingManager.h`, declared `ENGINE_API`). No separate module
+		// dependency is needed -- `Engine` is already a PublicDependencyModule
+		// above. The `#if WITH_EDITOR` gate around the call site prevents the
+		// flush from running in packaged builds where async compile is not a
+		// concern (cooked materials skip the compile path entirely).
 	}
 }

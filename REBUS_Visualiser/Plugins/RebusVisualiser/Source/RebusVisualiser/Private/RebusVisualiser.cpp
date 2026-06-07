@@ -59,6 +59,16 @@ namespace
 	// HAS OBSOLETE | v1.0.110 | v1.0.111+). Used to verify the v1.0.112 auto-purge
 	// landed and to diagnose any future "stale master" report from operators.
 	IConsoleCommand* GDumpBeamMasterVersionCommand = nullptr;
+	// v1.0.119 -- operator rescue command for the auto-purge path: regen the
+	// `M_RebusBeam` master even if the current probe reports it as current, then
+	// verify the on-disk asset actually flipped to the expected revision, then
+	// rebind every spawned-fixture BeamMID against the regenerated master. See
+	// HandleForceBeamMasterRegenCommand for the implementation.
+	IConsoleCommand* GForceBeamMasterRegenCommand = nullptr;
+	// v1.0.119 -- per-fixture material-binding health one-liner walker. Calls
+	// into `URebusVisualiserSubsystem::DumpBeamMaterialHealthForAllFixtures()`
+	// which forwards to each `ARebusFixtureActor::DumpBeamMaterialHealthForDebug`.
+	IConsoleCommand* GDumpBeamMaterialHealthCommand = nullptr;
 	// v1.0.107 -- top-centre version watermark overlay (UDebugDrawService("Foreground")
 	// canvas draw). Two commands: the visibility toggle (with a `status` arg that
 	// prints the live state + cached version string + Y-margin) and the top-edge
@@ -601,6 +611,100 @@ namespace
 			UE_LOG(LogRebusVisualiser, Log,
 				TEXT("Rebus.DumpBeamCulling '%s': dumped %d matching fixture(s)."), *Filter, Matched);
 		}
+	}
+
+	// v1.0.119 -- `Rebus.ForceBeamMasterRegen` operator rescue handler. Forces
+	// the v1.0.119 `RebuildAndVerifyBeamMaster(bForceEvenIfCurrent=true)`
+	// chokepoint so the regen runs even when the probe reports the master is
+	// already current (the case where the on-disk asset is OK but the per-
+	// fixture MIDs were created from a previous-session stale master). The
+	// `true` flag is the operator-rescue contract documented on the public
+	// `RebuildAndVerifyBeamMaster` accessor.
+	void HandleForceBeamMasterRegenCommand(const TArray<FString>& /*Args*/)
+	{
+		if (!GEngine)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.ForceBeamMasterRegen: GEngine null -- module not fully initialised; no-op."));
+			return;
+		}
+
+		int32 Worlds = 0;
+		int32 Succeeded = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World) continue;
+			const bool bRelevant =
+				Ctx.WorldType == EWorldType::Game ||
+				Ctx.WorldType == EWorldType::PIE ||
+				Ctx.WorldType == EWorldType::Editor;
+			if (!bRelevant) continue;
+			UGameInstance* GI = World->GetGameInstance();
+			if (!GI) continue;
+			URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>();
+			if (!Viz) continue;
+			++Worlds;
+			if (Viz->RebuildAndVerifyBeamMaster(/*bForceEvenIfCurrent=*/ true))
+			{
+				++Succeeded;
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.ForceBeamMasterRegen: probed %d world(s), %d regen+verify call(s) "
+				 "returned success. NEXT-STEP: run `Rebus.DumpBeamCulling` to confirm "
+				 "BeamMaterialRevision=119 (NOT MISSING) for every fixture, AND "
+				 "`Rebus.DumpBeamMaterialHealth` to confirm every cone's MaterialSlot0 "
+				 "is a `UMaterialInstanceDynamic` parented to `M_RebusBeam`. If verify "
+				 "FAILED (LOUD `Error` log one line above), check the OutputLog for a "
+				 "Python traceback and attach Saved/Logs/REBUS_Visualiser.log to a "
+				 "v1.0.120+ bug report."),
+			Worlds, Succeeded);
+	}
+
+	// v1.0.119 -- `Rebus.DumpBeamMaterialHealth` per-fixture material-binding
+	// health dump. Walks every spawned ARebusFixtureActor across every relevant
+	// world and prints one line per fixture: MaterialSlot0 (class + name), MID
+	// parent (class + name), live BeamMaterialRevision scalar readback, plus
+	// the subsystem-wide cached-master pointer state. See the doc-comment on
+	// `URebusVisualiserSubsystem::DumpBeamMaterialHealthForAllFixtures` for
+	// the field inventory.
+	void HandleDumpBeamMaterialHealthCommand(const TArray<FString>& /*Args*/)
+	{
+		if (!GEngine)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.DumpBeamMaterialHealth: GEngine null -- module not fully initialised; no-op."));
+			return;
+		}
+
+		int32 TotalFixtures = 0;
+		int32 Worlds = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World) continue;
+			const bool bRelevant =
+				Ctx.WorldType == EWorldType::Game ||
+				Ctx.WorldType == EWorldType::PIE ||
+				Ctx.WorldType == EWorldType::Editor;
+			if (!bRelevant) continue;
+			UGameInstance* GI = World->GetGameInstance();
+			if (!GI) continue;
+			URebusVisualiserSubsystem* Viz = GI->GetSubsystem<URebusVisualiserSubsystem>();
+			if (!Viz) continue;
+			++Worlds;
+			TotalFixtures += Viz->DumpBeamMaterialHealthForAllFixtures();
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.DumpBeamMaterialHealth: probed %d world(s), dumped %d fixture(s). "
+				 "Healthy line shape: slot0Class=`MaterialInstanceDynamic` slot0Asset=`MID_"
+				 "M_RebusBeam_*` midParentClass=`Material` midParentName=`M_RebusBeam` "
+				 "midRevision=%d expectedRevision=%d. Any line that diverges (slot0Class="
+				 "`Material` instead of MID, or slot0Asset=`WorldGridMaterial`/`DefaultMaterial`, "
+				 "or midRevision<expected) is a v1.0.117 grey-cone fallback case -- run "
+				 "`Rebus.ForceBeamMasterRegen` to recover."),
+			Worlds, TotalFixtures, 119, 119);
 	}
 
 	// v1.0.79 helpers: pluck the live cinematic camera pawn from any game/PIE world. There's
@@ -1155,13 +1259,22 @@ namespace
 				 "log block on the next line(s) confirming the regen landed."), PyCmd);
 
 		const bool bExecOk = GEngine->Exec(World, PyCmd, *GLog);
+		// v1.0.119 -- invalidate the cached master pointer so the next probe / fixture
+		// spawn round-trips through `LoadObject` and picks up the freshly-regenerated
+		// asset rather than the stale `TWeakObjectPtr` from before the regen. Mandatory
+		// when the master is regenerated out-of-band of `RebuildAndVerifyBeamMaster`
+		// (this command pre-dates that chokepoint and is kept for backwards compat).
+		// For a fully-verified regen-with-fixture-rebind, use `Rebus.ForceBeamMasterRegen`.
+		URebusVisualiserSubsystem::InvalidateBeamMasterCache();
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("Rebus.RebuildBeamMaterial: `py` Exec returned %s. "
+			TEXT("Rebus.RebuildBeamMaterial: `py` Exec returned %s; v1.0.119 BeamMaster cache invalidated. "
 				 "NEXT-STEP -- existing per-fixture BeamMIDs still reference the OLD master "
 				 "(the Python side regenerates the .uasset in place; UMaterialInstanceDynamic "
 				 "parent pointers don't refresh automatically). Run ClearScene + LoadScene "
 				 "from the portal to respawn every fixture (which calls BuildBeamCone, which "
-				 "LoadObject's the freshly-regenerated master) -- OR restart the editor."),
+				 "LoadObject's the freshly-regenerated master via the v1.0.119 cache) -- OR "
+				 "restart the editor -- OR (preferred since v1.0.119) run `Rebus.ForceBeamMaster"
+				 "Regen` which does the regen + verify + per-fixture MID rebind in one shot."),
 			bExecOk ? TEXT("OK") : TEXT("FAILED"));
 #else
 		UE_LOG(LogRebusVisualiser, Warning,
@@ -2092,6 +2205,54 @@ void FRebusVisualiserModule::StartupModule()
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpBeamCullingCommand),
 		ECVF_Default);
 
+	// v1.0.119 -- operator rescue command for the auto-purge path. Forces the
+	// `RebuildAndVerifyBeamMaster(true)` chokepoint, which (1) invalidates the
+	// cached master, (2) re-probes pre-regen, (3) invokes the Python
+	// `ensure_beam_material(force=True)` regen, (4) flushes async compile via
+	// `FAssetCompilingManager::FinishAllCompilation()`, (5) RE-PROBES the post-
+	// regen master to verify the new revision actually landed (the v1.0.117 /
+	// v1.0.118 silent-failure case), (6) rebinds every spawned-fixture BeamMID
+	// against the freshly-baked master. Use this when `Rebus.DumpBeamCulling` /
+	// `Rebus.DumpBeamMaterialHealth` show the master is current but the per-
+	// fixture MIDs are pointing at a stale UObject (the post-spawn race case
+	// `OnPostLoadMapAutoPurge` can't catch). Editor-only -- packaged builds
+	// cannot regen cooked .uasset files (PythonScriptPlugin doesn't ship).
+	GForceBeamMasterRegenCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.ForceBeamMasterRegen"),
+		TEXT("v1.0.119 -- operator rescue: force-regen the `M_RebusBeam` master + verify the "
+			 "regen actually landed + rebind every spawned-fixture BeamMID against the new "
+			 "master. Unlike `Rebus.RebuildBeamMaterial` (which only runs the Python regen), "
+			 "this command (1) invalidates the v1.0.119 cached master pointer, (2) runs the "
+			 "Python regen, (3) `FAssetCompilingManager::FinishAllCompilation()` to flush "
+			 "shader compile, (4) RE-PROBES the on-disk master + LOUD-error-logs if the "
+			 "expected revision did not land, (5) walks SpawnedFixtures + re-binds each "
+			 "BeamMID. Use this when `Rebus.DumpBeamCulling` reports BeamMaterialRevision="
+			 "MISSING or when per-fixture MIDs look stale relative to the on-disk master. "
+			 "Editor-only (the Python regen path is gated behind WITH_EDITOR). Usage: "
+			 "Rebus.ForceBeamMasterRegen"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleForceBeamMasterRegenCommand),
+		ECVF_Default);
+
+	// v1.0.119 -- per-fixture material-binding health one-liner walker. Companion
+	// to `Rebus.DumpBeamCulling` (which dumps culling flags). Surfaces the
+	// MaterialSlot0 + BeamMID parent + live BeamMaterialRevision state per
+	// fixture so the operator can see at a glance which fixtures rendered with
+	// the v1.0.117 grey-cone fallback vs a healthy `M_RebusBeam`-parented MID.
+	GDumpBeamMaterialHealthCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.DumpBeamMaterialHealth"),
+		TEXT("v1.0.119 -- dump per-fixture beam-material binding state in one line so the "
+			 "operator can see at a glance which fixtures have which material binding. "
+			 "Reports MaterialSlot0 (class + asset name) on the BeamCone proc-mesh, the "
+			 "BeamMID parent material (class + name), the live `BeamMaterialRevision` scalar "
+			 "read back off the MID (proves which generation of M_RebusBeam this MID was "
+			 "created from -- MISSING / older-than-expected means the v1.0.117 grey-cone "
+			 "fallback case), and the subsystem-wide cached-master pointer state. Healthy "
+			 "shape: slot0Class=`MaterialInstanceDynamic`, midParentName=`M_RebusBeam`, "
+			 "midRevision=119. Anything else -- run `Rebus.ForceBeamMasterRegen` to recover. "
+			 "Walks every Game/PIE/Editor world. Usage: Rebus.DumpBeamMaterialHealth"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpBeamMaterialHealthCommand),
+		ECVF_Default);
+
 	GDumpBeamMasterVersionCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Rebus.DumpBeamMasterVersion"),
 		TEXT("v1.0.112 -- probe the on-disk `/Game/REBUS/Materials/M_RebusBeam.uasset` and "
@@ -2255,6 +2416,16 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GDumpBeamMasterVersionCommand);
 		GDumpBeamMasterVersionCommand = nullptr;
+	}
+	if (GForceBeamMasterRegenCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GForceBeamMasterRegenCommand);
+		GForceBeamMasterRegenCommand = nullptr;
+	}
+	if (GDumpBeamMaterialHealthCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GDumpBeamMaterialHealthCommand);
+		GDumpBeamMaterialHealthCommand = nullptr;
 	}
 	if (GShowVersionCommand)
 	{

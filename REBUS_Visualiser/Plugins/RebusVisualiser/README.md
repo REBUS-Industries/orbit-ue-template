@@ -594,6 +594,65 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **v1.0.119 — ROOT-CAUSE FIX for v1.0.117/v1.0.118 stale-master + per-frame `FlushAsyncLoading` spam. The v1.0.117 PRIMARY ROOT-CAUSE FIX (`bRenderInDepthPass=false` on `BeamCone` + `disable_depth_test=true` on `M_RebusBeam`) only landed on the COMPONENT side in v1.0.117/v1.0.118 because the MATERIAL side regen path was non-functional. v1.0.119 fixes the regen path, hardens it with post-regen verification + LOUD failure logging + a per-fixture self-heal trigger, AND eliminates the per-frame `LogStreaming: Display: FlushAsyncLoading(...)` spam by hoisting all `M_RebusBeam` `LoadObject` calls to a session-wide cache.**
+>
+> ### What was broken (honest diagnosis)
+>
+> The user ran `Rebus.DumpBeamCulling` against a v1.0.118 binary and saw:
+>
+> ```
+> BeamCone={vis=1 hidGame=0 ... renderDepth=0 ... boundsScale=5.00 ... sortPrio=-10 ...}
+> ...
+> BeamMID.BeamMaterialRevision=MISSING -- pre-v1.0.117 master, run `Rebus.RebuildBeamMaterial`
+> (masterShape=STALE_MASTER -- run `Rebus.RebuildBeamMaterial` + ClearScene/LoadScene)
+> ```
+>
+> The C++ side of v1.0.117/118 was correct (`renderDepth=0`, every culling flag clean), but `BeamMaterialRevision=MISSING` proves the on-disk `M_RebusBeam.uasset` was never regenerated. The v1.0.112 auto-purge claimed success ("`py` Exec returned OK") but the post-regen .uasset was still the pre-v1.0.117 master.
+>
+> Root cause: `REBUS_Visualiser/Content/Python/build_rebus_base_level.py` mixed TAB and SPACE indentation in `build()` and `ensure_base_level()` since v1.0.117. Python 3 raises `TabError` at PARSE time — `import build_rebus_base_level` failed before any function in the module could run. The auto-purge's `py import build_rebus_base_level; build_rebus_base_level.ensure_beam_material(force=True)` Exec returned OK from the engine's perspective (no parse error in the C++ command string) but Python's exception was swallowed by the Python-bridge layer, so the master was never re-baked. **The `disable_depth_test=True` flag never made it onto the actual `.uasset`.**
+>
+> Compounding issue: every per-fixture `BuildBeamCone` did `LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/REBUS/Materials/M_RebusBeam.M_RebusBeam"))` as the cook-safe fallback. With N fixtures spawning in quick succession + the v1.0.117 `ProbeBeamMasterVersion()` probe calling `LoadObject<UMaterial>` for every refresh sink, the cumulative `LoadObject` traffic produced per-frame `LogStreaming: Display: FlushAsyncLoading(455): 1 QueuedPackages, 0 AsyncPackages` spam.
+>
+> ### What v1.0.119 changes — exact list
+>
+> 1. **`Content/Python/build_rebus_base_level.py::build()` / `ensure_base_level()`** — converted every line in both functions from mixed TAB/SPACE to consistent 4-space indentation (matching every other function in the module). The `TabError` is gone; `import build_rebus_base_level` works in Python 3 again; the C++ auto-purge's `py import ...; ensure_beam_material(force=True)` Exec actually runs the regen.
+> 2. **`REBUS_BEAM_MATERIAL_REVISION`** bumped 117 → 119 in both Python (`build_rebus_base_level.py`) and C++ (`RebusVisualiserSubsystem.cpp::RebusExpectedBeamMaterialRevision`). Every v1.0.117/118-era machine is forced to re-regen on next launch.
+> 3. **`URebusVisualiserSubsystem::RebuildAndVerifyBeamMaster(bool bForceEvenIfCurrent)`** — new chokepoint every regen call now routes through. Sequence: invalidate the cached master pointer → pre-regen probe (early-out unless `bForceEvenIfCurrent=true`) → invoke `py ensure_beam_material(force=True)` → `FAssetCompilingManager::Get().FinishAllCompilation()` to flush async shader compile → invalidate cache + RE-PROBE the post-regen master → on mismatch, LOUD `UE_LOG(Error)` with operator-actionable diagnostic → on success, `RefreshAllSpawnedFixtureBeamMIDs` to rebind every fixture's BeamMID. Returns true iff the post-regen revision matches expected.
+> 4. **`ARebusFixtureActor::SelfHealBeamMaterialRevisionIfMismatched()`** — new on-spawn probe called from the tail of `BuildBeamCone`. Reads back the live `BeamMaterialRevision` scalar from the just-created `BeamMID`. When it does NOT match the running-binary expected revision (the case where a fixture spawns AFTER the once-per-session `OnPostLoadMapAutoPurge` probe — e.g. portal mid-session `LoadScene`), triggers `RebuildAndVerifyBeamMaster(false)` so the regen fires + every fixture's MID is rebound. Cheap when healthy (single scalar read).
+> 5. **`URebusVisualiserSubsystem::GetCachedBeamMaster()` / `InvalidateBeamMasterCache()` / `GetBeamMasterLoadCount()`** — session-wide cache for the on-disk `M_RebusBeam` master pointer. Held as `static TWeakObjectPtr<UMaterialInterface>` so GC invalidates cleanly. EVERY in-plugin resolver of the master now routes through `GetCachedBeamMaster()`: `ARebusFixtureActor::BuildBeamCone` (was `LoadObject<UMaterialInterface>`), `URebusVisualiserSubsystem::ProbeBeamMasterVersion` (was `LoadObject<UMaterial>`). Counter `BeamMasterLoadCount` increments ONLY on actual `LoadObject` hits (cache hits do not increment) — should READ 1 in the startup banner, 2 after a regen.
+> 6. **`URebusVisualiserSubsystem::ProbeAndAutoPurgeStaleBeamMaster()`** — on regen FAILURE, releases `bBeamMasterAutoPurgeRun = false` so the next `PostLoadMapWithWorld` (or operator `Rebus.ForceBeamMasterRegen`) gets a fresh attempt instead of silently no-opping behind the latched bool.
+> 7. **`Rebus.ForceBeamMasterRegen`** — new console command. Wraps `RebuildAndVerifyBeamMaster(true)` (force even when current). Operator rescue path for the post-spawn race case where the on-disk master is current but per-fixture MIDs are pointing at a stale UObject.
+> 8. **`Rebus.DumpBeamMaterialHealth`** — new console command. Walks every spawned `ARebusFixtureActor` in every relevant world and dumps one line per fixture: MaterialSlot0 (class + asset name) on the BeamCone proc-mesh, BeamMID parent material (class + name), live `BeamMaterialRevision` scalar read back off the MID, cached-master pointer state. Healthy shape: `slot0Class=MaterialInstanceDynamic midParentName=M_RebusBeam midRevision=119`.
+> 9. **Startup banner extended** — now reports `cachedBeamMaster=<name>`, `beamMasterLoadCount=N`, `beamMasterRegen={attempts=N lastResult=X lastDetectedAfter=N}` so the operator can see the cache + regen telemetry on the same line as the existing version + verdict + md5 fields.
+> 10. **`Rebus.DumpBeamCulling` extended** — appended `BeamMasterCache={name=X loadCount=N expectedRev=119}` so per-fixture dumps also surface the cache state.
+>
+> ### Which call site was responsible for the `FlushAsyncLoading(455)` spam
+>
+> Two cumulative sources:
+> - `ARebusFixtureActor::BuildBeamCone` did `LoadObject<UMaterialInterface>(...)` once per fixture spawn. With 6+ fixtures and several CVar refresh sinks firing on top, the engine's async loader saw a steady stream of `LoadObject` requests.
+> - `URebusVisualiserSubsystem::ProbeBeamMasterVersion()` did `LoadObject<UMaterial>(...)` on every call. The probe runs from `Initialize()`, from `OnPostLoadMapAutoPurge` (every level reload), and from `HandleDumpBeamMasterVersionCommand` (operator-triggered). Each call forced a fresh round-trip even when the master was already resident.
+>
+> v1.0.119 routes BOTH through the cache. After the first session-wide load (logged: `[Rebus] v1.0.119 BeamMaster CACHE LOAD #1 -- 'M_RebusBeam' resolved + cached`), every subsequent caller hits the `TWeakObjectPtr::Get()` fast-path. The `BeamMasterLoadCount` counter exposes the audit result to the operator — steady-state should be 1, immediately after a regen should be 2; anything higher means a per-tick `LoadObject` path was missed and should be reported.
+>
+> ### Operator checklist
+>
+> 1. Pull v1.0.119, rebuild C++ binaries (close the editor first, then build the `REBUS_VisualiserEditor` target).
+> 2. Launch the editor. Watch the startup log for a banner like:
+>    ```
+>    ===== REBUS Visualiser v1.0.119 (binary built ...) -- beamMasterVerdict=v1.0.119+
+>    beamMasterRev=119/119 beamMasterUassetMd5=... cachedBeamMaster=M_RebusBeam
+>    beamMasterLoadCount=1 beamMasterRegen={attempts=1 lastResult=success lastDetectedAfter=119} =====
+>    ```
+>    First launch on a v1.0.117/118-era workspace: `beamMasterVerdict` will read `v1.0.111..v1.0.118` BEFORE the auto-purge runs, then the next log line will show `STALE BEAM MASTER detected`, then `v1.0.119 RebuildAndVerifyBeamMaster: invoking ...`, then `v1.0.119 RebuildAndVerifyBeamMaster SUCCESS -- ... post-regen probe reports revision 119`. After that, every fixture spawn picks up the v1.0.119 master cleanly.
+> 3. Run `Rebus.DumpBeamCulling` — confirm `BeamMID.BeamMaterialRevision=119` and `masterShape=OK` for every fixture; confirm `BeamMasterCache={name=M_RebusBeam loadCount=N expectedRev=119}` with `loadCount` reading 1 or 2.
+> 4. Run `Rebus.DumpBeamMaterialHealth` — confirm every line reports `slot0Class=MaterialInstanceDynamic midParentName=M_RebusBeam midRevision=119`.
+> 5. If `BeamMaterialRevision` still shows MISSING or <119 after launch, run `Rebus.ForceBeamMasterRegen` manually. Watch for `v1.0.119 RebuildAndVerifyBeamMaster SUCCESS` (or the LOUD `Error` line that exposes the new failure mode).
+> 6. If `Rebus.ForceBeamMasterRegen` still fails, attach `Saved/Logs/REBUS_Visualiser.log` to a v1.0.120+ bug report — the LOUD error line + the Python traceback above it identify the new failure mode for triage.
+>
+> ### What v1.0.119 does NOT change
+>
+> The v1.0.117 PRIMARY ROOT-CAUSE FIX (`disable_depth_test=true` on `M_RebusBeam`, `bRenderInDepthPass=false` on `BeamCone`, the full v1.0.117 cone-flag hardening set) is fully preserved. The v1.0.117 master graph itself is unchanged in v1.0.119 — the revision bump exists purely to invalidate cached masters cooked during the v1.0.117/118 broken-Python window so the auto-purge will recognise them as stale and force-regen with the now-working Python module.
+
 > **v1.0.118 — UE 5.7 BUILD FIX for the v1.0.117 extended `DumpBeamCullingStateForDebug` + the v1.0.117 `RefreshBeamConeCullingFlags` helper. The v1.0.117 PRIMARY ROOT-CAUSE FIX (`BeamCone->bRenderInDepthPass = false` on the primitive + `disable_depth_test = true` on `M_RebusBeam`) is UNCHANGED and intact — this release ONLY fixes the diagnostic dump + the cone-flag setter that broke the build, so the v1.0.117 fix can finally land on operators' machines.**
 >
 > ### What broke v1.0.117 in UE 5.7

@@ -861,9 +861,23 @@ def _build_beam_master(mat):
     # Python script. The runtime BeamMID inherits the master's default and
     # the v1.0.117 `Rebus.DumpBeamCulling` prints it back so the operator
     # can confirm the regen actually landed on their machine.
+    # v1.0.119 -- bumped 117.0 -> 119.0 (the v1.0.118 build-fix did NOT bump the
+    # revision; v1.0.119 ALSO did not change `_build_beam_master`'s graph but does
+    # carry the SHOWSTOPPER Python tabs/spaces fix in `build()` / `ensure_base_level()`
+    # without which the auto-purge could never actually invoke this function on the
+    # operator's machine -- so v1.0.119 is the FIRST release where the v1.0.117
+    # `disable_depth_test=True` flag is GUARANTEED to land on a stale master. Bumping
+    # the revision sentinel forces the v1.0.112 auto-purge probe in
+    # `URebusVisualiserSubsystem::ProbeAndAutoPurgeStaleBeamMaster` to treat every
+    # pre-v1.0.119 master as stale and re-regen it via the freshly-importable Python
+    # module, so operators who already booted v1.0.117/v1.0.118 (and got a master
+    # baked through some OTHER path -- e.g. they manually ran `ensure_beam_material`
+    # via Tools > Execute Python Script in a console that happened to handle the
+    # tabs/spaces error differently) get a clean regen too. Keep in lockstep with the
+    # C++ mirror `RebusExpectedBeamMaterialRevision` in `RebusVisualiserSubsystem.cpp`.
     rev = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -1100, -340)
     rev.set_editor_property("parameter_name", "BeamMaterialRevision")
-    rev.set_editor_property("default_value", 117.0)
+    rev.set_editor_property("default_value", 119.0)
 
     # ---- Driveable parameters (per-fixture MID) ----
     color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, -260)
@@ -1018,7 +1032,7 @@ def _build_beam_master(mat):
     mel.recompile_material(mat)
 
 
-REBUS_BEAM_MATERIAL_REVISION = 117
+REBUS_BEAM_MATERIAL_REVISION = 119
 """v1.0.117 -- sentinel revision baked into the on-disk M_RebusBeam master via the
 `BeamMaterialRevision` scalar parameter. Bumped by every release that touches the
 master so the v1.0.112 auto-purge probe in
@@ -1026,6 +1040,22 @@ master so the v1.0.112 auto-purge probe in
 stale on-disk master deterministically (instead of relying on a cooked-editor-state
 md5 which differs across operator machines / build configs). Bump this AND the C++
 mirror `RebusExpectedBeamMaterialRevision` in lockstep when the master changes.
+
+v1.0.119 -- bumped 117 -> 119. The v1.0.117 / v1.0.118 builds shipped a Python
+file whose `build()` / `ensure_base_level()` functions mixed TAB and SPACE
+indentation -- Python 3 raises `TabError` at PARSE time so `import build_rebus
+_base_level` failed unconditionally, the editor-startup level-author no-opped,
+AND the C++ auto-purge's `py import build_rebus_base_level; build_rebus_base
+_level.ensure_beam_material(force=True)` Exec failed at the import line.
+Operator effect: the v1.0.117 PRIMARY ROOT-CAUSE FIX (`disable_depth_test = True`
+on the master + matching `bRenderInDepthPass = false` on the cone primitive) only
+applied to the COMPONENT side; the MASTER side never re-baked because the regen
+path was non-functional. v1.0.119 fixes the Python file AND bumps this constant
+so the auto-purge will recognise any v1.0.117/v1.0.118 baked master (revision
+117) as STALE and force-regen it via the now-importable Python module. The
+v1.0.117 master graph itself is unchanged in v1.0.119 (no shader / parameter
+changes); the revision bump exists purely to invalidate cached masters cooked
+during the broken window.
 """
 
 
@@ -1616,22 +1646,35 @@ def build():
 
     Replaces whatever level is currently open, so call this only for an explicit
     (re)bake (Tools > Execute Python Script / headless -run=pythonscript).
+
+    v1.0.119 NOTE -- this function (and `ensure_base_level()` below) PREVIOUSLY
+    mixed TAB and SPACE indentation in v1.0.117 / v1.0.118, which causes Python 3
+    to raise `TabError: inconsistent use of tabs and spaces in indentation` at
+    PARSE time. The fallout was severe: `init_unreal.py`'s top-level
+    `import build_rebus_base_level as base` line caught the exception and set
+    `base = None`, so the editor-startup level-author path silently no-opped;
+    and the C++ auto-purge's `py import build_rebus_base_level;
+    build_rebus_base_level.ensure_beam_material(force=True)` Exec failed at the
+    import line, so a stale on-disk `M_RebusBeam.uasset` was never regenerated.
+    v1.0.119 converts every line in BOTH functions to 4-space indentation
+    (matching every other function in this module) so the import succeeds. See
+    the v1.0.119 README release block for the full diagnosis + fix.
     """
     # A full bake always overwrites the generated materials (no confirmation dialog);
     # safe because new_level below replaces the open level, so nothing references the
     # instances we just deleted/recreated.
-	ensure_ground_materials(force=True)
-	ensure_lens_material(force=True)
-	ensure_beam_material(force=True)
-	# v1.0.93 mirror lens (drives every Epic-beam lens object).
-	ensure_fixture_lens_material(force=True)
-	# v1.0.104 two-sided opaque master operators can re-parent Orbit-imported materials
-	# to so thin geometry renders both sides (see ORBIT_IMPORTED_PATH doc + README v1.0.104).
-	ensure_orbit_imported_material(force=True)
-	# v1.0.95 migration -- see the helper docstring + README v1.0.95.
-	_cleanup_internal_beam_assets()
+    ensure_ground_materials(force=True)
+    ensure_lens_material(force=True)
+    ensure_beam_material(force=True)
+    # v1.0.93 mirror lens (drives every Epic-beam lens object).
+    ensure_fixture_lens_material(force=True)
+    # v1.0.104 two-sided opaque master operators can re-parent Orbit-imported materials
+    # to so thin geometry renders both sides (see ORBIT_IMPORTED_PATH doc + README v1.0.104).
+    ensure_orbit_imported_material(force=True)
+    # v1.0.95 migration -- see the helper docstring + README v1.0.95.
+    _cleanup_internal_beam_assets()
 
-	les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
 
     # Create a fresh, empty level (replaces whatever is open) and make it current.
     les.new_level(LEVEL_PACKAGE_PATH)
@@ -1649,19 +1692,21 @@ def ensure_base_level():
     This is the idempotent entry point the startup hook (init_unreal.py) uses so
     opening the project always lands on a populated stage without clobbering an
     existing BaseLevel on every launch.
-    """
-	# Ground + lens materials self-heal independently of the map (cheap if already present).
-	ensure_ground_materials()
-	ensure_lens_material()
-	ensure_beam_material()
-	# v1.0.93 mirror lens self-heal (drives every Epic-beam lens object).
-	ensure_fixture_lens_material()
-	# v1.0.104 Orbit-imported two-sided opaque master self-heal.
-	ensure_orbit_imported_material()
-	# v1.0.95 migration -- see the helper docstring + README v1.0.95.
-	_cleanup_internal_beam_assets()
 
-	if unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH):
+    v1.0.119 NOTE -- see `build()`'s docstring; same tabs/spaces fix lives here.
+    """
+    # Ground + lens materials self-heal independently of the map (cheap if already present).
+    ensure_ground_materials()
+    ensure_lens_material()
+    ensure_beam_material()
+    # v1.0.93 mirror lens self-heal (drives every Epic-beam lens object).
+    ensure_fixture_lens_material()
+    # v1.0.104 Orbit-imported two-sided opaque master self-heal.
+    ensure_orbit_imported_material()
+    # v1.0.95 migration -- see the helper docstring + README v1.0.95.
+    _cleanup_internal_beam_assets()
+
+    if unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH):
         return False
     unreal.log("RebusBaseLevel: '{}' missing; generating it.".format(LEVEL_PACKAGE_PATH))
     build()

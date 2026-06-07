@@ -5,6 +5,13 @@
 #include "RebusIes.h"
 #include "RebusRestClient.h"
 #include "RebusVisualiserLog.h"
+// v1.0.119 -- `URebusVisualiserSubsystem::GetCachedBeamMaster()` (the v1.0.119
+// cached-master accessor that replaces the per-fixture LoadObject) +
+// `RebuildAndVerifyBeamMaster` (the self-heal trigger called from BuildBeamCone's
+// tail). See `BuildBeamCone` / `SelfHealBeamMaterialRevisionIfMismatched` for
+// the call-site rationale.
+#include "RebusVisualiserSubsystem.h"
+#include "Engine/GameInstance.h" // v1.0.119 -- AActor::GetGameInstance + UGameInstance::GetSubsystem in SelfHealBeamMaterialRevisionIfMismatched
 
 #include "Components/SpotLightComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -2878,10 +2885,22 @@ void ARebusFixtureActor::BuildBeamCone()
 	// Length = the SpotLight throw (AttenuationRadius) so the shaft matches the light's reach.
 	BeamLengthUnreal = SpotLight ? SpotLight->AttenuationRadius : 6000.f;
 
-	// Prefer the cook-safe CDO hard-ref; fall back to a runtime load by path (logged on failure).
+	// Prefer the cook-safe CDO hard-ref; fall back to the v1.0.119 SHARED cached
+	// master accessor. The v1.0.119 fix routes EVERY runtime resolver of the
+	// M_RebusBeam master through `URebusVisualiserSubsystem::GetCachedBeamMaster()`
+	// so the on-disk asset is `LoadObject`'d at most ONCE per session (twice if a
+	// regen ran). Previously every per-fixture spawn re-issued a fresh `LoadObject
+	// <UMaterialInterface>` round-trip when the BeamMaterial CDO hard-ref was
+	// stripped at cook time -- with N fixtures spawning in quick succession +
+	// several CVar refresh sinks firing on top, the cumulative `LoadObject` traffic
+	// was producing the per-frame `LogStreaming: Display: FlushAsyncLoading(...)`
+	// spam the v1.0.119 brief asked us to root-cause. The cache + the
+	// `BeamMasterLoadCount` counter surfaced in the v1.0.117 startup banner +
+	// `Rebus.DumpBeamCulling` lets the operator verify the audit landed
+	// (steady-state should READ count=1, count=2 immediately after a regen).
 	UMaterialInterface* Mat = BeamMaterial
 		? BeamMaterial.Get()
-		: LoadObject<UMaterialInterface>(nullptr, TEXT("/Game/REBUS/Materials/M_RebusBeam.M_RebusBeam"));
+		: URebusVisualiserSubsystem::GetCachedBeamMaster();
 	if (!Mat)
 	{
 		UE_LOG(LogRebusVisualiser, Warning,
@@ -3011,6 +3030,21 @@ void ARebusFixtureActor::BuildBeamCone()
 				 "`Rebus.PreferProceduralBeam 0` to restore Epic's MI_Beam canvas."),
 			*FixtureId);
 	}
+
+	// v1.0.119 -- on-spawn self-heal probe. The v1.0.112 auto-purge runs at
+	// subsystem `Initialize()` + on every `PostLoadMapWithWorld`, but fixtures
+	// spawn LATER on the per-tick scene-fetch chain -- a fixture that materialises
+	// AFTER the once-per-session probe (e.g. an operator mid-session sends a
+	// portal `LoadScene` that respawns fixtures, OR the very first scene's
+	// fetch resolves AFTER `OnPostLoadMapAutoPurge` fires) would otherwise spawn
+	// with a BeamMID parented to a still-stale master and silently render the
+	// v1.0.117 grey-cone fallback. The self-heal helper reads back the live
+	// `BeamMaterialRevision` scalar on this fixture's BeamMID and triggers
+	// `URebusVisualiserSubsystem::RebuildAndVerifyBeamMaster(false)` when it
+	// does NOT match the running-binary expected revision. Cheap when healthy
+	// (single scalar read). See the v1.0.119 README release block + the
+	// `SelfHealBeamMaterialRevisionIfMismatched` doc-comment for the contract.
+	SelfHealBeamMaterialRevisionIfMismatched();
 }
 
 void ARebusFixtureActor::UpdateBeamConeGeometry()
@@ -3761,7 +3795,8 @@ void ARebusFixtureActor::DumpBeamCullingStateForDebug() const
 			 "Capture={fov=%.1fdeg halfFov=%.1fdeg maxView=%.0fcm hiddenComponents=%d} | "
 			 "Geometry={outerHalf=%.2fdeg matchHalf=%.2fdeg coneScale=%.3f visConeHalf=%.2fdeg attenuationRadius=%.0fcm coneFitsCapture=%d} | "
 			 "Coincidence={spotLoc=(%.0f,%.0f,%.0f) coneOffsetCm=%.2f capOffsetCm=%.2f} | "
-			 "GlobalCVars={r.AllowOcclusionQueries=%d r.VolumetricFog=%d}"),
+			 "GlobalCVars={r.AllowOcclusionQueries=%d r.VolumetricFog=%d} | "
+			 "BeamMasterCache={name=%s loadCount=%d expectedRev=%d}"),
 		*FixtureId, *DisplayName,
 		*BeamConeFlags, *EpicBeamFlags,
 		bUsingEpicBeam ? 1 : 0, bPreferProceduralBeam ? 1 : 0, bMeshBeamEnabled ? 1 : 0,
@@ -3793,7 +3828,151 @@ void ARebusFixtureActor::DumpBeamCullingStateForDebug() const
 		(int32)([]() -> int32 {
 			IConsoleVariable* CV = IConsoleManager::Get().FindConsoleVariable(TEXT("r.VolumetricFog"));
 			return CV ? CV->GetInt() : -1;
-		}()));
+		}()),
+		// v1.0.119 -- cached-master pointer state + session load counter so
+		// the operator can see at a glance whether the v1.0.119 cache is
+		// working (`loadCount=1` is the steady state, `=2` means a regen
+		// ran, `>2` means a per-tick `LoadObject` path the v1.0.119 audit
+		// missed). See `URebusVisualiserSubsystem::GetCachedBeamMaster()`
+		// for the cache architecture + the per-frame `FlushAsyncLoading`
+		// spam root-cause this surfaces. `expectedRev` is the running-
+		// binary expectation so the field is paste-friendly without
+		// needing a separate `Rebus.DumpBeamMasterVersion` run.
+		URebusVisualiserSubsystem::GetCachedBeamMasterDisplayName(),
+		URebusVisualiserSubsystem::GetBeamMasterLoadCount(),
+		// 119 -- the v1.0.119 floor. Hard-coded here intentionally so the
+		// dump remains a pure read with no subsystem-instance round-trip;
+		// must be bumped in lockstep with `RebusExpectedBeamMaterialRevision`
+		// (in `RebusVisualiserSubsystem.cpp`) and `REBUS_BEAM_MATERIAL_REVISION`
+		// (in `Content/Python/build_rebus_base_level.py`). The v1.0.119
+		// release block in README documents the bump cadence.
+		119);
+}
+
+void ARebusFixtureActor::DumpBeamMaterialHealthForDebug(int32 ExpectedRevision,
+	const TCHAR* CachedMasterName, int32 CachedMasterLoadCount) const
+{
+	// v1.0.119 -- per-fixture one-liner reporting MaterialSlot0 + BeamMID parent
+	// + the live `BeamMaterialRevision` scalar read back off the MID, plus the
+	// subsystem-wide cache state forwarded by the caller. See the public-header
+	// doc-comment for the operator-facing contract.
+	//
+	// Layered defence: every field tag is null-safe so a partial-spawn fixture
+	// (cone null, MID null, MaterialSlot0 null) still produces a parseable line
+	// rather than dereferencing through nullptr.
+	const TCHAR* Slot0ClassName = TEXT("<no-cone>");
+	FString Slot0AssetName = TEXT("<no-cone>");
+	if (BeamCone)
+	{
+		UMaterialInterface* Slot0 = BeamCone->GetMaterial(0);
+		if (Slot0)
+		{
+			Slot0ClassName = *Slot0->GetClass()->GetName();
+			Slot0AssetName = Slot0->GetName();
+		}
+		else
+		{
+			Slot0ClassName = TEXT("<null-slot0>");
+			Slot0AssetName = TEXT("<null-slot0>");
+		}
+	}
+
+	const TCHAR* MidParentClassName = TEXT("<no-mid>");
+	FString MidParentName = TEXT("<no-mid>");
+	int32 MidDetectedRevision = -1;
+	if (BeamMID)
+	{
+		// `UMaterialInstance::Parent` is the canonical accessor for the master
+		// material a MID was created from. Read directly (no helper accessor in
+		// UE 5.7) -- the field is a public UPROPERTY (Engine/Source/Runtime/
+		// Engine/Classes/Materials/MaterialInstance.h:215 in 5.7).
+		if (UMaterialInterface* Parent = BeamMID->Parent)
+		{
+			MidParentClassName = *Parent->GetClass()->GetName();
+			MidParentName = Parent->GetName();
+		}
+		else
+		{
+			MidParentClassName = TEXT("<null-parent>");
+			MidParentName = TEXT("<null-parent>");
+		}
+		float RevAsFloat = 0.f;
+		// Same `FMaterialParameterInfo(NAME)` accessor the subsystem probe uses --
+		// returns true iff the scalar parameter exists on the MID's (effective)
+		// parameter set. A pre-v1.0.117 master leaves the MID without this
+		// parameter and the readback fails (-> -1 sentinel below).
+		if (BeamMID->GetScalarParameterValue(
+				FMaterialParameterInfo(TEXT("BeamMaterialRevision")), RevAsFloat))
+		{
+			MidDetectedRevision = FMath::RoundToInt(RevAsFloat);
+		}
+	}
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("[Rebus] DumpBeamMaterialHealth fixtureId=%s slot0Class=%s slot0Asset=%s "
+			 "midParentClass=%s midParentName=%s midRevision=%d expectedRevision=%d "
+			 "cachedMaster=%s cachedLoadCount=%d"),
+		*FixtureId,
+		Slot0ClassName, *Slot0AssetName,
+		MidParentClassName, *MidParentName,
+		MidDetectedRevision, ExpectedRevision,
+		CachedMasterName, CachedMasterLoadCount);
+}
+
+void ARebusFixtureActor::SelfHealBeamMaterialRevisionIfMismatched()
+{
+	// v1.0.119 -- on-spawn self-heal probe. See the public-header doc-comment
+	// for the contract. Cheap when MID is null (no-op) or revision matches
+	// (single scalar read).
+	if (!BeamMID) return;
+
+	float RevAsFloat = 0.f;
+	const bool bHas = BeamMID->GetScalarParameterValue(
+		FMaterialParameterInfo(TEXT("BeamMaterialRevision")), RevAsFloat);
+	const int32 DetectedRev = bHas ? FMath::RoundToInt(RevAsFloat) : -1;
+
+	// `RebusExpectedBeamMaterialRevision` lives at file scope in
+	// `RebusVisualiserSubsystem.cpp` (anonymous namespace, not accessible from
+	// here). Read it back via the subsystem's `GetCachedBeamMaster()` probe
+	// expectations instead -- the most ergonomic accessor here is the same
+	// scalar value the master itself was authored with, which `ProbeBeam
+	// MasterVersion()` exposes via `FBeamMasterVersionReport::ExpectedRevision`.
+	// `AActor::GetGameInstance()` returns nullptr when called from CDO / preview
+	// worlds; safe-defensive null-check below catches that.
+	UGameInstance* GI = GetGameInstance();
+	URebusVisualiserSubsystem* Viz = GI ? GI->GetSubsystem<URebusVisualiserSubsystem>() : nullptr;
+	if (!Viz)
+	{
+		// No subsystem -- nothing more we can do here. The probe runs at
+		// fixture spawn time, which is well after subsystem Initialize, so
+		// this should never happen in practice; if it does, the operator
+		// already has bigger problems (no Visualiser subsystem == no portal
+		// channel, no scene fetch, nothing).
+		return;
+	}
+	const URebusVisualiserSubsystem::FBeamMasterVersionReport ProbeNow = Viz->ProbeBeamMasterVersion();
+	const int32 ExpectedRev = ProbeNow.ExpectedRevision;
+	if (DetectedRev >= ExpectedRev && bHas)
+	{
+		// Healthy -- the MID was created from a master at or above the
+		// expected revision. Silent (no per-fixture spawn-time log).
+		return;
+	}
+
+	UE_LOG(LogRebusVisualiser, Warning,
+		TEXT("[Rebus] v1.0.119 self-heal fixture %s -- BeamMID reports BeamMaterialRevision="
+			 "%d (expected %d, hasScalar=%d). The fixture spawned AFTER the once-per-session "
+			 "PostLoadMapWithWorld auto-purge probe and into a still-stale on-disk master. "
+			 "Triggering RebuildAndVerifyBeamMaster() to regen + verify + rebind every "
+			 "spawned fixture's BeamMID. The portal operator does not need to do anything; "
+			 "if this warning re-fires after the regen, the regen itself failed -- check "
+			 "the OutputLog for the v1.0.119 LOUD error one line above this."),
+		*FixtureId, DetectedRev, ExpectedRev, bHas ? 1 : 0);
+
+	// Drive a regen + verify + rebind. `bForceEvenIfCurrent=false` because the
+	// stale state we just observed means the probe inside RebuildAndVerifyBeam
+	// Master will agree (and so the regen WILL fire); we use the polite flag.
+	Viz->RebuildAndVerifyBeamMaster(/*bForceEvenIfCurrent=*/ false);
 }
 
 void ARebusFixtureActor::RefreshBeamEmissive()

@@ -454,14 +454,23 @@ public:
 		// the three `BeamLight*` vectors). The v1.0.111-era state but with NO
 		// `BeamMaterialRevision` sentinel scalar OR with a sentinel that
 		// reports a value OLDER than `RebusExpectedBeamMaterialRevision`
-		// (currently 117). Stale wrt v1.0.117+ -- the master is missing the
-		// new `disable_depth_test=true` flag + the cone is still writing to
-		// the depth pass, which is the v1.0.117 root-cause symptom shape.
+		// (currently 119 -- v1.0.119 bumped from 117 to invalidate every
+		// v1.0.117/v1.0.118-era baked master, see the constexpr doc-comment
+		// in `RebusVisualiserSubsystem.cpp` for the regen-failed-silently
+		// root-cause analysis). Stale wrt v1.0.119+ -- the master is missing
+		// either the v1.0.117 `disable_depth_test=true` flag (so the cone is
+		// still writing to the depth pass, the v1.0.117 root-cause symptom
+		// shape) AND/OR was baked through the broken v1.0.117/v1.0.118
+		// Python import path (which silently no-opped, leaving the master
+		// at whatever revision was on disk before).
 		V111Plus,
-		// v1.0.117+ -- has the full v1.0.111 contract AND the
+		// v1.0.119+ -- has the full v1.0.111 contract AND the
 		// `BeamMaterialRevision` scalar reads the current expected revision
 		// (`RebusExpectedBeamMaterialRevision` in
-		// `RebusVisualiserSubsystem.cpp`). Current; no migration needed.
+		// `RebusVisualiserSubsystem.cpp`, currently 119). Current; no
+		// migration needed. (Enum value name preserved as `V117Plus` for
+		// backwards compatibility with any code paths that reference it by
+		// name; the LABEL string is now "v1.0.119+" -- see `BeamMasterVersionLabel`.)
 		V117Plus,
 	};
 
@@ -515,6 +524,91 @@ public:
 	// effects) -- safe to expose verbatim. See README v1.0.116 release block for
 	// the cross-TU visibility audit that motivated the move.
 	static FString ComputeBeamMasterUassetMd5();
+
+	// v1.0.119 -- file-scope cached pointer to the on-disk `M_RebusBeam` master.
+	// PROBLEM v1.0.119 fixes: the user reported per-frame `LogStreaming: Display:
+	// FlushAsyncLoading(455): 1 QueuedPackages, 0 AsyncPackages` spam on every
+	// rendered frame. The v1.0.117 audit identified `LoadObject<UMaterialInterface>
+	// (nullptr, TEXT("/Game/REBUS/Materials/M_RebusBeam.M_RebusBeam"))` as the
+	// canonical resolver for the master, called from `ARebusFixtureActor::
+	// BuildBeamCone` (one-shot per fixture spawn -- fine) BUT ALSO from a number
+	// of CVar refresh sinks + the v1.0.117 `ProbeBeamMasterVersion()` probe +
+	// `ComputeBeamMasterUassetMd5()` byte-hash (each of which forced a fresh
+	// `LoadObject` round-trip even when the master was already resident). With 6+
+	// fixtures and several refresh sinks firing on CVar changes / per-frame
+	// dumps, the cumulative `LoadObject` traffic was enough to keep the engine's
+	// async loader busy + repeatedly flush, producing the spam.
+	//
+	// `GetCachedBeamMaster()` returns the master, loading it ONCE (logged) and
+	// caching the resolved pointer for the rest of the session. Every call site
+	// in this plugin that previously did `LoadObject<UMaterial*>` against the
+	// `M_RebusBeam` path MUST route through this accessor instead. `Invalidate
+	// BeamMasterCache()` clears the cache after a successful regen so the next
+	// access picks up the new asset; the regen path always invalidates before
+	// re-probing so the probe reads the freshly-baked .uasset, not the stale
+	// pre-regen pointer.
+	//
+	// `GetBeamMasterLoadCount()` is a session-wide counter incremented every
+	// time we ACTUALLY hit `LoadObject` (vs a cache hit). Surfaces in the v1.0.117
+	// startup banner + `Rebus.DumpBeamCulling`; the operator can see at a glance
+	// whether the cache is functioning correctly (steady-state should be 1; 2 if
+	// a regen ran; >2 indicates a residual per-tick load path the audit missed).
+	//
+	// Static so `BuildBeamCone` (in a different translation unit) can call without
+	// resolving a subsystem instance; the master is a singleton package asset and
+	// doesn't have per-world identity. The cache is held as a `TWeakObjectPtr` so
+	// a forced GC of the package automatically invalidates it -- the next call
+	// re-loads cleanly. See README v1.0.119 release block for the audit results.
+	static UMaterialInterface* GetCachedBeamMaster();
+	static void InvalidateBeamMasterCache();
+	static int32 GetBeamMasterLoadCount();
+	static const TCHAR* GetCachedBeamMasterDisplayName();
+
+	// v1.0.119 -- "force regen the M_RebusBeam master + verify the on-disk asset
+	// actually flipped to the expected revision" entry point for the
+	// `Rebus.ForceBeamMasterRegen` console command + the per-fixture self-heal
+	// trigger from `BuildBeamCone`. Wraps the existing v1.0.112 auto-purge
+	// path with:
+	//   * cache invalidation BEFORE the regen Exec so the probe doesn't read the
+	//     stale pre-regen pointer back,
+	//   * a post-regen RE-PROBE that re-loads + reads the BeamMaterialRevision
+	//     scalar default and confirms it matches the expected revision (LOUD
+	//     `Error` log when it does NOT -- the failure mode v1.0.117 + v1.0.118
+	//     hit because the Python module failed to import, the regen silently
+	//     no-opped, and the v1.0.112 path logged "Exec OK" without verifying),
+	//   * a fixture-walk after success to re-bind every BeamMID against the new
+	//     master via the existing `ARebusFixtureActor::RefreshBeamMaterialBindings`
+	//     helper.
+	// Returns true if the post-regen probe verified the expected revision. The
+	// `bForceEvenIfCurrent` arg lets `Rebus.ForceBeamMasterRegen` regen even
+	// when the master is already at the expected revision (operator rescue path
+	// when the on-disk state looks current but the per-fixture MIDs are pointing
+	// at a stale UObject); false (the default) skips when current.
+	bool RebuildAndVerifyBeamMaster(bool bForceEvenIfCurrent);
+
+	// v1.0.119 -- per-fixture material-health one-liner used by `Rebus.Dump
+	// BeamMaterialHealth`. For every spawned ARebusFixtureActor in every world,
+	// reports MaterialSlot0 (class + name), MID parent (name + class), the
+	// detected `BeamMaterialRevision` scalar on the MID (live readback, surfaces
+	// EXISTS vs MISSING), and the cached-master state. Lets the operator see at
+	// a glance which fixtures have which material binding -- the gap the v1.0.117
+	// brief asked us to close (the v1.0.113 `Rebus.DumpBeamCulling` reports
+	// component flags but never the actual UObject on the cone's section 0).
+	// Returns the number of fixtures dumped so the console command can report
+	// the count.
+	int32 DumpBeamMaterialHealthForAllFixtures() const;
+
+	// v1.0.119 -- session counters surfaced in the v1.0.117 startup banner so an
+	// operator can see at a glance how many regen attempts have been made + the
+	// last result + what revision the post-regen probe actually read. These are
+	// instance state (NOT static / file-scope) because each GameInstance subsystem
+	// owns its own regen budget; a hot-reload of the subsystem resets the counter.
+	// Updated only from `RebuildAndVerifyBeamMaster` -- the existing v1.0.112
+	// auto-purge path now routes through `RebuildAndVerifyBeamMaster` so the
+	// counters cover both auto + manual regen calls.
+	int32 GetBeamMasterRegenAttempts() const { return BeamMasterRegenAttempts; }
+	const FString& GetLastBeamMasterRegenResult() const { return LastBeamMasterRegenResult; }
+	int32 GetLastBeamMasterRegenDetectedAfter() const { return LastBeamMasterRegenDetectedAfter; }
 
 	// Per-mesh dump entry surfaced by `Rebus.DumpOrbitNanite`. Grouped by UStaticMesh so
 	// each unique imported asset reports ONCE with a count of components referencing it
@@ -747,6 +841,16 @@ private:
 	// Silently no-ops on a null fixture or a null BeamMID.
 	void RefreshAllSpawnedFixtureBeamMIDs();
 	bool bBeamMasterAutoPurgeRun = false;
+
+	// v1.0.119 -- session counters for the v1.0.117 startup banner extension +
+	// the operator-facing visibility into the auto-purge / force-regen path.
+	// Incremented from `RebuildAndVerifyBeamMaster` (the single chokepoint every
+	// regen call routes through in v1.0.119). See the public accessor doc-comments
+	// above for the contract. Reset to zero on subsystem `Initialize` (so a hot-
+	// reload of the GameInstance subsystem starts fresh).
+	int32 BeamMasterRegenAttempts = 0;
+	FString LastBeamMasterRegenResult = TEXT("none");
+	int32 LastBeamMasterRegenDetectedAfter = -1;
 	// v1.0.113 -- delegate handle for the `FCoreUObjectDelegates::PostLoadMapWithWorld`
 	// hook that re-fires `ProbeAndAutoPurgeStaleBeamMaster` after every level load.
 	// Held so `Deinitialize` can unregister cleanly (a dangling delegate captured

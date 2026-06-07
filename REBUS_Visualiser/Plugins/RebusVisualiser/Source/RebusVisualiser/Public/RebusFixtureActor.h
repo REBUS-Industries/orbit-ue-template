@@ -603,6 +603,33 @@ public:
 	// command (registered in RebusVisualiser.cpp).
 	void DumpBeamCullingStateForDebug() const;
 
+	// v1.0.119 -- per-fixture material-binding health one-liner consumed by the
+	// `Rebus.DumpBeamMaterialHealth` console command + the subsystem's
+	// `DumpBeamMaterialHealthForAllFixtures()` walker. Logs MaterialSlot0 (class
+	// + asset name) of the BeamCone proc-mesh, the BeamMID parent material
+	// (class + name), the live `BeamMaterialRevision` scalar read back off the
+	// MID (so the operator can prove which generation of M_RebusBeam this
+	// fixture's MID was created from), and the subsystem-wide cached-master
+	// pointer state. Self-contained inside the actor (can read its own private
+	// `BeamCone` / `BeamMID` UPROPERTY refs without exposing accessors). See
+	// the `DumpBeamCullingStateForDebug` doc-comment above for the v1.0.117
+	// parent diagnostic this complements.
+	void DumpBeamMaterialHealthForDebug(int32 ExpectedRevision,
+		const TCHAR* CachedMasterName, int32 CachedMasterLoadCount) const;
+
+	// v1.0.119 -- on-spawn self-heal probe: read back the live `BeamMaterial
+	// Revision` scalar from `BeamMID` and, when it does NOT match the running
+	// binary's expected revision (RebusExpectedBeamMaterialRevision baked into
+	// the C++ side), log a clear warning + invoke `URebusVisualiserSubsystem::
+	// RebuildAndVerifyBeamMaster(false)` so the auto-purge path fires for
+	// fixtures spawning AFTER the once-per-session `OnPostLoadMapAutoPurge`
+	// probe (e.g. a portal `LoadScene` mid-session that respawns fixtures into
+	// a still-stale on-disk master). Idempotent / cheap when BeamMID is null
+	// (no-op) or the revision matches (single scalar read). See the v1.0.119
+	// README release block for the operator-facing per-fixture safety net the
+	// v1.0.117 brief asked us to add. Called from the tail of `BuildBeamCone`.
+	void SelfHealBeamMaterialRevisionIfMismatched();
+
 	// v1.0.117 PRIMARY ROOT-CAUSE FIX -- the user ran `Rebus.DumpBeamCulling` on a
 	// clipped fixture and the dump showed `BeamCone={... renderDepth=1 ...}`. An
 	// additive translucent cone writing to the depth pass causes cross-fixture
