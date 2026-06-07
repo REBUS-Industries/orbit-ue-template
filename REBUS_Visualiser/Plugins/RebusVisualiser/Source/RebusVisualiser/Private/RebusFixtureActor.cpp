@@ -3443,7 +3443,7 @@ void ARebusFixtureActor::DumpBeamCullingStateForDebug() const
 			C->bUseAttachParentBound ? 1 : 0,
 			C->bRenderInMainPass ? 1 : 0,
 			C->bRenderInDepthPass ? 1 : 0,
-			C->GetBoundsScale(),
+			C->BoundsScale,
 			C->MinDrawDistance,
 			C->LDMaxDrawDistance,
 			C->CachedMaxDrawDistance,

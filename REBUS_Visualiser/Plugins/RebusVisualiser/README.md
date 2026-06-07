@@ -594,6 +594,14 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **UE 5.7 build fix: `Rebus.DumpBeamCulling` log block — `UPrimitiveComponent::BoundsScale` accessor swap + printf format-sanitiser argument alignment (v1.0.115).**
+>
+> User-reported build break (verbatim, abridged):
+>
+> > "RebusFixtureActor.cpp(3446): error C2039: 'GetBoundsScale': is not a member of 'UPrimitiveComponent' ... RebusFixtureActor.cpp(3433): error C7595: ... TCheckedFormatStringPrivate<..., int,int,int,int,int,int,int,int,int, float,float,float, int> ... note: failure was caused by call of undefined function or one not declared 'constexpr' X(FNeedsFloatOrDoubleArg, "'%f' expects \`float\` or \`double\`.")"
+>
+> Both errors live in the v1.0.113 `Rebus.DumpBeamCulling` log block (`ARebusFixtureActor::DumpBeamCullingStateForDebug`'s `FlagsLine` lambda) and are a single root cause. `UPrimitiveComponent` does NOT expose a `GetBoundsScale()` accessor in UE 5.7 — the field is the public `float BoundsScale` UPROPERTY (`Engine/Source/Runtime/Engine/Classes/Components/PrimitiveComponent.h`, accessed by `SetBoundsScale` / `MarkRenderStateDirty` siblings as a direct member). The C2039 elided that one argument from the `FString::Printf` instantiation, which shifted every subsequent argument up one slot — so the format string's three trailing `%.1f` floats ended up bound to the next three args (`MinDrawDistance` / `LDMaxDrawDistance` / `CachedMaxDrawDistance`, all `float` — fine) and the final `%.1f cachedMax` slot landed on the trailing `bVisibleInRayTracing ? 1 : 0` `int`, triggering the compile-time `FNeedsFloatOrDoubleArg` sanitiser (C7595). The template instantiation in the error message (`<..., int×9, float×3, int>`) matches the post-elision arg list exactly — 9 bool-to-int args, then 3 float draw-distances, then the trailing int — confirming the diagnosis. v1.0.115 is a single one-character mechanical replacement: `C->GetBoundsScale()` → `C->BoundsScale` in `RebusFixtureActor.cpp:3446`. With the float arg restored, the format string and arg list realign (1 string + 9 ints + 4 floats + 1 int matches `%s` + `%d`×9 + `%.2f` + `%.1f`×3 + `%d`), the C7595 sanitiser passes, and the C2039 disappears. Zero behavioural change — `Rebus.DumpBeamCulling` log line content is byte-identical to the v1.0.113 design. `RebusVisualiser.uplugin` `VersionName` 1.0.114 → 1.0.115. Top-centre watermark + `[Rebus] STARTUP BANNER` will now read `v1.0.115` on the next launch; if you see anything earlier, your binary didn't rebuild.
+
 > **UE 5.7 build fix: switch the v1.0.105 Nanite walker from the deprecated `UStaticMesh::NaniteSettings` direct-field access to the engine accessor API (v1.0.114).**
 >
 > User-reported build break (verbatim, abridged):
