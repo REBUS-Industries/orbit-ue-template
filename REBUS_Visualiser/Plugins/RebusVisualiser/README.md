@@ -594,6 +594,14 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **UE 5.7 build fix: switch the v1.0.105 Nanite walker from the deprecated `UStaticMesh::NaniteSettings` direct-field access to the engine accessor API (v1.0.114).**
+>
+> User-reported build break (verbatim, abridged):
+>
+> > "failed: Compiling REBUS_VisualiserEditor failed (UnrealBuildTool exit 6). ... `RebusVisualiserSubsystem.cpp(2351,37): warning C4996: 'UStaticMesh::NaniteSettings': Please do not access this member directly, it will become private soon; use the various NaniteSettings accessor functions.`"
+>
+> UE 5.7 deprecated `UStaticMesh::NaniteSettings` direct-field access (`UE_DEPRECATED(5.7, ...)` on the UPROPERTY in `Engine/Source/Runtime/Engine/Classes/Engine/StaticMesh.h:734-736`). REBUS_VisualiserEditor builds with `-WarningsAsErrors`, so the v1.0.105 Nanite walker's nine `Mesh->NaniteSettings.bEnabled / .PositionPrecision / .FallbackPercentTriangles / .TrimRelativeError` read/write sites all hard-fail the build. The engine ships a non-const `FMeshNaniteSettings& UStaticMesh::GetNaniteSettings()` (`StaticMesh.h:840-843`) returning a mutable reference — semantically identical to the field access — so v1.0.114 is a single mechanical replacement: `Mesh->NaniteSettings.X` → `Mesh->GetNaniteSettings().X` across `RebusVisualiserSubsystem.cpp` (10 sites total; the build log surfaced 9, one additional near-neighbour was swept for consistency). Zero behavioural change. README/comment-string references to `NaniteSettings.bEnabled` are intentionally preserved — they're documentation of the operator-facing concept, not source-code references. README v1.0.114 release block above v1.0.113; `RebusVisualiser.uplugin` `VersionName` 1.0.113 → 1.0.114. Top-centre watermark + `[Rebus] STARTUP BANNER` will now read `v1.0.114` on the next launch; if you see anything earlier, your binary didn't rebuild.
+
 > **Audit every beam clipping/culling path; fix outside-frustum mask sample sizing + SceneCapture FOV coverage + lazy-Epic-beam self-shadow + per-level-load auto-purge re-fire + per-fixture culling diagnostic + on-disk master md5 banner (v1.0.113).**
 >
 > User report (verbatim):

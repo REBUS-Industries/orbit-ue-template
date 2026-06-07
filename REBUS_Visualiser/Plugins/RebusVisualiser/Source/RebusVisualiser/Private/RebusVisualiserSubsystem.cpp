@@ -2348,7 +2348,7 @@ URebusVisualiserSubsystem::FOrbitNaniteApplyCount URebusVisualiserSubsystem::Ens
 		if (!Mesh) continue;
 		++Count.Meshes;
 
-		const bool bAlreadyMatches = (Mesh->NaniteSettings.bEnabled == bWantOn);
+		const bool bAlreadyMatches = (Mesh->GetNaniteSettings().bEnabled == bWantOn);
 		const bool bAttemptedBefore = NaniteAttempted.Contains(Mesh);
 		if (bAlreadyMatches && bAttemptedBefore)
 		{
@@ -2384,7 +2384,7 @@ URebusVisualiserSubsystem::FOrbitNaniteApplyCount URebusVisualiserSubsystem::Ens
 			continue;
 		}
 
-		Mesh->NaniteSettings.bEnabled = bWantOn;
+		Mesh->GetNaniteSettings().bEnabled = bWantOn;
 		if (bWantOn)
 		{
 			// Conservative defaults for first-time enable. PositionPrecision = MIN_int32
@@ -2396,9 +2396,9 @@ URebusVisualiserSubsystem::FOrbitNaniteApplyCount URebusVisualiserSubsystem::Ens
 			// verbatim); TrimRelativeError = 0.0 disables aggressive simplification on
 			// the Nanite cluster build (we want crisp geometry on imported set pieces,
 			// not auto-LODed approximations).
-			Mesh->NaniteSettings.PositionPrecision = MIN_int32;
-			Mesh->NaniteSettings.FallbackPercentTriangles = 1.0f;
-			Mesh->NaniteSettings.TrimRelativeError = 0.0f;
+			Mesh->GetNaniteSettings().PositionPrecision = MIN_int32;
+			Mesh->GetNaniteSettings().FallbackPercentTriangles = 1.0f;
+			Mesh->GetNaniteSettings().TrimRelativeError = 0.0f;
 		}
 
 		// Build() rebuilds RenderData (incl. NaniteResources). Real cost -- seconds per
@@ -2425,7 +2425,7 @@ URebusVisualiserSubsystem::FOrbitNaniteApplyCount URebusVisualiserSubsystem::Ens
 			bWantOn ? TEXT("ENABLED") : TEXT("DISABLED"),
 			*Mesh->GetName(),
 			Faces,
-			Mesh->NaniteSettings.FallbackPercentTriangles * 100.f);
+			Mesh->GetNaniteSettings().FallbackPercentTriangles * 100.f);
 		++Count.Touched;
 	}
 #else
@@ -2489,13 +2489,13 @@ void URebusVisualiserSubsystem::SetNaniteOrbitImportsEnabled(bool bEnabled)
 			It.RemoveCurrent();
 			continue;
 		}
-		if (Mesh->NaniteSettings.bEnabled == bEnabled) continue;
+		if (Mesh->GetNaniteSettings().bEnabled == bEnabled) continue;
 		// Skip if the source MeshDescription is missing -- Build() would fail. The
 		// EnsureImportedNanite walker already logged the operator-fix Warning when the
 		// mesh first hit the no-source path.
 		if (Mesh->GetNumSourceModels() == 0 || !Mesh->IsMeshDescriptionValid(0)) continue;
 
-		Mesh->NaniteSettings.bEnabled = bEnabled;
+		Mesh->GetNaniteSettings().bEnabled = bEnabled;
 		Mesh->Build(/*bSilent*/ false);
 		++Restored;
 
@@ -2566,8 +2566,8 @@ TArray<URebusVisualiserSubsystem::FOrbitNaniteDumpEntry> URebusVisualiserSubsyst
 				{
 					Entry.Faces = Mesh->GetRenderData()->LODResources[0].GetNumTriangles();
 				}
-				Entry.bNaniteEnabled = Mesh->NaniteSettings.bEnabled;
-				Entry.FallbackTris = (int32)(Entry.Faces * Mesh->NaniteSettings.FallbackPercentTriangles);
+				Entry.bNaniteEnabled = Mesh->GetNaniteSettings().bEnabled;
+				Entry.FallbackTris = (int32)(Entry.Faces * Mesh->GetNaniteSettings().FallbackPercentTriangles);
 
 				// Per-slot bTwoSidedScalar probe (matches v1.0.104 EnsureImportedDoubleSided
 				// param contract). Reports how many of the first-seen component's slots
