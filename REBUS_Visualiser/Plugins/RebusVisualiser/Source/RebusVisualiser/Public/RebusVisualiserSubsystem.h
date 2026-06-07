@@ -478,6 +478,26 @@ public:
 	// log line. Matches the labels the v1.0.112 README release block uses.
 	static const TCHAR* BeamMasterVersionLabel(EBeamMasterVersion V);
 
+	// v1.0.113 -- compute the lowercase-hex MD5 hash of the on-disk
+	// `/Game/REBUS/Materials/M_RebusBeam.uasset` so the operator can prove from log
+	// output alone whether their packaged / cooked binary is running the master we
+	// expect. Resolves the long package name to a filesystem path via
+	// `FPackageName::TryConvertLongPackageNameToFilename` (matches the editor's
+	// `.uasset` extension); silently returns a self-describing sentinel string on
+	// resolve / IO failure (e.g. asset not on disk -- the same case the v1.0.112
+	// `EBeamMasterVersion::Missing` branch covers). Used by both the `Initialize`-
+	// time startup banner AND the `Rebus.DumpBeamMasterVersion` console command,
+	// so the two paths never disagree about what "current hash" means.
+	//
+	// v1.0.116 -- moved from `private:` to `public:` because
+	// `RebusVisualiser.cpp::HandleDumpBeamMasterVersionCommand` calls it from
+	// outside the class (`URebusVisualiserSubsystem::ComputeBeamMasterUassetMd5()`
+	// at file-scope), which triggered C2248 on UE 5.7 builds. The function is a
+	// pure-read static helper (file IO + MD5 of bytes; no instance state, no side
+	// effects) -- safe to expose verbatim. See README v1.0.116 release block for
+	// the cross-TU visibility audit that motivated the move.
+	static FString ComputeBeamMasterUassetMd5();
+
 	// Per-mesh dump entry surfaced by `Rebus.DumpOrbitNanite`. Grouped by UStaticMesh so
 	// each unique imported asset reports ONCE with a count of components referencing it
 	// (the OrbitConnector import shares trusses / set-piece geometry between many
@@ -717,15 +737,11 @@ private:
 	FDelegateHandle PostLoadMapAutoPurgeHandle;
 	void OnPostLoadMapAutoPurge(UWorld* LoadedWorld);
 
-	// v1.0.113 -- compute the lowercase-hex MD5 hash of the on-disk
-	// `/Game/REBUS/Materials/M_RebusBeam.uasset` so the operator can prove from log
-	// output alone whether their packaged / cooked binary is running the master we
-	// expect. Resolves the long package name to a filesystem path via
-	// `FPackageName::TryConvertLongPackageNameToFilename` (matches the editor's
-	// `.uasset` extension); silently returns "<missing>" on resolve failure (e.g.
-	// asset not on disk -- the same case the v1.0.112 EBeamMasterVersion::Missing
-	// branch covers). Used by both the `Initialize`-time startup banner AND the
-	// `Rebus.DumpBeamMasterVersion` console command, so the two paths never
-	// disagree about what "current hash" means.
-	static FString ComputeBeamMasterUassetMd5();
+	// (v1.0.116) `static FString ComputeBeamMasterUassetMd5()` was previously declared
+	// here in the `private:` block. It was always called from outside the class
+	// (`RebusVisualiser.cpp::HandleDumpBeamMasterVersionCommand` invokes it as
+	// `URebusVisualiserSubsystem::ComputeBeamMasterUassetMd5()` at file scope), so
+	// the declaration was moved into the `public:` block above (next to the related
+	// `ProbeBeamMasterVersion` / `BeamMasterVersionLabel` accessors). No body
+	// change -- only the access specifier moved. See README v1.0.116 release block.
 };
