@@ -811,6 +811,59 @@ def _build_beam_master(mat):
     _set(mat, "shading_model", unreal.MaterialShadingModel.MSM_UNLIT)
     _set(mat, "blend_mode", unreal.BlendMode.BLEND_ADDITIVE)
     _set(mat, "two_sided", True)
+    # v1.0.117 -- DISABLE FIXED-FUNCTION DEPTH TEST on the shaft material. This is the
+    # single biggest fix for the v1.0.117 user-reported "the beam clips against an
+    # invisible bounding box when I pan; AND `Rebus.BeamShadowMask 0` doesn't change
+    # it" symptom. With the depth-mask ruled out by the operator-toggle A/B
+    # (described in the README v1.0.117 release block), the most common remaining
+    # cause for additive translucent cones reading as "clipped behind invisible
+    # geometry" is FIXED-FUNCTION depth occlusion against OTHER translucent surfaces
+    # (sibling beam cones during a pan-cross, the chrome lens disc, LED-matrix
+    # `IsBeamLensComponents` PMCs -- anything that lands in the depth buffer
+    # between the camera and the cone fragment kills the cone's per-pixel depth
+    # test against an AABB-aligned silhouette).
+    #
+    # Crucially, the HLSL raymarch ALREADY does its own scene-depth occlusion via
+    # `tExit = min(tPix, tOcc)` in `_BEAM_RAYMARCH_HLSL` (the v1.0.39 entry/exit
+    # math, never removed). `tOcc` is computed from `SceneDepth` -- so the floor /
+    # wall / opaque-occluder fade is shader-driven and continues to work correctly
+    # even without the fixed-function depth test. The ONLY thing v1.0.117's
+    # `disable_depth_test = True` removes is the depth test against OTHER translucent
+    # surfaces -- exactly the failure surface the user reports.
+    #
+    # Pair this with the v1.0.117 C++ `RefreshBeamConeCullingFlags` (also v1.0.117 --
+    # sets `bRenderInDepthPass=false` on the cone primitive, the read+write
+    # complement to this material-side `disable_depth_test=True`).
+    _set(mat, "disable_depth_test", True)
+
+    # v1.0.117 -- explicit "the cone shaft is NOT a volumetric fog participant"
+    # assertion. The volumetric fog participant is the SpotLight's light function
+    # material (`M_RebusGoboLightFunction`, v1.0.93 -- its `bUsedWithVolumetricFog
+    # = True` is what carves cookie patterns into the fog volume); the shaft
+    # cone is a separate visible-additive surface that has no business landing
+    # in the volumetric fog froxel grid. Setting this explicitly false guards
+    # against a class of pipeline-state surprises where UE 5.7's translucent
+    # pass interacts with the volumetric fog tile grid (8x8x128 froxels) and
+    # can produce axis-aligned clip artefacts on cones that straddle a tile
+    # boundary -- a known UE failure mode the v1.0.117 user-symptom shape
+    # could otherwise be confused for.
+    _set(mat, "used_with_volumetric_fog", False)
+
+    # v1.0.117 -- BeamMaterialRevision sentinel scalar. Bumped by every release
+    # cycle that touches the master so the v1.0.112 auto-purge probe in
+    # `URebusVisualiserSubsystem::ProbeAndAutoPurgeStaleBeamMaster` can detect
+    # a stale on-disk master and force a regen WITHOUT relying on the .uasset
+    # md5 (which depends on the cooked editor state and isn't deterministic
+    # across operator machines). The C++ probe reads this scalar via
+    # `UMaterial::GetScalarParameterDefaultValue` and compares against the
+    # expected revision constant (`RebusExpectedBeamMaterialRevision = 117`
+    # in `RebusVisualiserSubsystem.cpp`); mismatch -> regen via the same
+    # Python script. The runtime BeamMID inherits the master's default and
+    # the v1.0.117 `Rebus.DumpBeamCulling` prints it back so the operator
+    # can confirm the regen actually landed on their machine.
+    rev = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -1100, -340)
+    rev.set_editor_property("parameter_name", "BeamMaterialRevision")
+    rev.set_editor_property("default_value", 117.0)
 
     # ---- Driveable parameters (per-fixture MID) ----
     color = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1100, -260)
@@ -965,24 +1018,40 @@ def _build_beam_master(mat):
     mel.recompile_material(mat)
 
 
+REBUS_BEAM_MATERIAL_REVISION = 117
+"""v1.0.117 -- sentinel revision baked into the on-disk M_RebusBeam master via the
+`BeamMaterialRevision` scalar parameter. Bumped by every release that touches the
+master so the v1.0.112 auto-purge probe in
+`URebusVisualiserSubsystem::ProbeAndAutoPurgeStaleBeamMaster` (C++) can detect a
+stale on-disk master deterministically (instead of relying on a cooked-editor-state
+md5 which differs across operator machines / build configs). Bump this AND the C++
+mirror `RebusExpectedBeamMaterialRevision` in lockstep when the master changes.
+"""
+
+
 def _beam_master_has_shadow_mask(master):
-    """v1.0.111: best-effort probe -- the existing on-disk M_RebusBeam master declares
-    the new light-space depth-mask parameter set (`BeamShadowMaskEnabled`,
-    `BeamShadowMaskBiasCm`, `BeamShadowMaskFadeCm`, `BeamShadowMaskFarCm`,
-    `BeamShadowMaskTanHalfFov`, `BeamShadowMaskDebug` scalars + `BeamLightFwd`,
-    `BeamLightRight`, `BeamLightUp` vectors + `BeamShadowMaskRT` texture). When ANY
-    of those are missing the on-disk master pre-dates v1.0.111 and the C++
-    per-fixture push will silently no-op (SetScalarParameterValue against a name
-    the MID doesn't know is a no-op), so the shadow mask never actually engages.
+    """v1.0.111 (extended v1.0.117): best-effort probe that the existing on-disk
+    M_RebusBeam master declares (a) the v1.0.111 light-space depth-mask parameter
+    set (`BeamShadowMaskEnabled`, `BeamShadowMaskBiasCm`, `BeamShadowMaskFadeCm`,
+    `BeamShadowMaskFarCm`, `BeamShadowMaskTanHalfFov`, `BeamShadowMaskDebug` scalars
+    + `BeamLightFwd`, `BeamLightRight`, `BeamLightUp` vectors + `BeamShadowMaskRT`
+    texture) AND (b) the v1.0.117 `BeamMaterialRevision` sentinel scalar at the
+    current revision constant `REBUS_BEAM_MATERIAL_REVISION` (117). When ANY of
+    those are missing OR the revision sentinel reads as a different number, the
+    on-disk master pre-dates v1.0.117 (or has been clobbered by a side-quest
+    edit) and the C++ per-fixture state push will silently no-op against the
+    stale parameter contract / missing material flags (`disable_depth_test`,
+    `bUsedWithVolumetricFog`, ...) -- so the v1.0.117 root-cause fix never
+    actually engages.
 
     Mirrors the v1.0.104 (`_orbit_imported_master_has_two_sided`) / v1.0.97
     (`_master_is_two_sided`) self-heal probes -- best-effort, ANY exception
     yields False so the self-heal treats the master as needs-regen (a redundant
-    rebake is cheap; missing the v1.0.111 contract would leave the operator on
-    an old un-shadowable master indefinitely).
+    rebake is cheap; missing the v1.0.117 contract would leave the operator on
+    an old un-fixed master indefinitely).
 
-    Returns True when the master DOES declare the full v1.0.111 parameter set
-    AND therefore needs no migration; False when the master is stale.
+    Returns True when the master DOES declare the full v1.0.117 parameter set
+    AT the current revision AND therefore needs no migration; False otherwise.
     """
     try:
         scalars = unreal.MaterialEditingLibrary.get_scalar_parameter_names(master)
@@ -996,12 +1065,29 @@ def _beam_master_has_shadow_mask(master):
     required_scalars = {
         "BeamShadowMaskEnabled", "BeamShadowMaskBiasCm", "BeamShadowMaskFadeCm",
         "BeamShadowMaskFarCm", "BeamShadowMaskTanHalfFov", "BeamShadowMaskDebug",
+        # v1.0.117 -- the revision sentinel must exist AND read the expected value
+        # below for the master to count as "matching".
+        "BeamMaterialRevision",
     }
     required_vectors = {"BeamLightFwd", "BeamLightRight", "BeamLightUp"}
     required_textures = {"BeamShadowMaskRT"}
-    return (required_scalars.issubset(scalar_names)
+    if not (required_scalars.issubset(scalar_names)
             and required_vectors.issubset(vector_names)
-            and required_textures.issubset(texture_names))
+            and required_textures.issubset(texture_names)):
+        return False
+    # v1.0.117 -- revision sentinel check. A master that has the parameter but
+    # at a different revision is stale (e.g. an old v1.0.117-dev build whose
+    # constants haven't been bumped yet, or a hand-edit that rewrote the
+    # default to a sentinel test value). Best-effort -- ANY exception in the
+    # default-read path means we fall through to "stale".
+    try:
+        rev_val = unreal.MaterialEditingLibrary.get_material_default_scalar_parameter_value(
+            master, "BeamMaterialRevision")
+        if int(round(float(rev_val))) != REBUS_BEAM_MATERIAL_REVISION:
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 
 def ensure_beam_material(force=False):

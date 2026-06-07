@@ -451,8 +451,18 @@ public:
 		V110,
 		// No obsolete params AND has the full v1.0.111 parameter contract
 		// (texture `BeamShadowMaskRT` + the six `BeamShadowMask*` scalars +
-		// the three `BeamLight*` vectors). Current.
+		// the three `BeamLight*` vectors). The v1.0.111-era state but with NO
+		// `BeamMaterialRevision` sentinel scalar OR with a sentinel that
+		// reports a value OLDER than `RebusExpectedBeamMaterialRevision`
+		// (currently 117). Stale wrt v1.0.117+ -- the master is missing the
+		// new `disable_depth_test=true` flag + the cone is still writing to
+		// the depth pass, which is the v1.0.117 root-cause symptom shape.
 		V111Plus,
+		// v1.0.117+ -- has the full v1.0.111 contract AND the
+		// `BeamMaterialRevision` scalar reads the current expected revision
+		// (`RebusExpectedBeamMaterialRevision` in
+		// `RebusVisualiserSubsystem.cpp`). Current; no migration needed.
+		V117Plus,
 	};
 
 	struct FBeamMasterVersionReport
@@ -466,6 +476,14 @@ public:
 		TArray<FString> MissingV111Scalars;
 		TArray<FString> MissingV111Vectors;
 		TArray<FString> MissingV111Textures;
+		// v1.0.117 -- the live BeamMaterialRevision default read from the loaded
+		// master (-1 sentinel => the parameter is absent entirely, which means
+		// the master pre-dates v1.0.117). Compared against the expected
+		// `RebusExpectedBeamMaterialRevision` constant in the cpp file; mismatch
+		// triggers an auto-regen even when the v1.0.111 parameter contract is
+		// otherwise complete.
+		int32 DetectedRevision = -1;
+		int32 ExpectedRevision = 0;
 	};
 
 	// Diagnostic entry point for the `Rebus.DumpBeamMasterVersion` console

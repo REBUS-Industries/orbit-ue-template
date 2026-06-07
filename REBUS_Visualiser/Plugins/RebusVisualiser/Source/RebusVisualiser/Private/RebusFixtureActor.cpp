@@ -109,26 +109,40 @@ namespace
 	// lens diameter rather than a near-point when a fixture reports an unrealistically tiny lens.
 	constexpr float RebusBeamLensRadiusFloorCm = 3.f;
 
-	// v1.0.113 -- raised from 1.5 -> 3.0 (belt-and-braces against the user's "beam is
-	// being clipped from old code, might be camera viewing angle culling it" report).
-	// The v1.0.113 audit found no remaining `nf` / `softOcc` / cone-mesh code path that
-	// can produce a camera-angle-dependent CLIP (the v1.0.39 entry/exit math and the
-	// v1.0.110 rip of the screen-space shadow trace are both clean -- see the README
-	// v1.0.113 release block for the full per-path audit). The remaining failure mode
-	// is HZB occlusion culling: a long, thin, additive translucent shaft whose AABB
-	// from `CreateMeshSection` is geometrically tight but whose screen projection
-	// falls mostly behind the floor at grazing angles can be HZB-culled (the v1.0.38
-	// release note already documented this, then v1.0.39 reduced the scalar to 1.5
-	// once the raymarch fix dropped because "bounds were NOT the cause" of the
-	// vanish-on-camera-close bug). 3.0x is the v1.0.113 belt-and-braces value -- still
-	// extent-only (origin unchanged so translucency sort order is unaffected), still
-	// just frustum / HZB-cull headroom, but enough margin that the elongated cone
-	// stays drawn through grazing-angle camera pans where the visible-but-tight
-	// 1.5x bounds was reading as "the beam vanishes when I look at it from below /
-	// from behind". Pair with `Rebus.DumpBeamCulling [fixtureId]` to verify the
-	// per-fixture BoundsScale landed in case a future per-fixture override path
-	// re-stomps it.
-	constexpr float RebusBeamBoundsScale = 3.f;
+	// v1.0.117 -- raised 3.0 -> 5.0 as part of the v1.0.117 "the user reports the SAME
+	// pan-edge clipping after v1.0.111/112/113 -- AND `Rebus.BeamShadowMask 0` does NOT
+	// make the clipping disappear" diagnostic / fix release. With the depth-mask ruled
+	// out (the master toggle was logging refresh counts but the user saw no behaviour
+	// change -- which proves the mask isn't producing the clip), the remaining
+	// frustum / HZB / translucency-sort failure modes ALL get a belt-and-braces
+	// hardening pass in v1.0.117. BoundsScale 5.0 (paired with the v1.0.117
+	// `Rebus.BeamConeBoundsScale` live CVar) is the most generous extent-only inflation
+	// that still keeps the bounds inside a single typical level's BSP volume, so it
+	// never trips streaming-volume culls. v1.0.117 ALSO sets the cone's
+	// `bAllowApproximateOcclusion = false` and bypasses the LD cull distance
+	// (`SetCullDistance(0)`) + the level cull-distance volume gate
+	// (`bAllowCullDistanceVolume = false`) + drops the cone's translucency sort priority
+	// to a stable -10 so multi-cone pan-cross frames sort consistently. All of these
+	// are extent-only / sort-only knobs; none of them change the visual contract.
+	// See the v1.0.117 README release block for the full root-cause analysis.
+	constexpr float RebusBeamBoundsScale = 5.f;
+
+	// v1.0.117 -- stable translucency sort priority for the cone-mesh shaft. UE 5.7 sorts
+	// translucent primitives by AABB CENTRE distance to camera by default; when two
+	// beam cones cross each other during a pan sweep (or one cone crosses an LED-matrix
+	// `IsBeamLensComponents` PMC, or a chrome lens disc that's also translucent), the
+	// AABB centres can swap order frame-to-frame and one cone reads as "occluded by"
+	// the other -- exactly the hard-edge clip the user reports. Pinning the cone to a
+	// negative priority forces it to render BEFORE other translucent surfaces with
+	// default priority (0), so the additive blend is always added on top of whatever
+	// else sorted afterwards. -10 is large enough that operator-tagged "front-most"
+	// translucent surfaces (priority > 0) still render after; pair with the
+	// material's `disable_depth_test = true` (v1.0.117 Python) to fully decouple the
+	// cone from the fixed-function depth pipeline (the HLSL raymarch already does its
+	// own scene-depth occlusion against `SceneDepth`, so disabling fixed-function
+	// depth-test only removes the bug where two translucent AABBs fight for visibility
+	// -- it does NOT remove floor/wall occlusion).
+	constexpr int32 RebusBeamTranslucencySortPriority = -10;
 
 	// v1.0.44/45/46: Epic DMX beam (M_Beam_Master) conventions, verified by introspecting the
 	// installed content (SM_Beam_RM + MI_Beam) plus runtime visual feedback:
@@ -290,6 +304,18 @@ float GRebusBeamShadowMaskFadeCm   = 20.f;
 float GRebusBeamShadowMaskFovMargin = 5.f; // v1.0.113: 2 -> 5 deg (belt-and-braces, see README v1.0.113)
 int32 GRebusBeamShadowMaskDebug    = 0;
 
+// v1.0.117 -- live-tweakable BeamCone bounds scale + global occlusion-query gate.
+// See `RebusBeamBoundsScale` doc-comment for the rationale (HZB / streaming
+// approximate-occlusion failure modes for a long, thin, additive translucent shaft).
+// `Rebus.BeamConeBoundsScale` mirrors the constexpr default (5.0); operators flip live
+// while diagnosing per-show clipping. `Rebus.AllowBeamOcclusionQueries` is the
+// v1.0.117 nuclear-test CVar -- writes through to UE's `r.AllowOcclusionQueries`
+// global so the operator can probe whether HOQ is the dominant cause without
+// hunting for the engine CVar by name. Pair with `Rebus.DumpBeamCulling` to verify
+// the per-fixture state landed.
+float GRebusBeamConeBoundsScale       = 5.f;
+int32 GRebusAllowBeamOcclusionQueries = 1; // 1 = default UE behaviour (HOQ on); 0 = force r.AllowOcclusionQueries 0
+
 static void RefreshBeamShadowMaskParamsOnEveryFixture(const TCHAR* CVarLabel, const FString& NewValStr)
 {
 	if (!GEngine) return;
@@ -421,6 +447,89 @@ FAutoConsoleVariableRef CVarRebusBeamShadowMaskDebug(
 	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
 	{
 		RefreshBeamShadowMaskParamsOnEveryFixture(TEXT("Rebus.BeamShadowMaskDebug"), FString::FromInt(CVar->GetInt()));
+	}),
+	ECVF_Default);
+
+// v1.0.117 -- live BeamCone bounds-scale tuning + the engine occlusion-query gate proxy.
+// Both CVars walk every Rebus fixture and re-push the new value through
+// `RefreshBeamConeCullingFlags` (the v1.0.117 single chokepoint for every "don't let the
+// cone get culled / sorted-behind / occluded by AABB" knob -- including the PRIMARY
+// `bRenderInDepthPass = false` v1.0.117 root-cause fix). See README v1.0.117 release
+// block for the full diagnosis + the operator A/B checklist.
+static void RefreshBeamConeCullingFlagsOnEveryFixture(const TCHAR* CVarLabel, const FString& NewValStr)
+{
+	if (!GEngine) return;
+	int32 Refreshed = 0;
+	for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+	{
+		UWorld* W = Ctx.World();
+		if (!W) continue;
+		for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+		{
+			if (ARebusFixtureActor* F = *It)
+			{
+				F->RefreshBeamConeCullingFlags();
+				++Refreshed;
+			}
+		}
+	}
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("%s -> %s, refreshed %d fixture(s) (v1.0.117 BeamCone bRenderInDepthPass=0 + "
+			 "BoundsScale + TranslucencySortPriority + occluder/approx/customDepth/decals/"
+			 "DFL/GI knobs re-pushed against the live render proxy)."),
+		CVarLabel, *NewValStr, Refreshed);
+}
+
+FAutoConsoleVariableRef CVarRebusBeamConeBoundsScale(
+	TEXT("Rebus.BeamConeBoundsScale"),
+	GRebusBeamConeBoundsScale,
+	TEXT("v1.0.117 -- live-tweakable BoundsScale multiplier on every Rebus fixture's "
+		 "procedural BeamCone (default 5.0; recommended 3..10). The cone is a long, thin, "
+		 "additive translucent shaft whose CreateMeshSection AABB is geometrically tight "
+		 "but whose screen projection can fall mostly behind the floor at grazing camera "
+		 "angles -- HZB occlusion can then cull the entire shaft draw call. Raising the "
+		 "bounds scale keeps the AABB poking past the floor occluder so the cone stays "
+		 "drawn. Extent-only (origin unchanged); never changes translucency sort order. "
+		 "Pair with `Rebus.DumpBeamCulling [fixtureId]` to verify the per-fixture "
+		 "BoundsScale landed. v1.0.117 raised the default from 3.0 (v1.0.113) -> 5.0 "
+		 "after the user's pan-edge clipping reports."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		RefreshBeamConeCullingFlagsOnEveryFixture(TEXT("Rebus.BeamConeBoundsScale"),
+			FString::SanitizeFloat(CVar->GetFloat()));
+	}),
+	ECVF_Default);
+
+FAutoConsoleVariableRef CVarRebusAllowBeamOcclusionQueries(
+	TEXT("Rebus.AllowBeamOcclusionQueries"),
+	GRebusAllowBeamOcclusionQueries,
+	TEXT("v1.0.117 -- nuclear-test escape hatch that proxies UE's `r.AllowOcclusionQueries` "
+		 "(default 1 = engine default, HOQ on). The v1.0.117 root-cause diagnosis pointed at "
+		 "BeamCone writing to the depth pass (`renderDepth=1` in `Rebus.DumpBeamCulling`), "
+		 "fixed at primitive level by `RefreshBeamConeCullingFlags` setting "
+		 "`bRenderInDepthPass = false`. If a future regression surfaces clipping that "
+		 "v1.0.117's fix DOESN'T resolve, flip this CVar to 0 to disable hardware "
+		 "occlusion queries globally -- if the clipping disappears then HOQ is back on "
+		 "the suspect list. Forwards through to `r.AllowOcclusionQueries` directly; the "
+		 "global affects EVERY primitive in the scene (real perf cost on Nanite-heavy "
+		 "scenes), so this is a diagnostic toggle, not a default-flip. Live."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		const int32 NewVal = CVar->GetInt() != 0 ? 1 : 0;
+		if (IConsoleVariable* EngineCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.AllowOcclusionQueries")))
+		{
+			EngineCVar->Set(NewVal, ECVF_SetByConsole);
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.AllowBeamOcclusionQueries -> %d (forwarded to r.AllowOcclusionQueries)."),
+				NewVal);
+		}
+		else
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.AllowBeamOcclusionQueries -> %d: r.AllowOcclusionQueries CVar not "
+					 "found in this engine build -- the proxy can't forward the change."),
+				NewVal);
+		}
 	}),
 	ECVF_Default);
 
@@ -1267,6 +1376,11 @@ bool ARebusFixtureActor::RefreshPreferProceduralBeamFromCVar(bool bNewPrefer)
 		if (BeamCone)
 		{
 			BeamCone->SetVisibility(bMeshBeamEnabled);
+			// v1.0.117 -- re-apply the cone culling hardening on the flip-back-to-
+			// procedural transition so a fixture that toggled to Epic and back still
+			// has the v1.0.117 bRenderInDepthPass=0 + BoundsScale + sort-priority + ...
+			// flags pushed against the live render proxy.
+			RefreshBeamConeCullingFlags();
 		}
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("Fixture %s beam: PreferProceduralBeam 1 -- Epic canvas hidden, procedural "
@@ -2782,14 +2896,16 @@ void ARebusFixtureActor::BuildBeamCone()
 	BeamCone->RegisterComponent();
 	BeamCone->SetMobility(EComponentMobility::Movable);
 	BeamCone->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	BeamCone->SetCastShadow(false);
-	BeamCone->bCastDynamicShadow = false;
 	BeamCone->SetVisibility(bMeshBeamEnabled);
-	// v1.0.38 culling fix: the cone is a long (~tens of metres), thin, additive-translucent mesh
-	// that runs from the fixture down to the floor. Use the component's OWN section bounds (never
-	// the small attach-parent bounds) and never let it act as an occluder.
-	BeamCone->bUseAttachParentBound = false;
-	BeamCone->bUseAsOccluder = false;
+	// v1.0.117 -- single chokepoint for every "don't let the cone get culled / sorted
+	// behind / occluded by AABB" knob. The brief was diagnosing the v1.0.117 user
+	// report (post-v1.0.116 binaries: "the same pan-edge clipping is back AND
+	// `Rebus.BeamShadowMask 0` doesn't change it"). With the depth-mask ruled out,
+	// the remaining failure surface is HZB / streaming / approximate-occlusion /
+	// translucency-sort -- v1.0.117 collapses every relevant flag onto this helper
+	// so the live CVar refresh sinks (`Rebus.BeamConeBoundsScale`,
+	// `Rebus.AllowBeamOcclusionQueries`) can re-push the full set without a respawn.
+	RefreshBeamConeCullingFlags();
 
 	BeamMID = UMaterialInstanceDynamic::Create(Mat, this);
 	// Constant-default seed for the radial-attenuation scalars. `RefreshBeamRadialParams`
@@ -2823,13 +2939,11 @@ void ARebusFixtureActor::BuildBeamCone()
 	UpdateBeamConeGeometry();     // also seeds BeamLength/LensRadius/FarRadius on the MID
 	BeamCone->SetMaterial(0, BeamMID);
 
-	// v1.0.38 culling fix: conservatively inflate the render bounds so the beam is never wrongly
-	// culled at certain camera angles. The CreateMeshSection bounds are geometrically correct, but a
-	// very elongated translucent shaft whose screen projection falls mostly over the closer opaque
-	// floor can be HZB occlusion-culled (and is borderline for frustum culling). A generous bounds
-	// scale keeps enough of the volume poking past occluders so the additive beam stays drawn. Only
-	// the extent is scaled (origin unchanged), so translucency sort order is unaffected.
-	BeamCone->SetBoundsScale(RebusBeamBoundsScale);
+	// v1.0.117 -- re-apply the v1.0.117 hardening AFTER UpdateBeamConeGeometry has run
+	// (CreateMeshSection rebuilds the proxy + bounds; the BoundsScale + flag set must
+	// be re-pushed against the fresh proxy). Skips when BeamCone got recycled to null
+	// between the calls (defensive; the call chain above can't actually null it).
+	RefreshBeamConeCullingFlags();
 	RefreshBeamEmissive();
 	RefreshBeamSpatialParams();   // seed world BeamOrigin/BeamDir (RefreshMotion re-pushes per frame)
 
@@ -3073,6 +3187,93 @@ void ARebusFixtureActor::RefreshBeamRadialParams()
 	BeamMID->SetScalarParameterValue(TEXT("BeamFalloff"),
 		FMath::Clamp(GRebusBeamFalloff, 0.f, 32.f));
 }
+
+void ARebusFixtureActor::RefreshBeamConeCullingFlags()
+{
+	// v1.0.117 PRIMARY ROOT-CAUSE FIX -- the user's `Rebus.DumpBeamCulling` on a
+	// clipped fixture proved the procedural BeamCone was writing to the depth pass
+	// (`renderDepth=1` in the dump), which is the textbook trigger for the
+	// pan-cross / sibling-fixture / self-occlusion clipping the user reports.
+	// An additive translucent shaft has no business writing to the per-pixel depth
+	// buffer; doing so causes:
+	//   * Cross-fixture z-rejection: when two BeamCones overlap in screen-space,
+	//     the second draw's per-pixel depth test rejects pixels behind the FIRST
+	//     cone's written depth values. The user's screenshot (5 cones, 3 of them
+	//     hard-clipped against sibling cones) is exactly this shape.
+	//   * Self-occlusion: the cone's far-cap triangles write depth that rejects
+	//     the FRONT cap on subsequent draws (UE's translucent pass is a single
+	//     draw-call per primitive, but depth state survives across primitives in
+	//     the same depth target).
+	//   * Pan-edge planar clips: as the head pans, the cone's AABB silhouette
+	//     sweeps across sibling cones' written depth -- pan-coupled clipping
+	//     with a hard planar shape exactly matching what the user shows.
+	// Combined with the v1.0.117 Python `disable_depth_test = True` on the
+	// `M_RebusBeam` master (which removes the cone's depth-test READ side), the
+	// cone is now fully decoupled from the per-pixel depth pipeline: the HLSL
+	// raymarch alone decides what's behind / in front of opaque geometry (via
+	// its `tOcc = (pixDepth - viewDot)/viewDot` scene-depth sampling, which is
+	// the v1.0.39 entry/exit math and continues to carve the shaft against
+	// floors / walls / opaque occluders correctly).
+	//
+	// The remaining flags are belt-and-braces hardening on adjacent surfaces
+	// that ALL contributed to the user's clip cluster across v1.0.111 .. v1.0.116:
+	//   * `bRenderCustomDepth = false` -- the cone has no business in the custom
+	//     depth buffer (post-process effects, selection outline, ...). Defaults
+	//     to false, but restated so a portal mis-push or a future scene-property
+	//     can't enable it behind our back.
+	//   * `bReceivesDecals = false` -- the cone is unlit additive, decals
+	//     don't apply. Defaults true; we want false so a deferred decal layer
+	//     can't ever write to the cone's per-pixel state.
+	//   * `bAffectDynamicIndirectLighting = false` / `bAffectDistanceFieldLighting
+	//     = false` -- the cone is unlit additive, must not contribute to GI / DFL
+	//     samples. Defaults true; explicit-false eliminates a class of latent
+	//     pipeline races between Lumen and the translucent pass.
+	//   * `SetCastHiddenShadow(false)` -- the cone must not cast a hidden-while-
+	//     visible shadow either (the `bCastHiddenShadow` UPROPERTY).
+	//   * `bUseAsOccluder = false` -- restated.
+	//   * `bUseAttachParentBound = false` -- restated.
+	//   * `bAllowApproximateOcclusion = false` -- UE 5.7's approximate-bound
+	//     occlusion test isn't right for a long/thin shaft.
+	//   * `bAllowCullDistanceVolume = false` + `SetCullDistance(0)` -- disable
+	//     LD cull distance + level cull-distance volume gate.
+	//   * `SetBoundsScale(GRebusBeamConeBoundsScale)` -- v1.0.117 default 5.0,
+	//     live-tweakable via `Rebus.BeamConeBoundsScale <float>`.
+	//   * `TranslucencySortPriority = RebusBeamTranslucencySortPriority` (-10)
+	//     -- stable cone-vs-other-translucent sort ordering across pan sweeps.
+	//   * `MarkRenderStateDirty()` -- proxy picks up every flag change.
+	// Idempotent / cheap; called from BuildBeamCone (initial seed),
+	// RefreshPreferProceduralBeamFromCVar (flip-back-to-procedural), and the
+	// `Rebus.BeamConeBoundsScale` CVar refresh sink. Silently no-ops when
+	// `BeamCone` is null (the M_RebusBeam-load-failed branch).
+	if (!BeamCone) return;
+
+	// --- PRIMARY: remove from depth pass + custom depth + decals + DF / GI ---
+	BeamCone->bRenderInDepthPass = false;
+	BeamCone->bRenderCustomDepth = false;
+	BeamCone->SetReceivesDecals(false);
+	BeamCone->bReceivesDecals = false;
+	BeamCone->bAffectDynamicIndirectLighting = false;
+	BeamCone->bAffectDistanceFieldLighting = false;
+
+	// --- Shadow casting belt-and-braces ---
+	BeamCone->SetCastShadow(false);
+	BeamCone->bCastDynamicShadow = false;
+	BeamCone->SetCastHiddenShadow(false);
+
+	// --- Bounds / occlusion / culling ---
+	BeamCone->bUseAttachParentBound = false;
+	BeamCone->bUseAsOccluder = false;
+	BeamCone->bAllowApproximateOcclusion = false;
+	BeamCone->bAllowCullDistanceVolume = false;
+	BeamCone->SetCullDistance(0); // disables LD cull distance entirely (0 == no max)
+
+	const float WantScale = FMath::Clamp(GRebusBeamConeBoundsScale, 1.f, 25.f);
+	BeamCone->SetBoundsScale(WantScale);
+	BeamCone->TranslucencySortPriority = RebusBeamTranslucencySortPriority;
+
+	BeamCone->MarkRenderStateDirty();
+}
+
 
 void ARebusFixtureActor::BuildBeamShadowMaskCapture()
 {
@@ -3429,20 +3630,36 @@ void ARebusFixtureActor::DumpBeamCullingStateForDebug() const
 		{
 			return FString::Printf(TEXT("%s=<null>"), Label);
 		}
+		// v1.0.117 -- extended with the new flags the v1.0.117 fix sets to false on
+		// every BeamCone: bRenderInDepthPass (PRIMARY ROOT-CAUSE), bRenderCustomDepth,
+		// bReceivesDecals, bAffectDynamicIndirectLighting, bAffectDistanceFieldLighting,
+		// bAllowApproximateOcclusion, bAllowCullDistanceVolume, bCastHiddenShadow +
+		// the TranslucencySortPriority. ALL of these should read 0 / -10 after a
+		// v1.0.117 BuildBeamCone -- if any of them surfaces non-zero (or sort != -10)
+		// the v1.0.117 fix didn't engage and the operator should report it.
 		return FString::Printf(
-			TEXT("%s={vis=%d hidGame=%d sceneCap=visOnly=%d hid=%d castShadow=%d occluder=%d "
-				 "attachBound=%d renderMain=%d renderDepth=%d boundsScale=%.2f minDraw=%.1f "
-				 "ldMax=%.1f cachedMax=%.1f visInRT=%d}"),
+			TEXT("%s={vis=%d hidGame=%d sceneCap=visOnly=%d hid=%d castShadow=%d castHiddenShadow=%d "
+				 "occluder=%d attachBound=%d approxOccl=%d cullDistVol=%d renderMain=%d renderDepth=%d "
+				 "customDepth=%d recvDecals=%d affGI=%d affDFL=%d sortPrio=%d boundsScale=%.2f "
+				 "minDraw=%.1f ldMax=%.1f cachedMax=%.1f visInRT=%d}"),
 			Label,
 			C->IsVisible() ? 1 : 0,
 			C->bHiddenInGame ? 1 : 0,
 			C->bVisibleInSceneCaptureOnly ? 1 : 0,
 			C->bHiddenInSceneCapture ? 1 : 0,
 			C->CastShadow ? 1 : 0,
+			C->bCastHiddenShadow ? 1 : 0,
 			C->bUseAsOccluder ? 1 : 0,
 			C->bUseAttachParentBound ? 1 : 0,
+			C->bAllowApproximateOcclusion ? 1 : 0,
+			C->bAllowCullDistanceVolume ? 1 : 0,
 			C->bRenderInMainPass ? 1 : 0,
 			C->bRenderInDepthPass ? 1 : 0,
+			C->bRenderCustomDepth ? 1 : 0,
+			C->bReceivesDecals ? 1 : 0,
+			C->bAffectDynamicIndirectLighting ? 1 : 0,
+			C->bAffectDistanceFieldLighting ? 1 : 0,
+			C->TranslucencySortPriority,
 			C->BoundsScale,
 			C->MinDrawDistance,
 			C->LDMaxDrawDistance,
@@ -3475,8 +3692,18 @@ void ARebusFixtureActor::DumpBeamCullingStateForDebug() const
 	const bool bHasSharp   = MidScalar(TEXT("BeamSharpness"), RadialSharp);
 	const bool bHasDensity = MidScalar(TEXT("BeamDensity"), RadialDensity);
 	const bool bHasFalloff = MidScalar(TEXT("BeamFalloff"), RadialFalloff);
+	// v1.0.117 -- read the BeamMaterialRevision sentinel back off the MID. A live
+	// BeamMID inherits its parent UMaterial's scalar defaults, so this readback
+	// surfaces whether the operator's actual running master is v1.0.117 (revision
+	// 117) or a pre-v1.0.117 master that never got auto-purged. Mismatch ->
+	// `BeamMID.BeamMaterialRevision=MISSING` or a non-117 number -> the
+	// `disable_depth_test=true` flag is also missing -> the v1.0.117 fix didn't
+	// land on this fixture.
+	float MaterialRevision = 0.f;
+	const bool bHasMaterialRevision = MidScalar(TEXT("BeamMaterialRevision"), MaterialRevision);
 	const bool bMasterShape = bHasMaskEnabled && bHasMaskBias && bHasMaskFade &&
-		bHasMaskFar && bHasMaskDebug && bHasMaskTan && bHasSharp && bHasDensity && bHasFalloff;
+		bHasMaskFar && bHasMaskDebug && bHasMaskTan && bHasSharp && bHasDensity && bHasFalloff &&
+		bHasMaterialRevision;
 
 	// World-transform coincidence check. SpotLight + BeamCone + SceneCapture MUST all
 	// sit at the same world origin (the SceneCapture is parented to the SpotLight
@@ -3510,15 +3737,18 @@ void ARebusFixtureActor::DumpBeamCullingStateForDebug() const
 	UE_LOG(LogRebusVisualiser, Log,
 		TEXT("DumpBeamCulling Fixture %s [%s]: %s %s | "
 			 "bUsingEpicBeam=%d bPreferProcedural=%d bMeshBeamEnabled=%d | "
+			 "BeamMID.BeamMaterialRevision=%s (v1.0.117 expects 117 -- mismatch => master is pre-v1.0.117 and the cone is still writing depth; PRIMARY ROOT-CAUSE FIX status) | "
 			 "BeamMID.MaskEnabled=%s BeamMID.MaskBiasCm=%s BeamMID.MaskFadeCm=%s "
 			 "BeamMID.MaskFarCm=%s BeamMID.MaskDebug=%s BeamMID.MaskTanHalfFov=%s | "
 			 "BeamMID.Sharpness=%s BeamMID.Density=%s BeamMID.Falloff=%s (masterShape=%s) | "
 			 "Capture={fov=%.1fdeg halfFov=%.1fdeg maxView=%.0fcm hiddenComponents=%d} | "
 			 "Geometry={outerHalf=%.2fdeg matchHalf=%.2fdeg coneScale=%.3f visConeHalf=%.2fdeg attenuationRadius=%.0fcm coneFitsCapture=%d} | "
-			 "Coincidence={spotLoc=(%.0f,%.0f,%.0f) coneOffsetCm=%.2f capOffsetCm=%.2f}"),
+			 "Coincidence={spotLoc=(%.0f,%.0f,%.0f) coneOffsetCm=%.2f capOffsetCm=%.2f} | "
+			 "GlobalCVars={r.AllowOcclusionQueries=%d r.VolumetricFog=%d}"),
 		*FixtureId, *DisplayName,
 		*BeamConeFlags, *EpicBeamFlags,
 		bUsingEpicBeam ? 1 : 0, bPreferProceduralBeam ? 1 : 0, bMeshBeamEnabled ? 1 : 0,
+		bHasMaterialRevision ? *FString::Printf(TEXT("%.0f"), MaterialRevision) : TEXT("MISSING -- pre-v1.0.117 master, run `Rebus.RebuildBeamMaterial`"),
 		bHasMaskEnabled ? *FString::Printf(TEXT("%.2f"), MaskEnabled) : TEXT("MISSING"),
 		bHasMaskBias    ? *FString::Printf(TEXT("%.2f"), MaskBias)    : TEXT("MISSING"),
 		bHasMaskFade    ? *FString::Printf(TEXT("%.2f"), MaskFade)    : TEXT("MISSING"),
@@ -3535,7 +3765,18 @@ void ARebusFixtureActor::DumpBeamCullingStateForDebug() const
 		BeamShadowMaskCapture ? BeamShadowMaskCapture->HiddenComponents.Num() : -1,
 		OuterHalfDeg, MatchHalfDeg, ConeScale, VisConeHalfDeg, AttenuationRadius,
 		bConeFitsCapture ? 1 : 0,
-		SpotLoc.X, SpotLoc.Y, SpotLoc.Z, ConeOffsetCm, CapOffsetCm);
+		SpotLoc.X, SpotLoc.Y, SpotLoc.Z, ConeOffsetCm, CapOffsetCm,
+		// v1.0.117 -- echo two engine global CVars that operators frequently flip
+		// when chasing translucent-cone clipping. Reading via IConsoleManager keeps
+		// the dump self-contained (no extra log line to grep for).
+		(int32)([]() -> int32 {
+			IConsoleVariable* CV = IConsoleManager::Get().FindConsoleVariable(TEXT("r.AllowOcclusionQueries"));
+			return CV ? CV->GetInt() : -1;
+		}()),
+		(int32)([]() -> int32 {
+			IConsoleVariable* CV = IConsoleManager::Get().FindConsoleVariable(TEXT("r.VolumetricFog"));
+			return CV ? CV->GetInt() : -1;
+		}()));
 }
 
 void ARebusFixtureActor::RefreshBeamEmissive()

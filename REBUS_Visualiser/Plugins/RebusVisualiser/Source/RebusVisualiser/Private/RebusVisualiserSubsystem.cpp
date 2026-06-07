@@ -175,15 +175,28 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		const FBeamMasterVersionReport BannerReport = ProbeBeamMasterVersion();
 		const TCHAR* BannerLabel = BeamMasterVersionLabel(BannerReport.Version);
 		const FString BeamMd5 = ComputeBeamMasterUassetMd5();
+		// v1.0.117 -- build timestamp from the __DATE__ / __TIME__ predefined macros.
+		// Pinned at compile time so the banner reports WHEN the loaded DLL was built --
+		// the operator can see "the .uplugin says v1.0.117 but the DLL was built at the
+		// v1.0.116 commit timestamp" if they pulled but didn't rebuild. Wrapped in
+		// PREPROCESSOR_TO_STRING so the macro expansion lands as a string literal in
+		// the format string slot.
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("[Rebus] STARTUP BANNER: pluginVersion=v%s beamMasterVerdict=%s beamMasterUassetMd5=%s "
-				 "expect=v1.0.111+ pluginExpect=>=v1.0.113. If pluginVersion < v1.0.113 the operator "
-				 "DID NOT REBUILD C++ binaries after the latest git pull -- the v1.0.112+ auto-purge "
-				 "doesn't exist in the loaded UnrealEditor-REBUS_Visualiser.dll. If beamMasterVerdict "
-				 "!= v1.0.111+ the on-disk M_RebusBeam.uasset is stale (auto-purge should fire one log "
-				 "line above). Pair with `Rebus.DumpBeamMasterVersion`, `Rebus.DumpBeamShadowMask`, "
-				 "and the v1.0.113 `Rebus.DumpBeamCulling` for per-fixture verification."),
-			*PluginVer, BannerLabel, *BeamMd5);
+			TEXT("===== REBUS Visualiser v%s (binary built %s %s) -- beamMasterVerdict=%s "
+				 "beamMasterRev=%d/%d beamMasterUassetMd5=%s =====%s"),
+			*PluginVer,
+			ANSI_TO_TCHAR(__DATE__), ANSI_TO_TCHAR(__TIME__),
+			BannerLabel,
+			BannerReport.DetectedRevision, BannerReport.ExpectedRevision,
+			*BeamMd5,
+			TEXT(" -- Operator triage: if pluginVersion != v1.0.117 the C++ binary "
+				 "is stale (`git pull` without rebuild); if beamMasterVerdict != "
+				 "v1.0.117+ the on-disk M_RebusBeam.uasset is stale and the v1.0.112+ "
+				 "auto-purge SHOULD fire one log line above (run `Rebus.DumpBeamMasterVersion` "
+				 "to confirm); if beamMasterRev != expected the master predates "
+				 "v1.0.117's `disable_depth_test=true` flag and the cone is still "
+				 "writing/reading depth (v1.0.117 PRIMARY ROOT-CAUSE FIX). Pair with "
+				 "`Rebus.DumpBeamCulling [fixtureId]` for per-fixture verification."));
 	}
 
 	// v1.0.107 -- compose the watermark display string ONCE from the plugin
@@ -2643,6 +2656,17 @@ namespace
 	const TCHAR* GV111BeamMaskTextures[] = {
 		TEXT("BeamShadowMaskRT"),
 	};
+
+	// v1.0.117 -- the on-disk M_RebusBeam master must declare a `BeamMaterialRevision`
+	// scalar parameter whose DEFAULT value matches this constant. The Python
+	// `_build_beam_master` (build_rebus_base_level.py) bakes the same revision into
+	// the master; mismatch (or missing param) triggers an auto-regen via the v1.0.112
+	// purge path. Bump this AND the Python mirror `REBUS_BEAM_MATERIAL_REVISION` in
+	// lockstep when the master changes (the v1.0.117 release block in README documents
+	// the bump cadence). MUST be >= 117 (the v1.0.117 floor; pre-v1.0.117 masters
+	// have no revision sentinel at all and report `DetectedRevision = -1`).
+	constexpr int32 RebusExpectedBeamMaterialRevision = 117;
+	const TCHAR* GBeamMaterialRevisionScalar = TEXT("BeamMaterialRevision");
 }
 
 const TCHAR* URebusVisualiserSubsystem::BeamMasterVersionLabel(EBeamMasterVersion V)
@@ -2653,7 +2677,8 @@ const TCHAR* URebusVisualiserSubsystem::BeamMasterVersionLabel(EBeamMasterVersio
 		case EBeamMasterVersion::PreV96:         return TEXT("pre-v1.0.96 (cone-only, no shadow contract)");
 		case EBeamMasterVersion::V96ThroughV109: return TEXT("v1.0.96..v1.0.109 (HAS OBSOLETE -- screen-space trace cooked in)");
 		case EBeamMasterVersion::V110:           return TEXT("v1.0.110 (clean slate, no shadow path)");
-		case EBeamMasterVersion::V111Plus:       return TEXT("v1.0.111+");
+		case EBeamMasterVersion::V111Plus:       return TEXT("v1.0.111..v1.0.116 (PRE-v1.0.117 -- cone still writes to depth pass, missing disable_depth_test)");
+		case EBeamMasterVersion::V117Plus:       return TEXT("v1.0.117+");
 		default:                                 return TEXT("UNKNOWN");
 	}
 }
@@ -2719,12 +2744,36 @@ URebusVisualiserSubsystem::FBeamMasterVersionReport URebusVisualiserSubsystem::P
 		}
 	}
 
+	// v1.0.117 -- read the `BeamMaterialRevision` default scalar value. The Python
+	// `_build_beam_master` always bakes it as a scalar parameter (default 117 at
+	// v1.0.117 ship time). A master that declares the parameter at the expected
+	// revision is current; a master that has the v1.0.111 contract but NOT this
+	// scalar (or reports a revision below the expected value) is pre-v1.0.117 and
+	// auto-purged below.
+	Report.ExpectedRevision = RebusExpectedBeamMaterialRevision;
+	{
+		float DetectedRevAsFloat = 0.f;
+		const bool bHasRev = Master->GetScalarParameterValue(
+			FMaterialParameterInfo(GBeamMaterialRevisionScalar), DetectedRevAsFloat);
+		if (bHasRev)
+		{
+			// Round-trip via FMath::RoundToInt -- the Python sentinel is authored as
+			// 117.0 but a future operator hand-edit to e.g. 117.5 must NOT pass as
+			// "matches 117" (the rounded value drives the equality test).
+			Report.DetectedRevision = FMath::RoundToInt(DetectedRevAsFloat);
+		}
+		else
+		{
+			Report.DetectedRevision = -1; // sentinel = "param absent" (pre-v1.0.117)
+		}
+	}
+
 	// Classify. Order matters: obsolete-present is the loudest staleness mode
 	// (cooked-in HLSL is producing the user-visible artefact) so it wins. Then
 	// missing-v1.0.111-contract is the second staleness mode (clean v1.0.110
-	// rollback state). Then no-obsolete-and-has-v1.0.111 is the current state.
-	// PreV96 is the residual "nothing on either side" case -- not actively
-	// broken but not what the runtime expects.
+	// rollback state). Then v1.0.117 revision check classifies whether the
+	// v1.0.111-contract master is current (V117Plus) or pre-v1.0.117 (V111Plus,
+	// auto-purge target).
 	const bool bHasObsolete = Report.DetectedObsoleteParams.Num() > 0;
 	const bool bMissingAnyV111 =
 		Report.MissingV111Scalars.Num() > 0 ||
@@ -2745,12 +2794,20 @@ URebusVisualiserSubsystem::FBeamMasterVersionReport URebusVisualiserSubsystem::P
 		// would have had the v1.0.42-era cone params but never had any shadow
 		// contract by design, same shape as the pre-v1.0.96 case from the
 		// probe's perspective). Either way the auto-regen path is the same:
-		// upgrade to v1.0.111+. We pick V110 for the label since v1.0.96 is
+		// upgrade to v1.0.117+. We pick V110 for the label since v1.0.96 is
 		// long dead -- it's the more recent of the two equally-stale shapes.
 		Report.Version = EBeamMasterVersion::V110;
 	}
+	else if (Report.DetectedRevision >= Report.ExpectedRevision)
+	{
+		Report.Version = EBeamMasterVersion::V117Plus;
+	}
 	else
 	{
+		// v1.0.117 -- has full v1.0.111 contract but missing / older revision
+		// sentinel. The cone is still writing to the depth pass (no
+		// `disable_depth_test` on the material) and the user's clip symptom
+		// persists. Same auto-regen path as the other stale states.
 		Report.Version = EBeamMasterVersion::V111Plus;
 	}
 	return Report;
@@ -2862,7 +2919,13 @@ void URebusVisualiserSubsystem::ProbeAndAutoPurgeStaleBeamMaster()
 	const bool bStale =
 		Report.Version == EBeamMasterVersion::V96ThroughV109 ||
 		Report.Version == EBeamMasterVersion::V110 ||
-		Report.Version == EBeamMasterVersion::PreV96;
+		Report.Version == EBeamMasterVersion::PreV96 ||
+		// v1.0.117 -- pre-v1.0.117 masters (V111Plus, full mask contract but
+		// `BeamMaterialRevision != ExpectedRevision`) are now also stale: they
+		// lack the v1.0.117 `disable_depth_test = true` flag so the cone keeps
+		// writing/reading depth and the user's clip symptom persists. Auto-
+		// regen path is the same Python rebake the other stale states use.
+		Report.Version == EBeamMasterVersion::V111Plus;
 
 	if (Report.Version == EBeamMasterVersion::Missing)
 	{
@@ -2893,21 +2956,26 @@ void URebusVisualiserSubsystem::ProbeAndAutoPurgeStaleBeamMaster()
 
 	// Stale. Compose the diagnostic line with the exact obsolete + missing params
 	// that triggered the verdict so operators / bug reports can correlate it.
+	// v1.0.117: also report the revision mismatch (got=N, want=117) when the
+	// staleness is the new V111Plus-but-pre-v1.0.117 case.
 	UE_LOG(LogRebusVisualiser, Warning,
 		TEXT("[Rebus] STALE BEAM MASTER detected -- %s. Obsolete v1.0.96..v1.0.109 scalars "
 			 "present: [%s]. Missing v1.0.111 scalars: [%s]. Missing v1.0.111 vectors: [%s]. "
-			 "Missing v1.0.111 textures: [%s]. This is the same on-disk staleness that bit us "
-			 "v1.0.99/v1.0.103/v1.0.110/v1.0.111: the cooked HLSL inside `M_RebusBeam.uasset` "
-			 "is older than the running plugin binary, so the per-fixture push reaches a "
-			 "parameter set that doesn't match the shader. The pre-v1.0.110 screen-space "
-			 "self-shadow trace cooked into a stale master IS the pan-edge side-cutting "
-			 "artefact the user reported in v1.0.112. Auto-running `Rebus.RebuildBeamMaterial` "
-			 "now to regenerate against the current `_BEAM_RAYMARCH_HLSL` source."),
+			 "Missing v1.0.111 textures: [%s]. BeamMaterialRevision detected=%d expected=%d. "
+			 "This is the same on-disk staleness that bit us v1.0.99/v1.0.103/v1.0.110/"
+			 "v1.0.111/v1.0.112: the cooked HLSL + material flags inside `M_RebusBeam.uasset` "
+			 "are older than the running plugin binary, so the per-fixture push reaches a "
+			 "parameter set that doesn't match the shader -- and in the v1.0.117 case the "
+			 "cone material is missing `disable_depth_test = true` (the v1.0.117 root-cause "
+			 "fix for the user's pan-cross / sibling-fixture clipping). Auto-running "
+			 "`Rebus.RebuildBeamMaterial` now to regenerate against the current "
+			 "`_BEAM_RAYMARCH_HLSL` source + v1.0.117 material flags."),
 		Label,
 		*JoinNames(Report.DetectedObsoleteParams),
 		*JoinNames(Report.MissingV111Scalars),
 		*JoinNames(Report.MissingV111Vectors),
-		*JoinNames(Report.MissingV111Textures));
+		*JoinNames(Report.MissingV111Textures),
+		Report.DetectedRevision, Report.ExpectedRevision);
 
 #if WITH_EDITOR
 	// Editor build -- invoke the Python regen via the engine's `py` console

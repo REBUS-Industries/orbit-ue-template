@@ -603,6 +603,52 @@ public:
 	// command (registered in RebusVisualiser.cpp).
 	void DumpBeamCullingStateForDebug() const;
 
+	// v1.0.117 PRIMARY ROOT-CAUSE FIX -- the user ran `Rebus.DumpBeamCulling` on a
+	// clipped fixture and the dump showed `BeamCone={... renderDepth=1 ...}`. An
+	// additive translucent cone writing to the depth pass causes cross-fixture
+	// z-rejection (sibling cones clip each other's pixels), self-occlusion (far-cap
+	// triangles reject front-cap fragments), and pan-edge planar clipping --
+	// exactly the symptom shape the user reported across v1.0.111 / v1.0.112 /
+	// v1.0.113 / v1.0.116. The user ALSO confirmed `Rebus.PreferProceduralBeam 0`
+	// removes the clip (which hides BeamCone and exposes EpicBeamComp -- on the
+	// canonical Ayrton Veloce fixture EpicBeamComp is `<null>` so the "expose" is
+	// "nothing visible", which the user sees as "the clip is gone"). The
+	// canonical UE pattern for additive translucent volumes that do their own
+	// scene-depth occlusion via SceneDepth sampling (which `_BEAM_RAYMARCH_HLSL`
+	// has done since v1.0.39) is to:
+	//   1. Set `bRenderInDepthPass = false` on the primitive (THIS HELPER).
+	//   2. Set `disable_depth_test = True` on the material (v1.0.117 Python).
+	// The combination FULLY decouples the cone from the per-pixel depth pipeline;
+	// the HLSL alone decides what's behind opaque geometry via its own `tOcc`
+	// scene-depth sample (which is unchanged and continues to carve cleanly).
+	//
+	// This helper is the SINGLE chokepoint for every per-component knob:
+	//   * `bRenderInDepthPass = false` (PRIMARY) -- the smoking-gun fix.
+	//   * `bRenderCustomDepth = false` -- belt-and-braces (cone has no business
+	//     in the custom depth buffer either).
+	//   * `SetReceivesDecals(false)` + `bReceivesDecals = false` -- deferred
+	//     decals must not project onto the unlit additive cone.
+	//   * `bAffectDynamicIndirectLighting = false` + `bAffectDistanceFieldLighting
+	//     = false` -- the cone must not contribute to GI / DFL samples.
+	//   * `SetCastShadow(false)` + `bCastDynamicShadow = false` +
+	//     `SetCastHiddenShadow(false)` -- no shadow casting at all.
+	//   * `bUseAsOccluder = false` + `bUseAttachParentBound = false` +
+	//     `bAllowApproximateOcclusion = false` -- no occlusion contribution.
+	//   * `SetCullDistance(0)` + `bAllowCullDistanceVolume = false` -- never
+	//     streamed out by LD cull distance / cull-distance volume.
+	//   * `SetBoundsScale(GRebusBeamConeBoundsScale)` -- v1.0.117 default 5.0,
+	//     live-tweakable via `Rebus.BeamConeBoundsScale <float>`.
+	//   * `TranslucencySortPriority = RebusBeamTranslucencySortPriority` (-10)
+	//     -- forces stable cone-vs-other-translucent sort ordering across pan
+	//     sweeps so sibling cones never flip past each other.
+	//   * `MarkRenderStateDirty()` -- proxy picks up every flag change.
+	// Called once from `BuildBeamCone` (initial seed), from
+	// `RefreshPreferProceduralBeamFromCVar` (flip-back-to-procedural), and from
+	// the `Rebus.BeamConeBoundsScale` CVar refresh sink. Silently no-ops when
+	// `BeamCone` is null (the M_RebusBeam-load-failed branch). Public so the
+	// CVar refresh sinks (registered in `RebusVisualiser.cpp` file scope) can
+	// call it without poking the private member directly.
+	void RefreshBeamConeCullingFlags();
 	// v1.0.101: assign the per-fixture cone-mesh radius scale + re-push the cone geometry
 	// + Epic-beam DMX Zoom param so a live `Rebus.BeamConeRadiusScale` change picks up
 	// without a respawn. Forces the rebuild gate in `UpdateBeamConeGeometry` (the gate

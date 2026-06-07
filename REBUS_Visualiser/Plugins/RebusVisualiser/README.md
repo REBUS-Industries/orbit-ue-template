@@ -594,6 +594,99 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **v1.0.117 — PRIMARY ROOT-CAUSE FIX for the persistent pan-cross / sibling-fixture beam clipping the user has reported across v1.0.111 → v1.0.116. `BeamCone->bRenderInDepthPass = false` + `disable_depth_test = true` on `M_RebusBeam`. Operator A/B checklist below.**
+>
+> ### User-visible symptom (v1.0.116 and earlier)
+>
+> The user reported the same shape across four release cycles: when 5 moving heads on a truss pan together, two or three of them clip with a hard planar edge against the SAME invisible boundary, as if "there is a hidden bounding box". `Rebus.BeamShadowMask 0` made ZERO difference (v1.0.116 hypothesis A invalidated). `Rebus.PreferProceduralBeam 0` removed the clipping. The user ran `Rebus.DumpBeamCulling` on a clipped Ayrton Veloce Profile and the dump returned the smoking gun:
+>
+> ```
+> BeamCone={vis=1 hidGame=0 sceneCap=visOnly=0 hid=0 castShadow=0 occluder=0 attachBound=0
+>           renderMain=1 renderDepth=1 boundsScale=3.00 ...}
+> EpicBeamComp=<null>
+> bPreferProcedural=1 bMeshBeamEnabled=1
+> ```
+>
+> **`renderDepth=1` on a translucent additive cone is the canonical UE failure mode for pan-coupled "hidden bounding box" clipping.** It causes (a) cross-fixture z-rejection — when two BeamCones overlap in screen-space, the second draw's per-pixel depth test rejects pixels behind the first's written depth; (b) self-occlusion — the cone's far-cap triangles write depth that rejects front-cap fragments on later draws; (c) pan-edge planar clips matching the user's screenshot exactly. The cone is unlit additive, has no business writing to the per-pixel depth buffer at all -- the HLSL raymarch (`_BEAM_RAYMARCH_HLSL`, v1.0.39) already does its own scene-depth occlusion via `tOcc = min(tPix, tOcc)`, so the floor / wall / opaque-occluder fade is shader-driven and continues to work correctly without the fixed-function depth pass.
+>
+> ### Fix 1 (PRIMARY, C++) — `BeamCone` out of the depth pass
+>
+> The single chokepoint is `ARebusFixtureActor::RefreshBeamConeCullingFlags()` (`Private/RebusFixtureActor.cpp`). v1.0.117 sets:
+>
+> | Flag | Was | Is | Why |
+> | --- | --- | --- | --- |
+> | `bRenderInDepthPass` | `true` | **`false`** | **PRIMARY** — the smoking gun from `Rebus.DumpBeamCulling` |
+> | `bRenderCustomDepth` | (default) | `false` | belt-and-braces (no business in custom depth either) |
+> | `bReceivesDecals` | `true` | `false` | unlit additive cone, no deferred decals |
+> | `bAffectDynamicIndirectLighting` | `true` | `false` | unlit additive cone, no GI contribution |
+> | `bAffectDistanceFieldLighting` | `true` | `false` | unlit additive cone, no DFL contribution |
+> | `CastShadow` / `bCastDynamicShadow` / `bCastHiddenShadow` | (mixed) | all `false` | no shadow casting at all |
+> | `BoundsScale` | `3.0` | `5.0` (live via `Rebus.BeamConeBoundsScale`) | extent-only inflation against HZB / streaming-volume false-cull |
+> | `TranslucencySortPriority` | `0` | `-10` | stable cone-vs-other-translucent sort across pan sweeps |
+> | `bAllowApproximateOcclusion` / `bAllowCullDistanceVolume` / `SetCullDistance(0)` | mixed | all off / 0 | no LD cull distance, no level cull-distance volume gate |
+>
+> The helper is called from `BuildBeamCone` (initial seed), from `RefreshPreferProceduralBeamFromCVar` (flip-back-to-procedural), and from the `Rebus.BeamConeBoundsScale` live CVar refresh sink. Idempotent / cheap; no-op when `BeamCone` is null.
+>
+> ### Fix 2 (PRIMARY, material) — `disable_depth_test = true` on `M_RebusBeam`
+>
+> The material-side complement to Fix 1. The cone's READ side (depth test against OTHER translucent surfaces, e.g. sibling beam cones during a pan-cross, the chrome lens disc, LED-matrix `IsBeamLensComponents` PMCs) is the last remaining failure surface. `disable_depth_test = true` on the master decouples the cone from the fixed-function depth pipeline entirely; the HLSL raymarch alone decides what's behind opaque geometry via `SceneDepth`.
+>
+> Also in `_build_beam_master` (`Content/Python/build_rebus_base_level.py`):
+>
+> - `disable_depth_test = True` — the primary material flag for additive translucent volumes.
+> - `used_with_volumetric_fog = False` — the cone is NOT a volumetric fog participant (the SpotLight's gobo light function `M_RebusGoboLightFunction` is; that's unaffected). Removes a known UE failure mode where the translucent pass interacts with the 8×8×128 fog froxel grid and produces axis-aligned tile-boundary clip artefacts.
+> - **New sentinel scalar `BeamMaterialRevision = 117`** — bumped every release that touches the master; the C++ probe reads it back via `UMaterial::GetScalarParameterValue` to decide whether the on-disk `.uasset` needs auto-regen.
+>
+> ### Fix 3 — Stale-master auto-purge extended to detect pre-v1.0.117
+>
+> `URebusVisualiserSubsystem::ProbeAndAutoPurgeStaleBeamMaster()` (`Private/RebusVisualiserSubsystem.cpp`, v1.0.112 infrastructure) now considers a master that has the full v1.0.111 parameter contract but a missing / older `BeamMaterialRevision` sentinel as STALE. The auto-regen fires the same Python rebake path used since v1.0.112. New verdict labels:
+>
+> - `V111Plus` → relabelled `v1.0.111..v1.0.116 (PRE-v1.0.117 — cone still writes to depth pass, missing disable_depth_test)` and now considered STALE.
+> - `V117Plus` → new label `v1.0.117+`, the only "not stale" verdict.
+>
+> If the user's `M_RebusBeam.uasset` doesn't regenerate automatically (e.g. running a packaged binary with no editor / no `PythonScriptPlugin`), the auto-purge logs a Warning naming the detected vs expected revision and points the operator at `Rebus.RebuildBeamMaterial`.
+>
+> ### Fix 4 — `Rebus.DumpBeamCulling` extended with material-side state
+>
+> `Rebus.DumpBeamCulling [fixtureId]` now also prints:
+>
+> - **`BeamCone.renderDepth`** (the v1.0.117 smoking-gun flag — should be `0`)
+> - `BeamCone.customDepth`, `recvDecals`, `affGI`, `affDFL`, `castHiddenShadow`, `approxOccl`, `cullDistVol`, `sortPrio` (the rest of the v1.0.117 hardening)
+> - **`BeamMID.BeamMaterialRevision`** (should be `117` — `MISSING` means pre-v1.0.117 master, run `Rebus.RebuildBeamMaterial`)
+> - `GlobalCVars={r.AllowOcclusionQueries r.VolumetricFog}` echoed for context.
+>
+> ### Fix 5 — Startup banner with build identity
+>
+> The `Initialize`-time one-line banner now stitches `[plugin version] (binary built [__DATE__ __TIME__]) beamMasterVerdict=[label] beamMasterRev=[detected/expected] beamMasterUassetMd5=[hash]` so the operator can see in one log line whether their loaded DLL matches the source tree they pulled.
+>
+> ### Fix 6 — Operator A/B checklist (RUN THIS ON YOUR BUILD)
+>
+> 1. Pull the v1.0.117 git tag (`git fetch && git checkout v1.0.117-ue5.7`) and rebuild the `REBUS_VisualiserEditor` target. **Required even if `git pull` ran cleanly — the C++ binary must be rebuilt.**
+> 2. Launch the editor / packaged build and confirm the startup banner shows `===== REBUS Visualiser v1.0.117 (binary built [recent date]) ... =====` in the Output log. If it says `v1.0.116` or earlier, the C++ binary is stale — rebuild.
+> 3. Run `Rebus.DumpBeamCulling` (no args = first clipped fixture). Confirm:
+>    - `BeamCone={... renderDepth=0 ...}` (was `1` in v1.0.116) — **this is the primary fix**
+>    - `BeamMID.BeamMaterialRevision=117` (was `MISSING`) — confirms the material auto-regen landed
+>    - `sortPrio=-10`, `boundsScale=5.00`, `customDepth=0 recvDecals=0 affGI=0 affDFL=0`
+> 4. If `BeamMaterialRevision != 117`, run `Rebus.RebuildBeamMaterial` manually, then `ClearScene` + `LoadScene` from the portal to rebuild all per-fixture BeamMIDs against the regenerated master.
+> 5. Pan the previously-clipped fixtures across each other. The hard planar clip should be gone in both `Rebus.PreferProceduralBeam 1` (default, procedural cone visible) and `Rebus.PreferProceduralBeam 0` (cone hidden) — toggling should make no visible difference because the cone no longer fights with other translucent surfaces.
+> 6. If the clipping STILL persists in v1.0.117, try these diagnostic toggles in order and report which one (if any) helps:
+>    - `Rebus.AllowBeamOcclusionQueries 0` — forces global HOQ off. If this fixes it, the failure mode is HOQ-related (unlikely; `r.AllowOcclusionQueries 0` was tested at v1.0.116 and didn't help).
+>    - `Rebus.BeamConeBoundsScale 8` — push the AABB further out (live, no rebuild needed).
+>    - `r.VolumetricFog 0` — disable volumetric fog entirely. If this fixes it, the froxel-tile-boundary failure mode is back on the suspect list.
+>    - Attach a fresh `Rebus.DumpBeamCulling` log from the still-clipped fixture for cross-check.
+>
+> **One-line root-cause statement:** v1.0.117's primary fix (`BeamCone->bRenderInDepthPass = false` on the primitive + `disable_depth_test = true` on the `M_RebusBeam` material) directly addresses the user's `renderDepth=1` finding from `Rebus.DumpBeamCulling`, decoupling the additive translucent cone from the per-pixel depth pipeline so sibling cones / lens discs / LED matrices can no longer reject its pixels via z-test.
+>
+> ### Dropped from the v1.0.117 brief (not the root cause; downgraded to "if symptom persists")
+>
+> - Cross-fixture `HiddenComponents` list on `BeamShadowMaskCapture` — depth mask was confirmed not to be the cause (`Rebus.BeamShadowMask 0` didn't help).
+> - Nanite-aware `SceneCapture` show-flags — depth mask not the cause.
+> - `EpicBeamComp` hide hardening — `EpicBeamComp` is `<null>` on the user's Ayrton Veloce fixture.
+> - Hardware-occlusion-query disable on BeamCone — `r.AllowOcclusionQueries 0` was tested at v1.0.116 and didn't help.
+> - Volumetric-fog tile occlusion / DLSS-TSR upsample edges — downgraded to "if symptom persists, try `r.VolumetricFog 0` / disable upsampling" in the checklist above.
+>
+> `RebusVisualiser.uplugin` `VersionName` 1.0.116 → 1.0.117. Top-centre watermark + `[Rebus] STARTUP BANNER` will read `v1.0.117 (binary built ...)` on the next launch; if you see anything earlier, your binary didn't rebuild.
+
 > **UE 5.7 build fix: move `URebusVisualiserSubsystem::ComputeBeamMasterUassetMd5` from `private:` to `public:` + audit pass of every cross-TU access specifier + UE 5.7 deprecation hotspot to break the recurring single-error build-fix cycle (v1.0.116).**
 >
 > User-reported build break (verbatim, abridged):
