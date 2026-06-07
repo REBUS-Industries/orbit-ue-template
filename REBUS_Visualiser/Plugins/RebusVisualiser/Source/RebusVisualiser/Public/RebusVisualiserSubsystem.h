@@ -683,9 +683,15 @@ private:
 
 	// v1.0.112 -- runtime stale-master probe + auto-purge for `M_RebusBeam`. See the
 	// public `EBeamMasterVersion` / `ProbeBeamMasterVersion` doc-comment for the full
-	// rationale + algorithm + user-report verbatim. Called once from `Initialize` --
-	// gated by `bBeamMasterAutoPurgeRun` so any future re-entry path can't re-fire
-	// the regen + per-fixture refresh inside the same session.
+	// rationale + algorithm + user-report verbatim. Called once from `Initialize` AND
+	// once from every `PostLoadMapWithWorld` (v1.0.113 hardening: the v1.0.112
+	// `bBeamMasterAutoPurgeRun` one-shot guard was per-subsystem-instance, but
+	// `UGameInstanceSubsystem` lives across level reloads inside one editor session --
+	// so an operator who reloaded the level WITHOUT restarting the editor would not
+	// see the auto-purge re-fire after they manually flipped a content path / un-
+	// fixed a known-stale master, defeating the v1.0.112 chokepoint). v1.0.113
+	// resets `bBeamMasterAutoPurgeRun = false` from the `PostLoadMapWithWorld`
+	// delegate and re-fires here.
 	void ProbeAndAutoPurgeStaleBeamMaster();
 	// Belt-and-braces walker called from `ProbeAndAutoPurgeStaleBeamMaster` after a
 	// successful Python regen. SpawnedFixtures is normally EMPTY at `Initialize`
@@ -703,4 +709,23 @@ private:
 	// Silently no-ops on a null fixture or a null BeamMID.
 	void RefreshAllSpawnedFixtureBeamMIDs();
 	bool bBeamMasterAutoPurgeRun = false;
+	// v1.0.113 -- delegate handle for the `FCoreUObjectDelegates::PostLoadMapWithWorld`
+	// hook that re-fires `ProbeAndAutoPurgeStaleBeamMaster` after every level load.
+	// Held so `Deinitialize` can unregister cleanly (a dangling delegate captured
+	// against `this` would crash on the next map load after a hot-reload of the
+	// subsystem). Mirrors the v1.0.107 `VersionWatermarkDrawHandle` shape.
+	FDelegateHandle PostLoadMapAutoPurgeHandle;
+	void OnPostLoadMapAutoPurge(UWorld* LoadedWorld);
+
+	// v1.0.113 -- compute the lowercase-hex MD5 hash of the on-disk
+	// `/Game/REBUS/Materials/M_RebusBeam.uasset` so the operator can prove from log
+	// output alone whether their packaged / cooked binary is running the master we
+	// expect. Resolves the long package name to a filesystem path via
+	// `FPackageName::TryConvertLongPackageNameToFilename` (matches the editor's
+	// `.uasset` extension); silently returns "<missing>" on resolve failure (e.g.
+	// asset not on disk -- the same case the v1.0.112 EBeamMasterVersion::Missing
+	// branch covers). Used by both the `Initialize`-time startup banner AND the
+	// `Rebus.DumpBeamMasterVersion` console command, so the two paths never
+	// disagree about what "current hash" means.
+	static FString ComputeBeamMasterUassetMd5();
 };

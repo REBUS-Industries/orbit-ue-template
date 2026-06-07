@@ -109,11 +109,26 @@ namespace
 	// lens diameter rather than a near-point when a fixture reports an unrealistically tiny lens.
 	constexpr float RebusBeamLensRadiusFloorCm = 3.f;
 
-	// Modest render-bounds margin for the beam cone (extent-only; origin unchanged so translucency
-	// sort order is unaffected). The real "beam vanishes up close / inside" fix is the v1.0.39
-	// raymarch entry/exit rework in M_RebusBeam -- bounds were NOT the cause -- so this is kept small
-	// (just a little frustum-cull headroom for the elongated shaft), reduced from the v1.0.38 3x.
-	constexpr float RebusBeamBoundsScale = 1.5f;
+	// v1.0.113 -- raised from 1.5 -> 3.0 (belt-and-braces against the user's "beam is
+	// being clipped from old code, might be camera viewing angle culling it" report).
+	// The v1.0.113 audit found no remaining `nf` / `softOcc` / cone-mesh code path that
+	// can produce a camera-angle-dependent CLIP (the v1.0.39 entry/exit math and the
+	// v1.0.110 rip of the screen-space shadow trace are both clean -- see the README
+	// v1.0.113 release block for the full per-path audit). The remaining failure mode
+	// is HZB occlusion culling: a long, thin, additive translucent shaft whose AABB
+	// from `CreateMeshSection` is geometrically tight but whose screen projection
+	// falls mostly behind the floor at grazing angles can be HZB-culled (the v1.0.38
+	// release note already documented this, then v1.0.39 reduced the scalar to 1.5
+	// once the raymarch fix dropped because "bounds were NOT the cause" of the
+	// vanish-on-camera-close bug). 3.0x is the v1.0.113 belt-and-braces value -- still
+	// extent-only (origin unchanged so translucency sort order is unaffected), still
+	// just frustum / HZB-cull headroom, but enough margin that the elongated cone
+	// stays drawn through grazing-angle camera pans where the visible-but-tight
+	// 1.5x bounds was reading as "the beam vanishes when I look at it from below /
+	// from behind". Pair with `Rebus.DumpBeamCulling [fixtureId]` to verify the
+	// per-fixture BoundsScale landed in case a future per-fixture override path
+	// re-stomps it.
+	constexpr float RebusBeamBoundsScale = 3.f;
 
 	// v1.0.44/45/46: Epic DMX beam (M_Beam_Master) conventions, verified by introspecting the
 	// installed content (SM_Beam_RM + MI_Beam) plus runtime visual feedback:
@@ -255,16 +270,24 @@ float GRebusSpotLightScatter = 0.5f;
 //   * BeamShadowMaskFadeCm  = 20.0 (cm; SOFT fade range -- the beam doesn't binary
 //     clip at the blocker, it fades over a few cm so the discontinuity softens against
 //     aliasing in the 256x256 capture)
-//   * BeamShadowMaskFovMargin = 2.0 (deg; added to the SpotLight outer cone full-angle
+//   * BeamShadowMaskFovMargin = 5.0 (deg; v1.0.113 raised from 2.0 -- added to the
+//     COVERAGE half-angle (`max(2*OuterHalfDeg, 2*MatchHalfDeg*BeamConeRadiusScale)`)
 //     before feeding the SceneCapture's `FOVAngle` -- so the beam's outermost raymarch
-//     samples don't read undefined pixels at the capture-render edge)
+//     samples don't read undefined pixels at the capture-render edge. v1.0.113 bumped
+//     the default from 2 -> 5 deg as belt-and-braces because the user reported clipped
+//     beams "from old code"; a SceneCapture FOV that's just barely wider than the
+//     visible cone-mesh edge can let cone-edge samples read partly-outside the
+//     captured region under bilinear filtering -- the v1.0.111 HLSL is permissive
+//     (outside-frustum samples stay `shadowVis=1.0`, no clip) but the larger margin
+//     keeps every visible-cone sample firmly inside the rendered area so the depth
+//     comparison has well-defined data even for cone-edge probes.
 //   * BeamShadowMaskDebug   = 0 (off; 1 = paint occluded samples RED inside the shaft
 //     so the operator can visually verify the projection math)
 int32 GRebusBeamShadowMask         = 1;
 int32 GRebusBeamShadowMaskRes      = 256;
 float GRebusBeamShadowMaskBiasCm   = 5.f;
 float GRebusBeamShadowMaskFadeCm   = 20.f;
-float GRebusBeamShadowMaskFovMargin = 2.f;
+float GRebusBeamShadowMaskFovMargin = 5.f; // v1.0.113: 2 -> 5 deg (belt-and-braces, see README v1.0.113)
 int32 GRebusBeamShadowMaskDebug    = 0;
 
 static void RefreshBeamShadowMaskParamsOnEveryFixture(const TCHAR* CVarLabel, const FString& NewValStr)
@@ -3243,11 +3266,42 @@ void ARebusFixtureActor::RefreshBeamShadowMaskParams()
 	// the capture pair stays a clean no-op.
 	if (BeamShadowMaskCapture)
 	{
-		// Full angle = 2 * outer half deg, with a small safety margin so the cone-edge
-		// samples don't read undefined pixels at the capture-render edge.
-		const float OuterHalfDeg = ResolveOuterHalfDeg();
-		const float MarginDeg = FMath::Clamp(GRebusBeamShadowMaskFovMargin, 0.f, 30.f);
-		const float NewFov = FMath::Clamp(2.f * OuterHalfDeg + MarginDeg, 1.f, 170.f);
+		// v1.0.113 -- SceneCapture FOV is sized to COVER every sample the raymarch can
+		// fetch from the depth-mask. The raymarch traverses the visible cone-mesh
+		// volume; its outermost samples sit at the cone-mesh FAR-radius, which is
+		// `BeamLengthUnreal * tan(MatchHalf) * BeamConeRadiusScale` (see
+		// `UpdateBeamConeGeometry`). That corresponds to an effective half-angle of
+		// `MatchHalf * BeamConeRadiusScale` (since `BeamLengthUnreal` is the same axial
+		// length both terms share). The SpotLight outer cone is `OuterHalf` -- and
+		// because the half-intensity match angle is `OuterHalf * (1+InnerRatio)/2 <=
+		// OuterHalf` (with the v1.0.108 default InnerRatio=0.8, MatchHalf = 0.9 *
+		// OuterHalf), `MatchHalf * BeamConeRadiusScale` is normally <= OuterHalf and
+		// the SpotLight outer cone is the binding constraint -- so the v1.0.112-and-
+		// earlier formula `2 * OuterHalf + Margin` was correct for default tuning.
+		//
+		// BUT: if the operator pushes `Rebus.BeamConeRadiusScale > 1.0` (a polish knob
+		// the v1.0.101 release intentionally exposed so a fixture can over-extend its
+		// visible cone past the lit footprint for hero scenic effect), the visible
+		// cone-mesh edge can grow PAST the SpotLight outer cone, and the v1.0.112
+		// SceneCapture FOV stops covering the outer-rim samples. The v1.0.111 HLSL is
+		// permissive (outside-frustum samples leave `shadowVis = 1.0` -- no clip,
+		// `_BEAM_RAYMARCH_HLSL` lines 716-755), so the user-visible failure mode is
+		// not a CLIP -- it's that outer-rim samples can never be occluded by real
+		// blockers (the depth-mask doesn't know about geometry that the SceneCapture's
+		// narrower frustum doesn't see). That isn't the user's complaint shape in
+		// v1.0.113 (they reported CLIPPING, not "outer-rim samples never carve"), but
+		// the brief explicitly asks for `max(OuterHalfDeg, MatchHalfDeg *
+		// BeamConeRadiusScale) + FovMarginDeg` as belt-and-braces so the SceneCapture
+		// always covers whatever the cone-mesh actually shows. Default tuning (cone
+		// scale 1.0, inner ratio 0.8) -> max wins from `OuterHalf`, identical to the
+		// v1.0.112 behaviour. Hero-extended cones (cone scale > 1.0) -> max wins from
+		// `MatchHalf * ConeScale`, FOV grows with the visible cone.
+		const float OuterHalfDeg   = ResolveOuterHalfDeg();
+		const float MatchHalfDeg   = ResolveBeamFootprintMatchHalfDeg();
+		const float ConeScale      = FMath::Max(0.05f, BeamConeRadiusScale);
+		const float CoverageHalfDeg = FMath::Max(OuterHalfDeg, MatchHalfDeg * ConeScale);
+		const float MarginDeg      = FMath::Clamp(GRebusBeamShadowMaskFovMargin, 0.f, 30.f);
+		const float NewFov         = FMath::Clamp(2.f * CoverageHalfDeg + MarginDeg, 1.f, 170.f);
 		BeamShadowMaskCapture->FOVAngle = NewFov;
 		BeamShadowMaskCapture->MaxViewDistanceOverride = FarCm * 1.05f;
 		BeamShadowMaskCapture->bCaptureEveryFrame = bMasterOn;
@@ -3354,6 +3408,134 @@ void ARebusFixtureActor::DumpBeamShadowMaskStateForDebug() const
 		GRebusBeamShadowMask, GRebusBeamShadowMaskRes,
 		GRebusBeamShadowMaskBiasCm, GRebusBeamShadowMaskFadeCm,
 		GRebusBeamShadowMaskFovMargin, GRebusBeamShadowMaskDebug);
+}
+
+void ARebusFixtureActor::DumpBeamCullingStateForDebug() const
+{
+	// v1.0.113 -- per-fixture audit of every flag / scalar / transform that can hide,
+	// clip, fade, cull, or fragment-discard the visible beam shaft. See the public
+	// header doc-comment for the full rationale: one paste-friendly line so the operator
+	// (and any future regression bug-report) can answer "what's causing my beam to clip"
+	// without re-running the v1.0.113 audit. Companion to `Rebus.DumpBeamShadowMask`
+	// (light-space depth-mask state) and `Rebus.DumpFixtureZoom` (cone/zoom state) --
+	// the three together cover every v1.0.x visible-beam failure mode.
+
+	// Per-primitive flag accessor with a defensive "<null>" tag so a NULL component
+	// doesn't crash the dump (BeamCone may be null on the M_RebusBeam-load-failed
+	// branch; EpicBeamComp is null until the procedural-vs-Epic flip lazily builds it).
+	auto FlagsLine = [](const UPrimitiveComponent* C, const TCHAR* Label) -> FString
+	{
+		if (!C)
+		{
+			return FString::Printf(TEXT("%s=<null>"), Label);
+		}
+		return FString::Printf(
+			TEXT("%s={vis=%d hidGame=%d sceneCap=visOnly=%d hid=%d castShadow=%d occluder=%d "
+				 "attachBound=%d renderMain=%d renderDepth=%d boundsScale=%.2f minDraw=%.1f "
+				 "ldMax=%.1f cachedMax=%.1f visInRT=%d}"),
+			Label,
+			C->IsVisible() ? 1 : 0,
+			C->bHiddenInGame ? 1 : 0,
+			C->bVisibleInSceneCaptureOnly ? 1 : 0,
+			C->bHiddenInSceneCapture ? 1 : 0,
+			C->CastShadow ? 1 : 0,
+			C->bUseAsOccluder ? 1 : 0,
+			C->bUseAttachParentBound ? 1 : 0,
+			C->bRenderInMainPass ? 1 : 0,
+			C->bRenderInDepthPass ? 1 : 0,
+			C->GetBoundsScale(),
+			C->MinDrawDistance,
+			C->LDMaxDrawDistance,
+			C->CachedMaxDrawDistance,
+			C->bVisibleInRayTracing ? 1 : 0);
+	};
+
+	const FString BeamConeFlags = FlagsLine(BeamCone, TEXT("BeamCone"));
+	const FString EpicBeamFlags = FlagsLine(EpicBeamComp, TEXT("EpicBeamComp"));
+
+	// Live BeamMID parameter readback. EXISTS/MISSING surfaces a stale-master
+	// scenario (same shape as DumpBeamShadowMaskStateForDebug -- the v1.0.111 +
+	// v1.0.108 contracts are both proven against the loaded master).
+	auto MidScalar = [this](const TCHAR* Name, float& Out) -> bool
+	{
+		if (!BeamMID) { Out = 0.f; return false; }
+		FMaterialParameterInfo Info(Name);
+		return BeamMID->GetScalarParameterValue(Info, Out);
+	};
+
+	float MaskEnabled = 0.f, MaskBias = 0.f, MaskFade = 0.f, MaskFar = 0.f, MaskDebug = 0.f, MaskTan = 0.f;
+	const bool bHasMaskEnabled = MidScalar(TEXT("BeamShadowMaskEnabled"), MaskEnabled);
+	const bool bHasMaskBias    = MidScalar(TEXT("BeamShadowMaskBiasCm"), MaskBias);
+	const bool bHasMaskFade    = MidScalar(TEXT("BeamShadowMaskFadeCm"), MaskFade);
+	const bool bHasMaskFar     = MidScalar(TEXT("BeamShadowMaskFarCm"), MaskFar);
+	const bool bHasMaskDebug   = MidScalar(TEXT("BeamShadowMaskDebug"), MaskDebug);
+	const bool bHasMaskTan     = MidScalar(TEXT("BeamShadowMaskTanHalfFov"), MaskTan);
+
+	float RadialSharp = 0.f, RadialDensity = 0.f, RadialFalloff = 0.f;
+	const bool bHasSharp   = MidScalar(TEXT("BeamSharpness"), RadialSharp);
+	const bool bHasDensity = MidScalar(TEXT("BeamDensity"), RadialDensity);
+	const bool bHasFalloff = MidScalar(TEXT("BeamFalloff"), RadialFalloff);
+	const bool bMasterShape = bHasMaskEnabled && bHasMaskBias && bHasMaskFade &&
+		bHasMaskFar && bHasMaskDebug && bHasMaskTan && bHasSharp && bHasDensity && bHasFalloff;
+
+	// World-transform coincidence check. SpotLight + BeamCone + SceneCapture MUST all
+	// sit at the same world origin (the SceneCapture is parented to the SpotLight
+	// identity; the BeamCone is co-located in DriveBeamConeFromSpotLight). A divergence
+	// here means the per-tick alignment (DriveBeamConeFromSpotLight + the SceneCapture's
+	// component-hierarchy auto-tracking) hasn't fired -- the v1.0.111 light-space
+	// projection would then misalign the depth-mask samples vs the actual shaft.
+	const FVector SpotLoc = SpotLight ? SpotLight->GetComponentLocation() : FVector::ZeroVector;
+	const FVector ConeLoc = BeamCone ? BeamCone->GetComponentLocation() : FVector::ZeroVector;
+	const FVector CapLoc  = BeamShadowMaskCapture ? BeamShadowMaskCapture->GetComponentLocation() : FVector::ZeroVector;
+	const float ConeOffsetCm = SpotLight ? (float)FVector::Distance(SpotLoc, ConeLoc) : -1.f;
+	const float CapOffsetCm  = SpotLight ? (float)FVector::Distance(SpotLoc, CapLoc)  : -1.f;
+
+	// Geometric-coverage check: visible cone-mesh half-angle (`MatchHalf * ConeScale`)
+	// vs the SceneCapture's half-FOV. If cone > capture, outer-rim samples lie outside
+	// the capture frustum (HLSL is permissive -> no clip, just no occlusion data for
+	// those samples). Surfaces the v1.0.113 "operator pushed BeamConeRadiusScale > 1"
+	// diagnosis cleanly.
+	const float MatchHalfDeg = ResolveBeamFootprintMatchHalfDeg();
+	const float OuterHalfDeg = ResolveOuterHalfDeg();
+	const float ConeScale    = FMath::Max(0.05f, BeamConeRadiusScale);
+	const float VisConeHalfDeg = MatchHalfDeg * ConeScale;
+	const float CaptureHalfFovDeg = BeamShadowMaskCapture
+		? (BeamShadowMaskCapture->FOVAngle * 0.5f)
+		: -1.f;
+	const bool bConeFitsCapture = (CaptureHalfFovDeg < 0.f) || (VisConeHalfDeg <= CaptureHalfFovDeg + 0.01f);
+
+	const float CaptureMaxView = BeamShadowMaskCapture ? BeamShadowMaskCapture->MaxViewDistanceOverride : -1.f;
+	const float AttenuationRadius = SpotLight ? SpotLight->AttenuationRadius : -1.f;
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("DumpBeamCulling Fixture %s [%s]: %s %s | "
+			 "bUsingEpicBeam=%d bPreferProcedural=%d bMeshBeamEnabled=%d | "
+			 "BeamMID.MaskEnabled=%s BeamMID.MaskBiasCm=%s BeamMID.MaskFadeCm=%s "
+			 "BeamMID.MaskFarCm=%s BeamMID.MaskDebug=%s BeamMID.MaskTanHalfFov=%s | "
+			 "BeamMID.Sharpness=%s BeamMID.Density=%s BeamMID.Falloff=%s (masterShape=%s) | "
+			 "Capture={fov=%.1fdeg halfFov=%.1fdeg maxView=%.0fcm hiddenComponents=%d} | "
+			 "Geometry={outerHalf=%.2fdeg matchHalf=%.2fdeg coneScale=%.3f visConeHalf=%.2fdeg attenuationRadius=%.0fcm coneFitsCapture=%d} | "
+			 "Coincidence={spotLoc=(%.0f,%.0f,%.0f) coneOffsetCm=%.2f capOffsetCm=%.2f}"),
+		*FixtureId, *DisplayName,
+		*BeamConeFlags, *EpicBeamFlags,
+		bUsingEpicBeam ? 1 : 0, bPreferProceduralBeam ? 1 : 0, bMeshBeamEnabled ? 1 : 0,
+		bHasMaskEnabled ? *FString::Printf(TEXT("%.2f"), MaskEnabled) : TEXT("MISSING"),
+		bHasMaskBias    ? *FString::Printf(TEXT("%.2f"), MaskBias)    : TEXT("MISSING"),
+		bHasMaskFade    ? *FString::Printf(TEXT("%.2f"), MaskFade)    : TEXT("MISSING"),
+		bHasMaskFar     ? *FString::Printf(TEXT("%.0f"), MaskFar)     : TEXT("MISSING"),
+		bHasMaskDebug   ? *FString::Printf(TEXT("%.0f"), MaskDebug)   : TEXT("MISSING"),
+		bHasMaskTan     ? *FString::Printf(TEXT("%.4f"), MaskTan)     : TEXT("MISSING"),
+		bHasSharp       ? *FString::Printf(TEXT("%.3f"), RadialSharp)   : TEXT("MISSING"),
+		bHasDensity     ? *FString::Printf(TEXT("%.4f"), RadialDensity) : TEXT("MISSING"),
+		bHasFalloff     ? *FString::Printf(TEXT("%.3f"), RadialFalloff) : TEXT("MISSING"),
+		bMasterShape ? TEXT("OK") : TEXT("STALE_MASTER -- run `Rebus.RebuildBeamMaterial` + ClearScene/LoadScene"),
+		BeamShadowMaskCapture ? BeamShadowMaskCapture->FOVAngle : -1.f,
+		CaptureHalfFovDeg,
+		CaptureMaxView,
+		BeamShadowMaskCapture ? BeamShadowMaskCapture->HiddenComponents.Num() : -1,
+		OuterHalfDeg, MatchHalfDeg, ConeScale, VisConeHalfDeg, AttenuationRadius,
+		bConeFitsCapture ? 1 : 0,
+		SpotLoc.X, SpotLoc.Y, SpotLoc.Z, ConeOffsetCm, CapOffsetCm);
 }
 
 void ARebusFixtureActor::RefreshBeamEmissive()
@@ -3520,11 +3702,30 @@ bool ARebusFixtureActor::TryBuildEpicBeam()
 	UpdateEpicBeamParams();
 	DriveEpicBeamFromSpotLight();
 
+	// v1.0.113 -- if `BuildBeamShadowMaskCapture` ran BEFORE this point (the common
+	// case for fresh-spawn fixtures: BuildBeamCone -> BuildBeamShadowMaskCapture ->
+	// TryBuildEpicBeam in sequence), `EpicBeamComp` would not have existed when the
+	// capture's `HiddenComponents` was seeded, so the SceneCapture would render Epic's
+	// canvas as a depth-1cm blocker at the lens plane and shadow EVERY shaft sample
+	// against itself -- the user's "beam is being clipped" symptom would manifest the
+	// instant an operator flipped `Rebus.PreferProceduralBeam 0` to switch to Epic's
+	// beam. Add the now-built `EpicBeamComp` to `HiddenComponents` here so the
+	// SceneCapture skips it on the next capture frame regardless of when the
+	// procedural-vs-Epic flip happened relative to mask-capture construction. Same
+	// shape as the v1.0.111 BuildBeamShadowMaskCapture per-fixture hide loop. Safe
+	// when BeamShadowMaskCapture is null (the v1.0.110-or-earlier hot-reload path)
+	// because the inner null-check skips silently.
+	if (BeamShadowMaskCapture && EpicBeamComp)
+	{
+		BeamShadowMaskCapture->HiddenComponents.AddUnique(EpicBeamComp);
+	}
+
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s beam: using Epic M_LightBeam (MI_Beam + SM_Beam_RM) attached=%s localEmission=(%.0f,%.0f,%.0f) scale=1 (WPO cone) src=%s."),
+		TEXT("Fixture %s beam: using Epic M_LightBeam (MI_Beam + SM_Beam_RM) attached=%s localEmission=(%.0f,%.0f,%.0f) scale=1 (WPO cone) src=%s shadowMaskHidden=%d."),
 		*FixtureId, SpotLight ? TEXT("SpotLight") : TEXT("FixtureRoot"),
 		RebusEpicBeamLocalEmission.X, RebusEpicBeamLocalEmission.Y, RebusEpicBeamLocalEmission.Z,
-		EpicBeamMaterial ? TEXT("CDO") : TEXT("LoadObject"));
+		EpicBeamMaterial ? TEXT("CDO") : TEXT("LoadObject"),
+		(BeamShadowMaskCapture && EpicBeamComp) ? 1 : 0);
 	return true;
 }
 

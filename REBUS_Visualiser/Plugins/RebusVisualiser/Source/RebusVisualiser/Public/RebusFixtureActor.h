@@ -573,6 +573,36 @@ public:
 	// `Rebus.DumpBeamShadowMask`.
 	void DumpBeamShadowMaskStateForDebug() const;
 
+	// v1.0.113 -- dump every component / material flag that can hide, clip, fade, mask,
+	// cull, or fragment-discard the visible beam shaft. The brief's "what's causing my
+	// beam to clip?" diagnostic: rather than reading the cpp code on the next regression,
+	// the operator (or a future bug-report) pastes ONE log line that includes:
+	//   * `BeamCone` visibility flags (bVisible, bHiddenInGame, bVisibleInRayTracing,
+	//     bVisibleInSceneCaptureOnly, bHiddenInSceneCapture, bUseAsOccluder,
+	//     bUseAttachParentBound, bRenderInMainPass, bRenderInDepthPass, BoundsScale,
+	//     MinDrawDistance, LDMaxDrawDistance, CachedMaxDrawDistance),
+	//   * Same shape for `EpicBeamComp` when it exists,
+	//   * Live `bUsingEpicBeam` flag + `bPreferProceduralBeam` per-fixture seed +
+	//     `bMeshBeamEnabled` (the bMeshBeams scene-property mirror),
+	//   * Live `BeamMID` parameter readback for the v1.0.111 light-space mask scalars
+	//     AND the v1.0.108 radial-attenuation scalars (`BeamSharpness / BeamDensity /
+	//     BeamFalloff`) so the operator can see whether their `Rebus.Beam*` push landed
+	//     against the MID (vs the master defaults),
+	//   * `BeamShadowMaskCapture` FOVAngle + AttenuationRadius (light-throw) +
+	//     `HiddenComponents.Num()` (the v1.0.111 + v1.0.113 self-shadow defence list),
+	//   * Coincidence check: SpotLight world transform + BeamCone world transform +
+	//     SceneCapture world transform (these MUST be co-located -- a divergence
+	//     means the v1.0.111 SceneCapture isn't riding the head),
+	//   * Geometric coverage check: visible cone far-radius half-angle
+	//     (`MatchHalfDeg * BeamConeRadiusScale`) vs SceneCapture half-FOV. When the
+	//     former exceeds the latter, outer-rim cone samples fall outside the
+	//     capture frustum -- not a CLIP (the v1.0.111 HLSL is permissive) but
+	//     diagnoses that operator-tuned `Rebus.BeamConeRadiusScale > 1` is in play.
+	// Mirrors `Rebus.DumpBeamShadowMask`'s shape -- one paste-friendly line per
+	// fixture. Called by the v1.0.113 `Rebus.DumpBeamCulling [fixtureId]` console
+	// command (registered in RebusVisualiser.cpp).
+	void DumpBeamCullingStateForDebug() const;
+
 	// v1.0.101: assign the per-fixture cone-mesh radius scale + re-push the cone geometry
 	// + Epic-beam DMX Zoom param so a live `Rebus.BeamConeRadiusScale` change picks up
 	// without a respawn. Forces the rebuild gate in `UpdateBeamConeGeometry` (the gate

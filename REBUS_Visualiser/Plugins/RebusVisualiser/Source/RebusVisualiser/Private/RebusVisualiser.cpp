@@ -54,6 +54,7 @@ namespace
 	IConsoleCommand* GDumpFixtureZoomCommand = nullptr;
 	// v1.0.111 -- per-fixture light-space depth-mask beam-occlusion state dump.
 	IConsoleCommand* GDumpBeamShadowMaskCommand = nullptr;
+	IConsoleCommand* GDumpBeamCullingCommand = nullptr; // v1.0.113 -- per-fixture culling diagnostic
 	// v1.0.112 -- on-disk M_RebusBeam master version probe (pre-v1.0.96 | v1.0.96..v1.0.109
 	// HAS OBSOLETE | v1.0.110 | v1.0.111+). Used to verify the v1.0.112 auto-purge
 	// landed and to diagnose any future "stale master" report from operators.
@@ -489,6 +490,21 @@ namespace
 			return FString::Join(Names, TEXT(","));
 		};
 
+		// v1.0.113 -- compute the loaded-plugin VersionName + on-disk
+		// `M_RebusBeam.uasset` md5 ONCE outside the per-world loop (both are
+		// process-global state; per-world iteration would just repeat the same
+		// data). The md5 is the ground-truth invariant for "is the operator's
+		// cooked master what we expect"; the plugin VersionName surfaces the
+		// "operator pulled v1.0.113 but didn't rebuild C++" failure mode in one
+		// line (if `pluginVersion < 1.0.113` the v1.0.112 auto-purge regen +
+		// re-fire-on-PostLoadMapWithWorld code DOES NOT EXIST in the loaded
+		// UnrealEditor-REBUS_Visualiser.dll, regardless of what's on disk).
+		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("RebusVisualiser"));
+		const FString PluginVer = Plugin.IsValid()
+			? Plugin->GetDescriptor().VersionName
+			: FString(TEXT("?.?.?"));
+		const FString BeamMd5 = URebusVisualiserSubsystem::ComputeBeamMasterUassetMd5();
+
 		int32 Worlds = 0;
 		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
 		{
@@ -509,20 +525,82 @@ namespace
 			const TCHAR* Label = URebusVisualiserSubsystem::BeamMasterVersionLabel(Report.Version);
 
 			UE_LOG(LogRebusVisualiser, Log,
-				TEXT("Rebus.DumpBeamMasterVersion world='%s': Master Version: %s. Obsolete v1.0.96..v1.0.109 scalars present: [%s]. Missing v1.0.111 scalars: [%s]. Missing v1.0.111 vectors: [%s]. Missing v1.0.111 textures: [%s]."),
-				*World->GetName(), Label,
+				TEXT("Rebus.DumpBeamMasterVersion world='%s' pluginVersion=v%s beamMasterUassetMd5=%s: Master Version: %s. Obsolete v1.0.96..v1.0.109 scalars present: [%s]. Missing v1.0.111 scalars: [%s]. Missing v1.0.111 vectors: [%s]. Missing v1.0.111 textures: [%s]."),
+				*World->GetName(), *PluginVer, *BeamMd5, Label,
 				*JoinNames(Report.DetectedObsoleteParams),
 				*JoinNames(Report.MissingV111Scalars),
 				*JoinNames(Report.MissingV111Vectors),
 				*JoinNames(Report.MissingV111Textures));
 		}
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("Rebus.DumpBeamMasterVersion: probed %d world(s). Expect `v1.0.111+` after a "
-				 "fresh editor launch on a v1.0.112+ workspace; anything else means the v1.0.112 "
+			TEXT("Rebus.DumpBeamMasterVersion: probed %d world(s) pluginVersion=v%s beamMasterUassetMd5=%s. Expect `v1.0.111+` after a "
+				 "fresh editor launch on a v1.0.112+ workspace AND `pluginVersion=v1.0.113+`; anything else means the v1.0.112 "
 				 "auto-purge didn't fire (look one log line up for `[Rebus] STALE BEAM MASTER "
 				 "detected`) OR the operator is on a packaged build with a stale cooked master "
-				 "(re-cook in editor on v1.0.112+)."),
-			Worlds);
+				 "(re-cook in editor on v1.0.112+) OR (v1.0.113) the operator pulled the source but did not "
+				 "rebuild the C++ binaries -- v1.0.113 added the on-disk md5 here so the operator can "
+				 "diff it against the known-good cooked master."),
+			Worlds, *PluginVer, *BeamMd5);
+	}
+
+	// v1.0.113 -- `Rebus.DumpBeamCulling [fixtureId]` per-fixture culling diagnostic.
+	// Mirrors `Rebus.DumpBeamShadowMask`'s shape and routes through the
+	// ARebusFixtureActor::DumpBeamCullingStateForDebug per-fixture dump. See the
+	// header doc-comment on DumpBeamCullingStateForDebug for the per-line field
+	// inventory.
+	void HandleDumpBeamCullingCommand(const TArray<FString>& Args)
+	{
+		if (!GEngine) return;
+
+		const FString Filter = Args.Num() > 0 ? Args[0] : FString();
+
+		// One-line header so the operator can see the global CVars + plugin
+		// version on the same paste as the per-fixture dump (any per-fixture
+		// scalar diff is then interpretable against the live operator-tweaked
+		// defaults). Same shape as `Rebus.DumpBeamShadowMask`'s CVar header.
+		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("RebusVisualiser"));
+		const FString PluginVer = Plugin.IsValid()
+			? Plugin->GetDescriptor().VersionName
+			: FString(TEXT("?.?.?"));
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("DumpBeamCulling CVars: pluginVersion=v%s. Filter='%s' (empty => every fixture)."),
+			*PluginVer, *Filter);
+
+		int32 Matched = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					if (!Filter.IsEmpty() && !F->GetFixtureId().Equals(Filter, ESearchCase::IgnoreCase))
+					{
+						continue;
+					}
+					F->DumpBeamCullingStateForDebug();
+					++Matched;
+				}
+			}
+		}
+
+		if (Filter.IsEmpty())
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.DumpBeamCulling: dumped %d fixture(s) (no filter)."), Matched);
+		}
+		else if (Matched == 0)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.DumpBeamCulling '%s': NOT FOUND (scanned every Game/PIE/Editor world; check the Speckle node id -- same key SetFixture* uses)."),
+				*Filter);
+		}
+		else
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("Rebus.DumpBeamCulling '%s': dumped %d matching fixture(s)."), *Filter, Matched);
+		}
 	}
 
 	// v1.0.79 helpers: pluck the live cinematic camera pawn from any game/PIE world. There's
@@ -1985,6 +2063,35 @@ void FRebusVisualiserModule::StartupModule()
 	// verdict. Mirrors `Rebus.DumpOrbitNanite`'s shape -- per-world line + a final
 	// aggregate. See URebusVisualiserSubsystem::EBeamMasterVersion in
 	// RebusVisualiserSubsystem.h for the full version enum + classification rules.
+	// v1.0.113 -- per-fixture beam-culling diagnostic. The "what's causing my beam
+	// to clip?" answer the v1.0.99..v1.0.112 brief loop did not have. Surfaces
+	// every component / material / scalar / transform that can hide / clip / fade
+	// / cull the visible shaft, in one paste-friendly log line per fixture.
+	// Mirrors `Rebus.DumpBeamShadowMask`'s shape (optional fixtureId filter, empty
+	// = every fixture). See `ARebusFixtureActor::DumpBeamCullingStateForDebug`'s
+	// header doc-comment for the per-field inventory.
+	GDumpBeamCullingCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.DumpBeamCulling"),
+		TEXT("v1.0.113 -- dump per-fixture beam-culling state in one line so the operator can "
+			 "diagnose 'why is my beam being clipped' without rerunning the v1.0.113 audit. "
+			 "Includes BeamCone + EpicBeamComp visibility / culling / bounds-scale / draw-"
+			 "distance flags (every flag that can hide the shaft); bUsingEpicBeam + "
+			 "bPreferProceduralBeam + bMeshBeamEnabled (which beam path is live); BeamMID "
+			 "live readback of the v1.0.111 light-space mask scalars + the v1.0.108 radial-"
+			 "attenuation scalars (EXISTS/MISSING surfaces a stale pre-v1.0.111 master, same "
+			 "as Rebus.DumpBeamShadowMask); SceneCapture FOV + MaxViewDistance + "
+			 "HiddenComponents count; geometric coverage check (visible-cone half-angle vs "
+			 "SceneCapture half-FOV -- when the cone is geometrically wider than the capture "
+			 "the outer-rim samples lie outside the depth-mask, which the HLSL handles "
+			 "permissively but the operator should be AWARE of); world-transform "
+			 "coincidence check (SpotLight + BeamCone + SceneCapture distances; >1 cm is a "
+			 "v1.0.111 head-tracking bug). With no arg dumps every fixture; with a fixtureId "
+			 "(Speckle node id, same key SetFixture* uses) dumps just that one. Pair with "
+			 "Rebus.DumpBeamShadowMask + Rebus.DumpFixtureZoom for the full diagnostic "
+			 "trifecta. Usage: Rebus.DumpBeamCulling [fixtureId]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpBeamCullingCommand),
+		ECVF_Default);
+
 	GDumpBeamMasterVersionCommand = IConsoleManager::Get().RegisterConsoleCommand(
 		TEXT("Rebus.DumpBeamMasterVersion"),
 		TEXT("v1.0.112 -- probe the on-disk `/Game/REBUS/Materials/M_RebusBeam.uasset` and "
@@ -2138,6 +2245,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GDumpBeamShadowMaskCommand);
 		GDumpBeamShadowMaskCommand = nullptr;
+	}
+	if (GDumpBeamCullingCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GDumpBeamCullingCommand);
+		GDumpBeamCullingCommand = nullptr;
 	}
 	if (GDumpBeamMasterVersionCommand)
 	{

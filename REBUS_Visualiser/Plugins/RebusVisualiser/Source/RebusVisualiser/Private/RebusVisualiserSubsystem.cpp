@@ -25,6 +25,16 @@
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/EngineVersion.h"
 #include "Misc/App.h"
+// v1.0.113 -- on-disk M_RebusBeam.uasset md5 hash for the operator-facing "is your
+// cooked master what we expect" diagnostic. FFileHelper loads the raw bytes,
+// FMD5 computes the digest, FPackageName resolves /Game/... long names to the
+// filesystem path, FCoreUObjectDelegates::PostLoadMapWithWorld re-fires the
+// auto-purge on every level load (the v1.0.113 hardening for the v1.0.112 one-
+// shot guard staying latched across PIE-stop / level-switch cycles).
+#include "Misc/FileHelper.h"
+#include "Misc/SecureHash.h"
+#include "Misc/PackageName.h"
+#include "UObject/UObjectGlobals.h" // FCoreUObjectDelegates::PostLoadMapWithWorld
 #include "Engine/PostProcessVolume.h"
 #include "Engine/ExponentialHeightFog.h"
 #include "Engine/StaticMeshActor.h"
@@ -131,6 +141,51 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	// the editor-only Python regen path, and the packaged-build Warning fallback.
 	ProbeAndAutoPurgeStaleBeamMaster();
 
+	// v1.0.113 -- the v1.0.112 auto-purge is gated on a per-subsystem-instance
+	// one-shot bool `bBeamMasterAutoPurgeRun`. `UGameInstanceSubsystem` instances
+	// LIVE ACROSS LEVEL RELOADS inside one editor session (the game instance
+	// outlives any individual UWorld), so the guard stayed latched true through a
+	// `ClearScene + LoadScene` cycle, through a Play-In-Editor stop-and-restart, and
+	// through any operator-initiated level reload. An operator who pulled a fresh
+	// `M_RebusBeam.uasset` onto a running editor would never see the auto-regen
+	// re-fire even though the on-disk state had changed underneath. Hook
+	// `FCoreUObjectDelegates::PostLoadMapWithWorld` to reset the one-shot AND
+	// re-fire the probe on every level load -- the v1.0.113 hardening so the
+	// v1.0.112 chokepoint stays accurate for the actual lifetime of an editor
+	// session. Mirrors the v1.0.107 `VersionWatermarkDrawHandle` shape (registered
+	// here, unregistered in Deinitialize, never leaked).
+	PostLoadMapAutoPurgeHandle = FCoreUObjectDelegates::PostLoadMapWithWorld.AddUObject(
+		this, &URebusVisualiserSubsystem::OnPostLoadMapAutoPurge);
+
+	// v1.0.113 -- one-line operator-facing startup banner stitching the loaded
+	// PLUGIN VersionName, the EBeamMasterVersion verdict on the live
+	// `/Game/REBUS/Materials/M_RebusBeam.uasset`, AND the on-disk md5 hash of that
+	// uasset (the ground-truth invariant -- if the operator pulls a fresh build but
+	// doesn't rebuild C++ binaries OR doesn't restart the editor, the md5 surfaces
+	// the mismatch immediately). Replaces the long string of guess-the-failure
+	// theorising the v1.0.99..v1.0.112 brief loop went through; the operator can
+	// now paste THIS one line and we can tell whether they're on a v1.0.113 binary,
+	// against a v1.0.111+ master, with the cooked hash we expect. Mirrors the
+	// v1.0.107 watermark banner shape.
+	{
+		const TSharedPtr<IPlugin> PluginForBanner = IPluginManager::Get().FindPlugin(TEXT("RebusVisualiser"));
+		const FString PluginVer = PluginForBanner.IsValid()
+			? PluginForBanner->GetDescriptor().VersionName
+			: FString(TEXT("?.?.?"));
+		const FBeamMasterVersionReport BannerReport = ProbeBeamMasterVersion();
+		const TCHAR* BannerLabel = BeamMasterVersionLabel(BannerReport.Version);
+		const FString BeamMd5 = ComputeBeamMasterUassetMd5();
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("[Rebus] STARTUP BANNER: pluginVersion=v%s beamMasterVerdict=%s beamMasterUassetMd5=%s "
+				 "expect=v1.0.111+ pluginExpect=>=v1.0.113. If pluginVersion < v1.0.113 the operator "
+				 "DID NOT REBUILD C++ binaries after the latest git pull -- the v1.0.112+ auto-purge "
+				 "doesn't exist in the loaded UnrealEditor-REBUS_Visualiser.dll. If beamMasterVerdict "
+				 "!= v1.0.111+ the on-disk M_RebusBeam.uasset is stale (auto-purge should fire one log "
+				 "line above). Pair with `Rebus.DumpBeamMasterVersion`, `Rebus.DumpBeamShadowMask`, "
+				 "and the v1.0.113 `Rebus.DumpBeamCulling` for per-fixture verification."),
+			*PluginVer, BannerLabel, *BeamMd5);
+	}
+
 	// v1.0.107 -- compose the watermark display string ONCE from the plugin
 	// descriptor's VersionName (the engine-blessed source-of-truth that always
 	// reflects the running binary). Caching here makes the per-frame draw zero-
@@ -187,9 +242,36 @@ void URebusVisualiserSubsystem::Deinitialize()
 		UDebugDrawService::Unregister(VersionWatermarkDrawHandle);
 		VersionWatermarkDrawHandle.Reset();
 	}
+	// v1.0.113 -- always unregister the PostLoadMapWithWorld delegate the
+	// v1.0.113 auto-purge re-fire hook installed at `Initialize`. A dangling
+	// delegate captured against `this` would crash on the next map load after
+	// a hot-reload of the subsystem (the captured `this` having been
+	// destructed). Mirrors the v1.0.107 watermark unregister above.
+	if (PostLoadMapAutoPurgeHandle.IsValid())
+	{
+		FCoreUObjectDelegates::PostLoadMapWithWorld.Remove(PostLoadMapAutoPurgeHandle);
+		PostLoadMapAutoPurgeHandle.Reset();
+	}
 	Channel.Reset();
 	Rest.Reset();
 	Super::Deinitialize();
+}
+
+void URebusVisualiserSubsystem::OnPostLoadMapAutoPurge(UWorld* /*LoadedWorld*/)
+{
+	// v1.0.113 -- re-fire the v1.0.112 stale-master probe after every level load.
+	// The v1.0.112 `bBeamMasterAutoPurgeRun` one-shot bool was per-subsystem-
+	// instance, but `UGameInstanceSubsystem` lives across level reloads inside one
+	// editor session -- so the operator workflow `ClearScene + LoadScene` (or
+	// Play-In-Editor stop + restart, or any operator-initiated level reload) would
+	// NOT re-fire the auto-purge even after the operator manually flipped the on-
+	// disk master to a known-stale state. Reset the bool and re-call the probe so
+	// the v1.0.112 chokepoint stays accurate for the actual lifetime of an editor
+	// session. The probe itself is idempotent / cheap when the master is current
+	// (an `EBeamMasterVersion::V111Plus` verdict skips the `py` regen and just logs
+	// a one-liner), so re-firing on every map load is safe.
+	bBeamMasterAutoPurgeRun = false;
+	ProbeAndAutoPurgeStaleBeamMaster();
 }
 
 // v1.0.107 -- single chokepoint for the version-watermark visibility toggle.
@@ -2672,6 +2754,51 @@ URebusVisualiserSubsystem::FBeamMasterVersionReport URebusVisualiserSubsystem::P
 		Report.Version = EBeamMasterVersion::V111Plus;
 	}
 	return Report;
+}
+
+FString URebusVisualiserSubsystem::ComputeBeamMasterUassetMd5()
+{
+	// v1.0.113 -- the ground-truth invariant for "is the operator's cooked master
+	// the one we expect": MD5 of the bytes on disk. We've spent v1.0.99/v1.0.103/
+	// v1.0.110/v1.0.111/v1.0.112 chasing "the wrong shader is compiled in" -- the
+	// hash exposes that condition the operator can't otherwise see (the loaded
+	// UMaterial in memory is a deserialised representation; the on-disk .uasset
+	// is the cook artefact the engine actually reads at boot). One log-line in,
+	// one md5 out -- the operator pastes it in a bug report and we can tell at a
+	// glance whether their workspace is the v1.0.113 cooked output.
+	//
+	// Resolve the engine's `/Game/REBUS/Materials/M_RebusBeam` long-package name
+	// to a filesystem path via FPackageName::TryConvertLongPackageNameToFilename
+	// (the same accessor `LoadObject` uses internally). FPackageName::GetAssetPackageExtension()
+	// = ".uasset" for non-cooked / standard cooked content; the runtime + editor
+	// both produce that extension.
+	const FString LongPackageName = TEXT("/Game/REBUS/Materials/M_RebusBeam");
+	FString FilesystemPath;
+	if (!FPackageName::TryConvertLongPackageNameToFilename(
+			LongPackageName, FilesystemPath, FPackageName::GetAssetPackageExtension()))
+	{
+		return FString(TEXT("<filesystem-path-unresolvable>"));
+	}
+
+	// `FFileHelper::LoadFileToArray` is the canonical "byte-for-byte read this
+	// file" helper -- doesn't transform line endings (text-mode load would),
+	// streams into a TArray<uint8>. Bail with a self-describing sentinel string
+	// on any failure (file not on disk, IO error, permission denied) so the
+	// operator gets a SOMETHING-IS-WRONG signal in the banner without crashing.
+	TArray<uint8> RawBytes;
+	if (!FFileHelper::LoadFileToArray(RawBytes, *FilesystemPath))
+	{
+		return FString::Printf(TEXT("<load-failed:%s>"), *FilesystemPath);
+	}
+
+	// FMD5::HashBytes signature in UE 5.7: `static FString HashBytes(const uint8*
+	// Input, int64 InputSize)`. Returns 32-char lowercase hex (e.g.
+	// "d41d8cd98f00b204e9800998ecf8427e" for empty input). MD5 is FINE for asset
+	// staleness diagnostics -- it's not a cryptographic claim, just a stable
+	// fingerprint of the cooked bytes; the existing engine uses FMD5 for the
+	// same purpose in `UStaticMesh::ComputeRenderDataHash` etc.
+	const FString Md5 = FMD5::HashBytes(RawBytes.GetData(), (int64)RawBytes.Num());
+	return Md5;
 }
 
 void URebusVisualiserSubsystem::RefreshAllSpawnedFixtureBeamMIDs()

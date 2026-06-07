@@ -594,6 +594,199 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **Audit every beam clipping/culling path; fix outside-frustum mask sample sizing + SceneCapture FOV coverage + lazy-Epic-beam self-shadow + per-level-load auto-purge re-fire + per-fixture culling diagnostic + on-disk master md5 banner (v1.0.113).**
+>
+> User report (verbatim):
+>
+> > "The beams are sitll being clipped from old code. Might be camera viewing angle culling it. Please review any code the cuts the beam that isnt the new method in v.1.0.11"
+>
+> Filed against post-v1.0.112 binaries. v1.0.110 ripped the screen-space self-
+> shadow trace. v1.0.111 redesigned the shadow path on a light-space depth-
+> mask architecture. v1.0.112 auto-purged the stale pre-v1.0.110 cooked
+> `M_RebusBeam.uasset` so the new HLSL would actually be the running shader.
+> Even after all three the user reports the SAME pan-edge clipping shape,
+> now with an explicit camera-angle correlation: "might be camera viewing
+> angle culling it."
+>
+> **The v1.0.113 audit -- every code path that can hide / clip / fade / mask
+> / cull / fragment-discard the visible shaft.** The brief asked for "no
+> stones unturned" and called out the failure mode by name: the user's
+> camera-angle clue meant the bug is either (a) the v1.0.112 auto-purge not
+> taking effect on the user's deployment, OR (b) a SEPARATE clipping /
+> culling code path that's never been audited because every previous release
+> cycle's attention was on the (now-deleted) screen-space shadow trace. The
+> audit verdict, path by path:
+>
+> | Path | Status | Action |
+> | --- | --- | --- |
+> | `_BEAM_RAYMARCH_HLSL` outside-frustum branch (`shadowVis` for sample outside SceneCapture FOV) | REVIEWED -- clean | The else branch correctly leaves `shadowVis = 1.0` (permissive). See `build_rebus_base_level.py` lines 716-755. |
+> | `_BEAM_RAYMARCH_HLSL` `nf` near-fade term (`saturate(t / NEAR_FADE_CM)`) | REVIEWED -- clean | Depends on distance from CAMERA, but only fades when camera is INSIDE the cone (`tEntry = 0`). Not camera-angle-dependent in a clipping shape. |
+> | `_BEAM_RAYMARCH_HLSL` `softOcc` term (`saturate((tOcc - t) / DEPTH_FADE_CM)`) | REVIEWED -- clean | DMX-style fade where shaft meets opaque geometry. Camera-angle-dependent in a "shaft dissolves at the floor" shape, NOT a wholesale-clip shape. Intended behaviour, no fix. |
+> | `_BEAM_RAYMARCH_HLSL` cosine-dot fade `dot(CameraVector, BeamDir)` | REVIEWED -- not present | No such term exists in the post-v1.0.111 HLSL. |
+> | `_BEAM_RAYMARCH_HLSL` world-Z height clamp | REVIEWED -- not present | No floor / ceiling clip. |
+> | `_BEAM_RAYMARCH_HLSL` `TranslatedWorldToClip` / `LWCHackToFloat` survivor | REVIEWED -- not present | The only `abs(ndc.xy) < 1.0` is the LIGHT-space frustum probe (axes `lFwd / lRight / lUp`), NOT a screen-space NDC survivor. |
+> | `_BEAM_RAYMARCH_HLSL` light-space depth-mask "infinite-depth" sentinel guard | REVIEWED -- clean | `blockerDepthCm > 1.0 && blockerDepthCm < maskFar * 1.01` correctly treats freshly-cleared RT pixels AND "missed all" rays as unoccluded. |
+> | Material blend mode / two-sided / OpacityMask | REVIEWED -- clean | `M_RebusBeam` is Translucent additive, two-sided, no OpacityMask discard. The two-sided render lets the back-face fragment carry the shaft per the v1.0.39 entry/exit math; no fix. |
+> | `BeamCone` `bUseAttachParentBound` | REVIEWED -- clean | Set to `false` so the cone uses its OWN section bounds (the small attach-parent bound would frustum-cull aggressively). |
+> | `BeamCone` `bUseAsOccluder` | REVIEWED -- clean | Set to `false` (a translucent additive shaft should never occlude opaque geometry). |
+> | `BeamCone` `CastShadow` / `bCastDynamicShadow` | REVIEWED -- clean | Both `false` (the shaft is unlit; it doesn't cast). |
+> | `BeamCone` `bHiddenInSceneCapture` / `bVisibleInSceneCaptureOnly` | REVIEWED -- clean | Neither toggled. The v1.0.111 `BuildBeamShadowMaskCapture` only adds the cone to the SceneCapture's `HiddenComponents` per-capture list -- that doesn't hide it from the main scene render. |
+> | `BeamCone` `MinDrawDistance` / `LDMaxDrawDistance` / `SetCullDistance` | REVIEWED -- clean | None of these are touched anywhere in the v1.0.x code. |
+> | `BeamCone->SetBoundsScale(1.5f)` | REVIEWED -- BUG (latent), FIXED | The 1.5x bounds inflation is tight for an elongated tens-of-metres translucent shaft. The auto-computed `CreateMeshSection` bounds are geometrically correct, but HZB occlusion at grazing-angle camera pans can cull a thin shaft whose screen projection falls mostly behind the floor. v1.0.113 raises the constexpr to 3.0x as belt-and-braces -- extent-only (translucency sort order is unaffected). |
+> | `BeamCone` `bRenderInMainPass` / `bRenderInDepthPass` | REVIEWED -- clean | UE defaults (true / true) untouched; correct for a translucent additive shaft. |
+> | `EpicBeamComp` lazy build (operator flips `Rebus.PreferProceduralBeam 0` after spawn) | REVIEWED -- BUG, FIXED | `BuildBeamShadowMaskCapture` ran at `BuildBeamCone` time when `EpicBeamComp` was null; on a later lazy `TryBuildEpicBeam` the new canvas was NOT added to `HiddenComponents`, so the SceneCapture would shadow Epic's beam against itself (a lens-plane depth-1cm blocker hiding every shaft sample). v1.0.113 adds the lazy `EpicBeamComp` to `HiddenComponents` at the end of `TryBuildEpicBeam`. The user's complaint shape doesn't manifest on the default-procedural path, but the fix preempts the next regression. |
+> | SceneCapture FOV sizing (`2 * OuterHalfDeg + Margin`) | REVIEWED -- LATENT BUG, FIXED | For default tuning (`BeamConeRadiusScale = 1.0`, `InnerRatio = 0.8` -> `MatchHalf = 0.9 * OuterHalf`), the SpotLight outer cone is the binding constraint and the v1.0.112 formula is correct. For operator-tuned `BeamConeRadiusScale > 1.0` (the v1.0.101 hero-scene polish knob), the visible cone-mesh edge grows PAST the SpotLight outer cone and the SceneCapture frustum stops covering the outer-rim samples. The HLSL is permissive (outside-frustum samples leave `shadowVis = 1.0`, no clip), so this is NOT the user's complaint shape -- but the brief explicitly asked for `max(OuterHalfDeg, MatchHalfDeg * BeamConeRadiusScale) + FovMarginDeg` as belt-and-braces, applied. |
+> | `Rebus.BeamShadowMaskFovMargin` default 2.0 deg | REVIEWED -- LATENT BUG, FIXED | A 2-deg margin barely covers the cone-edge samples under bilinear filtering of the depth-mask RT. v1.0.113 raises the default to 5.0 deg as belt-and-braces (same fix shape as the bounds scale). |
+> | SceneCapture `MaxViewDistanceOverride = AttenuationRadius * 1.05` | REVIEWED -- clean | Correct: occluders within the SpotLight throw render in the capture; beyond-throw geometry doesn't matter for occlusion (the light doesn't reach there). |
+> | SceneCapture `Translucency` show flag | REVIEWED -- clean | Disabled. Translucent occluders don't render to the depth mask -- correct (translucent shafts shouldn't occlude). |
+> | SceneCapture parented to `SpotLight` (auto-track aim) | REVIEWED -- clean | `BuildBeamShadowMaskCapture` attaches with identity relative transform; the component hierarchy then auto-tracks pan / tilt / head motion. |
+> | v1.0.112 `ProbeAndAutoPurgeStaleBeamMaster` `WITH_EDITOR` / `IsModuleLoaded("PythonScriptPlugin")` defence | REVIEWED -- clean | Both paths log a Warning (not silent no-op). |
+> | v1.0.112 `bBeamMasterAutoPurgeRun` one-shot guard | REVIEWED -- BUG, FIXED | Per-subsystem-instance state. `UGameInstanceSubsystem` lives across level reloads inside one editor session, so an operator who reloaded the level WITHOUT restarting the editor would not see the auto-purge re-fire after they pulled a fresh on-disk master. v1.0.113 hooks `FCoreUObjectDelegates::PostLoadMapWithWorld` to reset the bool + re-fire the probe on every level load. |
+> | v1.0.112 `RefreshAllSpawnedFixtureBeamMIDs` walk timing | REVIEWED -- clean | Called from `ProbeAndAutoPurgeStaleBeamMaster` AFTER the `py` Exec returns. `SpawnedFixtures` is empty at `Initialize` time (subsystem init runs before any per-tick scene-fetch spawn), so the walk is normally a no-op; the regenerated master is picked up cleanly by `BuildBeamCone`'s `LoadObject` on the actual fixture spawns. |
+> | v1.0.112 `py` Exec error logging | REVIEWED -- clean | Already logs `OK` / `FAILED` based on the bool return, plus the next-step operator nudge. |
+> | Loaded plugin binary version vs source-tree version | REVIEWED -- BUG (silent until v1.0.113), FIXED | If the operator `git pull`ed v1.0.113 but didn't rebuild C++ binaries, `ProbeAndAutoPurgeStaleBeamMaster` doesn't exist in the loaded `UnrealEditor-REBUS_Visualiser.dll` -- the auto-purge silently doesn't run. v1.0.113 adds a `[Rebus] STARTUP BANNER` log line at subsystem `Initialize` that prints the loaded plugin VersionName + the on-disk `M_RebusBeam.uasset` md5 + the version verdict, so the operator can see the mismatch from one log line. |
+> | `EpicBeamComp` "false occlusion" via v1.0.111 self-hide (operator flipped `Rebus.PreferProceduralBeam 0`) | REVIEWED -- see EpicBeamComp lazy-build row above | Same fix. |
+> | `bMeshBeamEnabled` (the bMeshBeams scene-property mirror) | REVIEWED -- clean | When false the shaft is hidden by design via `SetVisibility(false)` on BeamCone -- that's the operator-toggle, not a code-path bug. Surfaced in `Rebus.DumpBeamCulling` so the operator can see the toggle state. |
+> | Anywhere else: workspace-wide `Cull` / `Clip` / `Frustum` / `Discard` / `SetHidden` / `bHidden` / `bVisible` / `SetVisibility` / `MarkRenderStateDirty` touching `BeamCone` / `EpicBeamComp` / `BeamMID` | REVIEWED -- clean | The only touches are inside `BuildBeamCone` / `TryBuildEpicBeam` / `BuildBeamShadowMaskCapture` / `RefreshPreferProceduralBeamFromCVar` / `SetMeshBeamEnabled` -- all expected, all documented. No drive-by visibility flip path exists. |
+>
+> **What v1.0.113 ships:**
+>
+> 1. **`RebusBeamBoundsScale` 1.5 -> 3.0** (`RebusFixtureActor.cpp` constexpr).
+>    Belt-and-braces against HZB occlusion-culling the elongated translucent
+>    shaft at grazing camera angles. Extent-only inflation (origin unchanged
+>    so translucency sort order is unaffected). The v1.0.38 release block
+>    documented the same headroom theory at 3x; v1.0.39's raymarch entry/exit
+>    rework was the actual fix for the "vanishes inside the cone" bug, so
+>    v1.0.40+ trimmed the scalar back to 1.5x as "we don't need that much
+>    headroom any more". v1.0.113 restores the 3x headroom as belt-and-
+>    braces specifically against the camera-angle culling shape the user
+>    reported.
+> 2. **`Rebus.BeamShadowMaskFovMargin` default 2.0 -> 5.0 deg**
+>    (`GRebusBeamShadowMaskFovMargin` initialiser). Same belt-and-braces
+>    shape: a 2-deg margin barely covers the cone-edge samples under
+>    bilinear filtering of the depth-mask RT; 5-deg ensures every visible-
+>    cone sample falls firmly inside the rendered area regardless of cone
+>    scale or zoom angle.
+> 3. **SceneCapture FOV coverage formula** in `RefreshBeamShadowMaskParams`:
+>    `NewFov = max(2 * OuterHalfDeg, 2 * MatchHalfDeg * BeamConeRadiusScale)
+>    + MarginDeg`. Default tuning (`ConeScale = 1.0`, `InnerRatio = 0.8`)
+>    -> max wins from `2 * OuterHalfDeg`, identical to v1.0.112. Hero-
+>    extended cones (`ConeScale > 1.0`) -> max wins from `2 * MatchHalfDeg
+>    * ConeScale`, FOV grows with the visible cone so the depth-mask
+>    always has data for outer-rim samples.
+> 4. **`EpicBeamComp` added to `BeamShadowMaskCapture->HiddenComponents`
+>    at the end of `TryBuildEpicBeam`** when the SceneCapture already
+>    exists. Closes the lazy-build window where flipping
+>    `Rebus.PreferProceduralBeam 0` after spawn could leave Epic's canvas
+>    self-shadowing in the depth-mask.
+> 5. **`FCoreUObjectDelegates::PostLoadMapWithWorld` hook** in
+>    `URebusVisualiserSubsystem::Initialize` resets `bBeamMasterAutoPurgeRun
+>    = false` and re-fires `ProbeAndAutoPurgeStaleBeamMaster` on every
+>    level load. Operators who pull a fresh on-disk master and reload the
+>    level (without restarting the editor) now see the auto-purge re-fire
+>    correctly. Unregistered cleanly in `Deinitialize` (mirrors the
+>    v1.0.107 `VersionWatermarkDrawHandle` shape).
+> 6. **`URebusVisualiserSubsystem::ComputeBeamMasterUassetMd5()` static
+>    helper** (`Misc/FileHelper.h` + `Misc/SecureHash.h` + `Misc/PackageName.h`).
+>    Resolves the long-package name to a filesystem path, byte-loads the
+>    .uasset, returns the lowercase-hex MD5 -- the ground-truth invariant
+>    for "is the operator's cooked master what we expect". Used by both
+>    the v1.0.113 startup banner AND the extended `Rebus.DumpBeamMaster
+>    Version` console command, so the two paths never disagree.
+> 7. **`[Rebus] STARTUP BANNER` log line at subsystem Initialize**
+>    stitches the loaded plugin VersionName, the EBeamMasterVersion verdict,
+>    and the on-disk md5 into ONE paste-friendly line. If the operator
+>    pastes this line, we can tell from it alone:
+>    * Are they on the v1.0.113 binary? (or did they `git pull` without
+>      rebuilding C++)
+>    * Is the on-disk master v1.0.111+?
+>    * What is the actual md5 of the bytes the engine cooked / loaded
+>      (the ground truth for "did the v1.0.112 auto-purge actually
+>      rewrite the .uasset")
+> 8. **`Rebus.DumpBeamCulling [fixtureId]` new console command** +
+>    `ARebusFixtureActor::DumpBeamCullingStateForDebug()` per-fixture dump.
+>    One paste-friendly line per fixture inventorying every flag / scalar /
+>    transform that can hide / clip / fade / cull the visible shaft:
+>    * BeamCone visibility + culling + bounds-scale + draw-distance flags
+>      (the row matrix the v1.0.113 audit walked through).
+>    * Same shape for `EpicBeamComp` (when alive).
+>    * `bUsingEpicBeam` + `bPreferProceduralBeam` + `bMeshBeamEnabled` --
+>      which beam path is currently live.
+>    * Live `BeamMID` readback of the v1.0.111 light-space mask scalars
+>      (Enabled / BiasCm / FadeCm / FarCm / Debug / TanHalfFov) AND the
+>      v1.0.108 radial-attenuation scalars (Sharpness / Density / Falloff)
+>      -- EXISTS / MISSING surfaces a stale master, same as
+>      `Rebus.DumpBeamShadowMask`.
+>    * SceneCapture FOV + MaxViewDistance + HiddenComponents count.
+>    * Geometric coverage check: visible cone half-angle (`MatchHalf *
+>      ConeScale`) vs SceneCapture half-FOV -- when the cone is
+>      geometrically wider than the capture, `coneFitsCapture = 0` and
+>      the operator knows their `Rebus.BeamConeRadiusScale > 1` is in
+>      play (HLSL is permissive so it's not a CLIP -- just no
+>      occlusion data for the outer-rim samples).
+>    * World-transform coincidence check: SpotLight + BeamCone +
+>      SceneCapture distances. >1 cm divergence is a v1.0.111 head-tracking
+>      bug.
+> 9. **Extended `Rebus.DumpBeamMasterVersion`** now also reports the
+>    loaded plugin VersionName + the on-disk md5 alongside the version
+>    verdict (every per-world line + the aggregate footer). Same data the
+>    startup banner shows, on demand.
+> 10. **`RebusVisualiser.uplugin` `VersionName` -> `1.0.113`** so the
+>     watermark (v1.0.107) AND the v1.0.113 startup banner AND the
+>     `Rebus.DumpBeamMasterVersion` report all read `v1.0.113`. The
+>     watermark on the live PixelStreaming2 stream is the at-a-glance
+>     verification the loaded binary matches the released version.
+>
+> **Operator verification (v1.0.113).**
+>
+> 1. `git pull`, then **REBUILD the C++ binaries** (Tools > Refresh
+>    Visual Studio Project + Build, or `Build.bat REBUS_VisualiserEditor
+>    Win64 Development -Project=...`). v1.0.113 added new C++ code
+>    (the `PostLoadMapWithWorld` hook + `ComputeBeamMasterUassetMd5` +
+>    the startup banner + `DumpBeamCullingStateForDebug`); a stale
+>    `UnrealEditor-REBUS_Visualiser.dll` doesn't have any of it.
+> 2. **Fully restart the editor** (don't hot-reload). The plugin's
+>    GameInstance subsystem `Initialize` only fires on a fresh launch
+>    of the GameInstance, which is bound to the editor lifecycle for
+>    PIE/standalone -- a hot-reload of the module leaves the previously-
+>    initialised subsystem instance running with the OLD code.
+> 3. Watch the log on startup. Expect ONE line of shape:
+>    ```
+>    LogRebusVisualiser: [Rebus] STARTUP BANNER: pluginVersion=v1.0.113 beamMasterVerdict=v1.0.111+ beamMasterUassetMd5=<32-hex>
+>    ```
+>    If `pluginVersion != v1.0.113` -> rebuild C++ + restart (step 1+2).
+>    If `beamMasterVerdict != v1.0.111+` -> the v1.0.112 auto-purge
+>    should fire ONE line BELOW this banner (`[Rebus] STALE BEAM
+>    MASTER detected ... auto-running Rebus.RebuildBeamMaterial`); after
+>    the regen, send `ClearScene + LoadScene` from the portal (or
+>    restart the editor) to rebuild per-fixture BeamMIDs off the
+>    regenerated master.
+> 4. Top-centre watermark should read `v1.0.113`. If it reads anything
+>    else, you're on the wrong binary -- repeat step 1.
+> 5. Fire a fixture. Move the camera through every angle around the
+>    beam: front, behind the lens, side, above, below, grazing. The
+>    shaft must remain continuous. Only LEGITIMATE occluders (cubes /
+>    props between the fixture and the lit footprint) should carve.
+> 6. If anything looks wrong, paste the output of:
+>    * `Rebus.DumpBeamMasterVersion` (shows pluginVersion + md5 + verdict)
+>    * `Rebus.DumpBeamShadowMask` (per-fixture light-space mask state +
+>      EXISTS/MISSING flag for the v1.0.111 master parameter contract)
+>    * `Rebus.DumpBeamCulling` (v1.0.113 -- per-fixture inventory of
+>      every flag that can hide / clip / cull the shaft)
+>    * `Rebus.DumpFixtureZoom` (per-fixture cone-mesh + SpotLight outer
+>      cone state)
+>    Those four together cover every v1.0.x visible-beam failure mode
+>    in known logs -- if the dumps show the expected state and the
+>    artefact still appears, the audit missed something genuinely new,
+>    not a recurrence of a past bug.
+>
+> **Lean on truth over velocity.** v1.0.99 -> v1.0.103 -> v1.0.110 ->
+> v1.0.111 -> v1.0.112 -> v1.0.113 is six release cycles on
+> functionally one user-reported symptom shape. v1.0.113 ships the
+> hardening that proves the diagnosis from log output alone -- the
+> startup banner + the md5 + the `Rebus.DumpBeamCulling` inventory.
+> No more guess-the-failure on the next regression.
+
 > **Auto-purge stale pre-v1.0.110 `M_RebusBeam` master on subsystem startup -- kill the screen-space pan-edge artefact for good (v1.0.112).**
 >
 > User report (verbatim):
