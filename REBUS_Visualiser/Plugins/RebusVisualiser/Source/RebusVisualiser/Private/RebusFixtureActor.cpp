@@ -118,9 +118,8 @@ namespace
 	// hardening pass in v1.0.117. BoundsScale 5.0 (paired with the v1.0.117
 	// `Rebus.BeamConeBoundsScale` live CVar) is the most generous extent-only inflation
 	// that still keeps the bounds inside a single typical level's BSP volume, so it
-	// never trips streaming-volume culls. v1.0.117 ALSO sets the cone's
-	// `bAllowApproximateOcclusion = false` and bypasses the LD cull distance
-	// (`SetCullDistance(0)`) + the level cull-distance volume gate
+	// never trips streaming-volume culls. v1.0.117 ALSO bypasses the LD cull
+	// distance (`SetCullDistance(0)`) + the level cull-distance volume gate
 	// (`bAllowCullDistanceVolume = false`) + drops the cone's translucency sort priority
 	// to a stable -10 so multi-cone pan-cross frames sort consistently. All of these
 	// are extent-only / sort-only knobs; none of them change the visual contract.
@@ -475,7 +474,7 @@ static void RefreshBeamConeCullingFlagsOnEveryFixture(const TCHAR* CVarLabel, co
 	}
 	UE_LOG(LogRebusVisualiser, Log,
 		TEXT("%s -> %s, refreshed %d fixture(s) (v1.0.117 BeamCone bRenderInDepthPass=0 + "
-			 "BoundsScale + TranslucencySortPriority + occluder/approx/customDepth/decals/"
+			 "BoundsScale + TranslucencySortPriority + occluder/customDepth/decals/"
 			 "DFL/GI knobs re-pushed against the live render proxy)."),
 		CVarLabel, *NewValStr, Refreshed);
 }
@@ -3232,8 +3231,13 @@ void ARebusFixtureActor::RefreshBeamConeCullingFlags()
 	//     visible shadow either (the `bCastHiddenShadow` UPROPERTY).
 	//   * `bUseAsOccluder = false` -- restated.
 	//   * `bUseAttachParentBound = false` -- restated.
-	//   * `bAllowApproximateOcclusion = false` -- UE 5.7's approximate-bound
-	//     occlusion test isn't right for a long/thin shaft.
+	//   * (v1.0.118 NOTE: the v1.0.117 brief listed `bAllowApproximateOcclusion =
+	//     false` here, but that flag lives on `FPrimitiveSceneProxy`, NOT on
+	//     `UPrimitiveComponent` (UE 5.7 build break -- see v1.0.118 README). The
+	//     proxy default for `EComponentMobility::Movable` -- which `BeamCone`
+	//     always is -- is already `false`, so the v1.0.117 intent (don't allow
+	//     approximate-bound occlusion on the cone) is preserved by the engine
+	//     default; no game-thread write needed.)
 	//   * `bAllowCullDistanceVolume = false` + `SetCullDistance(0)` -- disable
 	//     LD cull distance + level cull-distance volume gate.
 	//   * `SetBoundsScale(GRebusBeamConeBoundsScale)` -- v1.0.117 default 5.0,
@@ -3263,7 +3267,15 @@ void ARebusFixtureActor::RefreshBeamConeCullingFlags()
 	// --- Bounds / occlusion / culling ---
 	BeamCone->bUseAttachParentBound = false;
 	BeamCone->bUseAsOccluder = false;
-	BeamCone->bAllowApproximateOcclusion = false;
+	// v1.0.118 -- `bAllowApproximateOcclusion` lives on `FPrimitiveSceneProxy` (the
+	// render-thread proxy in `Engine/Source/Runtime/Engine/Public/PrimitiveSceneProxy.h`),
+	// NOT on `UPrimitiveComponent` -- there is no public game-thread accessor in UE 5.7,
+	// so v1.0.117's `BeamCone->bAllowApproximateOcclusion = false;` was a build break
+	// (C2039: not a member of UPrimitiveComponent). Dropped in v1.0.118. The proxy
+	// default for movable components is already `false` (`PrimitiveSceneProxy.cpp:383`:
+	// `bAllowApproximateOcclusion(InProxyDesc.Mobility != EComponentMobility::Movable)`)
+	// and `BeamCone` is `EComponentMobility::Movable` (set in `BuildBeamCone`), so the
+	// engine default already gives us the value we wanted -- no replacement needed.
 	BeamCone->bAllowCullDistanceVolume = false;
 	BeamCone->SetCullDistance(0); // disables LD cull distance entirely (0 == no max)
 
@@ -3633,13 +3645,19 @@ void ARebusFixtureActor::DumpBeamCullingStateForDebug() const
 		// v1.0.117 -- extended with the new flags the v1.0.117 fix sets to false on
 		// every BeamCone: bRenderInDepthPass (PRIMARY ROOT-CAUSE), bRenderCustomDepth,
 		// bReceivesDecals, bAffectDynamicIndirectLighting, bAffectDistanceFieldLighting,
-		// bAllowApproximateOcclusion, bAllowCullDistanceVolume, bCastHiddenShadow +
-		// the TranslucencySortPriority. ALL of these should read 0 / -10 after a
-		// v1.0.117 BuildBeamCone -- if any of them surfaces non-zero (or sort != -10)
-		// the v1.0.117 fix didn't engage and the operator should report it.
+		// bAllowCullDistanceVolume, bCastHiddenShadow + the TranslucencySortPriority.
+		// ALL of these should read 0 / -10 after a v1.0.117 BuildBeamCone -- if any of
+		// them surfaces non-zero (or sort != -10) the v1.0.117 fix didn't engage and
+		// the operator should report it.
+		// v1.0.118 -- DROPPED `approxOccl=%d` slot + the matching
+		// `C->bAllowApproximateOcclusion` arg: that flag lives on
+		// `FPrimitiveSceneProxy` (render-thread), NOT on `UPrimitiveComponent`,
+		// so the v1.0.117 dump triggered C2039 in UE 5.7. The proxy default is
+		// `false` for movable components, which is what we want; no game-thread
+		// equivalent to surface in this dump.
 		return FString::Printf(
 			TEXT("%s={vis=%d hidGame=%d sceneCap=visOnly=%d hid=%d castShadow=%d castHiddenShadow=%d "
-				 "occluder=%d attachBound=%d approxOccl=%d cullDistVol=%d renderMain=%d renderDepth=%d "
+				 "occluder=%d attachBound=%d cullDistVol=%d renderMain=%d renderDepth=%d "
 				 "customDepth=%d recvDecals=%d affGI=%d affDFL=%d sortPrio=%d boundsScale=%.2f "
 				 "minDraw=%.1f ldMax=%.1f cachedMax=%.1f visInRT=%d}"),
 			Label,
@@ -3651,7 +3669,6 @@ void ARebusFixtureActor::DumpBeamCullingStateForDebug() const
 			C->bCastHiddenShadow ? 1 : 0,
 			C->bUseAsOccluder ? 1 : 0,
 			C->bUseAttachParentBound ? 1 : 0,
-			C->bAllowApproximateOcclusion ? 1 : 0,
 			C->bAllowCullDistanceVolume ? 1 : 0,
 			C->bRenderInMainPass ? 1 : 0,
 			C->bRenderInDepthPass ? 1 : 0,

@@ -632,8 +632,13 @@ public:
 	//     = false` -- the cone must not contribute to GI / DFL samples.
 	//   * `SetCastShadow(false)` + `bCastDynamicShadow = false` +
 	//     `SetCastHiddenShadow(false)` -- no shadow casting at all.
-	//   * `bUseAsOccluder = false` + `bUseAttachParentBound = false` +
-	//     `bAllowApproximateOcclusion = false` -- no occlusion contribution.
+	//   * `bUseAsOccluder = false` + `bUseAttachParentBound = false`
+	//     -- no occlusion contribution. (v1.0.118: the v1.0.117 brief also
+	//     listed `bAllowApproximateOcclusion = false` here, but that flag
+	//     lives on `FPrimitiveSceneProxy`, not `UPrimitiveComponent`, and is
+	//     already `false` for movable components by engine default. No game-
+	//     thread write needed; v1.0.117 attempting it caused a UE 5.7 build
+	//     break that v1.0.118 drops.)
 	//   * `SetCullDistance(0)` + `bAllowCullDistanceVolume = false` -- never
 	//     streamed out by LD cull distance / cull-distance volume.
 	//   * `SetBoundsScale(GRebusBeamConeBoundsScale)` -- v1.0.117 default 5.0,

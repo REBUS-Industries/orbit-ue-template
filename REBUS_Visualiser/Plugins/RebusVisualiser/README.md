@@ -594,6 +594,105 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **v1.0.118 — UE 5.7 BUILD FIX for the v1.0.117 extended `DumpBeamCullingStateForDebug` + the v1.0.117 `RefreshBeamConeCullingFlags` helper. The v1.0.117 PRIMARY ROOT-CAUSE FIX (`BeamCone->bRenderInDepthPass = false` on the primitive + `disable_depth_test = true` on `M_RebusBeam`) is UNCHANGED and intact — this release ONLY fixes the diagnostic dump + the cone-flag setter that broke the build, so the v1.0.117 fix can finally land on operators' machines.**
+>
+> ### What broke v1.0.117 in UE 5.7
+>
+> v1.0.117 introduced two new touch points on `UPrimitiveComponent::bAllowApproximateOcclusion`:
+>
+> - `RebusFixtureActor.cpp:3266` (in the new `RefreshBeamConeCullingFlags`) wrote `BeamCone->bAllowApproximateOcclusion = false;`.
+> - `RebusFixtureActor.cpp:3654` (in the v1.0.117-extended `DumpBeamCullingStateForDebug`'s `FlagsLine` lambda) read `C->bAllowApproximateOcclusion ? 1 : 0` and printed it via an `approxOccl=%d` slot in the format string.
+>
+> Both fail to compile in UE 5.7:
+>
+> ```
+> RebusFixtureActor.cpp(3654): error C2039: 'bAllowApproximateOcclusion':
+>     is not a member of 'UPrimitiveComponent'
+>         C->bAllowApproximateOcclusion ? 1 : 0,
+> ```
+>
+> The flag exists, but it lives on `FPrimitiveSceneProxy` (the render-thread proxy), not on the game-thread `UPrimitiveComponent`. Confirmed against `Engine/Source/Runtime/Engine/Public/PrimitiveSceneProxy.h:1583` (`uint8 bAllowApproximateOcclusion : 1;`) and `Engine/Source/Runtime/Engine/Private/PrimitiveSceneProxy.cpp:383` (`bAllowApproximateOcclusion(InProxyDesc.Mobility != EComponentMobility::Movable)`). UE 5.7 does NOT expose a public game-thread accessor for it.
+>
+> The v1.0.117 brief (which originated from a UE 4.x / pre-restructure mental model) listed `bAllowApproximateOcclusion = false` as one of the per-component flags to set; that was wrong. The correct picture in UE 5.7 is: **the proxy default is already what we wanted** for the procedural BeamCone (which is `EComponentMobility::Movable`, set in `BuildBeamCone`), so the engine constructor gives us `false` automatically — no game-thread write is needed (or possible).
+>
+> The C2039 cascaded into a second compiler error against the format-string sanitizer:
+>
+> ```
+> RebusFixtureActor.cpp(3641): error C7595:
+>     'UE::Core::Private::FormatStringSan::TCheckedFormatStringPrivate<...,
+>         int×16, float×4, int>::...': call to immediate function is not a constant expression
+> note: X(DNeedsIntegerArg, "'%d' expects integral arg ...")
+> ```
+>
+> ...because once the compiler dropped the broken `bAllowApproximateOcclusion` arg from its variadic deduction, all subsequent args shifted up by one position relative to the format string, so the `%d sortPrio` slot ended up bound to the float `BoundsScale` arg. Both errors collapse to a single root cause; fixing the underlying access fixes both.
+>
+> ### What v1.0.118 changes — exact list
+>
+> 1. **`RebusFixtureActor.cpp::RefreshBeamConeCullingFlags`** — removed the line `BeamCone->bAllowApproximateOcclusion = false;` (was at line 3266 in v1.0.117). Replaced with a comment block citing the engine source (`PrimitiveSceneProxy.cpp:383`) that proves the proxy default for movable components is already `false`. **No behaviour change** — the cone gets the same `bAllowApproximateOcclusion = false` it would have gotten with the v1.0.117 line; the flag is just set by the engine constructor instead of by us.
+> 2. **`RebusFixtureActor.cpp::DumpBeamCullingStateForDebug` (FlagsLine lambda)** — dropped the `approxOccl=%d` slot from the format string AND the matching `C->bAllowApproximateOcclusion ? 1 : 0` arg from the variadic list. After this:
+>    - format-string spec count: 22 (1 `%s` + 16 `%d` + 1 `%.2f` + 3 `%.1f` + 1 `%d`)
+>    - arg count: 22 (1 TCHAR* + 16 ints + 1 float + 3 floats + 1 int)
+>    - per-position type match verified by hand (see "Specifier-vs-arg verification table" below).
+>    - The dump line is now:
+>      ```
+>      BeamCone={vis=%d hidGame=%d sceneCap=visOnly=%d hid=%d castShadow=%d castHiddenShadow=%d
+>                occluder=%d attachBound=%d cullDistVol=%d renderMain=%d renderDepth=%d
+>                customDepth=%d recvDecals=%d affGI=%d affDFL=%d sortPrio=%d boundsScale=%.2f
+>                minDraw=%.1f ldMax=%.1f cachedMax=%.1f visInRT=%d}
+>      ```
+>      The PRIMARY-ROOT-CAUSE smoking-gun field — `renderDepth` — is still in the dump. The other v1.0.117 hardening fields (`castHiddenShadow`, `cullDistVol`, `customDepth`, `recvDecals`, `affGI`, `affDFL`, `sortPrio`) are also still all there. The only field removed is `approxOccl`, which we couldn't have surfaced from the game thread anyway in UE 5.7.
+> 3. **Updated doc-comments** in `RefreshBeamConeCullingFlags` (impl + header), the constexpr-doc-block on `RebusBeamBoundsScale`, the `RefreshBeamConeCullingFlagsOnEveryFixture` log line, and the FlagsLine doc-block — all explain WHY the field was dropped + cite the engine source so the next operator who pulls a 5.x → 5.8 / etc. update doesn't re-introduce it.
+>
+> ### Specifier-vs-arg verification table (DumpBeamCullingStateForDebug FlagsLine, AFTER v1.0.118 fix)
+>
+> Hand-counted, position-by-position, against the post-fix code at `RebusFixtureActor.cpp:3658-3684`:
+>
+> | i | spec | arg expression | arg type | match? |
+> |---|------|----------------|----------|--------|
+> |  0 | `%s`   | `Label`                                          | `const TCHAR*` | OK |
+> |  1 | `%d`   | `C->IsVisible() ? 1 : 0`                         | int            | OK |
+> |  2 | `%d`   | `C->bHiddenInGame ? 1 : 0`                       | int            | OK |
+> |  3 | `%d`   | `C->bVisibleInSceneCaptureOnly ? 1 : 0`          | int            | OK |
+> |  4 | `%d`   | `C->bHiddenInSceneCapture ? 1 : 0`               | int            | OK |
+> |  5 | `%d`   | `C->CastShadow ? 1 : 0`                          | int            | OK |
+> |  6 | `%d`   | `C->bCastHiddenShadow ? 1 : 0`                   | int            | OK |
+> |  7 | `%d`   | `C->bUseAsOccluder ? 1 : 0`                      | int            | OK |
+> |  8 | `%d`   | `C->bUseAttachParentBound ? 1 : 0`               | int            | OK |
+> |  9 | `%d`   | `C->bAllowCullDistanceVolume ? 1 : 0`            | int            | OK |
+> | 10 | `%d`   | `C->bRenderInMainPass ? 1 : 0`                   | int            | OK |
+> | 11 | `%d`   | `C->bRenderInDepthPass ? 1 : 0`                  | int            | OK |
+> | 12 | `%d`   | `C->bRenderCustomDepth ? 1 : 0`                  | int            | OK |
+> | 13 | `%d`   | `C->bReceivesDecals ? 1 : 0`                     | int            | OK |
+> | 14 | `%d`   | `C->bAffectDynamicIndirectLighting ? 1 : 0`      | int            | OK |
+> | 15 | `%d`   | `C->bAffectDistanceFieldLighting ? 1 : 0`        | int            | OK |
+> | 16 | `%d`   | `C->TranslucencySortPriority`                    | `int32`        | OK |
+> | 17 | `%.2f` | `C->BoundsScale`                                 | `float`        | OK |
+> | 18 | `%.1f` | `C->MinDrawDistance`                             | `float`        | OK |
+> | 19 | `%.1f` | `C->LDMaxDrawDistance`                           | `float`        | OK |
+> | 20 | `%.1f` | `C->CachedMaxDrawDistance`                       | `float`        | OK |
+> | 21 | `%d`   | `C->bVisibleInRayTracing ? 1 : 0`                | int            | OK |
+>
+> Total: 22 specs ↔ 22 args, every type pair matches. (`UPrimitiveComponent::TranslucencySortPriority` is declared `int32` at `PrimitiveComponent.h:850`; `BoundsScale` is `float` at `:925`; `MinDrawDistance` `:278`; `LDMaxDrawDistance` `:282`; `CachedMaxDrawDistance` `:289`. Verified.)
+>
+> ### Other v1.0.117 multi-line UE_LOG / FString::Printf re-verified by hand
+>
+> Same protocol applied to every other multi-line format string touched in v1.0.117 (or extended in v1.0.111+ and still live):
+>
+> - **Outer `DumpBeamCullingStateForDebug` UE_LOG** (`RebusFixtureActor.cpp:3737..3779`): 35 specs (15 `%s`, 7 `%d`, 13 `%.Nf`) ↔ 35 args (15 TCHAR*, 7 ints, 13 floats/doubles — `FVector` components are double in UE 5.x but `%f`/`%.Nf` accepts both float and double in `TCheckedFormatString`). All match. Checked.
+> - **`DumpBeamShadowMaskStateForDebug` UE_LOG** (`RebusFixtureActor.cpp:3594..3611`, extended in v1.0.111): 25 specs (10 `%s`, 4 `%d`, 11 `%.Nf`) ↔ 25 args (10 TCHAR*, 4 int32, 11 floats/doubles). All match. Checked.
+> - **v1.0.117 startup banner UE_LOG** (`RebusVisualiserSubsystem.cpp:184..199`): 8 specs (6 `%s`, 2 `%d`) ↔ 8 args (6 TCHAR*, 2 int32 — `BannerReport.DetectedRevision` and `ExpectedRevision`). All match. Checked.
+> - **`ProbeAndAutoPurgeStaleBeamMaster` STALE log** (`RebusVisualiserSubsystem.cpp:2961..2978`, with v1.0.117 `DetectedRevision` / `ExpectedRevision` extension): 7 specs (5 `%s`, 2 `%d`) ↔ 7 args (5 TCHAR*, 2 int32). All match. Checked.
+> - **v1.0.117 new `RefreshBeamConeCullingFlagsOnEveryFixture` UE_LOG** (`RebusFixtureActor.cpp:112..116`): 3 specs (2 `%s`, 1 `%d`) ↔ 3 args (`CVarLabel`, `*NewValStr`, `Refreshed`). Match. Checked.
+> - **v1.0.117 new `Rebus.AllowBeamOcclusionQueries -> %d` log** (`RebusFixtureActor.cpp:158..160`): 1 spec ↔ 1 int arg. Match. Checked.
+>
+> All clean. No further format / arg mismatches.
+>
+> ### Build-cycle hygiene note (lessons learned)
+>
+> v1.0.115, v1.0.116, v1.0.117 were each released with the claim "audit complete". v1.0.117 still shipped a build break. Pattern: a flag (`bAllowApproximateOcclusion`) was assumed to exist on `UPrimitiveComponent` because it appears on `FPrimitiveSceneProxy` and the symbol-name is suggestive. The audit pass would have caught it via a one-line `rg "UPrimitiveComponent::" "$UE_57_ENGINE_SRC"` cross-check against every flag the new helper writes — but that step was skipped, and reading the diff visually didn't surface the proxy-vs-component distinction. v1.0.118 is gated on a hand-built specifier-vs-arg verification table (above) AND a manual cross-check of every newly-touched `UPrimitiveComponent` field name against the UE 5.7 header before committing — both of which caught real issues this round.
+>
+> `RebusVisualiser.uplugin` `VersionName` 1.0.117 → 1.0.118. Top-centre watermark + `[Rebus] STARTUP BANNER` will read `v1.0.118 (binary built ...)` on the next launch. The PRIMARY ROOT-CAUSE FIX from v1.0.117 is unchanged in this release; once a v1.0.118 binary builds, operators get the v1.0.117 `bRenderInDepthPass = false` + `disable_depth_test = true` decoupling on the cone, and the persistent pan-cross / sibling-fixture clipping should finally clear.
+
 > **v1.0.117 — PRIMARY ROOT-CAUSE FIX for the persistent pan-cross / sibling-fixture beam clipping the user has reported across v1.0.111 → v1.0.116. `BeamCone->bRenderInDepthPass = false` + `disable_depth_test = true` on `M_RebusBeam`. Operator A/B checklist below.**
 >
 > ### User-visible symptom (v1.0.116 and earlier)
