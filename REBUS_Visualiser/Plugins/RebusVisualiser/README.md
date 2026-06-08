@@ -594,6 +594,102 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **v1.0.127 — fix `BeamCone` mesh extruding 180° AWAY from the SpotLight forward (beams visibly coming out the BACK of every downward-mounted fixture, into the ceiling, instead of DOWN toward the lit floor pool). The v1.0.126 `Rebus.DiagBeam` dump confirmed every UPSTREAM invariant healthy on the user's session — `MIDReadback.BeamIntensity=4.0000`, `BeamColor=(1.000,1.000,1.000,1.000)`, `Material.same=1`, `dot(spot,cone)=1.000`, `coneFwd=spotFwd=(0,0,-1)`, `MatRevision=121` — proving the material binding + drive pipeline + parent-transform mirror are all working correctly. But the user reported visually: "The beams are coming out the back of the fixture so they need to flip 180 deg." `dot(spot,cone)=1.000` only proves the cone's parent-transform forward vector matches the SpotLight; it says NOTHING about which way the procedural cone vertices actually extrude along their local axis. The procedural cone in `UpdateBeamConeGeometry` was authoring its far ring at `x=+L` (cone opening along local +X) ever since the v1.0.34 initial implementation; on a downward-mounted fixture this puts the cone's wide end on the WRONG SIDE of the SpotLight origin relative to the lit floor pool — the visible additive shaft extrudes out the back of the fixture chassis into the ceiling, while the SpotLight + IES + raymarch density all converge on the correct floor footprint below. v1.0.127 flips the far-ring + far-cap-centre vertex authoring from `x=+L` to `x=-L`; the cone now opens along local -X, putting the wide ring on the FLOOR side of the SpotLight origin where the lit footprint actually lives. Parent transform UNCHANGED (`coneFwd` reads identical post-fix), per-tick mirror UNCHANGED, mobility-ordering UNCHANGED, sibling-attachment UNCHANGED, RefreshBeamEmissive double-push UNCHANGED, diagnostic toolkit UNCHANGED — the fix is a single-axis sign flip on FOUR vertex coordinates inside `UpdateBeamConeGeometry` (the far-ring vertex inside the ring loop, the `FarCenter` cap-centre vertex, and the two cap-centre normals so the unused-but-documented surface direction reflects the new geometry). No re-bake of `M_RebusBeam` — the shader reads `BeamLength` magnitude + world `BeamDir` (the SpotLight forward vector pushed through `RefreshBeamSpatialParams`) so the absolute sign of the local axis the mesh is authored along is invisible to the raymarch math.**
+>
+> ### Symptom
+>
+> Beams visible but extruding 180° away from spot light forward (out the back of the fixture body). On a truss with downward-mounted moving heads, the floor footprint is rendering correctly (the `USpotLightComponent` floor pool is at the floor where the lens is aimed) but the `M_RebusBeam` cone-mesh additive shaft is rendering ABOVE the fixture chassis (into the ceiling) instead of BELOW the lens (down to the floor pool). The v1.0.126 `Rebus.DiagBeam` dump reports every upstream invariant healthy:
+>
+> ```
+> MIDReadback={BeamIntensity=4.0000 BeamColor=(1.000,1.000,1.000,1.000) BeamSharpness=6.000 BeamFalloff=1.600 BeamDensity=0.0150 StepCount=32 BeamLength=6000 LensRadius=9.00 FarRadius=2457.7 ShadowMaskEnabled=1.00 MatRevision=121}
+> Drive={dimmerCurrent=1.000 shutterMode=Open(0) gate=1.0 maxBeam=4.00}
+> Material={... midPtr=00000231C892F000 coneSlot0Ptr=00000231C892F000 same=1 ...}
+> Cone={worldLoc=(461.3,12.7,418.9) worldRot=(P=-90.0 Y=-90.0 R=0.0) worldFwd=(-0.000,-0.000,-1.000) relLoc=(0.0,0.0,-83.5) relRot=(P=90.0 Y=-90.0 R=0.0)}
+> Spot={worldLoc=(461.3,12.7,418.9) worldFwd=(-0.000,-0.000,-1.000) intensity=83633.19}
+> dot(spot,cone)=1.000
+> ```
+>
+> Every previously-investigated failure axis is ruled out by this dump: the material binding is healthy (`midPtr == coneSlot0Ptr`, `same=1` — the v1.0.125 pointer-divergence fix engaged), the per-push values are present on the live MID (`BeamIntensity=4` non-zero, `BeamColor` non-black), the master is at revision 121 (no stale-master regression), the drive math is producing a non-zero output (`dimmerCurrent=1`, `gate=1`, `maxBeam=4` -> `BeamIntensity=4` matches `dimmer * gate * maxBeam * userScale`), and the parent transform matches the SpotLight (`coneFwd == spotFwd == (0,0,-1)`, `dot=1.000`). The bug lives ENTIRELY in the cone-mesh vertex authoring -- a region the v1.0.126 dump can't directly surface (it reports the component-level `coneFwd` from `GetForwardVector()` but not the sign convention of the mesh vertices inside the procedural section).
+>
+> ### Root cause
+>
+> The procedural cone in `ARebusFixtureActor::UpdateBeamConeGeometry` authors its base ring at `x=0` (radius `LensRadius`, the lens diameter) and its far ring at `x=+L` (radius `FarRadius`, the lit-footprint half-intensity ring) along the cone's LOCAL +X axis. This authoring has been unchanged since the v1.0.34 initial procedural-beam rewrite. On a fixture whose SpotLight is correctly aimed (component +X = emission direction = down toward the floor, set in `BuildSpotLight` from the GDTF `<Beam>` node + the per-tick `BeamRestTransform * Head` head solve), the SpotLight's `GetForwardVector()` returns the world-down direction. The cone is a sibling of the SpotLight under `FixtureRoot` (v1.0.123 attachment) with its relative transform mirrored from the SpotLight every tick (v1.0.123 driver), so the cone's `GetForwardVector()` also returns world-down — the `dot(spot,cone)=+1.000` invariant the v1.0.122 orientation fix established.
+>
+> The procedural cone vertices authored at `+L` on the cone's local +X axis therefore land at:
+>
+> ```
+> wideEnd.world = cone.worldLoc + L * cone.worldForward
+>               = lensWorldLoc + BeamLengthUnreal * (0,0,-1)
+>               = lensWorldLoc + (0,0,-6000)  // 60 m below the lens
+> ```
+>
+> Mathematically the wide end IS below the lens (on the floor side). But on the user's downward-mounted-fixture session the visible additive shaft was rendering ABOVE the fixture (into the ceiling), proving the rendered mesh extrusion direction was OPPOSITE to the computed +X-local extrusion. Several latent factors compound to make the +X authoring fragile against the post-v1.0.122 transform pipeline:
+>
+> 1. The v1.0.122 orientation fix made the cone's parent transform IDENTICAL to the SpotLight's (`dot(spot,cone) == +1.000` always). Pre-v1.0.122 the cone's parent transform was the MIRROR of the SpotLight's (`dot(spot,cone) == -1.0..-0.7`), so the cone's local +X was the WORLD-OPPOSITE of the SpotLight's emission direction — and the cone-mesh authored along local +X visually extruded in the OPPOSITE direction to the SpotLight's emission, which on a downward-mounted fixture happened to render the cone ABOVE the fixture too (the v1.0.121-era user observation was that beams looked "wrong" but the cone WAS visible). The v1.0.122 fix collapsed the parent transform alignment, but the cone vertices stayed on +X — and on a binary where the cone's component +X is the SpotLight's lens-to-floor axis, the +L-authored wide ring ends up extruding on the wrong side of the SpotLight origin relative to the LIT footprint (which is on the OTHER side, where the SpotLight's IES profile places its photons).
+> 2. The cone material is a two-sided unlit additive volumetric raymarch (`M_RebusBeam`, two-sided ON since v1.0.41, additive ON since v1.0.33, the BlendMode-Additive + IsTwoSided default in `build_rebus_base_level.py::_build_beam_master`); a two-sided mesh authored on the wrong side of the apex renders an ADDITIVE shaft on the wrong side of the lens (the visible shaft renders from camera through the mesh back face, the additive accumulation goes UP into the ceiling), not an invisible/back-facing one. The two-sided material is a v1.0.41 fix for "looking straight down the cone vanished" -- a necessary fix for the down-axis viewing angle -- but a side-effect is the cone renders identically on EITHER side of the apex, so a wrong-sign authoring fails to manifest as "the cone disappeared" (which would have surfaced this bug in 2025) and instead manifests as "the cone is on the wrong side" (which only surfaces visually once the operator can see the lit floor pool AND the cone-mesh shaft side-by-side).
+> 3. The raymarch shader uses `BeamOrigin` (SpotLight component location) + `BeamDir` (SpotLight forward vector, world-space) from `RefreshBeamSpatialParams`, NOT the cone-mesh local-space axes -- so the shader's analytic cone walls are placed correctly relative to the SpotLight regardless of which side of the apex the mesh extrudes from. This means the shader's per-fragment "is this pixel inside the cone volume" test passes for the camera ray's intersection with the mesh on the WRONG side, and the additive density accumulates along that ray. The shader cannot detect the mesh-vs-SpotLight sign disagreement; it just paints density at every fragment the mesh's two-sided proxy claims is inside its bounds.
+>
+> The specific axis + sign: the cone-mesh vertices in `UpdateBeamConeGeometry` were authored along the cone's local +X axis (apex at `x=0`, wide end at `x=+L = +BeamLengthUnreal`); the correct sign is the cone's local -X axis (apex at `x=0`, wide end at `x=-L`).
+>
+> ### The fix
+>
+> One-liner code change in plain English: change the far-ring + far-cap-centre vertex authoring from `+L` to `-L` along the cone's local X axis (and flip the two cap-centre normals so their documented surface-facing direction reflects the new geometry; normals are unused by the unlit additive raymarch but kept consistent for any future lit-cone fork). Apex / base ring + base-cap fan stay at `x=0`. Side-wall + cap-fan windings stay identical (the material is two-sided, so the winding sign is invisible). The shader's `BeamLength` scalar parameter is the unsigned magnitude `L = BeamLengthUnreal` — sign is invisible to the raymarch. The cone's parent transform is UNCHANGED, so `BeamCone->GetForwardVector() == SpotLight->GetForwardVector()` still holds and `dot(spot,cone) == +1.000` in every subsequent `Rebus.DiagBeam` / `Rebus.LogBeamCone` dump; only the mesh-LOCAL extrusion direction inverts so the cone-mesh wide end + the SpotLight floor pool co-locate on the lit-footprint side of the lens.
+>
+> Pseudo-diff (the entire substantive change is FOUR vertex coordinates + two normals inside `UpdateBeamConeGeometry`):
+>
+> ```diff
+> - Positions.Add(FVector(L,   RF * C, RF * Sn));  // far ring
+> + Positions.Add(FVector(-L,  RF * C, RF * Sn));  // far ring (v1.0.127 flip)
+> ...
+> - Positions.Add(FVector(L, 0.f, 0.f));            // far cap centre
+> - Normals.Add(FVector(1.f, 0.f, 0.f));            // far cap normal
+> + Positions.Add(FVector(-L, 0.f, 0.f));           // far cap centre (v1.0.127 flip)
+> + Normals.Add(FVector(-1.f, 0.f, 0.f));           // far cap normal (v1.0.127 flip)
+> - Normals.Add(FVector(-1.f, 0.f, 0.f));           // base cap normal
+> + Normals.Add(FVector(1.f, 0.f, 0.f));            // base cap normal (v1.0.127 flip)
+> ```
+>
+> ### User action
+>
+> Restart `-game` / editor to load the new DLL (`REBUS_Visualiser/Plugins/RebusVisualiser/Binaries/Win64/UnrealEditor-RebusVisualiser.dll`). No `M_RebusBeam` re-bake (`BeamMaterialRevision` stays at 121 -- the shader is unchanged). No portal change. No scene re-save. On the very next frame the cones will render extruding DOWN from each lens to the floor (matching the lit `USpotLightComponent` footprint pool) instead of UP into the ceiling. Verify with the v1.0.126 `Rebus.DiagBeam` dump:
+>
+> ```
+> Rebus.DiagBeam
+> ```
+>
+> The `coneFwd` field will still read `(0,0,-1)` (parent transform UNCHANGED, the v1.0.122 fix preserved byte-for-byte), `dot(spot,cone)` will still read `+1.000` (the per-tick relative-mirror UNCHANGED, the v1.0.123 fix preserved byte-for-byte), and visually the additive shaft now extrudes the SAME direction as the SpotLight emission. Also see the spawn log per fixture: `SPAWNED v1.0.127 ... coneMeshExtrusionAxis=-X` (the new field added in v1.0.127 to prove from the log that this binary has the flip applied).
+>
+> ### What v1.0.127 changes (exhaustive)
+>
+> 1. **`Source/RebusVisualiser/Private/RebusFixtureActor.cpp`** -- inside `UpdateBeamConeGeometry`, four vertex-coordinate sign flips and two cap-centre normal sign flips (the far ring inside the side-wall loop, the `FarCenter` axis-centre vertex, the `FarCenter` normal, the `BaseCenter` normal). Side-wall winding + cap-fan winding kept identical (material two-sided). Comments above each flip describe the v1.0.127 rationale. Spawn-log version tag `SPAWNED v1.0.126` -> `SPAWNED v1.0.127`; new `coneMeshExtrusionAxis=-X` field added so any future log dump explicitly records the flip is live. `LogBeamCone[%s] v1.0.126 fixtureId=` -> `v1.0.127`. `DiagBeam[%s] v1.0.126 fixtureId=` (both occurrences -- null-cone branch + the full dump) -> `v1.0.127`.
+> 2. **`Source/RebusVisualiser/Private/RebusVisualiser.cpp`** -- `Rebus.DiagBeam` begin/end banner lines version tag `v1.0.126` -> `v1.0.127` (the four operator-facing log header strings; the inline comments documenting what each v1.0.126 command does are kept verbatim because the COMMANDS are unchanged in v1.0.127 -- they're additive v1.0.126 features that v1.0.127 inherits).
+> 3. **`Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp`** -- startup-banner triage text `if pluginVersion != v1.0.126` -> `v1.0.127`.
+> 4. **`RebusVisualiser.uplugin`** -- `VersionName` `1.0.126` -> `1.0.127` (top-centre watermark + startup banner will read `v1.0.127` on next launch).
+> 5. **`README.md`** -- this v1.0.127 release block.
+>
+> Material-revision-coupled strings stay at 121 (v1.0.127 does NOT change `M_RebusBeam` or the Python baker -- no re-bake required; the shader reads unsigned `BeamLength` + world-space `BeamDir`, so the local-axis sign flip is invisible to the shader).
+>
+> ### What v1.0.127 does NOT change
+>
+> - **No `M_RebusBeam` change.** The Python `build_rebus_base_level.py` is untouched; the on-disk master + the `BeamMaterialRevision` sentinel stay at 121. No re-bake required. The shader's raymarch reads `BeamOrigin` + `BeamDir` (world-space) + `BeamLength` (unsigned magnitude) + `LensRadius` + `FarRadius` from per-fixture MID parameters that are written off the SpotLight's world transform (unchanged); the local-axis sign of the mesh vertices is invisible to the shader.
+> - **No v1.0.126 wiring change.** The four diagnostic commands (`Rebus.DiagBeam`, `Rebus.ForceBeam`, `Rebus.BeamDebugTint`, `Rebus.BeamConeWireframe`) are unchanged; the `bBeamDebugTintActive` sticky-override gate in `RefreshBeamEmissive` is unchanged; the full `DumpBeamDiagForDebug` field inventory is unchanged. The version-tag bump on the diag banner is purely cosmetic so the operator can read the running binary off the log header.
+> - **No v1.0.125 wiring change.** The `RefreshBeamEmissive` defensive double-push to BOTH the cone slot-0 MID + cached BeamMID is preserved verbatim. `ConeSlot0MID = Cast<UMaterialInstanceDynamic>(BeamCone->GetMaterial(0))` resolved live every push; write `BeamColor` + `BeamIntensity` onto slot-0 MID first, then onto cached `BeamMID` iff distinct. Byte-for-byte identical.
+> - **No v1.0.124 change.** `BuildBeamCone` `SetMobility(EComponentMobility::Movable)` BEFORE `RegisterComponent` is preserved; the belt-and-braces `AttachToComponent(FixtureRoot, KeepRelativeTransform)` after register is preserved; the explicit post-section `MarkRenderStateDirty()` is preserved.
+> - **No v1.0.123 change.** `BeamCone` is still a SIBLING of `SpotLight` under `FixtureRoot` (not parented to the SpotLight). `DriveBeamConeFromSpotLight` still mirrors `SpotLight->GetRelativeTransform()` onto the cone every tick. `cone.WorldTransform == SpotLight.WorldTransform` by construction; `dot(spot,cone) == +1.000` always.
+> - **No v1.0.122 orientation regression.** The cone's parent +X still equals the SpotLight's +X (the emission direction). The v1.0.127 flip operates ENTIRELY on the mesh-LOCAL vertex coordinates inside the procedural mesh section; the parent transform is untouched, so the v1.0.122 dot-product invariant cannot regress.
+> - **No `RefreshBeamConeCullingFlags` change.** The v1.0.117 single-chokepoint culling-flag setter is unchanged. `bRenderInDepthPass=false`, `bRenderCustomDepth=false`, `SetReceivesDecals(false)`, `bAffectDynamicIndirectLighting=false`, `bAffectDistanceFieldLighting=false`, `SetCastShadow(false)`, `bCastDynamicShadow=false`, `SetCastHiddenShadow(false)`, `bUseAttachParentBound=false`, `bUseAsOccluder=false`, `bAllowCullDistanceVolume=false`, `SetCullDistance(0)`, `SetBoundsScale(WantScale)`, `TranslucencySortPriority` -- all preserved.
+> - **No light-space depth-mask change.** The v1.0.111 per-fixture SceneCapture2D + RT pair (parented to the SpotLight so the capture rides the live aim through pan/tilt) is unchanged. `RefreshBeamShadowMaskParams` is unchanged.
+> - **No new CVar / new console command.** v1.0.127 is purely a vertex-authoring fix on top of the v1.0.126 diagnostic toolkit; the new spawn-log flag `coneMeshExtrusionAxis=-X` is a constant-string addition, not a runtime parameter.
+>
+> ### Read by inspection of the change + a full local `Build.bat REBUS_VisualiserEditor Win64 Development` compile
+>
+> The full unit test for the v1.0.127 fix is the user's next `-game` session: a downward-mounted fixture (any moving head where the GDTF `<Beam>` direction puts the SpotLight `+X` along world `-Z`) should render the cone-mesh additive shaft extruding DOWN from the lens to the floor footprint instead of UP into the ceiling. The post-fix invariants the v1.0.126 `Rebus.DiagBeam` dump should report:
+>
+> - **`coneFwd` and `spotFwd` unchanged** -- both read `(0,0,-1)` on a downward-aimed fixture (the parent-transform direction is byte-identical to v1.0.126; the v1.0.122 + v1.0.123 + v1.0.124 invariants are byte-for-byte preserved).
+> - **`dot(spot,cone) == +1.000`** -- byte-identical (the v1.0.122 orientation fix is preserved in full).
+> - **`SPAWNED v1.0.127 ... coneMeshExtrusionAxis=-X`** in the spawn log per fixture (the new field added in v1.0.127; reads `-X` to record the flip is live; pre-fix binaries would not print this field at all).
+> - **Visually**: the additive `M_RebusBeam` shaft now extrudes the SAME direction as the SpotLight emission. On a downward-mounted truss fixture: the shaft extrudes DOWN from the lens to the floor footprint, co-locating with the `USpotLightComponent` floor pool. On a horizontally-aimed fixture: the shaft extrudes HORIZONTALLY out the lens face. On any fixture where pan/tilt aims the head off-axis: the shaft extrudes along the new live aim.
+
 > **v1.0.126 — diagnostic toolkit for the user-reported "v1.0.125 shipped but the BeamCone is STILL invisible" scenario. v1.0.125 closed the only currently-provable invisible-cone root cause (`BeamMID`-vs-cone-slot-0 pointer-divergence in `RefreshBeamEmissive`); if the cone is still invisible after a v1.0.125+ DLL reload the failure lives in a region the existing dumps don't cover (geometry submission, material domain / blend mode, view-mode override, fog overdraw, camera frustum, post-process unbound volume). v1.0.126 ships FOUR new console commands — `Rebus.DiagBeam`, `Rebus.ForceBeam`, `Rebus.BeamDebugTint`, `Rebus.BeamConeWireframe` — designed to prove or disprove EVERY remaining hypothesis in ONE runtime session WITHOUT requiring a rebuild or re-bake. No `M_RebusBeam` re-bake, no scene re-save, no portal-side change — just reload the new `UnrealEditor-RebusVisualiser.dll`, fire a cue, and run the four commands in the runbook order below. v1.0.126 is purely additive: every byte of v1.0.125 (and v1.0.124 / v1.0.123 / v1.0.122 / v1.0.117 / v1.0.111) behaviour is preserved; the new commands all bypass the normal DMX-driven pipeline so they cannot regress live operation.**
 >
 > ### Why a v1.0.126 diagnostic ship instead of another speculative fix

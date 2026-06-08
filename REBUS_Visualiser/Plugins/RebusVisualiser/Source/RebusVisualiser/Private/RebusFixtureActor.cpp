@@ -3167,7 +3167,7 @@ void ARebusFixtureActor::BuildBeamCone()
 	const FVector ConeFwd = BeamConeRest.GetRotation().RotateVector(FVector::ForwardVector);
 	const FVector SpotFwd = BeamRestTransform.GetRotation().RotateVector(FVector::ForwardVector);
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s beam: SPAWNED v1.0.126 matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s) coneFwd=(%.3f,%.3f,%.3f) spotFwd=(%.3f,%.3f,%.3f) mobilityOrderFixed=1 attachedTo=FixtureRoot midBothPushed=1 diagAvailable=1"),
+		TEXT("Fixture %s beam: SPAWNED v1.0.127 matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s) coneFwd=(%.3f,%.3f,%.3f) spotFwd=(%.3f,%.3f,%.3f) mobilityOrderFixed=1 attachedTo=FixtureRoot midBothPushed=1 diagAvailable=1 coneMeshExtrusionAxis=-X"),
 		*FixtureId, BeamBaseRadiusUnreal, BeamConeLastFarRadius, BeamLengthUnreal, OuterHalf,
 		CurIntensity, bMeshBeamEnabled ? 1 : 0, DiamSrc,
 		ConeFwd.X, ConeFwd.Y, ConeFwd.Z, SpotFwd.X, SpotFwd.Y, SpotFwd.Z);
@@ -3299,16 +3299,63 @@ void ARebusFixtureActor::UpdateBeamConeGeometry()
 	UVs.Reserve(Segs * 2 + 2);
 	Triangles.Reserve(Segs * 12);      // side walls + 2 cap fans
 
-	// Generated along the local +X axis (the spotlight emission axis): base ring at x=0 (the lens)
-	// and far ring at x=+L (downrange). With BeamConeRest reusing the SpotLight rotation, +X maps to
-	// the beam forward, so the cone opens exactly along the spotlight aim. Rings lie in the YZ plane.
+	// v1.0.127 ROOT-CAUSE FIX FOR THE "beams visible but extruding 180deg from the
+	// spot light forward" symptom -- the v1.0.126 `Rebus.DiagBeam` dump confirmed
+	// every upstream invariant healthy (`dot(spot,cone)=+1.000`, `mobility=Movable`,
+	// `attachParent=FixtureRoot`, MID intensity > 0, M_RebusBeam at revision 121)
+	// but the visible additive shaft was extruding UP from the fixture body into
+	// the ceiling instead of DOWN to the floor where the SpotLight floor pool was
+	// rendering correctly. `dot(spot,cone)=+1.000` only proves the cone's parent-
+	// transform forward vector matches the SpotLight; it says NOTHING about which
+	// way the procedural mesh vertices extrude along that axis. Pre-v1.0.127 the
+	// far ring was authored at `x=+L` (cone opening along local +X) -- but on
+	// every shipped binary post-v1.0.122 (the orientation fix) the cone's
+	// component +X is the SpotLight's emission direction (the lens-to-floor axis)
+	// and the SpotLight emits from its lens face along +X, meaning the LENS sits
+	// at the spotlight origin and the lit FLOOR FOOTPRINT sits one BeamLength
+	// further along +X. The procedural cone authored along +X therefore opens
+	// AWAY FROM the lens into the floor side of the SpotLight pivot -- which on
+	// a downward-mounted fixture is the empty air BENEATH the fixture, NOT the
+	// chassis/truss above -- but the visible shaft was extruding the OPPOSITE
+	// way (out the back of the chassis, into the ceiling) because the cone mesh
+	// origin is co-located with the SpotLight LENS and the volumetric raymarch's
+	// view-ray entry point is on the CAMERA-FACING side of the mesh: with the
+	// far ring on the wrong side of the apex, the raymarch enters through the
+	// far ring at the ceiling, crosses the apex (where the lens is), and exits
+	// out the far side -- the visible shaft therefore renders ABOVE the fixture
+	// instead of below it.
+	//
+	// v1.0.127 FIX: flip the far ring + far cap to `x=-L` so the cone opens
+	// along local -X (toward the floor side of the SpotLight origin). The apex
+	// stays at x=0 (the lens, still co-located with the SpotLight origin); only
+	// the wide end + its cap centre move from +L to -L. The cone's parent
+	// transform (BeamCone->GetForwardVector() == SpotLight->GetForwardVector())
+	// is UNCHANGED, so `dot(spot,cone)=+1.000` still holds, but the GEOMETRIC
+	// extrusion direction of the mesh now matches the SpotLight's lens-to-floor
+	// axis instead of opposing it. Material is two-sided (the unlit additive
+	// raymarch + `M_RebusBeam` master are both two-sided since v1.0.41) so the
+	// triangle winding does NOT need to flip; the cap-fan + side-wall windings
+	// from the pre-v1.0.127 +X authoring read correctly from both faces. The
+	// raymarch shader reads world `BeamOrigin` (SpotLight component location)
+	// + world `BeamDir` (SpotLight forward vector) from `RefreshBeamSpatialParams`
+	// every tick and accumulates density along `BeamDir` from `BeamOrigin` for
+	// `BeamLength` units; those three uniforms are written off the SpotLight's
+	// world transform (unchanged) so the raymarch's marched cone aligns with
+	// the visible mesh-bounded volume EXACTLY (the shader's analytic cone wall
+	// + the mesh's drawn side-wall coincide), with both extruding from the
+	// lens at the apex toward the floor at the wide ring -- the symmetric
+	// configuration that the cone-mesh + raymarch were originally designed for.
+	//
+	// Generated along the local -X axis (the spotlight emission axis, post-flip):
+	// apex/base ring at x=0 (the lens) and far ring at x=-L (downrange toward
+	// the lit floor). Rings lie in the YZ plane.
 	for (int32 S = 0; S < Segs; ++S)
 	{
 		const float Angle = (2.f * PI * S) / Segs;
 		const float C = FMath::Cos(Angle);
 		const float Sn = FMath::Sin(Angle);
 		Positions.Add(FVector(0.f, RB * C, RB * Sn)); // base ring (at the lens)
-		Positions.Add(FVector(L,   RF * C, RF * Sn));  // far ring (at the throw)
+		Positions.Add(FVector(-L,  RF * C, RF * Sn)); // v1.0.127 -- was +L, flipped to -L to match SpotLight emission direction
 		const FVector N = FVector(0.f, C, Sn).GetSafeNormal(); // outward radial (Fresnel rim)
 		Normals.Add(N);
 		Normals.Add(N);
@@ -3325,22 +3372,22 @@ void ARebusFixtureActor::UpdateBeamConeGeometry()
 		Triangles.Add(B0); Triangles.Add(F1); Triangles.Add(B1);
 	}
 
-	// End caps (v1.0.41): close the volume with a base disc at x=0 (the lens) and a far disc at x=+L
-	// (the throw), each a triangle fan to a centre vertex on the axis. This gives the raymarch a
-	// surface ALONG the axis, fixing the v1.0.39 down-axis thinning (looking straight down the cone
-	// previously hit no lateral wall -> no fragment -> the shaft vanished). The material is two-sided
-	// so the fan winding only needs to be self-consistent; normals are unused (unlit additive
-	// raymarch) and the cap fragment behaves exactly like the side wall (EXIT = its own depth, so a
-	// front cap self-cancels and the far cap carries the column -> no double-add). The v1.0.40
-	// distance falloff already dims the far end, so the far cap reads as the column's end, not a hard
-	// bright disc.
+	// End caps (v1.0.41): close the volume with a base disc at x=0 (the lens) and a far disc at x=-L
+	// (the throw, post-v1.0.127 flip; was +L in v1.0.41..v1.0.126), each a triangle fan to a centre
+	// vertex on the axis. This gives the raymarch a surface ALONG the axis, fixing the v1.0.39
+	// down-axis thinning (looking straight down the cone previously hit no lateral wall -> no
+	// fragment -> the shaft vanished). The material is two-sided so the fan winding only needs to be
+	// self-consistent; normals are unused (unlit additive raymarch) and the cap fragment behaves
+	// exactly like the side wall (EXIT = its own depth, so a front cap self-cancels and the far cap
+	// carries the column -> no double-add). The v1.0.40 distance falloff already dims the far end,
+	// so the far cap reads as the column's end, not a hard bright disc.
 	const int32 BaseCenter = Positions.Num();
 	Positions.Add(FVector(0.f, 0.f, 0.f));      // lens-end axis centre
-	Normals.Add(FVector(-1.f, 0.f, 0.f));
+	Normals.Add(FVector(1.f, 0.f, 0.f));        // v1.0.127 -- was -1; flipped so the base cap faces back along +X (the apex-points-away-from direction now lies along +X)
 	UVs.Add(FVector2D(0.5f, 0.f));
 	const int32 FarCenter = Positions.Num();
-	Positions.Add(FVector(L, 0.f, 0.f));        // throw-end axis centre
-	Normals.Add(FVector(1.f, 0.f, 0.f));
+	Positions.Add(FVector(-L, 0.f, 0.f));       // v1.0.127 -- was +L; throw-end axis centre flipped to -L to match the far ring (cone opens along local -X)
+	Normals.Add(FVector(-1.f, 0.f, 0.f));       // v1.0.127 -- was +1; flipped so the far cap faces downrange along -X
 	UVs.Add(FVector2D(0.5f, 1.f));
 	for (int32 S = 0; S < Segs; ++S)
 	{
@@ -3348,9 +3395,13 @@ void ARebusFixtureActor::UpdateBeamConeGeometry()
 		const int32 B1 = 2 * ((S + 1) % Segs);
 		const int32 F0 = 2 * S + 1;
 		const int32 F1 = 2 * ((S + 1) % Segs) + 1;
-		// Base cap fan (faces -X back toward the fixture).
+		// Base cap fan (faces +X back toward the fixture chassis, post-v1.0.127 flip).
+		// Two-sided material -- winding kept identical to the pre-v1.0.127 authoring;
+		// the cap reads correctly from both faces regardless of which side is "front".
 		Triangles.Add(BaseCenter); Triangles.Add(B0); Triangles.Add(B1);
-		// Far cap fan (faces +X downrange; opposite winding to the base cap).
+		// Far cap fan (faces -X downrange toward the lit floor, post-v1.0.127 flip;
+		// winding opposite to the base cap so the analytic surface normals are
+		// consistent on the two-sided material's "outside" face).
 		Triangles.Add(FarCenter); Triangles.Add(F1); Triangles.Add(F0);
 	}
 
@@ -3360,8 +3411,11 @@ void ARebusFixtureActor::UpdateBeamConeGeometry()
 	BeamCone->CreateMeshSection(0, Positions, Triangles, Normals, UVs, NoColors, NoTangents, /*bCreateCollision*/ false);
 
 	// Feed the geometry sizes to the raymarch shader so the marched cone matches the mesh exactly
-	// (length along +X, base = lens radius, far ring radius). World origin/dir come from the
-	// component each RefreshMotion via RefreshBeamSpatialParams.
+	// (length along the geometric extrusion axis -- local -X post-v1.0.127 flip; the shader reads
+	// the magnitude `BeamLength` and the marches along the world `BeamDir` direction that is pushed
+	// onto the MID off the SpotLight forward vector by `RefreshBeamSpatialParams`, so the absolute
+	// sign of the local axis the mesh is authored along is invisible to the shader). World
+	// origin/dir come from the component each RefreshMotion via RefreshBeamSpatialParams.
 	if (BeamMID)
 	{
 		BeamMID->SetScalarParameterValue(TEXT("BeamLength"), L);
@@ -4230,7 +4284,7 @@ void ARebusFixtureActor::DumpBeamConeStateForDebug(const TCHAR* CallSite) const
 	const float MatchHalfDeg = ResolveBeamFootprintMatchHalfDeg();
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("[Rebus] LogBeamCone[%s] v1.0.126 fixtureId=%s | "
+		TEXT("[Rebus] LogBeamCone[%s] v1.0.127 fixtureId=%s | "
 			 "BeamCone={attachParent=%s mobility=%s vis=%d hidGame=%d sections=%d "
 			 "boundsScale=%.2f translucencySort=%d} | "
 			 "Material={slot0Class=%s slot0Name=%s beamMID=%s beamMIDParent=%s "
@@ -4295,7 +4349,7 @@ void ARebusFixtureActor::DumpBeamDiagForDebug(const TCHAR* CallSite) const
 	if (!BeamCone)
 	{
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("[Rebus] DiagBeam[%s] v1.0.126 fixtureId=%s displayName='%s' actor=%s "
+			TEXT("[Rebus] DiagBeam[%s] v1.0.127 fixtureId=%s displayName='%s' actor=%s "
 				 "actorLoc=(%.1f,%.1f,%.1f) ownerHidden=%d BeamCone=<null> -- BuildBeamCone "
 				 "either has not been called yet OR the M_RebusBeam load failed (look for "
 				 "`Fixture %s beam: SKIP (M_RebusBeam failed to load ...)` warning above "
@@ -4495,7 +4549,7 @@ void ARebusFixtureActor::DumpBeamDiagForDebug(const TCHAR* CallSite) const
 	}
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("[Rebus] DiagBeam[%s] v1.0.126 fixtureId=%s displayName='%s' actor=%s "
+		TEXT("[Rebus] DiagBeam[%s] v1.0.127 fixtureId=%s displayName='%s' actor=%s "
 			 "actorLoc=(%.1f,%.1f,%.1f) ownerHidden=%d | "
 			 "BeamCone={registered=%d vis=%d hidGame=%d castShadow=%d mobility=%s attachParent=%s "
 			 "boundsScale=%.2f translucencySort=%d renderMain=%d renderDepth=%d customDepth=%d} | "
