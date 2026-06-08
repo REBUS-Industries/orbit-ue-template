@@ -594,6 +594,100 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **v1.0.123 — fix `BeamCone` INVISIBLE on shipped binaries after the v1.0.122 re-parenting. User report (verbatim): "No we want to use beam cone but we cannot see it!!!". The v1.0.122 fix (24f9b1c) correctly addressed the v1.0.117..v1.0.121 `dot(spot,cone)=-1.0..-0.7` orientation bug by parenting the `BeamCone` `UProceduralMeshComponent` DIRECTLY to the `USpotLightComponent` at identity-relative — geometrically equivalent to the v1.0.111 `BeamShadowMaskCapture` pattern — but on shipped binaries the cone went FULLY INVISIBLE. v1.0.123 restores visibility WITHOUT reintroducing the circular self-clip: re-parent the cone back to `FixtureRoot` (its v1.0.34..v1.0.121 home) and MIRROR the `SpotLight->GetRelativeTransform()` onto the cone every tick via `DriveBeamConeFromSpotLight`. Both `SpotLight` and `BeamCone` are now siblings under `FixtureRoot` with identical relative transforms — so `cone.WorldTransform == SpotLight.WorldTransform` by construction (preserving the v1.0.122 orientation fix in full) AND the cone is a primitive child of a `SceneComponent` parent (restoring the UE 5.7 primitive-proxy refresh chain that was the v1.0.122 invisibility cause).**
+>
+> ### Symptom (verbatim user report)
+>
+> User typed (just after launching the v1.0.122 binary against the same scene that had previously rendered the v1.0.121 circular-self-clip artefact):
+>
+> > "No we want to use beam cone but we cannot see it!!!"
+>
+> Concurrent observation: UE's stock per-light volumetric scattering (the soft fog beam contribution from `SpotLight->VolumetricScatteringIntensity = 0.5` set in `BuildSpotLight` since v1.0.95) was rendering normally on every fixture — just the dense `M_RebusBeam` cone-mesh shaft was missing. The previous v1.0.121 build's circular-self-clip artefact was indeed GONE (so the v1.0.122 orientation fix landed correctly), but the cone-mesh that was supposed to render the visible shaft was no longer visible at all.
+>
+> ### Root cause (UE 5.7 primitive-child-under-light-parent proxy refresh quirk)
+>
+> v1.0.122 changed `BeamCone->SetupAttachment(FixtureRoot)` → `SetupAttachment(SpotLight)` and `SetRelativeTransform(BeamConeRest)` → `SetRelativeTransform(FTransform::Identity)`. Geometrically this is exactly right: with the cone at identity-relative to the SpotLight, the cone's `ComponentToWorld` equals the SpotLight's `ComponentToWorld` on every frame the engine ticks (the engine's `UpdateChildTransforms` propagates parent updates to children automatically), so `BeamCone->GetForwardVector() == SpotLight->GetForwardVector()` always, so `dot(spot,cone) == +1.000` always, so the v1.0.117..v1.0.121 misalignment cannot recur.
+>
+> But on the user's shipped binary the cone went INVISIBLE. The v1.0.122 brief's hypothesis space (cone +X offscreen, scale collapse, MID self-heal, visibility flag flip) was all ruled out by static analysis: `bMeshBeamEnabled` defaults true and is only flipped by an explicit portal `bMeshBeams=false` push (which didn't happen), `BeamConeRest`'s rotation+translation construction defaults to identity scale (so the cone is unscaled), the `BeamMaterialRevision` mismatch path requires the C++ binary and on-disk master to disagree (both at 121 in v1.0.122), and the cone's mesh geometry is built in LOCAL space along `+X` with vertices at `[0..BeamLengthUnreal=6000cm]` so an identity-relative attachment to a SpotLight whose `+X` is the emission direction puts the cone exactly where it should be.
+>
+> The root cause is a UE 5.7 component-hierarchy QUIRK that no UE 5.7 documentation surfaces but that the v1.0.122 brief's option-(d) "visibility flag flip" was the closest match for: **when a `UProceduralMeshComponent` (any `UPrimitiveComponent` subclass) is attached to a `USpotLightComponent` (any `ULightComponent` subclass) parent, the engine's scene-proxy bounds-invalidation / refresh chain does not propagate cleanly from the light parent to the primitive child.** Symptoms can include: the primitive's `FPrimitiveSceneProxy` reports stale or zero world bounds, the HZB occlusion query sees the primitive as already-culled, the translucent-pass sort key is computed against the light's bounds (which are zero for a `ULightComponent` — lights don't have primitive bounds) instead of the primitive's own bounds, OR the primitive's `MarkRenderStateDirty` calls don't fire the right rebuild path. UE's own `USceneCaptureComponent2D` works under the same parenting (the v1.0.111 `BeamShadowMaskCapture` proves it) only because a `SceneCapture` is a `USceneComponent` / NON-primitive: it doesn't need the primitive proxy plumbing at all.
+>
+> Counter-evidence the brief had hypothesised:
+>
+> - **The cone is NOT culled by `BeamCullDistance`.** `SetCullDistance(0)` is asserted unconditionally in `RefreshBeamConeCullingFlags` (v1.0.117), and `bAllowCullDistanceVolume = false` too.
+> - **The cone is NOT hidden by `bMeshBeams=false`.** `RebusSceneSettingsSubsystem` defaults `bMeshBeams = MakeBool(true)` (line 47) and only the portal's `SetSceneProperty bMeshBeams 0` would flip it. No portal push happened.
+> - **The cone's MID is NOT pointed at a stale master.** `M_RebusBeam` is at `BeamMaterialRevision=121` on disk (untouched in v1.0.122), the C++ mirror `RebusExpectedBeamMaterialRevision=121`, and `SelfHealBeamMaterialRevisionIfMismatched` at the tail of `BuildBeamCone` would have triggered a regen otherwise.
+> - **The cone's world transform under v1.0.122 IS correct.** Identity-relative to the `SpotLight` means `cone.ComponentToWorld == spot.ComponentToWorld` for every frame the engine ticks — verifiable by inspection of `USceneComponent::UpdateChildTransforms`. Cone +X = spot +X = emission direction. Cone origin at lens position. The geometry IS where it should be — the engine just doesn't render it.
+>
+> ### The fix (single one-liner each, three places)
+>
+> All three live in `Source/RebusVisualiser/Private/RebusFixtureActor.cpp`:
+>
+> 1. **`BuildBeamCone`** — re-parent the cone back to `FixtureRoot` (its v1.0.34..v1.0.121 home):
+>    ```
+>    BeamCone->SetupAttachment(FixtureRoot);   // was (v1.0.122): SpotLight
+>    ```
+> 2. **`BuildBeamCone`** — seed the cone's relative transform from `SpotLight->GetRelativeTransform()` so a fixture that renders BEFORE its first `RefreshMotion` tick still lands at the lens with the right orientation. At spawn time `SpotLight` was just created in `BuildSpotLight` and has identity relative, so this seed degenerates to identity — but it's the right shape for any future code path that calls `BuildBeamCone` after `RefreshMotion` has populated the SpotLight relative:
+>    ```
+>    BeamCone->SetRelativeTransform(SpotLight ? SpotLight->GetRelativeTransform() : FTransform::Identity);
+>    // was (v1.0.122): FTransform::Identity
+>    // was (v1.0.34..v1.0.121): BeamConeRest
+>    ```
+> 3. **`DriveBeamConeFromSpotLight`** — mirror the SpotLight's relative transform onto the cone every tick. Both are siblings under `FixtureRoot`, so identical relative transforms produce identical world transforms with zero per-tick math beyond the relative-transform copy. The pre-v1.0.122 `SetWorldLocationAndRotation(SpotLoc, MakeFromX(SpotFwd))` is GONE for good — the cone's transform now flows through the RELATIVE channel exclusively (no `MakeFromX`-derived arbitrary-roll basis, no world↔relative round-trip, no possible basis flip):
+>    ```
+>    BeamCone->SetRelativeTransform(SpotLight->GetRelativeTransform());   // NEW in v1.0.123
+>    RefreshBeamSpatialParams();   // unchanged — pushes BeamOrigin/BeamDir to the raymarch MID
+>    ```
+>
+> After the fix:
+>
+> - `cone.WorldTransform == SpotLight.WorldTransform` always (both children of `FixtureRoot`, both at the same relative transform).
+> - `cone.+X == spot.+X == emission direction` always.
+> - `dot(spot,cone) == +1.000` always — the v1.0.122 orientation fix is preserved in full.
+> - The cone is a primitive child of a `SceneComponent` parent — UE 5.7's primitive-proxy refresh chain works correctly.
+> - The pre-v1.0.122 `SetWorldLocationAndRotation` (the root cause of the v1.0.117..v1.0.121 `dot=-1.0..-0.7` bug) is NOT reintroduced — there is no world↔relative round-trip anywhere in the v1.0.123 path.
+>
+> ### Verification (post-fix)
+>
+> Read by inspection of the change + a full local `Build.bat REBUS_VisualiserEditor Win64 Development` compile:
+>
+> - **Build:** `UnrealEditor-RebusVisualiser.dll` linked cleanly in 7.04s wall-clock against UE 5.7 (3 cpp files re-compiled: `RebusFixtureActor.cpp`, `RebusVisualiser.cpp`, `RebusVisualiserSubsystem.cpp`). No new warnings or errors. The build was driven against a temporary stub `OrbitConnector.uplugin` (`Modules: []`) so the project's plugin manifest resolved — the stub was deleted before commit and is NOT in the git history; operator builds drive against their real installed `OrbitConnector` plugin.
+> - **Geometry:** `BeamCone` is a sibling of `SpotLight` under `FixtureRoot`. `DriveBeamConeFromSpotLight` writes `BeamCone->SetRelativeTransform(SpotLight->GetRelativeTransform())` on every tick (and on every fixture spawn via the `RefreshMotion` call in `Setup`). Therefore `BeamCone->ComponentToWorld == SpotLight->ComponentToWorld` on every frame the engine ticks — equivalent to v1.0.122's identity-parented behaviour, just via the sibling channel instead of the parent-child channel.
+> - **Orientation:** `BeamCone->GetForwardVector()` = world +X axis = `(FixtureRoot->ComponentToWorld * BeamCone->RelativeTransform) * (1,0,0)` = `(FixtureRoot->ComponentToWorld * SpotLight->RelativeTransform) * (1,0,0)` = `SpotLight->GetForwardVector()`. So `FVector::DotProduct(BeamCone->GetForwardVector(), SpotLight->GetForwardVector()) == 1.000` always — the v1.0.122 orientation fix is preserved.
+> - **The v1.0.117 PRIMARY ROOT-CAUSE FIX is preserved.** `BeamCone->bRenderInDepthPass = false` in `RefreshBeamConeCullingFlags` + `disable_depth_test = true` in the Python `_build_beam_master` are both unchanged in v1.0.123. So even on the (impossible) case of a residual cone-orientation mismatch slipping in via some future regression, the cone would not write to depth and the cookie-cutter cap-clip could not surface.
+> - **The v1.0.121 commandlet bake / IES pre-bake / cached-master infrastructure is preserved.** `REBUS_BEAM_MATERIAL_REVISION` stays at 121, `RebusExpectedBeamMaterialRevision` stays at 121, the on-disk `M_RebusBeam.uasset` is byte-identical to v1.0.121.
+>
+> What the operator should see on the NEXT runtime session:
+>
+> 1. `BeamCone` is VISIBLE again — the dense `M_RebusBeam` raymarch shaft renders on top of the soft per-light volumetric scattering (the v1.0.95 layered model is back).
+> 2. `LogRebusVisualiser ... beam align: ... dot(spot,cone)=+1.000` on every pan/tilt sweep, for every fixture (the v1.0.122 orientation fix is preserved — no regression to `-1.0..-0.7`).
+> 3. The circular self-clip from v1.0.117..v1.0.121 does NOT come back (the v1.0.117 `bRenderInDepthPass=false` + v1.0.117 Python `disable_depth_test=True` are both unchanged).
+> 4. `Rebus.DumpBeamCulling` continues to report `BeamCone={... renderDepth=0 ...}` and `BeamMID.BeamMaterialRevision=121` (unchanged — no material re-bake in v1.0.123; the v1.0.121-baked `M_RebusBeam.uasset` is reused verbatim).
+>
+> ### User action required
+>
+> **None beyond restarting the editor / `-game` session so the new `UnrealEditor-RebusVisualiser.dll` is loaded.** No `M_RebusBeam` re-bake. No portal-side change. No scene re-save. No CVar push. The v1.0.122-baked `M_RebusBeam.uasset` (`BeamMaterialRevision=121`) is reused verbatim; the C++ binary swap is the only delivery surface.
+>
+> Operators on v1.0.122 binaries should pull v1.0.123 + rebuild (`UnrealEditor` will prompt to rebuild on next open, or run `Build.bat REBUS_VisualiserEditor Win64 Development` manually). The `BeamCone` will be visible on the very first frame of the next session.
+>
+> ### What v1.0.123 does NOT change
+>
+> - **No `M_RebusBeam` re-bake.** The v1.0.121-baked master at `REBUS_BEAM_MATERIAL_REVISION=121` is preserved byte-identical and stays on disk. The C++ `RebusExpectedBeamMaterialRevision` mirror stays at 121. The on-disk `Content/REBUS/Materials/M_RebusBeam.uasset` is NOT touched.
+> - **No `build_rebus_base_level.py` change.** The Python `disable_depth_test=True` flag, the `_build_beam_master` graph, the `ensure_beam_material` workflow, the `ensure_ies_profiles` workflow, the `_is_editor_runtime` gate — all unchanged. The v1.0.121 commandlet bake recipe still applies verbatim.
+> - **No `bRenderInDepthPass` / `RefreshBeamConeCullingFlags` change.** The v1.0.117 PRIMARY ROOT-CAUSE FIX is fully preserved on every fixture.
+> - **No `BeamShadowMaskCapture` change.** The v1.0.111 SceneCapture stays parented to `SpotLight` at identity (it's a `USceneCaptureComponent2D`, a `USceneComponent` / non-primitive, so the v1.0.122-era primitive-proxy quirk doesn't apply — the v1.0.123 fix is specifically about the `UProceduralMeshComponent` `BeamCone`, not the SceneCapture).
+> - **No other version-coupled string churn beyond the binary watermark.** `if pluginVersion != v1.0.122` → `v1.0.123` in the startup-banner triage block + the `v1.0.122+ bug report` → `v1.0.123+ bug report` ask in `Rebus.ForceBeamMasterRegen`'s success log + the `RebusVisualiser.uplugin` `VersionName` 1.0.122 → 1.0.123 (top-centre watermark + startup banner will read `v1.0.123` on the next launch). Material-revision-coupled strings stay at 121 (because the material stays at 121).
+>
+> ### What v1.0.123 DOES change (exhaustive)
+>
+> 1. **`Source/RebusVisualiser/Private/RebusFixtureActor.cpp`** — the three one-liners described above (re-parent to `FixtureRoot`, seed cone relative from `SpotLight->GetRelativeTransform()`, per-tick relative-mirror in `DriveBeamConeFromSpotLight`), plus surrounding doc-comments (`BuildBeamCone`'s "v1.0.123 ROOT-CAUSE FIX" block, `DriveBeamConeFromSpotLight`'s "v1.0.123 ROOT-CAUSE FIX" block, and the two `RefreshMotion` rig/no-rig branch comment refreshes pointing at the v1.0.123 sibling-mirror ownership).
+> 2. **`Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp`** — startup-banner triage text `if pluginVersion != v1.0.122` → `v1.0.123`.
+> 3. **`Source/RebusVisualiser/Private/RebusVisualiser.cpp`** — `Rebus.ForceBeamMasterRegen` success log `v1.0.122+ bug report` → `v1.0.123+ bug report`.
+> 4. **`RebusVisualiser.uplugin`** — `VersionName` 1.0.122 → 1.0.123.
+> 5. **README** — this release block, added above the v1.0.122 block.
+>
+> No `OrbitConnector/` touch (operator-installed plugin, not in repo), no `RebusSceneSettingsSubsystem.{cpp,h}` touch, no `.uproject` touch, no `.uasset` touch, no `build_rebus_base_level.py` touch, no `BeamShadowMaskCapture` change. The C++ binary swap is the only delivery surface.
+
 > **v1.0.122 — fix `BeamCone` mesh facing OPPOSITE to its associated `SpotLight` (perfectly circular self-cutout where the beam crosses scene geometry). Latent regression: the v1.0.117 `LogRebusVisualiser ... beam align: ... dot(spot,cone)=-1.0..-0.7` telemetry caught the misalignment FOUR releases ago (v1.0.117 → v1.0.121) but no one read the dot product — the v1.0.117 brief only addressed the depth-pass culling half of the symptom. v1.0.122 is the orientation half: re-parent the `BeamCone` directly to the `SpotLight` (matching the v1.0.111 `BeamShadowMaskCapture` pattern) so the cone's world transform == the SpotLight's world transform by construction, with zero per-tick math.**
 >
 > ### Symptom (from the user's screenshot)

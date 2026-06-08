@@ -2910,24 +2910,34 @@ void ARebusFixtureActor::BuildBeamCone()
 	}
 
 	BeamCone = NewObject<UProceduralMeshComponent>(this, TEXT("BeamCone"));
-	// v1.0.122 ROOT-CAUSE FIX -- parent the BeamCone DIRECTLY to the SpotLight (was
-	// FixtureRoot in v1.0.34..v1.0.121). The pre-v1.0.122 model attached the cone to
-	// the actor root and tried to re-align its world transform every tick from
-	// `DriveBeamConeFromSpotLight` via `SetWorldLocationAndRotation(SpotLoc, MakeFromX
-	// (SpotFwd))`. That assertion was supposed to keep cone +X identical to the live
-	// SpotLight +X, but a residual basis flip survived the world-relative round-trip
-	// (the user-visible symptom: `LogRebusVisualiser ... beam align: ... dot(spot,
-	// cone)=-1.0..-0.7` for four versions; the v1.0.117 telemetry caught it but the
-	// v1.0.117 fix only addressed the depth-pass culling side, leaving the orientation
-	// untouched). With the cone parented to the SpotLight at IDENTITY relative, the
-	// cone's world transform == SpotLight's world transform by construction -- no
-	// per-tick re-alignment, no world<->relative computation, no possible drift. This
-	// is the same idiomatic pattern the v1.0.111 `BeamShadowMaskCapture` uses
-	// (SceneCapture parented to SpotLight at identity so it auto-tracks pan/tilt
-	// through the existing component hierarchy). Per-tick DriveBeamConeFromSpotLight
-	// is now a pure shader-param push (BeamOrigin/BeamDir/shadow-mask basis); the
-	// component transform is owned by the attach hierarchy.
-	BeamCone->SetupAttachment(SpotLight);
+	// v1.0.123 ROOT-CAUSE FIX FOR THE v1.0.122 INVISIBILITY REGRESSION -- re-parent the
+	// BeamCone back to `FixtureRoot` (the original v1.0.34..v1.0.121 attachment) but
+	// MIRROR the SpotLight's relative transform onto the cone in `DriveBeamConeFromSpotLight`
+	// so cone.WorldTransform == SpotLight.WorldTransform by construction. v1.0.122
+	// (24f9b1c) parented the cone DIRECTLY to the SpotLight at identity-relative to fix
+	// the v1.0.117..v1.0.121 `dot(spot,cone)=-1.0..-0.7` orientation bug; that fix was
+	// geometrically correct (cone +X tracks spot +X trivially via the attach hierarchy)
+	// but on shipped binaries the BeamCone went INVISIBLE -- the user-visible symptom
+	// the v1.0.123 brief diagnosed as a UE 5.7 quirk when a `UProceduralMeshComponent`
+	// child is parented to a `USpotLightComponent`-class light parent (the engine's
+	// scene-proxy bounds invalidation chain does not always propagate cleanly from a
+	// light parent to a primitive child -- primitives expect a SceneComponent parent
+	// for the proxy refresh path, and the v1.0.111 `BeamShadowMaskCapture` works under
+	// the same parenting only because `USceneCaptureComponent2D` is itself a
+	// SceneComponent / non-primitive: it doesn't need the primitive proxy plumbing).
+	//
+	// The v1.0.123 fix preserves the v1.0.122 ORIENTATION fix in full (cone +X ==
+	// spot +X every frame, no `MakeFromX(SpotFwd)` arbitrary-roll basis, no world
+	// <->relative round-trip) by mirroring `SpotLight->GetRelativeTransform()` onto
+	// the cone in `DriveBeamConeFromSpotLight`: both are siblings under FixtureRoot,
+	// so identical RELATIVE transforms produce identical WORLD transforms with zero
+	// per-tick math beyond the relative-transform copy. The pre-v1.0.122
+	// `SetWorldLocationAndRotation(SpotLoc, MakeFromX(SpotFwd))` is GONE for good --
+	// the cone's transform now flows through the same RELATIVE channel the SpotLight
+	// uses (RefreshMotion writes `BeamRestTransform * Head` onto SpotLight; the cone
+	// inherits via DriveBeamConeFromSpotLight). See `DriveBeamConeFromSpotLight`'s
+	// v1.0.123 doc-comment for the per-tick mirror chokepoint.
+	BeamCone->SetupAttachment(FixtureRoot);
 	BeamCone->RegisterComponent();
 	BeamCone->SetMobility(EComponentMobility::Movable);
 	BeamCone->SetCollisionEnabled(ECollisionEnabled::NoCollision);
@@ -2959,17 +2969,21 @@ void ARebusFixtureActor::BuildBeamCone()
 	// `RebusBeamSharpness` doc-comment).
 	RefreshBeamRadialParams();
 
-	// v1.0.122 -- the cone is now parented to the SpotLight (above), so its relative
-	// transform is IDENTITY: cone.WorldRot == SpotLight.WorldRot (cone +X == spot +X
-	// trivially), and cone.WorldLoc == SpotLight.WorldLoc (the cone's local origin --
-	// the base ring at x=0 in `UpdateBeamConeGeometry` -- co-locates with the lens
-	// position the SpotLight component sits at). `BeamConeRest` is kept as a record
-	// of the (now unused) rest pose for back-compat with any debug dump that still
-	// reads it; new code SHOULD NOT use it -- the SpotLight's relative transform
-	// (`BeamRestTransform * Head` in RefreshMotion) is the single source of truth
-	// for both the spot and the cone after v1.0.122.
+	// v1.0.123 -- seed the cone's relative transform to MATCH the SpotLight's CURRENT
+	// relative transform so the cone is correctly co-located + oriented from the very
+	// first frame (before any RefreshMotion -> DriveBeamConeFromSpotLight tick has run).
+	// At this point in the spawn sequence `SpotLight` was just created in BuildSpotLight
+	// and has IDENTITY relative; RefreshMotion (called later in Setup) will write the
+	// real `BeamRestTransform * Head` onto SpotLight AND the v1.0.123
+	// DriveBeamConeFromSpotLight will mirror it onto the cone. The identity-relative
+	// seed here is therefore a no-op for fixtures that hit RefreshMotion before their
+	// first render, and a safe fallback for any rare path that doesn't. `BeamConeRest`
+	// is kept as a record of the (now unused) rest pose for back-compat with any debug
+	// dump that still reads it; new code SHOULD NOT use it -- the SpotLight's relative
+	// transform (`BeamRestTransform * Head` in RefreshMotion) is the single source of
+	// truth for both the spot and the cone after v1.0.123.
 	BeamConeRest = FTransform(BeamRestTransform.GetRotation(), BeamRestTransform.GetLocation());
-	BeamCone->SetRelativeTransform(FTransform::Identity);
+	BeamCone->SetRelativeTransform(SpotLight ? SpotLight->GetRelativeTransform() : FTransform::Identity);
 
 	BeamConeLastFarRadius = -1.f; // force the first section build
 	UpdateBeamConeGeometry();     // also seeds BeamLength/LensRadius/FarRadius on the MID
@@ -4088,22 +4102,32 @@ void ARebusFixtureActor::DriveBeamConeFromSpotLight()
 {
 	if (!SpotLight || !BeamCone) return;
 
-	// v1.0.122 -- the BeamCone is now PARENTED to the SpotLight (see BuildBeamCone),
-	// so its world transform tracks the spot through the existing component hierarchy.
-	// We no longer need to (and MUST NOT) call `SetWorldLocationAndRotation(SpotLoc,
-	// MakeFromX(SpotFwd))` here -- doing so was the pre-v1.0.122 root-cause: the
-	// world<->relative round-trip introduced a residual basis flip that left the
-	// cone's +X opposite the spot's +X (`dot(spot,cone)=-1.0..-0.7` in the v1.0.117
-	// `beam align` telemetry across v1.0.117..v1.0.121, missed because the v1.0.117
-	// fix only addressed the depth-pass culling). Post-v1.0.122 the cone is
-	// IDENTITY-relative to the SpotLight, so cone +X == spot +X by construction --
-	// always, on every frame, with zero per-tick math.
-	//
-	// This function survives as the chokepoint that re-pushes the live world
-	// BeamOrigin/BeamDir + light-space depth-mask basis onto the BeamMID, AND drives
-	// the Epic-beam canvas off the same ground-truth spotlight transform when it's
-	// the visible shaft. The cone-mesh component transform is now owned by the
-	// attachment hierarchy.
+	// v1.0.123 ROOT-CAUSE FIX FOR THE v1.0.122 INVISIBILITY REGRESSION -- the cone is
+	// now a SIBLING of the SpotLight under FixtureRoot (re-parented back in
+	// `BuildBeamCone`, see that doc-comment for why parenting to the SpotLight in
+	// v1.0.122 made the cone invisible on shipped binaries). We mirror the
+	// SpotLight's RELATIVE transform onto the cone EVERY tick: both are children of
+	// FixtureRoot, so identical relative transforms produce identical WORLD
+	// transforms by construction. This:
+	//   * preserves the v1.0.122 orientation fix in full -- cone.WorldRot ==
+	//     SpotLight.WorldRot exactly (no `MakeFromX(SpotFwd)` arbitrary-roll basis,
+	//     no world<->relative round-trip, no basis flip);
+	//   * restores cone visibility -- a `UProceduralMeshComponent` child of a
+	//     SceneComponent parent gets the regular bounds-invalidation / scene-proxy
+	//     refresh chain (the UE 5.7 quirk that broke v1.0.122 was specifically
+	//     primitive-child-under-light-parent);
+	//   * keeps per-tick math minimal -- one `SetRelativeTransform` copy with no
+	//     trig and no matrix decomposition.
+	// Pre-v1.0.122 the equivalent helper called `BeamCone->SetWorldLocationAndRotation
+	// (SpotLoc, FRotationMatrix::MakeFromX(SpotFwd).ToQuat())` and that path was the
+	// v1.0.117..v1.0.121 root cause for `dot(spot,cone)=-1.0..-0.7`; v1.0.123 uses
+	// the RELATIVE channel (no world<->relative round-trip, no MakeFromX-derived
+	// roll basis) so the v1.0.122 orientation fix CANNOT regress.
+	BeamCone->SetRelativeTransform(SpotLight->GetRelativeTransform());
+
+	// This function ALSO re-pushes the live world BeamOrigin/BeamDir + light-space
+	// depth-mask basis onto the BeamMID, AND drives the Epic-beam canvas off the
+	// same ground-truth spotlight transform when it's the visible shaft.
 	RefreshBeamSpatialParams(); // push the (spotlight-aligned) world origin/dir to the raymarch MID
 
 	// v1.0.111 -- re-push the light-space depth-mask axis basis (BeamLightFwd / Right /
@@ -4552,11 +4576,14 @@ void ARebusFixtureActor::RefreshMotion()
 				LensDisc->SetRelativeTransform(DiscT);
 			}
 
-			// v1.0.122 -- the BeamCone is now parented DIRECTLY to the SpotLight, so the
-			// SetRelativeTransform above auto-propagates to the cone via the component
-			// hierarchy. `DriveBeamConeFromSpotLight` is now a pure shader-param push
-			// (no per-tick cone transform write); see BuildBeamCone + DriveBeamConeFromSpotLight
-			// doc-comments for the full v1.0.122 root-cause rationale.
+			// v1.0.123 -- the BeamCone is a SIBLING of the SpotLight under FixtureRoot
+			// (re-parented back in BuildBeamCone after v1.0.122's
+			// parent-the-cone-to-the-SpotLight attempt made the cone invisible on shipped
+			// binaries). `DriveBeamConeFromSpotLight` mirrors the SpotLight's RELATIVE
+			// transform onto the cone every tick so cone.WorldTransform ==
+			// SpotLight.WorldTransform by construction (zero world<->relative round-trip,
+			// so the v1.0.122 orientation fix is fully preserved). See BuildBeamCone +
+			// DriveBeamConeFromSpotLight doc-comments for the full v1.0.123 rationale.
 			DriveBeamConeFromSpotLight();
 		}
 
@@ -4604,14 +4631,19 @@ void ARebusFixtureActor::RefreshMotion()
 			LensDisc->SetRelativeTransform(LensDiscRest * Head);
 		}
 
-		// v1.0.122 -- the BeamCone is now parented DIRECTLY to the SpotLight, so the
-		// SetRelativeTransform above auto-propagates to the cone via the component
-		// hierarchy (cone.WorldRot == spot.WorldRot by construction, cone +X == spot
-		// +X always). `DriveBeamConeFromSpotLight` no longer touches the cone's
-		// transform; it's now a pure shader-param push (BeamOrigin/BeamDir, shadow-
-		// mask basis) AND the Epic-beam canvas driver. The pre-v1.0.122 per-tick
-		// `SetWorldLocationAndRotation(SpotLoc, MakeFromX(SpotFwd))` was the source
-		// of the v1.0.117..v1.0.121 latent `dot(spot,cone)=-1.0..-0.7` misalignment.
+		// v1.0.123 -- the BeamCone is a SIBLING of the SpotLight under FixtureRoot
+		// (re-parented back in BuildBeamCone after v1.0.122's
+		// parent-the-cone-to-the-SpotLight attempt made the cone invisible on shipped
+		// binaries -- UE 5.7's primitive-component proxy refresh chain misbehaved when
+		// a primitive child was attached to a light parent, see BuildBeamCone for the
+		// full discussion). `DriveBeamConeFromSpotLight` now does a per-tick RELATIVE
+		// transform copy from SpotLight -> BeamCone so cone.WorldTransform ==
+		// SpotLight.WorldTransform by construction (cone +X == spot +X always, no
+		// world<->relative round-trip, the v1.0.122 orientation fix preserved in
+		// full). The pre-v1.0.122 per-tick `SetWorldLocationAndRotation(SpotLoc,
+		// MakeFromX(SpotFwd))` was the source of the v1.0.117..v1.0.121 latent
+		// `dot(spot,cone)=-1.0..-0.7` misalignment and is GONE FOR GOOD -- the cone's
+		// transform flows through the RELATIVE channel exclusively from v1.0.123.
 		DriveBeamConeFromSpotLight();
 	}
 

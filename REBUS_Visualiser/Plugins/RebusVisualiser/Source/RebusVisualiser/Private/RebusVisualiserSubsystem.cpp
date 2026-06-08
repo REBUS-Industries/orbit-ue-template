@@ -226,7 +226,7 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 			BeamMasterRegenAttempts,
 			*LastBeamMasterRegenResult,
 			LastBeamMasterRegenDetectedAfter,
-			TEXT(" -- Operator triage: if pluginVersion != v1.0.122 the C++ binary "
+			TEXT(" -- Operator triage: if pluginVersion != v1.0.123 the C++ binary "
 				 "is stale (`git pull` without rebuild); if beamMasterVerdict != "
 				 "v1.0.121+ the on-disk M_RebusBeam.uasset is stale -- in a real "
 				 "editor OR commandlet session the v1.0.112+ auto-purge SHOULD fire "
