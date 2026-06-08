@@ -617,6 +617,45 @@ public:
 	void DumpBeamMaterialHealthForDebug(int32 ExpectedRevision,
 		const TCHAR* CachedMasterName, int32 CachedMasterLoadCount) const;
 
+	// v1.0.124 -- per-fixture BeamCone diagnostic dump consumed by the new
+	// `Rebus.LogBeamCone <0|1>` CVar AND called once unconditionally from the
+	// tail of `BuildBeamCone` so a "v1.0.124 BeamCone post-build" line lands
+	// in the logs for EVERY fixture spawn (the v1.0.124 brief asked for a
+	// permanent diagnostic so future "cone invisible" reports become a
+	// one-line ask: "run `Rebus.LogBeamCone 1` and paste a frame"). The line
+	// includes:
+	//   * `BeamCone` UPROPERTY pointer (null = M_RebusBeam-load-failed branch),
+	//   * Attach parent name (must be `FixtureRoot` after the v1.0.123 fix --
+	//     surfaces the v1.0.122 `BeamCone parented to SpotLight` regression
+	//     even on a stale binary),
+	//   * `bVisible` / `bHiddenInGame` (visibility gates),
+	//   * `Mobility` (`Static` is the v1.0.124 PRIMARY ROOT-CAUSE FIX target --
+	//     pre-v1.0.124 `SetMobility(Movable)` was called AFTER `RegisterComponent`
+	//     so the proxy was created Static, silently dropping every per-tick
+	//     `SetRelativeTransform` write),
+	//   * Number of mesh sections (`GetNumSections`) -- expects 1 (the cone
+	//     created in `UpdateBeamConeGeometry::CreateMeshSection`),
+	//   * Cone world location + forward + relative location + relative rotation
+	//     + relative scale,
+	//   * SpotLight world location + forward (the truth the cone should be
+	//     mirroring after v1.0.123),
+	//   * `dot(SpotFwd, ConeFwd)` -- expect `+1.000` post-v1.0.123,
+	//   * `BeamLengthCm` + `BeamBaseRadiusCm` + `OuterHalfDeg` + `MatchHalfDeg`
+	//     (the geometry the mesh was built from -- a degenerate input here
+	//     surfaces hypothesis #5 "mesh has zero vertices because length/angle
+	//     defaulted to 0"),
+	//   * Material slot 0 class + name (`UMaterialInstanceDynamic` parented to
+	//     `M_RebusBeam` is the healthy state; `WorldGridMaterial` is the UE
+	//     fallback that means the assignment failed),
+	//   * `bMeshBeamEnabled` + `bUsingEpicBeam` + `bPreferProceduralBeam` (the
+	//     three flags that gate cone visibility via SetVisibility paths).
+	// Public so the file-scope `Rebus.LogBeamCone` refresh sink (registered in
+	// `RebusVisualiser.cpp`) can call it on every fixture without poking the
+	// private members directly. Idempotent / cheap; safe to call multiple times
+	// per frame (the per-tick driver rate-limits via the file-scope
+	// `GRebusLogBeamConeNextSec` throttle).
+	void DumpBeamConeStateForDebug(const TCHAR* CallSite) const;
+
 	// v1.0.119 -- on-spawn self-heal probe: read back the live `BeamMaterial
 	// Revision` scalar from `BeamMID` and, when it does NOT match the running
 	// binary's expected revision (RebusExpectedBeamMaterialRevision baked into
@@ -1015,6 +1054,14 @@ private:
 	// Last beam forward (= SpotLight world emission) we emitted an alignment log for; throttles the
 	// per-update beam-align proof to meaningful aim changes (dot < 0.999) instead of every tick.
 	FVector LastLoggedBeamFwd = FVector::ZeroVector;
+	// v1.0.124 -- per-fixture rate-limit timestamp (seconds since startup) for the
+	// `Rebus.LogBeamCone 1` per-tick stream. Compared against `GRebusLogBeamConeIntervalSec`
+	// in `DriveBeamConeFromSpotLight`. `mutable` so the const-correct dump path in
+	// `DumpBeamConeStateForDebug` can advance it without breaking the const contract on
+	// callers that hold a `const ARebusFixtureActor*` (e.g. CVar refresh sinks). Defaults
+	// to FLT_MIN-equivalent so the very first tick always logs (gives the operator one
+	// guaranteed line on the flip-to-1 push, in addition to the CVar refresh-sink dump).
+	mutable double LastBeamConeLogTimeSec = -1.0;
 	float BeamBaseRadiusUnreal = 2.f;    // cone base radius (lens radius), UE cm
 	float BeamLengthUnreal = 6000.f;     // cone length (= SpotLight AttenuationRadius), UE cm
 	float BeamConeLastFarRadius = -1.f;  // last-built far radius (rebuild gate), UE cm

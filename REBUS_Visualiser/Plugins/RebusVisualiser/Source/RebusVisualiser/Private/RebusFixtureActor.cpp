@@ -539,6 +539,81 @@ FAutoConsoleVariableRef CVarRebusAllowBeamOcclusionQueries(
 	}),
 	ECVF_Default);
 
+// v1.0.124 -- per-fixture BeamCone diagnostic logging gate. The v1.0.124 user-report
+// loop ("we are not seeing the beamcones" with NO visible cone on every fixture
+// despite the v1.0.123 ship) made the v1.0.117..v1.0.123 pattern of "diagnose by
+// re-reading the cpp" untenable -- v1.0.124 bakes a permanent per-fixture diagnostic
+// dump into the runtime that the operator can flip on with one CVar push.
+//   * `Rebus.LogBeamCone 0` (default) -- silent steady state. The unconditional
+//     post-spawn line in `BuildBeamCone` STILL prints once per fixture spawn (low-
+//     volume; lets us prove the build went through even with the gate off), but
+//     no per-tick log noise.
+//   * `Rebus.LogBeamCone 1` -- on push, walks every Rebus fixture and dumps the
+//     full `DumpBeamConeStateForDebug` line for each. Subsequent ticks print one
+//     additional line per fixture every `Rebus.LogBeamConeIntervalSec` seconds (the
+//     rate-limit floor) so a steady stream of diagnostics is captured without
+//     drowning the log. Flip back to 0 to silence.
+// Pair with `Rebus.DumpBeamCulling` (v1.0.113), `Rebus.DumpBeamMaterialHealth`
+// (v1.0.119), `Rebus.DumpBeamShadowMask` (v1.0.111) for the full per-fixture
+// triage stack: this CVar is the v1.0.124 entry-point for "is the cone alive at
+// all?" diagnosis -- the others assume it is and probe specific failure modes.
+int32 GRebusLogBeamCone           = 0;
+float GRebusLogBeamConeIntervalSec = 1.0f; // per-fixture per-tick rate-limit floor
+
+FAutoConsoleVariableRef CVarRebusLogBeamCone(
+	TEXT("Rebus.LogBeamCone"),
+	GRebusLogBeamCone,
+	TEXT("v1.0.124 -- 0|1 (default 0). When 1, every Rebus fixture's BeamCone state "
+		 "is logged on every tick (rate-limited per-fixture by `Rebus.LogBeamConeIntervalSec`, "
+		 "default 1.0 sec). Each line includes: cone material name, world location + "
+		 "forward, dot(SpotFwd, ConeFwd), beam length / half-angle, component "
+		 "visibility / hidden-in-game / mobility / mesh-section count, attach parent "
+		 "name, relative location / rotation / scale, plus the bMeshBeamEnabled / "
+		 "bUsingEpicBeam / bPreferProceduralBeam gate flags. The v1.0.124 brief asked "
+		 "for a permanent diagnostic so future 'cone invisible' reports become a "
+		 "one-line ask: paste a frame of `Rebus.LogBeamCone 1` output. On flip to 1 "
+		 "the refresh sink also dumps ONE line per fixture immediately so the "
+		 "operator gets feedback before the per-tick stream starts. Flip back to 0 "
+		 "to silence (the unconditional one-line-per-fixture-spawn log in BuildBeamCone "
+		 "stays put either way -- low-volume, lets us prove the build went through)."),
+	FConsoleVariableDelegate::CreateLambda([](IConsoleVariable* CVar)
+	{
+		if (!GEngine) return;
+		int32 Refreshed = 0;
+		const int32 NewVal = CVar->GetInt();
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			for (TActorIterator<ARebusFixtureActor> It(W); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					if (NewVal != 0)
+					{
+						F->DumpBeamConeStateForDebug(TEXT("CVarRefresh"));
+					}
+					++Refreshed;
+				}
+			}
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.LogBeamCone -> %d, walked %d fixture(s). Per-tick rate-limit floor: "
+				 "%.2f sec/fixture (`Rebus.LogBeamConeIntervalSec`)."),
+			NewVal, Refreshed, GRebusLogBeamConeIntervalSec);
+	}),
+	ECVF_Default);
+
+FAutoConsoleVariableRef CVarRebusLogBeamConeIntervalSec(
+	TEXT("Rebus.LogBeamConeIntervalSec"),
+	GRebusLogBeamConeIntervalSec,
+	TEXT("v1.0.124 -- per-fixture rate-limit floor (seconds) for the per-tick "
+		 "`Rebus.LogBeamCone 1` stream. Default 1.0. Lower (0.1) for sub-frame "
+		 "diagnostics on a single fixture; raise (5.0) for trickle-monitoring. "
+		 "0 = per-frame; <0 clamped to 0. The unconditional per-spawn log line "
+		 "in BuildBeamCone is unaffected. Live."),
+	ECVF_Default);
+
 // v1.0.101 -- per-fixture cone-mesh visible far-radius scale, applied identically to the
 // procedural M_RebusBeam cone (UpdateBeamConeGeometry) AND the Epic-beam canvas
 // `DMX Zoom` (UpdateEpicBeamParams). Default 1.0 = the visible shaft is sized strictly
@@ -2909,37 +2984,94 @@ void ARebusFixtureActor::BuildBeamCone()
 		return;
 	}
 
-	BeamCone = NewObject<UProceduralMeshComponent>(this, TEXT("BeamCone"));
-	// v1.0.123 ROOT-CAUSE FIX FOR THE v1.0.122 INVISIBILITY REGRESSION -- re-parent the
-	// BeamCone back to `FixtureRoot` (the original v1.0.34..v1.0.121 attachment) but
-	// MIRROR the SpotLight's relative transform onto the cone in `DriveBeamConeFromSpotLight`
-	// so cone.WorldTransform == SpotLight.WorldTransform by construction. v1.0.122
-	// (24f9b1c) parented the cone DIRECTLY to the SpotLight at identity-relative to fix
-	// the v1.0.117..v1.0.121 `dot(spot,cone)=-1.0..-0.7` orientation bug; that fix was
-	// geometrically correct (cone +X tracks spot +X trivially via the attach hierarchy)
-	// but on shipped binaries the BeamCone went INVISIBLE -- the user-visible symptom
-	// the v1.0.123 brief diagnosed as a UE 5.7 quirk when a `UProceduralMeshComponent`
-	// child is parented to a `USpotLightComponent`-class light parent (the engine's
-	// scene-proxy bounds invalidation chain does not always propagate cleanly from a
-	// light parent to a primitive child -- primitives expect a SceneComponent parent
-	// for the proxy refresh path, and the v1.0.111 `BeamShadowMaskCapture` works under
-	// the same parenting only because `USceneCaptureComponent2D` is itself a
-	// SceneComponent / non-primitive: it doesn't need the primitive proxy plumbing).
+	// v1.0.124 ROOT-CAUSE FIX FOR THE v1.0.122..v1.0.123 INVISIBILITY REGRESSION
+	// THAT v1.0.123 DID NOT ACTUALLY RESOLVE -- the user reported (against the
+	// shipped v1.0.123 build) "we are not seeing the beamcones" with NO visible
+	// cone on every fixture, even though spotlights + IES profiles were firing
+	// correctly (4 floor pools visible). v1.0.123's hypothesis was "primitive-
+	// child-under-light-parent UE 5.7 proxy quirk" and the fix was to re-parent
+	// the cone back to `FixtureRoot` (sibling of `SpotLight`) and mirror the
+	// SpotLight's relative transform onto the cone every tick. That hypothesis
+	// was geometrically sound but addressed the WRONG root cause: v1.0.121 had
+	// the SAME `FixtureRoot` parenting and the cone WAS visible, the only
+	// material code path difference between v1.0.121 (visible) and v1.0.123
+	// (invisible) is HOW the cone's transform is updated post-spawn:
+	//   v1.0.121: per-tick `SetWorldLocationAndRotation(SpotLoc, MakeFromX(SpotFwd))`
+	//   v1.0.122: identity-relative under SpotLight (no per-tick transform write)
+	//   v1.0.123: per-tick `SetRelativeTransform(SpotLight->GetRelativeTransform())`
 	//
-	// The v1.0.123 fix preserves the v1.0.122 ORIENTATION fix in full (cone +X ==
-	// spot +X every frame, no `MakeFromX(SpotFwd)` arbitrary-roll basis, no world
-	// <->relative round-trip) by mirroring `SpotLight->GetRelativeTransform()` onto
-	// the cone in `DriveBeamConeFromSpotLight`: both are siblings under FixtureRoot,
-	// so identical RELATIVE transforms produce identical WORLD transforms with zero
-	// per-tick math beyond the relative-transform copy. The pre-v1.0.122
-	// `SetWorldLocationAndRotation(SpotLoc, MakeFromX(SpotFwd))` is GONE for good --
-	// the cone's transform now flows through the same RELATIVE channel the SpotLight
-	// uses (RefreshMotion writes `BeamRestTransform * Head` onto SpotLight; the cone
-	// inherits via DriveBeamConeFromSpotLight). See `DriveBeamConeFromSpotLight`'s
-	// v1.0.123 doc-comment for the per-tick mirror chokepoint.
+	// v1.0.124 PRIMARY ROOT CAUSE: `BeamCone->SetMobility(EComponentMobility::
+	// Movable)` was being called AFTER `BeamCone->RegisterComponent()`. UE's
+	// default mobility for a `UProceduralMeshComponent` (UMeshComponent ->
+	// UPrimitiveComponent -> USceneComponent) is `EComponentMobility::Static`,
+	// so the FPrimitiveSceneProxy was being created with the Static mobility
+	// flag set. On UE 5.7, a Static-mobility-registered scene proxy ignores
+	// subsequent per-tick `SetRelativeTransform` writes (the engine assumes
+	// Static primitives never move and the proxy's transform is baked at
+	// register time). v1.0.121 worked because `SetWorldLocationAndRotation`
+	// is a different update path that forces the proxy to refresh its
+	// transform via `MarkRenderStateDirty` even on Static-flagged proxies;
+	// v1.0.122 worked geometrically because the cone's world transform was
+	// inherited THROUGH THE ATTACH HIERARCHY (no transform write on the cone
+	// itself); v1.0.123's per-tick `SetRelativeTransform` is the failure
+	// mode this primary root-cause introduces. The fix is to set Mobility
+	// BEFORE Register so the proxy is created Movable and accepts per-tick
+	// relative-transform writes correctly.
+	//
+	// v1.0.124 SECONDARY ROOT CAUSE: a hot-reload edge-case where a previous
+	// `BeamCone` UPROPERTY pointer survives across a Setup() call (e.g. the
+	// portal pushes a re-Setup mid-session). The pre-v1.0.124 NewObject would
+	// rename the existing BeamCone and create a new one, but the OLD scene
+	// proxy could remain registered until GC, leaving a phantom cone at the
+	// previous transform AND occupying the "BeamCone" name. v1.0.124
+	// explicitly destroys any pre-existing BeamCone before NewObject so the
+	// component name + scene proxy are both reclaimed cleanly.
+	//
+	// v1.0.124 BELT-AND-BRACES: an explicit `AttachToComponent(FixtureRoot,
+	// KeepRelativeTransform)` AFTER RegisterComponent. SetupAttachment alone
+	// is honoured at first-register time; the additional AttachToComponent
+	// call is a runtime no-op when SetupAttachment took effect AND a runtime
+	// rescue when it didn't (covers any future hot-reload / Live++ path that
+	// registers the component before SetupAttachment lands -- the cone CANNOT
+	// end up parented to something other than FixtureRoot after this).
+	//
+	// Preserves v1.0.122 orientation fix (cone +X == spot +X via the per-tick
+	// relative-transform mirror) AND v1.0.123 visibility (cone is still a
+	// SIBLING of SpotLight under FixtureRoot) -- v1.0.124 is purely a register-
+	// order + defensive-attach fix on top.
+	if (BeamCone)
+	{
+		// Defensive: tear down any pre-existing component first. Common case is
+		// null on the first BuildBeamCone call (the UPROPERTY default); this only
+		// fires on a re-Setup. Without explicit destroy the NewObject below would
+		// rename the existing component to make room for the name "BeamCone",
+		// orphaning the old scene proxy until GC -- the v1.0.124 secondary root
+		// cause for "phantom invisible cone surviving the new build".
+		BeamCone->DestroyComponent();
+		BeamCone = nullptr;
+	}
+	BeamCone = NewObject<UProceduralMeshComponent>(this, TEXT("BeamCone"));
+	// v1.0.124 PRIMARY ROOT-CAUSE FIX: SetMobility BEFORE RegisterComponent so
+	// the FPrimitiveSceneProxy is created with `EComponentMobility::Movable`.
+	// Pre-v1.0.124 this was after Register, so the proxy was Static-flagged
+	// and silently dropped per-tick `SetRelativeTransform` writes from the
+	// v1.0.123 `DriveBeamConeFromSpotLight` mirror -- the cone never moved
+	// off identity-relative-to-FixtureRoot, the BeamRestTransform's downward
+	// pitch never reached the cone, and visually the cone rendered AT THE
+	// FIXTURE BODY POINTING ALONG ACTOR +X (typically horizontal, hidden
+	// inside the truss / fixture chassis). The user saw "no beamcones" because
+	// the cones were geometrically present but stacked on top of each other
+	// inside the trusses, hidden by the fixture chassis meshes.
+	BeamCone->SetMobility(EComponentMobility::Movable);
 	BeamCone->SetupAttachment(FixtureRoot);
 	BeamCone->RegisterComponent();
-	BeamCone->SetMobility(EComponentMobility::Movable);
+	// v1.0.124 BELT-AND-BRACES: explicit runtime re-attach so any code path
+	// where SetupAttachment was bypassed (hot-reload edge cases, Live++ paths
+	// that re-create the component on a registered actor) STILL ends up with
+	// the cone as a child of FixtureRoot. KeepRelativeTransform preserves the
+	// initial transform we'll seed below; AttachToComponent on a freshly-
+	// registered component already attached via SetupAttachment is a no-op.
+	BeamCone->AttachToComponent(FixtureRoot, FAttachmentTransformRules::KeepRelativeTransform);
 	BeamCone->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	BeamCone->SetVisibility(bMeshBeamEnabled);
 	// v1.0.117 -- single chokepoint for every "don't let the cone get culled / sorted
@@ -2988,6 +3120,14 @@ void ARebusFixtureActor::BuildBeamCone()
 	BeamConeLastFarRadius = -1.f; // force the first section build
 	UpdateBeamConeGeometry();     // also seeds BeamLength/LensRadius/FarRadius on the MID
 	BeamCone->SetMaterial(0, BeamMID);
+	// v1.0.124 -- explicit MarkRenderStateDirty after the section + material
+	// assignments so the (now-Movable, freshly-Registered) proxy picks up
+	// every change in one shot. Pre-v1.0.124 the only MarkRenderStateDirty
+	// call on the spawn path was the one inside RefreshBeamConeCullingFlags
+	// below; with the v1.0.124 mobility-ordering fix the proxy is brand new
+	// and accepts the dirty flag cleanly, but an explicit call here defends
+	// against any future code-path reordering.
+	BeamCone->MarkRenderStateDirty();
 
 	// v1.0.117 -- re-apply the v1.0.117 hardening AFTER UpdateBeamConeGeometry has run
 	// (CreateMeshSection rebuilds the proxy + bounds; the BoundsScale + flag set must
@@ -3016,10 +3156,18 @@ void ARebusFixtureActor::BuildBeamCone()
 	const FVector ConeFwd = BeamConeRest.GetRotation().RotateVector(FVector::ForwardVector);
 	const FVector SpotFwd = BeamRestTransform.GetRotation().RotateVector(FVector::ForwardVector);
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s beam: SPAWNED matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s) coneFwd=(%.3f,%.3f,%.3f) spotFwd=(%.3f,%.3f,%.3f)"),
+		TEXT("Fixture %s beam: SPAWNED v1.0.124 matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s) coneFwd=(%.3f,%.3f,%.3f) spotFwd=(%.3f,%.3f,%.3f) mobilityOrderFixed=1 attachedTo=FixtureRoot"),
 		*FixtureId, BeamBaseRadiusUnreal, BeamConeLastFarRadius, BeamLengthUnreal, OuterHalf,
 		CurIntensity, bMeshBeamEnabled ? 1 : 0, DiamSrc,
 		ConeFwd.X, ConeFwd.Y, ConeFwd.Z, SpotFwd.X, SpotFwd.Y, SpotFwd.Z);
+	// v1.0.124 -- unconditional post-build BeamCone diagnostic dump. Single line
+	// per fixture spawn at Log level; no rate-limiting (we want this in EVERY log,
+	// regardless of `Rebus.LogBeamCone`, so the operator can verify the v1.0.124
+	// mobility-ordering fix actually engaged for THIS fixture's BeamCone proxy).
+	// The same helper is invoked rate-limited on every per-tick mirror through
+	// `DriveBeamConeFromSpotLight` ONLY when `Rebus.LogBeamCone 1` is set. See
+	// `DumpBeamConeStateForDebug` doc-comment for the field inventory.
+	DumpBeamConeStateForDebug(TEXT("BuildBeamCone"));
 
 	// v1.0.106 -- seed the per-fixture preference from the live CVar so a fresh-spawn fixture
 	// inherits the operator's current `Rebus.PreferProceduralBeam` choice (default 1 = prefer
@@ -3951,6 +4099,114 @@ void ARebusFixtureActor::DumpBeamMaterialHealthForDebug(int32 ExpectedRevision,
 		CachedMasterName, CachedMasterLoadCount);
 }
 
+void ARebusFixtureActor::DumpBeamConeStateForDebug(const TCHAR* CallSite) const
+{
+	// v1.0.124 -- one-line per-fixture BeamCone dump consumed by the
+	// `Rebus.LogBeamCone <0|1>` CVar refresh sink AND by the unconditional
+	// post-build call in `BuildBeamCone`. See public-header doc-comment for
+	// the operator-facing contract + the field inventory rationale.
+	//
+	// Layered defence: every dereference is null-safe so a partial-spawn
+	// fixture (cone null, MID null, SpotLight null) still produces a parseable
+	// line rather than crashing the dump.
+
+	const TCHAR* Site = CallSite ? CallSite : TEXT("?");
+
+	if (!BeamCone)
+	{
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("[Rebus] LogBeamCone[%s] fixtureId=%s BeamCone=<null> -- BuildBeamCone "
+				 "either has not been called yet OR the M_RebusBeam load failed (look "
+				 "for `Fixture %s beam: SKIP (M_RebusBeam failed to load ...)` warning "
+				 "above this line)."),
+			Site, *FixtureId, *FixtureId);
+		return;
+	}
+
+	// Attach parent name -- expects `FixtureRoot` post-v1.0.123. Surfaces a
+	// stale v1.0.122 binary (where the cone is parented to `SpotLight`) or the
+	// v1.0.124 hot-reload edge-case (a saved-attachment leftover) immediately.
+	const USceneComponent* AttachParent = BeamCone->GetAttachParent();
+	const FString AttachParentName = AttachParent
+		? FString::Printf(TEXT("%s(%s)"), *AttachParent->GetClass()->GetName(), *AttachParent->GetName())
+		: FString(TEXT("<null>"));
+
+	// Mobility: the v1.0.124 PRIMARY ROOT-CAUSE FIX target. Pre-v1.0.124
+	// `SetMobility(Movable)` was called AFTER `RegisterComponent`, so the
+	// scene proxy was created `Static` -- per-tick `SetRelativeTransform`
+	// writes were silently dropped and the cone never moved off identity.
+	// Post-fix the mobility is set BEFORE register so the proxy is created
+	// `Movable` and accepts the per-tick mirror. `Static` here on a v1.0.124
+	// binary means a code-path slipped past the fix.
+	const TCHAR* MobilityName = TEXT("?");
+	switch (BeamCone->Mobility)
+	{
+	case EComponentMobility::Static:     MobilityName = TEXT("Static"); break;
+	case EComponentMobility::Stationary: MobilityName = TEXT("Stationary"); break;
+	case EComponentMobility::Movable:    MobilityName = TEXT("Movable"); break;
+	default: break;
+	}
+
+	const int32 SectionCount = BeamCone->GetNumSections();
+
+	const FVector ConeWorldLoc = BeamCone->GetComponentLocation();
+	const FVector ConeWorldFwd = BeamCone->GetForwardVector().GetSafeNormal();
+	const FVector ConeRelLoc = BeamCone->GetRelativeLocation();
+	const FRotator ConeRelRot = BeamCone->GetRelativeRotation();
+	const FVector ConeRelScale = BeamCone->GetRelativeScale3D();
+
+	const FVector SpotWorldLoc = SpotLight ? SpotLight->GetComponentLocation() : FVector::ZeroVector;
+	const FVector SpotWorldFwd = SpotLight ? SpotLight->GetForwardVector().GetSafeNormal() : FVector::ZeroVector;
+	const float DotSpotCone = SpotLight
+		? FVector::DotProduct(SpotWorldFwd, ConeWorldFwd)
+		: -2.f; // sentinel -- impossible value so the operator can spot the no-spotlight case
+
+	// Material slot 0 -- expects `UMaterialInstanceDynamic` parented to
+	// `M_RebusBeam`. `WorldGridMaterial` (the UE fallback when no material was
+	// successfully assigned) is the smoking-gun for "cone is opaque grey".
+	UMaterialInterface* Slot0 = BeamCone->GetMaterial(0);
+	const FString Slot0Class = Slot0 ? Slot0->GetClass()->GetName() : FString(TEXT("<null>"));
+	const FString Slot0Name = Slot0 ? Slot0->GetName() : FString(TEXT("<null>"));
+
+	const float OuterHalfDeg = ResolveOuterHalfDeg();
+	const float MatchHalfDeg = ResolveBeamFootprintMatchHalfDeg();
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("[Rebus] LogBeamCone[%s] v1.0.124 fixtureId=%s | "
+			 "BeamCone={attachParent=%s mobility=%s vis=%d hidGame=%d sections=%d "
+			 "boundsScale=%.2f translucencySort=%d} | "
+			 "Material={slot0Class=%s slot0Name=%s beamMID=%s beamMIDParent=%s} | "
+			 "Geometry={lengthCm=%.0f baseRadiusCm=%.2f farRadiusCm=%.1f outerHalfDeg=%.2f matchHalfDeg=%.2f coneScale=%.3f} | "
+			 "Cone={worldLoc=(%.1f,%.1f,%.1f) worldFwd=(%.3f,%.3f,%.3f) "
+			 "relLoc=(%.1f,%.1f,%.1f) relRot=(P=%.1f Y=%.1f R=%.1f) relScale=(%.3f,%.3f,%.3f)} | "
+			 "Spot={worldLoc=(%.1f,%.1f,%.1f) worldFwd=(%.3f,%.3f,%.3f)} dot(spot,cone)=%.3f | "
+			 "Gates={bMeshBeamEnabled=%d bUsingEpicBeam=%d bPreferProcedural=%d}"),
+		Site, *FixtureId,
+		*AttachParentName, MobilityName,
+		BeamCone->IsVisible() ? 1 : 0,
+		BeamCone->bHiddenInGame ? 1 : 0,
+		SectionCount,
+		BeamCone->BoundsScale,
+		BeamCone->TranslucencySortPriority,
+		*Slot0Class, *Slot0Name,
+		BeamMID ? TEXT("OK") : TEXT("<null>"),
+		(BeamMID && BeamMID->Parent) ? *BeamMID->Parent->GetName() : TEXT("<null>"),
+		BeamLengthUnreal, BeamBaseRadiusUnreal, BeamConeLastFarRadius,
+		OuterHalfDeg, MatchHalfDeg,
+		FMath::Max(0.05f, BeamConeRadiusScale),
+		ConeWorldLoc.X, ConeWorldLoc.Y, ConeWorldLoc.Z,
+		ConeWorldFwd.X, ConeWorldFwd.Y, ConeWorldFwd.Z,
+		ConeRelLoc.X, ConeRelLoc.Y, ConeRelLoc.Z,
+		ConeRelRot.Pitch, ConeRelRot.Yaw, ConeRelRot.Roll,
+		ConeRelScale.X, ConeRelScale.Y, ConeRelScale.Z,
+		SpotWorldLoc.X, SpotWorldLoc.Y, SpotWorldLoc.Z,
+		SpotWorldFwd.X, SpotWorldFwd.Y, SpotWorldFwd.Z,
+		DotSpotCone,
+		bMeshBeamEnabled ? 1 : 0,
+		bUsingEpicBeam ? 1 : 0,
+		bPreferProceduralBeam ? 1 : 0);
+}
+
 void ARebusFixtureActor::SelfHealBeamMaterialRevisionIfMismatched()
 {
 	// v1.0.119 -- on-spawn self-heal probe. See the public-header doc-comment
@@ -4123,12 +4379,42 @@ void ARebusFixtureActor::DriveBeamConeFromSpotLight()
 	// v1.0.117..v1.0.121 root cause for `dot(spot,cone)=-1.0..-0.7`; v1.0.123 uses
 	// the RELATIVE channel (no world<->relative round-trip, no MakeFromX-derived
 	// roll basis) so the v1.0.122 orientation fix CANNOT regress.
+	//
+	// v1.0.124 NOTE -- this RELATIVE-channel mirror only takes effect when the
+	// BeamCone scene proxy was created with `EComponentMobility::Movable`. The
+	// v1.0.124 PRIMARY ROOT-CAUSE FIX in `BuildBeamCone` (SetMobility BEFORE
+	// RegisterComponent) is what actually makes the proxy accept these per-tick
+	// writes; pre-v1.0.124 the proxy was Static and the writes here were silently
+	// dropped, leaving the cone at identity-relative-to-FixtureRoot (the user's
+	// "no beamcones" symptom against the v1.0.123 build). See the v1.0.124
+	// release block in README + the `BuildBeamCone` doc-comment for the full
+	// chain of evidence.
 	BeamCone->SetRelativeTransform(SpotLight->GetRelativeTransform());
 
 	// This function ALSO re-pushes the live world BeamOrigin/BeamDir + light-space
 	// depth-mask basis onto the BeamMID, AND drives the Epic-beam canvas off the
 	// same ground-truth spotlight transform when it's the visible shaft.
 	RefreshBeamSpatialParams(); // push the (spotlight-aligned) world origin/dir to the raymarch MID
+
+	// v1.0.124 -- per-tick BeamCone diagnostic stream gate. Skips silently when
+	// `Rebus.LogBeamCone 0` (the default). When 1, dumps `DumpBeamConeStateForDebug`
+	// once per fixture per `Rebus.LogBeamConeIntervalSec` (default 1.0 sec) -- the
+	// rate-limit floor keeps the log volume sane on a 30-fixture rig. The
+	// `LastBeamConeLogTimeSec = -1.0` initial value guarantees one line per fixture
+	// the very first tick after the operator flips the CVar to 1 (in addition to
+	// the immediate dump from the CVar refresh sink). See
+	// `RebusFixtureActor.cpp::CVarRebusLogBeamCone` for the file-scope CVar
+	// declaration + the operator-facing doc.
+	if (GRebusLogBeamCone != 0)
+	{
+		const double NowSec = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+		const double Interval = (double)FMath::Max(0.f, GRebusLogBeamConeIntervalSec);
+		if (LastBeamConeLogTimeSec < 0.0 || (NowSec - LastBeamConeLogTimeSec) >= Interval)
+		{
+			DumpBeamConeStateForDebug(TEXT("DriveBeamCone"));
+			LastBeamConeLogTimeSec = NowSec;
+		}
+	}
 
 	// v1.0.111 -- re-push the light-space depth-mask axis basis (BeamLightFwd / Right /
 	// Up) onto the BeamMID so the shader's per-step `wp - BeamOrigin` -> light-local

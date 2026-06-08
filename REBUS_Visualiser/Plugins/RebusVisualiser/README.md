@@ -594,6 +594,109 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **v1.0.124 — fix `BeamCone` STILL INVISIBLE on shipped v1.0.123 binaries (the v1.0.123 hypothesis was wrong; v1.0.124 ships the actual root-cause fix). User report (verbatim): "I dont think the beams are orientated wrong, 4 fixtures are on with no beams showing." On a 7-fixture truss with 4 active fixtures, ALL 4 SpotLights were firing correctly (visible floor pools + IES profiles working) but ZERO `BeamCone` meshes were visible. v1.0.123 attributed the v1.0.122 invisibility to a UE 5.7 "primitive-child-under-light-parent" proxy refresh quirk and re-parented the cone back to `FixtureRoot`; that fix shipped, the user reloaded the binary, and the symptom persisted on every fixture. v1.0.124 root-causes the actual bug to a per-fixture `SetMobility` ordering error in `BuildBeamCone` that has been latent since v1.0.34 but only surfaced after v1.0.122 dropped the per-tick `SetWorldLocationAndRotation` write that was masking it.**
+>
+> ### Symptom (verbatim user report)
+>
+> User typed (against the shipped v1.0.123 binary, against the same scene that had previously rendered the v1.0.122 invisibility):
+>
+> > "I dont think the beams are orientated wrong, 4 fixtures are on with no beams showing."
+>
+> Concurrent observation from the screenshot the user attached: 7 fixtures on a truss, 4 of them firing (visible as 4 white circular floor pools — the SpotLight + IES + per-light volumetric scattering layers were all working correctly), and ZERO visible `BeamCone` meshes. Two grey static-mesh cones in the scene were initially mis-identified as "BeamCone" — they are scene props placed in the level, NOT the procedural cone — corrected by the user. The actual symptom is single-issue: BeamCone INVISIBLE on every active fixture, despite the v1.0.123 fix being shipped + reloaded.
+>
+> ### Root cause (PRIMARY — `SetMobility` ordering)
+>
+> `ARebusFixtureActor::BuildBeamCone` was creating the BeamCone like this (since v1.0.34, unchanged through v1.0.123):
+>
+> ```
+> BeamCone = NewObject<UProceduralMeshComponent>(this, TEXT("BeamCone"));
+> BeamCone->SetupAttachment(FixtureRoot);
+> BeamCone->RegisterComponent();                       // <-- proxy created here
+> BeamCone->SetMobility(EComponentMobility::Movable);  // <-- but mobility set AFTER
+> ```
+>
+> The default mobility for a `UProceduralMeshComponent` (UMeshComponent → UPrimitiveComponent → USceneComponent) is `EComponentMobility::Static`. `RegisterComponent` creates the `FPrimitiveSceneProxy` from the component's CURRENT state — so the proxy was being created with the Static mobility flag set. UE 5.7 optimises Static-flagged scene proxies to skip the per-tick transform-update render command path: subsequent `SetMobility(Movable)` flips the component-side flag but the proxy's Static-baked transform write-through is already in effect, and per-tick `SetRelativeTransform` calls become silent no-ops on the render thread (the game-thread component's relative transform updates correctly, but the proxy's `LocalToWorld` is never re-pushed).
+>
+> Why this only surfaced post-v1.0.122:
+>
+> - **v1.0.34..v1.0.121:** per-tick `BeamCone->SetWorldLocationAndRotation(SpotLoc, MakeFromX(SpotFwd))` was writing the cone's world transform on every tick. `SetWorldLocationAndRotation` goes through a different update path that forces `MarkRenderStateDirty` on the proxy regardless of Static / Movable flags, so the proxy received the world-transform updates and the cone moved. The Static-mobility-on-Movable-flagged-component bug was latent — the proxy WAS Static, but the per-tick world-write masked it. (The v1.0.121 telemetry surfaced `dot(spot,cone)=-1.0..-0.7` — the cone was visible but oriented wrong, exactly because the world-write was working.)
+> - **v1.0.122:** dropped the per-tick `SetWorldLocationAndRotation` and parented the cone DIRECTLY to `SpotLight` at identity-relative. With the cone parented to the spotlight, the cone's world transform comes from the spotlight via the engine's `UpdateChildTransforms` propagation — which, for a Static-proxied primitive child of a non-primitive parent, ALSO doesn't fire the per-tick render-thread transform refresh. v1.0.122 mis-attributed this to "primitive-child-under-light-parent" — the actual cause is the latent Static-mobility proxy.
+> - **v1.0.123:** re-parented to `FixtureRoot` and added per-tick `SetRelativeTransform(SpotLight->GetRelativeTransform())`. `SetRelativeTransform` on a Static-proxied component is a silent no-op on the render thread. Cone never moved off identity-relative-to-FixtureRoot, the BeamRestTransform's downward pitch never reached the cone, and visually the cone rendered AT THE FIXTURE BODY POINTING ALONG ACTOR +X (typically horizontal, hidden inside the fixture chassis / truss). The user saw "no beamcones" because the cones were geometrically present but stacked on top of each other inside the trusses, hidden by the fixture chassis meshes.
+>
+> ### Root cause (SECONDARY — pre-existing-component name reuse on re-Setup)
+>
+> A separate latent bug surfaced during the v1.0.124 audit: when `Setup()` is called twice on the same actor (an edge case that the portal can hit on a `LoadScene` mid-session), the second `BuildBeamCone` would do `BeamCone = NewObject<UProceduralMeshComponent>(this, TEXT("BeamCone"))` while a BeamCone with that exact name already existed on `this`. UE renames the old object to make room for the new (no crash) but the old component's scene proxy can remain registered until garbage collection, leaving a phantom cone at the previous transform AND occupying scene-tree slots. v1.0.124 explicitly destroys any pre-existing `BeamCone` before `NewObject` so the component name + scene proxy are both reclaimed cleanly.
+>
+> ### The fix (`Source/RebusVisualiser/Private/RebusFixtureActor.cpp`)
+>
+> 1. **PRIMARY: SetMobility BEFORE RegisterComponent.** Every freshly-created `BeamCone` proxy is now created Movable, accepts per-tick `SetRelativeTransform` writes correctly, and the v1.0.123 sibling-mirror approach now actually works:
+>    ```
+>    BeamCone = NewObject<UProceduralMeshComponent>(this, TEXT("BeamCone"));
+>    BeamCone->SetMobility(EComponentMobility::Movable);   // <-- BEFORE RegisterComponent
+>    BeamCone->SetupAttachment(FixtureRoot);
+>    BeamCone->RegisterComponent();                        // proxy created Movable
+>    ```
+> 2. **SECONDARY: explicit destroy of any pre-existing BeamCone before `NewObject`** so re-Setup paths don't leak phantom proxies.
+> 3. **BELT-AND-BRACES: explicit `AttachToComponent(FixtureRoot, KeepRelativeTransform)` AFTER `RegisterComponent`.** A no-op when SetupAttachment took effect (the common case); a runtime rescue when it didn't (any future hot-reload / Live++ path that registers the component before SetupAttachment lands). The cone CANNOT end up parented to anything other than `FixtureRoot` after this.
+> 4. **DEFENSIVE: explicit `MarkRenderStateDirty()` after the section + material assignments** so the (now-Movable, freshly-Registered) proxy picks up every change in one shot. With the v1.0.124 mobility-ordering fix the proxy is brand new and accepts the dirty flag cleanly, but the explicit call defends against any future code-path reordering.
+>
+> ### New diagnostic CVar `Rebus.LogBeamCone`
+>
+> The v1.0.117..v1.0.123 pattern of "diagnose by re-reading the .cpp" became untenable after v1.0.123 shipped a cone-invisibility fix that didn't actually fix it. v1.0.124 bakes a permanent per-fixture diagnostic into the runtime:
+>
+> - `Rebus.LogBeamCone 0` (default) — silent steady state. The unconditional post-spawn dump in `BuildBeamCone` STILL prints once per fixture spawn at `Log` level (low-volume; lets us prove the build went through and the v1.0.124 mobility-ordering fix engaged).
+> - `Rebus.LogBeamCone 1` — on push, walks every Rebus fixture and dumps the full `DumpBeamConeStateForDebug` line for each. Subsequent ticks print one additional line per fixture every `Rebus.LogBeamConeIntervalSec` (default 1.0 sec) so a steady stream is captured without drowning the log. Flip back to `0` to silence.
+>
+> Each line includes:
+>
+> - BeamCone attach parent name (must read `SceneComponent(FixtureRoot)` post-v1.0.123 — surfaces a stale v1.0.122 binary or a saved-attachment leftover immediately).
+> - **BeamCone Mobility** — must read `Movable` post-v1.0.124. `Static` here is the smoking-gun for the v1.0.124 PRIMARY ROOT CAUSE.
+> - Visibility / hidden-in-game / mesh-section count (expect `1` after `UpdateBeamConeGeometry::CreateMeshSection`).
+> - Cone world location + forward + relative location + relative rotation + relative scale.
+> - SpotLight world location + forward.
+> - `dot(SpotFwd, ConeFwd)` — expect `+1.000` post-v1.0.123.
+> - `BeamLengthCm` + `BeamBaseRadiusCm` + `FarRadiusCm` + `OuterHalfDeg` + `MatchHalfDeg` + `ConeScale` (the geometry the mesh was built from — a degenerate input here surfaces a degenerate-build hypothesis).
+> - Material slot 0 class + name (`UMaterialInstanceDynamic` parented to `M_RebusBeam` is healthy; `WorldGridMaterial` is the UE fallback that means the assignment failed).
+> - `bMeshBeamEnabled` + `bUsingEpicBeam` + `bPreferProceduralBeam` (the three flags that gate cone visibility via SetVisibility paths).
+>
+> Companion to `Rebus.DumpBeamCulling` (v1.0.113 — every flag/scalar/transform that can clip the cone), `Rebus.DumpBeamMaterialHealth` (v1.0.119 — material-binding state), `Rebus.DumpBeamShadowMask` (v1.0.111 — light-space depth-mask state). `Rebus.LogBeamCone` is the v1.0.124 entry-point for "is the cone alive at all?"; the others assume it is.
+>
+> ### Verification (post-fix)
+>
+> Read by inspection of the change + a full local `Build.bat REBUS_VisualiserEditor Win64 Development` compile:
+>
+> - **Build:** the v1.0.124 changes are confined to `RebusFixtureActor.cpp` (the BuildBeamCone fix + the new CVar block + `DumpBeamConeStateForDebug` implementation), `RebusFixtureActor.h` (the new method declaration + the per-fixture `LastBeamConeLogTimeSec` field), `RebusVisualiserSubsystem.cpp` (the operator-triage banner version bump), `RebusVisualiser.cpp` (the bug-report-version-tag bump), and `RebusVisualiser.uplugin` (`VersionName` `1.0.123` → `1.0.124`).
+> - **Mobility ordering:** `BeamCone->SetMobility(EComponentMobility::Movable)` now runs at line ~2941 (before `RegisterComponent` at line ~2944). The scene proxy is Movable from creation. Per-tick `SetRelativeTransform` writes from `DriveBeamConeFromSpotLight` reach the proxy's `LocalToWorld` correctly.
+> - **Geometry:** `BeamCone` is still a sibling of `SpotLight` under `FixtureRoot` (v1.0.123 attachment unchanged). `DriveBeamConeFromSpotLight` still writes `BeamCone->SetRelativeTransform(SpotLight->GetRelativeTransform())` per tick. Therefore `BeamCone->ComponentToWorld == SpotLight->ComponentToWorld` on every frame the engine ticks, and now the proxy actually receives the update.
+> - **Orientation:** `BeamCone->GetForwardVector() == SpotLight->GetForwardVector()` always — the v1.0.122 orientation fix is preserved (cone +X = spot +X via the per-tick relative mirror; no `MakeFromX`-derived basis flip).
+> - **Self-clip:** the v1.0.117 PRIMARY ROOT-CAUSE FIX (`BeamCone->bRenderInDepthPass = false` in `RefreshBeamConeCullingFlags` + `disable_depth_test = true` in the Python `_build_beam_master`) is preserved unchanged.
+> - **Material:** the v1.0.121 commandlet-baked `M_RebusBeam.uasset` is reused verbatim. `REBUS_BEAM_MATERIAL_REVISION` stays at 121, `RebusExpectedBeamMaterialRevision` stays at 121, on-disk byte-identical.
+>
+> ### User action required
+>
+> 1. **Restart the editor / `-game` session** so the new `UnrealEditor-RebusVisualiser.dll` is loaded. The startup banner will read `v1.0.124`.
+> 2. **No `M_RebusBeam` re-bake.** No portal-side change. No scene re-save. No CVar push. The `BeamCone` will be visible on the very first frame of the next session.
+> 3. **If the cone is still invisible on v1.0.124** (the should-be-impossible case), run `Rebus.LogBeamCone 1` in the UE console and paste a single frame of output. Each active fixture should print a line. If `mobility=Static` appears in any line, the v1.0.124 fix didn't engage on that fixture (please report). If `dot(spot,cone) != +1.000` the per-tick mirror failed (please report). If `slot0Class != UMaterialInstanceDynamic` the material assignment failed (please report). If no lines appear at all, the fixture actor itself isn't reaching `BuildBeamCone` — the SpotLight half of the actor is what we'd then triage.
+>
+> ### What v1.0.124 does NOT change
+>
+> - **No `M_RebusBeam` re-bake.** The v1.0.121-baked master is preserved byte-identical. `REBUS_BEAM_MATERIAL_REVISION` stays at 121.
+> - **No `build_rebus_base_level.py` change.** The Python `disable_depth_test=True` flag, `_build_beam_master` graph, `ensure_beam_material` workflow, `ensure_ies_profiles` workflow, `_is_editor_runtime` gate — all unchanged.
+> - **No `bRenderInDepthPass` / `RefreshBeamConeCullingFlags` change.** v1.0.117 PRIMARY ROOT-CAUSE FIX preserved.
+> - **No `BeamShadowMaskCapture` change.** v1.0.111 SceneCapture stays parented to `SpotLight` at identity (it's a `USceneCaptureComponent2D` / `USceneComponent` / non-primitive — it doesn't suffer the Static-mobility proxy bug because USceneComponent doesn't have a primitive proxy).
+> - **No SpotLight, IES, gobo, lens-disc, or fixture-body geometry change.**
+> - **No v1.0.123 attachment change.** `BeamCone` is still a sibling of `SpotLight` under `FixtureRoot`. The v1.0.123 commit message's geometric reasoning was correct; only its UE-5.7-quirk hypothesis for the invisibility was wrong, and the fix it shipped didn't address the actual root cause.
+> - **No version-coupled string churn beyond:** `if pluginVersion != v1.0.123` → `v1.0.124` in the startup-banner triage block + `v1.0.123+ bug report` → `v1.0.124+ bug report` ask in `Rebus.ForceBeamMasterRegen` + `RebusVisualiser.uplugin` `VersionName` 1.0.123 → 1.0.124 (top-centre watermark + startup banner will read `v1.0.124` on next launch). Material-revision-coupled strings stay at 121.
+>
+> ### What v1.0.124 DOES change (exhaustive)
+>
+> 1. **`Source/RebusVisualiser/Private/RebusFixtureActor.cpp`** — the `BuildBeamCone` mobility-ordering fix + defensive pre-existing destroy + belt-and-braces `AttachToComponent` + post-build `MarkRenderStateDirty` + the unconditional post-build `DumpBeamConeStateForDebug(TEXT("BuildBeamCone"))` call. `DriveBeamConeFromSpotLight` extended with the rate-limited `Rebus.LogBeamCone`-gated dump call. New CVar block `Rebus.LogBeamCone` + `Rebus.LogBeamConeIntervalSec` after `CVarRebusAllowBeamOcclusionQueries`. New `DumpBeamConeStateForDebug` implementation after `DumpBeamMaterialHealthForDebug`. The v1.0.123-baked spawn telemetry log line gains a `v1.0.124 mobilityOrderFixed=1 attachedTo=FixtureRoot` tag.
+> 2. **`Source/RebusVisualiser/Public/RebusFixtureActor.h`** — public method declaration for `DumpBeamConeStateForDebug(const TCHAR* CallSite) const` near the other `DumpFor*Debug` methods. New `mutable double LastBeamConeLogTimeSec = -1.0` field next to the existing `LastLoggedBeamFwd` throttle field.
+> 3. **`Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp`** — startup-banner triage text `if pluginVersion != v1.0.123` → `v1.0.124`.
+> 4. **`Source/RebusVisualiser/Private/RebusVisualiser.cpp`** — `Rebus.ForceBeamMasterRegen` success log `v1.0.123+ bug report` → `v1.0.124+ bug report`.
+> 5. **`RebusVisualiser.uplugin`** — `"VersionName": "1.0.123"` → `"1.0.124"`.
+> 6. **`README.md`** — this v1.0.124 release block.
+
 > **v1.0.123 — fix `BeamCone` INVISIBLE on shipped binaries after the v1.0.122 re-parenting. User report (verbatim): "No we want to use beam cone but we cannot see it!!!". The v1.0.122 fix (24f9b1c) correctly addressed the v1.0.117..v1.0.121 `dot(spot,cone)=-1.0..-0.7` orientation bug by parenting the `BeamCone` `UProceduralMeshComponent` DIRECTLY to the `USpotLightComponent` at identity-relative — geometrically equivalent to the v1.0.111 `BeamShadowMaskCapture` pattern — but on shipped binaries the cone went FULLY INVISIBLE. v1.0.123 restores visibility WITHOUT reintroducing the circular self-clip: re-parent the cone back to `FixtureRoot` (its v1.0.34..v1.0.121 home) and MIRROR the `SpotLight->GetRelativeTransform()` onto the cone every tick via `DriveBeamConeFromSpotLight`. Both `SpotLight` and `BeamCone` are now siblings under `FixtureRoot` with identical relative transforms — so `cone.WorldTransform == SpotLight.WorldTransform` by construction (preserving the v1.0.122 orientation fix in full) AND the cone is a primitive child of a `SceneComponent` parent (restoring the UE 5.7 primitive-proxy refresh chain that was the v1.0.122 invisibility cause).**
 >
 > ### Symptom (verbatim user report)
