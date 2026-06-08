@@ -25,6 +25,17 @@
 #include "Engine/CanvasRenderTarget2D.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
+// v1.0.126 -- `DumpBeamDiagForDebug` reads back `UMaterial::MaterialDomain` (the
+// EMaterialDomain enum lives in `MaterialShared.h`/`SceneTypes.h` but the
+// `UMaterial::MaterialDomain` UPROPERTY is declared on `UMaterial`, NOT on
+// `UMaterialInterface`); pull in `Material.h` explicitly so the dump can
+// safely traverse `UMaterialInterface::GetMaterial()` -> `UMaterial` to read
+// the domain. Matching `MaterialShared.h` pull for `EMaterialDomain` /
+// `EBlendMode` / `EMaterialShadingModel` defensively (already transitively
+// included via `MaterialInterface.h`, but explicit beats implicit when a
+// future engine refactor moves the typedefs).
+#include "Materials/Material.h"
+#include "MaterialShared.h"
 #include "ImageUtils.h"
 #include "UObject/ConstructorHelpers.h"
 #include "Misc/ConfigCacheIni.h"
@@ -3156,7 +3167,7 @@ void ARebusFixtureActor::BuildBeamCone()
 	const FVector ConeFwd = BeamConeRest.GetRotation().RotateVector(FVector::ForwardVector);
 	const FVector SpotFwd = BeamRestTransform.GetRotation().RotateVector(FVector::ForwardVector);
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s beam: SPAWNED v1.0.125 matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s) coneFwd=(%.3f,%.3f,%.3f) spotFwd=(%.3f,%.3f,%.3f) mobilityOrderFixed=1 attachedTo=FixtureRoot midBothPushed=1"),
+		TEXT("Fixture %s beam: SPAWNED v1.0.126 matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s) coneFwd=(%.3f,%.3f,%.3f) spotFwd=(%.3f,%.3f,%.3f) mobilityOrderFixed=1 attachedTo=FixtureRoot midBothPushed=1 diagAvailable=1"),
 		*FixtureId, BeamBaseRadiusUnreal, BeamConeLastFarRadius, BeamLengthUnreal, OuterHalf,
 		CurIntensity, bMeshBeamEnabled ? 1 : 0, DiamSrc,
 		ConeFwd.X, ConeFwd.Y, ConeFwd.Z, SpotFwd.X, SpotFwd.Y, SpotFwd.Z);
@@ -4219,7 +4230,7 @@ void ARebusFixtureActor::DumpBeamConeStateForDebug(const TCHAR* CallSite) const
 	const float MatchHalfDeg = ResolveBeamFootprintMatchHalfDeg();
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("[Rebus] LogBeamCone[%s] v1.0.125 fixtureId=%s | "
+		TEXT("[Rebus] LogBeamCone[%s] v1.0.126 fixtureId=%s | "
 			 "BeamCone={attachParent=%s mobility=%s vis=%d hidGame=%d sections=%d "
 			 "boundsScale=%.2f translucencySort=%d} | "
 			 "Material={slot0Class=%s slot0Name=%s beamMID=%s beamMIDParent=%s "
@@ -4263,6 +4274,462 @@ void ARebusFixtureActor::DumpBeamConeStateForDebug(const TCHAR* CallSite) const
 		bMeshBeamEnabled ? 1 : 0,
 		bUsingEpicBeam ? 1 : 0,
 		bPreferProceduralBeam ? 1 : 0);
+}
+
+void ARebusFixtureActor::DumpBeamDiagForDebug(const TCHAR* CallSite) const
+{
+	// v1.0.126 -- EXHAUSTIVE one-line per-fixture diagnostic consumed by the
+	// `Rebus.DiagBeam` console command. See the public-header doc-comment for
+	// the operator-facing contract + the field inventory rationale. Designed
+	// to be paste-friendly (one line) AND comprehensive (every known failure
+	// axis for an invisible BeamCone), so a single paste of one fixture is
+	// enough to triage. Layered defence: every dereference is null-safe so a
+	// partial-spawn fixture (cone null, MID null, SpotLight null) still
+	// produces a parseable line rather than crashing the dump.
+	const TCHAR* Site = CallSite ? CallSite : TEXT("?");
+
+	const FVector ActorLoc = GetActorLocation();
+	const FString ActorName = GetName();
+	const bool bOwnerHidden = IsHidden();
+
+	if (!BeamCone)
+	{
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("[Rebus] DiagBeam[%s] v1.0.126 fixtureId=%s displayName='%s' actor=%s "
+				 "actorLoc=(%.1f,%.1f,%.1f) ownerHidden=%d BeamCone=<null> -- BuildBeamCone "
+				 "either has not been called yet OR the M_RebusBeam load failed (look for "
+				 "`Fixture %s beam: SKIP (M_RebusBeam failed to load ...)` warning above "
+				 "this line). EVERY downstream diagnostic field is N/A in this branch."),
+			Site, *FixtureId, *DisplayName, *ActorName,
+			ActorLoc.X, ActorLoc.Y, ActorLoc.Z, bOwnerHidden ? 1 : 0, *FixtureId);
+		return;
+	}
+
+	// --- BeamCone existence + registration + visibility gates ---
+	const bool bRegistered = BeamCone->IsRegistered();
+	const bool bVisible = BeamCone->IsVisible();
+	const bool bHiddenInGame = BeamCone->bHiddenInGame;
+	const bool bCastShadow = (BeamCone->CastShadow != 0);
+	const TCHAR* MobilityName = TEXT("?");
+	switch (BeamCone->Mobility)
+	{
+	case EComponentMobility::Static:     MobilityName = TEXT("Static"); break;
+	case EComponentMobility::Stationary: MobilityName = TEXT("Stationary"); break;
+	case EComponentMobility::Movable:    MobilityName = TEXT("Movable"); break;
+	default: break;
+	}
+
+	const USceneComponent* AttachParent = BeamCone->GetAttachParent();
+	const FString AttachParentName = AttachParent
+		? FString::Printf(TEXT("%s(%s)"), *AttachParent->GetClass()->GetName(), *AttachParent->GetName())
+		: FString(TEXT("<null>"));
+
+	// --- BeamCone geometry inventory ---
+	// Walk every procedural mesh section and total the triangle + vertex counts.
+	// A `triCount=0` or `verts=0` here is the smoking gun for "BuildBeamCone
+	// created the component but UpdateBeamConeGeometry::CreateMeshSection
+	// failed silently" or "the cone was rebuilt from a degenerate
+	// BeamLength/MatchHalf input (both ~= 0)".
+	const int32 SectionCount = BeamCone->GetNumSections();
+	int32 TotalTris = 0;
+	int32 TotalVerts = 0;
+	for (int32 SecIdx = 0; SecIdx < SectionCount; ++SecIdx)
+	{
+		if (const FProcMeshSection* Sec = BeamCone->GetProcMeshSection(SecIdx))
+		{
+			TotalVerts += Sec->ProcVertexBuffer.Num();
+			TotalTris += Sec->ProcIndexBuffer.Num() / 3;
+		}
+	}
+
+	// Local bounds (un-transformed, the proxy-level bounds the renderer culls
+	// against before the per-component BoundsScale multiplier). A degenerate
+	// sphere radius / zero box extent surfaces a "bounds-only invisible" case
+	// (proxy submitted, but culled to a point that never intersects the view
+	// frustum).
+	const FBoxSphereBounds LocalBounds = BeamCone->CalcBounds(FTransform::Identity);
+
+	// --- World transforms (the v1.0.124 per-tick mirror landed?) ---
+	const FVector ConeWorldLoc = BeamCone->GetComponentLocation();
+	const FRotator ConeWorldRot = BeamCone->GetComponentRotation();
+	const FVector ConeWorldFwd = BeamCone->GetForwardVector().GetSafeNormal();
+	const FVector ConeRelLoc = BeamCone->GetRelativeLocation();
+	const FRotator ConeRelRot = BeamCone->GetRelativeRotation();
+	const FVector ConeRelScale = BeamCone->GetRelativeScale3D();
+
+	const FVector SpotWorldLoc = SpotLight ? SpotLight->GetComponentLocation() : FVector::ZeroVector;
+	const FVector SpotWorldFwd = SpotLight ? SpotLight->GetForwardVector().GetSafeNormal() : FVector::ZeroVector;
+	const float DotSpotCone = SpotLight ? FVector::DotProduct(SpotWorldFwd, ConeWorldFwd) : -2.f;
+
+	// --- Material slot 0 + cached BeamMID divergence (v1.0.125 hypothesis 5) ---
+	UMaterialInterface* Slot0 = BeamCone->GetMaterial(0);
+	const FString Slot0Class = Slot0 ? Slot0->GetClass()->GetName() : FString(TEXT("<null>"));
+	const FString Slot0Name = Slot0 ? Slot0->GetName() : FString(TEXT("<null>"));
+	const FString Slot0PathName = Slot0 ? Slot0->GetPathName() : FString(TEXT("<null>"));
+	UMaterialInstanceDynamic* const ConeSlot0MID = Cast<UMaterialInstanceDynamic>(Slot0);
+
+	UMaterialInstanceDynamic* const BeamMIDRaw = BeamMID.Get();
+	const FString BeamMIDParentPath = (BeamMIDRaw && BeamMIDRaw->Parent)
+		? BeamMIDRaw->Parent->GetPathName()
+		: FString(TEXT("<null>"));
+	const int32 MidPtrSame = (BeamMIDRaw != nullptr && BeamMIDRaw == ConeSlot0MID) ? 1 : 0;
+
+	// --- LIVE READBACK from the cone's slot-0 MID (the values the SHADER sees) ---
+	// EVERY scalar/vector that gates the raymarch HLSL output is sampled here.
+	// A zero in any non-trivial slot is a one-line root-cause for "cone
+	// invisible". Falls back to the cached BeamMID when slot-0 isn't a MID
+	// (the wireframe-debug state, OR the M_RebusBeam-load-failed branch).
+	UMaterialInstanceDynamic* const ReadbackMID = ConeSlot0MID ? ConeSlot0MID : BeamMIDRaw;
+	auto MidScalar = [ReadbackMID](const TCHAR* Name, float& Out) -> bool
+	{
+		if (!ReadbackMID) { Out = 0.f; return false; }
+		return ReadbackMID->GetScalarParameterValue(FMaterialParameterInfo(Name), Out);
+	};
+	auto MidVector = [ReadbackMID](const TCHAR* Name, FLinearColor& Out) -> bool
+	{
+		if (!ReadbackMID) { Out = FLinearColor::Transparent; return false; }
+		return ReadbackMID->GetVectorParameterValue(FMaterialParameterInfo(Name), Out);
+	};
+
+	float MidIntensity = -1.f, MidSharpness = -1.f, MidFalloff = -1.f, MidDensity = -1.f;
+	float MidStepCount = -1.f, MidBeamLength = -1.f, MidLensRadius = -1.f, MidFarRadius = -1.f;
+	float MidShadowMaskEnabled = -1.f, MidMaterialRevision = -1.f;
+	FLinearColor MidColor(0.f, 0.f, 0.f, 0.f);
+	const bool bHasIntensity   = MidScalar(TEXT("BeamIntensity"), MidIntensity);
+	const bool bHasColor       = MidVector(TEXT("BeamColor"), MidColor);
+	const bool bHasSharpness   = MidScalar(TEXT("BeamSharpness"), MidSharpness);
+	const bool bHasFalloff     = MidScalar(TEXT("BeamFalloff"), MidFalloff);
+	const bool bHasDensity     = MidScalar(TEXT("BeamDensity"), MidDensity);
+	const bool bHasStepCount   = MidScalar(TEXT("StepCount"), MidStepCount);
+	const bool bHasBeamLength  = MidScalar(TEXT("BeamLength"), MidBeamLength);
+	const bool bHasLensRadius  = MidScalar(TEXT("LensRadius"), MidLensRadius);
+	const bool bHasFarRadius   = MidScalar(TEXT("FarRadius"), MidFarRadius);
+	const bool bHasMaskEnabled = MidScalar(TEXT("BeamShadowMaskEnabled"), MidShadowMaskEnabled);
+	const bool bHasMatRev      = MidScalar(TEXT("BeamMaterialRevision"), MidMaterialRevision);
+
+	auto FmtScalar = [](bool bHas, float Val, int32 Prec) -> FString
+	{
+		if (!bHas) return FString(TEXT("MISSING"));
+		switch (Prec)
+		{
+		case 0: return FString::Printf(TEXT("%.0f"), Val);
+		case 2: return FString::Printf(TEXT("%.2f"), Val);
+		case 3: return FString::Printf(TEXT("%.3f"), Val);
+		case 4: return FString::Printf(TEXT("%.4f"), Val);
+		default: return FString::Printf(TEXT("%.1f"), Val);
+		}
+	};
+	const FString IntensityStr = FmtScalar(bHasIntensity, MidIntensity, 4);
+	const FString SharpnessStr = FmtScalar(bHasSharpness, MidSharpness, 3);
+	const FString FalloffStr   = FmtScalar(bHasFalloff,   MidFalloff,   3);
+	const FString DensityStr   = FmtScalar(bHasDensity,   MidDensity,   4);
+	const FString StepCountStr = FmtScalar(bHasStepCount, MidStepCount, 0);
+	const FString BeamLengthStr= FmtScalar(bHasBeamLength,MidBeamLength,0);
+	const FString LensRadiusStr= FmtScalar(bHasLensRadius,MidLensRadius,2);
+	const FString FarRadiusStr = FmtScalar(bHasFarRadius, MidFarRadius, 1);
+	const FString MaskEnStr    = FmtScalar(bHasMaskEnabled,MidShadowMaskEnabled,2);
+	const FString MatRevStr    = FmtScalar(bHasMatRev,    MidMaterialRevision,0);
+	const FString ColorStr     = bHasColor
+		? FString::Printf(TEXT("(%.3f,%.3f,%.3f,%.3f)"), MidColor.R, MidColor.G, MidColor.B, MidColor.A)
+		: FString(TEXT("MISSING"));
+
+	// --- SpotLight cross-check ---
+	const float SpotIntensityNow = SpotLight ? SpotLight->Intensity : -1.f;
+	const float SpotVolScattering = SpotLight ? SpotLight->VolumetricScatteringIntensity : -1.f;
+	const float DimmerCurrent = FMath::Clamp(Dimmer.Current, 0.f, 1.f);
+	const int32 ShutterModeInt = static_cast<int32>(ShutterMode);
+	const TCHAR* ShutterModeStr = TEXT("?");
+	float GateNow = 1.f;
+	switch (ShutterMode)
+	{
+	case ERebusShutterMode::Open:   ShutterModeStr = TEXT("Open"); GateNow = 1.f; break;
+	case ERebusShutterMode::Closed: ShutterModeStr = TEXT("Closed"); GateNow = 0.f; break;
+	case ERebusShutterMode::Strobe: ShutterModeStr = TEXT("Strobe"); GateNow = (ShutterPhase < 0.5f) ? 1.f : 0.f; break;
+	default: break;
+	}
+
+	// Material domain / blend mode / two-sided / shading model on the parent
+	// master. A wrong domain (e.g. PostProcess instead of Surface) or wrong
+	// blend mode (Opaque instead of Additive) breaks the cone at the material
+	// authoring layer regardless of what we push at runtime.
+	const TCHAR* MaterialDomainStr = TEXT("<null>");
+	const TCHAR* BlendModeStr = TEXT("<null>");
+	const TCHAR* ShadingModelStr = TEXT("<null>");
+	int32 bMatTwoSided = -1;
+	if (UMaterialInterface* ParentMatIface = (BeamMIDRaw && BeamMIDRaw->Parent) ? BeamMIDRaw->Parent : nullptr)
+	{
+		// `GetMaterialDomain()` is declared on `UMaterial`, NOT on
+		// `UMaterialInterface`, in UE 5.7 -- traverse to the base UMaterial
+		// via `GetMaterial()` (which UMaterialInstance overrides to return
+		// the master). `IsValid()`-safe so a runtime MID with a missing
+		// parent doesn't crash the dump.
+		if (UMaterial* BaseMat = ParentMatIface->GetMaterial())
+		{
+			switch (BaseMat->MaterialDomain)
+			{
+			case EMaterialDomain::MD_Surface: MaterialDomainStr = TEXT("Surface"); break;
+			case EMaterialDomain::MD_DeferredDecal: MaterialDomainStr = TEXT("DeferredDecal"); break;
+			case EMaterialDomain::MD_LightFunction: MaterialDomainStr = TEXT("LightFunction"); break;
+			case EMaterialDomain::MD_Volume: MaterialDomainStr = TEXT("Volume"); break;
+			case EMaterialDomain::MD_PostProcess: MaterialDomainStr = TEXT("PostProcess"); break;
+			case EMaterialDomain::MD_UI: MaterialDomainStr = TEXT("UI"); break;
+			default: MaterialDomainStr = TEXT("Other"); break;
+			}
+		}
+		switch (ParentMatIface->GetBlendMode())
+		{
+		case EBlendMode::BLEND_Opaque: BlendModeStr = TEXT("Opaque"); break;
+		case EBlendMode::BLEND_Masked: BlendModeStr = TEXT("Masked"); break;
+		case EBlendMode::BLEND_Translucent: BlendModeStr = TEXT("Translucent"); break;
+		case EBlendMode::BLEND_Additive: BlendModeStr = TEXT("Additive"); break;
+		case EBlendMode::BLEND_Modulate: BlendModeStr = TEXT("Modulate"); break;
+		case EBlendMode::BLEND_AlphaComposite: BlendModeStr = TEXT("AlphaComposite"); break;
+		case EBlendMode::BLEND_AlphaHoldout: BlendModeStr = TEXT("AlphaHoldout"); break;
+		default: BlendModeStr = TEXT("Other"); break;
+		}
+		const FMaterialShadingModelField Models = ParentMatIface->GetShadingModels();
+		if (Models.HasShadingModel(MSM_Unlit)) ShadingModelStr = TEXT("Unlit");
+		else if (Models.HasShadingModel(MSM_DefaultLit)) ShadingModelStr = TEXT("DefaultLit");
+		else ShadingModelStr = TEXT("Other");
+		bMatTwoSided = ParentMatIface->IsTwoSided() ? 1 : 0;
+	}
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("[Rebus] DiagBeam[%s] v1.0.126 fixtureId=%s displayName='%s' actor=%s "
+			 "actorLoc=(%.1f,%.1f,%.1f) ownerHidden=%d | "
+			 "BeamCone={registered=%d vis=%d hidGame=%d castShadow=%d mobility=%s attachParent=%s "
+			 "boundsScale=%.2f translucencySort=%d renderMain=%d renderDepth=%d customDepth=%d} | "
+			 "Geom={sections=%d tris=%d verts=%d localBoundsRadius=%.1f localBoundsBoxExtent=(%.1f,%.1f,%.1f)} | "
+			 "Cone={worldLoc=(%.1f,%.1f,%.1f) worldRot=(P=%.1f Y=%.1f R=%.1f) worldFwd=(%.3f,%.3f,%.3f) "
+			 "relLoc=(%.1f,%.1f,%.1f) relRot=(P=%.1f Y=%.1f R=%.1f) relScale=(%.3f,%.3f,%.3f)} | "
+			 "Spot={worldLoc=(%.1f,%.1f,%.1f) worldFwd=(%.3f,%.3f,%.3f) intensity=%.2f volScatter=%.3f} "
+			 "dot(spot,cone)=%.3f | "
+			 "Material={slot0Class=%s slot0Name=%s slot0Path=%s isMID=%d beamMID=%s beamMIDParentPath=%s "
+			 "midPtr=%p coneSlot0Ptr=%p same=%d domain=%s blend=%s shading=%s twoSided=%d} | "
+			 "MIDReadback={BeamIntensity=%s BeamColor=%s BeamSharpness=%s BeamFalloff=%s BeamDensity=%s "
+			 "StepCount=%s BeamLength=%s LensRadius=%s FarRadius=%s ShadowMaskEnabled=%s MatRevision=%s} | "
+			 "Drive={dimmerCurrent=%.3f shutterMode=%s(%d) shutterPhase=%.3f gate=%.1f "
+			 "meshBeamUserScale=%.2f maxBeam=%.2f} | "
+			 "Gates={bMeshBeamEnabled=%d bUsingEpicBeam=%d bPreferProcedural=%d bBeamDebugTintActive=%d}"),
+		Site, *FixtureId, *DisplayName, *ActorName,
+		ActorLoc.X, ActorLoc.Y, ActorLoc.Z, bOwnerHidden ? 1 : 0,
+		bRegistered ? 1 : 0, bVisible ? 1 : 0, bHiddenInGame ? 1 : 0, bCastShadow ? 1 : 0,
+		MobilityName, *AttachParentName,
+		BeamCone->BoundsScale, BeamCone->TranslucencySortPriority,
+		BeamCone->bRenderInMainPass ? 1 : 0,
+		BeamCone->bRenderInDepthPass ? 1 : 0,
+		BeamCone->bRenderCustomDepth ? 1 : 0,
+		SectionCount, TotalTris, TotalVerts,
+		LocalBounds.SphereRadius,
+		LocalBounds.BoxExtent.X, LocalBounds.BoxExtent.Y, LocalBounds.BoxExtent.Z,
+		ConeWorldLoc.X, ConeWorldLoc.Y, ConeWorldLoc.Z,
+		ConeWorldRot.Pitch, ConeWorldRot.Yaw, ConeWorldRot.Roll,
+		ConeWorldFwd.X, ConeWorldFwd.Y, ConeWorldFwd.Z,
+		ConeRelLoc.X, ConeRelLoc.Y, ConeRelLoc.Z,
+		ConeRelRot.Pitch, ConeRelRot.Yaw, ConeRelRot.Roll,
+		ConeRelScale.X, ConeRelScale.Y, ConeRelScale.Z,
+		SpotWorldLoc.X, SpotWorldLoc.Y, SpotWorldLoc.Z,
+		SpotWorldFwd.X, SpotWorldFwd.Y, SpotWorldFwd.Z,
+		SpotIntensityNow, SpotVolScattering, DotSpotCone,
+		*Slot0Class, *Slot0Name, *Slot0PathName,
+		ConeSlot0MID ? 1 : 0,
+		BeamMIDRaw ? TEXT("OK") : TEXT("<null>"),
+		*BeamMIDParentPath,
+		(void*)BeamMIDRaw, (void*)ConeSlot0MID, MidPtrSame,
+		MaterialDomainStr, BlendModeStr, ShadingModelStr, bMatTwoSided,
+		*IntensityStr, *ColorStr, *SharpnessStr, *FalloffStr, *DensityStr,
+		*StepCountStr, *BeamLengthStr, *LensRadiusStr, *FarRadiusStr, *MaskEnStr, *MatRevStr,
+		DimmerCurrent, ShutterModeStr, ShutterModeInt, ShutterPhase, GateNow,
+		MeshBeamUserScale, RebusMeshBeamMaxIntensity,
+		bMeshBeamEnabled ? 1 : 0, bUsingEpicBeam ? 1 : 0,
+		bPreferProceduralBeam ? 1 : 0, bBeamDebugTintActive ? 1 : 0);
+}
+
+int32 ARebusFixtureActor::ForceBeamForDebug(float NewIntensity)
+{
+	// v1.0.126 -- `Rebus.ForceBeam <intensity>` per-fixture chokepoint.
+	// See the public-header doc-comment for the operator-facing contract.
+	// Defensive double-push shape matches v1.0.125 RefreshBeamEmissive --
+	// both MIDs are pushed independently so pointer divergence cannot leave
+	// the visible MID with stale-default scalars. Bypasses the normal DMX
+	// pipeline entirely (`Dimmer * MeshBeamUserScale * Gate *
+	// RebusMeshBeamMaxIntensity`) so this is a clean upstream-vs-downstream
+	// triage test.
+	const FLinearColor White(1.f, 1.f, 1.f, 1.f);
+
+	UMaterialInstanceDynamic* ConeSlot0MID = nullptr;
+	if (BeamCone)
+	{
+		ConeSlot0MID = Cast<UMaterialInstanceDynamic>(BeamCone->GetMaterial(0));
+	}
+	UMaterialInstanceDynamic* const BeamMIDRaw = BeamMID.Get();
+
+	int32 PushCount = 0;
+	if (ConeSlot0MID)
+	{
+		ConeSlot0MID->SetVectorParameterValue(TEXT("BeamColor"), White);
+		ConeSlot0MID->SetScalarParameterValue(TEXT("BeamIntensity"), NewIntensity);
+		++PushCount;
+	}
+	if (BeamMIDRaw && BeamMIDRaw != ConeSlot0MID)
+	{
+		BeamMIDRaw->SetVectorParameterValue(TEXT("BeamColor"), White);
+		BeamMIDRaw->SetScalarParameterValue(TEXT("BeamIntensity"), NewIntensity);
+		++PushCount;
+	}
+
+	float ReadbackIntensity = -1.f;
+	UMaterialInstanceDynamic* const ReadbackMID = ConeSlot0MID ? ConeSlot0MID : BeamMIDRaw;
+	if (ReadbackMID)
+	{
+		ReadbackMID->GetScalarParameterValue(
+			FMaterialParameterInfo(TEXT("BeamIntensity")), ReadbackIntensity);
+	}
+	const float SpotIntensityNow = SpotLight ? SpotLight->Intensity : -1.f;
+	const int32 MidPtrSame = (BeamMIDRaw != nullptr && BeamMIDRaw == ConeSlot0MID) ? 1 : 0;
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("[Rebus] ForceBeam fixtureId=%s pushed BeamIntensity=%.4f BeamColor=(1,1,1,1) "
+			 "readback=%.4f midPtr=%p coneSlot0Ptr=%p same=%d pushCount=%d spotIntensity=%.2f "
+			 "(v1.0.126 -- bypasses DMX pipeline; if readback > 0 AND cone is still invisible "
+			 "the failure is DOWNSTREAM of BeamIntensity; if readback == 0 the v1.0.125 double-"
+			 "push fix did not engage on this fixture)"),
+		*FixtureId, NewIntensity, ReadbackIntensity,
+		(void*)BeamMIDRaw, (void*)ConeSlot0MID, MidPtrSame, PushCount, SpotIntensityNow);
+
+	return (PushCount > 0) ? 1 : 0;
+}
+
+int32 ARebusFixtureActor::SetBeamDebugTintForDebug(bool bEnable)
+{
+	// v1.0.126 -- `Rebus.BeamDebugTint <0|1>` per-fixture chokepoint.
+	// See the public-header doc-comment for the operator-facing contract.
+	// On enable: pin BeamColor=(1,0,1,1) + BeamIntensity=100 AND set the
+	// sticky `bBeamDebugTintActive` flag so RefreshBeamEmissive's per-tick
+	// pushes are suppressed (otherwise the next DMX-driven tick would
+	// overwrite the magenta and defeat the diagnostic). On disable: clear
+	// the sticky flag and let the next RefreshBeamEmissive call restore
+	// the correct live state (any of SetFixtureColor / SetFixtureIntensity
+	// / SetFixtureShutter / ApplyDimmer / the per-tick fade-driven
+	// RefreshBeamEmissive will re-seed it within one frame).
+	if (bEnable)
+	{
+		bBeamDebugTintActive = true;
+
+		const FLinearColor Magenta(1.f, 0.f, 1.f, 1.f);
+		const float DebugIntensity = 100.f;
+
+		UMaterialInstanceDynamic* ConeSlot0MID = nullptr;
+		if (BeamCone)
+		{
+			ConeSlot0MID = Cast<UMaterialInstanceDynamic>(BeamCone->GetMaterial(0));
+		}
+		UMaterialInstanceDynamic* const BeamMIDRaw = BeamMID.Get();
+
+		int32 PushCount = 0;
+		if (ConeSlot0MID)
+		{
+			ConeSlot0MID->SetVectorParameterValue(TEXT("BeamColor"), Magenta);
+			ConeSlot0MID->SetScalarParameterValue(TEXT("BeamIntensity"), DebugIntensity);
+			++PushCount;
+		}
+		if (BeamMIDRaw && BeamMIDRaw != ConeSlot0MID)
+		{
+			BeamMIDRaw->SetVectorParameterValue(TEXT("BeamColor"), Magenta);
+			BeamMIDRaw->SetScalarParameterValue(TEXT("BeamIntensity"), DebugIntensity);
+			++PushCount;
+		}
+
+		const int32 MidPtrSame = (BeamMIDRaw != nullptr && BeamMIDRaw == ConeSlot0MID) ? 1 : 0;
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("[Rebus] BeamDebugTint=1 fixtureId=%s pushed BeamColor=(1,0,1,1) "
+				 "BeamIntensity=100.0 midPtr=%p coneSlot0Ptr=%p same=%d pushCount=%d "
+				 "(v1.0.126 -- RefreshBeamEmissive is now SUPPRESSED on this fixture "
+				 "until Rebus.BeamDebugTint 0; if you do NOT see a bright magenta cone "
+				 "the failure is DOWNSTREAM of BeamColor + BeamIntensity)"),
+			*FixtureId, (void*)BeamMIDRaw, (void*)ConeSlot0MID, MidPtrSame, PushCount);
+
+		return (PushCount > 0) ? 1 : 0;
+	}
+	else
+	{
+		bBeamDebugTintActive = false;
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("[Rebus] BeamDebugTint=0 fixtureId=%s -- sticky override CLEARED; "
+				 "next RefreshBeamEmissive tick will restore live BeamColor + "
+				 "BeamIntensity from the DMX-driven pipeline."),
+			*FixtureId);
+		// Force one RefreshBeamEmissive call now so the cone visually
+		// returns to its live drive state immediately (the operator
+		// doesn't have to wait for the next per-tick fade refresh).
+		RefreshBeamEmissive();
+		return 1;
+	}
+}
+
+int32 ARebusFixtureActor::SetBeamConeWireframeForDebug(bool bEnable)
+{
+	// v1.0.126 -- `Rebus.BeamConeWireframe <0|1>` per-fixture chokepoint.
+	// See the public-header doc-comment for the operator-facing contract.
+	// On enable: capture the current slot-0 material into the
+	// `PreWireframeBeamMaterial` UPROPERTY and swap slot-0 to nullptr.
+	// UE's engine-default fallback when a primitive has no slot-0
+	// material is the `WorldGridMaterial` (an opaque grey checker visible
+	// from EVERY angle, NOT additive, NOT translucent) -- the smoking-gun
+	// test for "is the BeamCone geometry actually being submitted to the
+	// renderer at all?". On disable: restore the captured material from
+	// `PreWireframeBeamMaterial` and clear the saved pointer.
+	if (!BeamCone)
+	{
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("[Rebus] BeamConeWireframe=%d fixtureId=%s SKIP -- BeamCone is null "
+				 "(BuildBeamCone either has not been called yet OR the M_RebusBeam "
+				 "load failed; check the v1.0.126 Rebus.DiagBeam dump for the "
+				 "BeamCone=<null> branch)."),
+			bEnable ? 1 : 0, *FixtureId);
+		return 0;
+	}
+
+	if (bEnable)
+	{
+		// Capture the current slot-0 only if we have not already captured one
+		// (idempotent: re-entering enable mode without an intervening disable
+		// preserves the ORIGINAL non-wireframe material -- prevents a "save
+		// the wireframe-null state as the restore target" bug).
+		if (!PreWireframeBeamMaterial)
+		{
+			PreWireframeBeamMaterial = BeamCone->GetMaterial(0);
+		}
+		BeamCone->SetMaterial(0, nullptr);
+		BeamCone->MarkRenderStateDirty();
+
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("[Rebus] BeamConeWireframe=1 fixtureId=%s slot-0 SWAPPED to nullptr "
+				 "(engine falls back to opaque grey WorldGridMaterial); saved prev=%s "
+				 "(v1.0.126 -- if you NOW see a grey-checker cone the geometry IS alive "
+				 "and the entire failure is on the material side; if you see NOTHING "
+				 "the BeamCone is not reaching the renderer)"),
+			*FixtureId,
+			PreWireframeBeamMaterial ? *PreWireframeBeamMaterial->GetPathName() : TEXT("<null>"));
+		return 1;
+	}
+	else
+	{
+		UMaterialInterface* const Restore = PreWireframeBeamMaterial.Get();
+		BeamCone->SetMaterial(0, Restore);
+		BeamCone->MarkRenderStateDirty();
+		PreWireframeBeamMaterial = nullptr;
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("[Rebus] BeamConeWireframe=0 fixtureId=%s slot-0 RESTORED to %s; "
+				 "any subsequent RefreshBeamEmissive call will re-push live "
+				 "BeamColor + BeamIntensity onto the restored MID."),
+			*FixtureId, Restore ? *Restore->GetPathName() : TEXT("<null>"));
+		// Force a fresh RefreshBeamEmissive so the restored MID gets the live
+		// drive state immediately (the operator doesn't have to wait for the
+		// next per-tick fade refresh).
+		RefreshBeamEmissive();
+		return 1;
+	}
 }
 
 void ARebusFixtureActor::SelfHealBeamMaterialRevisionIfMismatched()
@@ -4355,6 +4822,32 @@ void ARebusFixtureActor::SelfHealBeamMaterialRevisionIfMismatched()
 
 void ARebusFixtureActor::RefreshBeamEmissive()
 {
+	// v1.0.126 -- `Rebus.BeamDebugTint` sticky-override gate. When the operator
+	// has flipped `Rebus.BeamDebugTint 1` on this fixture (via the per-fixture
+	// `SetBeamDebugTintForDebug(true)` chokepoint), the cone's slot-0 MID is
+	// pinned at BeamColor=(1,0,1,1) (opaque magenta) + BeamIntensity=100 to
+	// make the cone IMPOSSIBLE to miss visually. Without this early return,
+	// the very next `SetFixtureIntensity` / `SetFixtureColor` / per-tick
+	// fade-driven `RefreshBeamEmissive` call would overwrite the magenta with
+	// the live DMX-driven values (typically `BeamColor=(white)` +
+	// `BeamIntensity = dimmer * userScale * 50`), defeating the diagnostic
+	// before the operator can see the result. The gate runs BEFORE the
+	// v1.0.125 logic so it strictly adds to (never replaces) the v1.0.125
+	// pointer-divergence fix -- when the gate is inactive (the default),
+	// every byte of v1.0.125 behaviour is preserved. Flip the gate off with
+	// `Rebus.BeamDebugTint 0` to resume normal operation; the next push
+	// after that will restore the correct live colour + intensity within
+	// one frame (no explicit restore push needed -- any of SetFixtureColor
+	// / SetFixtureIntensity / SetFixtureShutter / ApplyDimmer / the per-tick
+	// fade-driven RefreshBeamEmissive call will re-seed it). See the
+	// public-header doc-comment on `SetBeamDebugTintForDebug` for the
+	// operator-facing contract + the v1.0.126 README runbook for the
+	// triage tree.
+	if (bBeamDebugTintActive)
+	{
+		return;
+	}
+
 	// v1.0.125 PRIMARY ROOT-CAUSE FIX FOR THE v1.0.124..v1.0.125 "cone geometrically
 	// perfect but BeamIntensity stuck at 0" SYMPTOM. The pre-v1.0.125 body pushed
 	// BeamColor + BeamIntensity ONLY onto the cached `BeamMID` UPROPERTY. If a code

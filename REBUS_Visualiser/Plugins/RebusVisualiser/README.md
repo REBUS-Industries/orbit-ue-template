@@ -594,6 +594,95 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **v1.0.126 — diagnostic toolkit for the user-reported "v1.0.125 shipped but the BeamCone is STILL invisible" scenario. v1.0.125 closed the only currently-provable invisible-cone root cause (`BeamMID`-vs-cone-slot-0 pointer-divergence in `RefreshBeamEmissive`); if the cone is still invisible after a v1.0.125+ DLL reload the failure lives in a region the existing dumps don't cover (geometry submission, material domain / blend mode, view-mode override, fog overdraw, camera frustum, post-process unbound volume). v1.0.126 ships FOUR new console commands — `Rebus.DiagBeam`, `Rebus.ForceBeam`, `Rebus.BeamDebugTint`, `Rebus.BeamConeWireframe` — designed to prove or disprove EVERY remaining hypothesis in ONE runtime session WITHOUT requiring a rebuild or re-bake. No `M_RebusBeam` re-bake, no scene re-save, no portal-side change — just reload the new `UnrealEditor-RebusVisualiser.dll`, fire a cue, and run the four commands in the runbook order below. v1.0.126 is purely additive: every byte of v1.0.125 (and v1.0.124 / v1.0.123 / v1.0.122 / v1.0.117 / v1.0.111) behaviour is preserved; the new commands all bypass the normal DMX-driven pipeline so they cannot regress live operation.**
+>
+> ### Why a v1.0.126 diagnostic ship instead of another speculative fix
+>
+> v1.0.125 closed the only invisible-cone hypothesis that the v1.0.124 diagnostic surfaced concretely (the user's `Rebus.LogBeamCone 1` dump confirmed every per-cone invariant but NEVER reported the live BeamMID `BeamIntensity` scalar — v1.0.125 added that readback AND defended against the pointer-divergence shape that could leave it stuck at 0). If the cone is invisible AFTER a v1.0.125 DLL reload (the user report this v1.0.126 release is responding to), one of these remains true:
+>
+> 1. **The v1.0.125 double-push isn't reaching the visible MID at all.** The cached `BeamMID` AND the cone's slot-0 are both pushed in `RefreshBeamEmissive` — but `RefreshBeamEmissive` itself is not being called, or both pointers are null (the pre-`BuildBeamCone` state, or the M_RebusBeam-load-failed branch). Surface with `Rebus.DiagBeam` (`MIDReadback.BeamIntensity=0` AND `Material.beamMID=<null>`).
+> 2. **`Dimmer.Current` is stuck at 0 / `Gate` is stuck at 0.** `RefreshBeamEmissive` IS being called and IS pushing, but the value it pushes is 0 because `Dimmer * MeshBeamUserScale * Gate * RebusMeshBeamMaxIntensity = 0`. Surface with `Rebus.DiagBeam` (`Drive.dimmerCurrent=0` or `Drive.gate=0`) AND prove the cone CAN render with `Rebus.ForceBeam 50` (which bypasses the entire drive math).
+> 3. **`BeamIntensity` IS reaching the visible MID at a non-zero value, but `coverage` is 0 in the HLSL raymarch.** `BeamColor * BeamIntensity * coverage` is the emissive output; if `coverage = saturate(1 - exp(-d * dt))` saturates to 0 (e.g. `BeamDensity * core * widthNorm * srcAtten * nf * softOcc * shadowVis = 0` for every march step), the additive output is 0 regardless of BeamIntensity. Surface with `Rebus.DiagBeam` (`MIDReadback.BeamDensity=0` or `StepCount=0` or `LensRadius`/`FarRadius=0` => degenerate cone, march never integrates).
+> 4. **The cone IS rendering BeamColor * BeamIntensity * coverage > 0 but the visible result is being hidden downstream.** Material domain wrong (PostProcess instead of Surface), blend mode wrong (Opaque instead of Additive), two-sided=false on a cone seen from the wrong side, view-mode override hiding additive translucents, fog overdraw saturating the cone in volumetric fog, post-process unbound-volume blowing out the emissive to white, camera position outside the cone's view frustum, view-projection issue. Surface with `Rebus.BeamDebugTint 1` (push impossible-to-miss magenta + BeamIntensity=100; if STILL invisible the failure is downstream of BeamColor + BeamIntensity).
+> 5. **The cone's geometry isn't reaching the renderer at all.** BeamCone proc-mesh component is null, scene proxy never registered, BoundsScale degenerate, attached to a hidden parent, `bHiddenInGame=1` set behind our back. Surface with `Rebus.BeamConeWireframe 1` (swap slot-0 to nullptr -> engine falls back to opaque grey WorldGridMaterial; if you see grey-checker cones the geometry IS alive and #4 is the culprit; if you see NOTHING #5 is the culprit).
+>
+> The v1.0.126 toolkit covers all FIVE hypotheses in one runtime session. The user's "one chance" constraint -- run-it-once-and-paste -- is the design driver for `Rebus.DiagBeam`'s exhaustive one-line-per-fixture dump.
+>
+> ### Runbook (copy-paste this into the console; order matters)
+>
+> Each step's purpose + how to read the result is described inline. **Run them in order**: each step is gated on the result of the previous one, so skipping ahead loses signal.
+>
+> ```
+> # STEP 1 -- baseline. Flip the v1.0.124 per-push log on so every subsequent SetFixtureIntensity push
+> # surfaces a line in the OutputLog. The v1.0.125 pushCount + same fields are visible from this point.
+> Rebus.LogBeamCone 1
+>
+> # STEP 2 -- fire any cue from the portal so SetFixtureIntensity descriptors actually drive Dimmer.
+> # The per-push log lines should report BeamIntensity > 0 and pushCount=1 or 2. If pushCount=0 the
+> # v1.0.125 fix did not engage on this fixture (BeamMID + ConeSlot0 both null).
+>
+> # STEP 3 -- the EXHAUSTIVE per-fixture dump. ONE world-level header line then one line per fixture
+> # covering every known failure axis. Read the MIDReadback / Drive / Geom / Material blocks in order.
+> Rebus.DiagBeam
+>
+> # STEP 4 -- bypass the DMX pipeline. Pushes BeamIntensity=50 + BeamColor=(1,1,1,1) onto every
+> # fixture's slot-0 MID AND cached BeamMID. If you NOW see bright white cones the failure was
+> # UPSTREAM of BeamIntensity (Dimmer.Current=0, Gate=0, etc -- check the Drive block of step 3).
+> # If you STILL see nothing the failure is DOWNSTREAM; continue to step 5.
+> Rebus.ForceBeam 50
+>
+> # STEP 5 -- impossible-to-miss visual test. Pins BeamColor=(1,0,1,1) magenta + BeamIntensity=100
+> # AND suppresses RefreshBeamEmissive on every fixture. If you do NOT see bright magenta cones
+> # the failure is DOWNSTREAM of BeamColor + BeamIntensity (material domain wrong, blend mode wrong,
+> # view-mode hiding additive translucents, camera/frustum, fog overdraw, post-process blowing out
+> # the emissive). Continue to step 6.
+> Rebus.BeamDebugTint 1
+>
+> # STEP 6 -- SMOKING-GUN geometry test. Swaps slot-0 to nullptr; UE falls back to opaque grey
+> # WorldGridMaterial (checker pattern visible from every angle). If you see grey-checker cones
+> # the geometry IS alive and the entire failure is on the MATERIAL side -- send the screenshot
+> # + Rebus.DiagBeam output of step 3 and we can root-cause from there. If you see NOTHING the
+> # geometry is not reaching the renderer (BeamCone null, scene proxy never registered, etc) --
+> # the Rebus.DiagBeam output of step 3 has the BeamCone.{registered, vis, hidGame, sections,
+> # tris, verts, localBoundsRadius} fields needed to triage.
+> Rebus.BeamConeWireframe 1
+>
+> # STEP 7 -- restore. Roll back the debug overrides so live operation resumes.
+> Rebus.BeamConeWireframe 0
+> Rebus.BeamDebugTint 0
+> Rebus.LogBeamCone 0
+> ```
+>
+> ### Result combinations + what they mean
+>
+> | DiagBeam BeamIntensity readback | ForceBeam result | BeamDebugTint result | BeamConeWireframe result | Verdict |
+> | --- | --- | --- | --- | --- |
+> | `0.0000` AND `dimmerCurrent>0` | white cone | n/a | n/a | UPSTREAM -- the v1.0.125 double-push isn't landing. Check `Material.same`; if `0` the cached BeamMID and the visible MID have diverged AND the v1.0.125 fix engaged on a different slot. |
+> | `>0` AND visually invisible | n/a | invisible | invisible | DOWNSTREAM -- geometry submitted, material rendering nothing visible. Likely material domain / blend mode / view-mode. Check `Material.domain` (should be `Surface`) + `Material.blend` (should be `Additive`) + `Material.shading` (should be `Unlit`) + `Material.twoSided` (should be `1`) in the `Rebus.DiagBeam` dump. |
+> | `>0` AND visually invisible | n/a | invisible | grey-checker cone visible | DOWNSTREAM-MATERIAL -- geometry alive, material rendering nothing visible. The M_RebusBeam shader is failing somewhere between BeamColor*BeamIntensity*coverage and the final additive blend; could be `coverage=0` (check `BeamDensity` / `StepCount` / `LensRadius` / `FarRadius` in the dump), or could be fog/post-process eating the emissive. |
+> | `>0` AND visually invisible | n/a | invisible | invisible | DOWNSTREAM-GEOMETRY -- BeamCone is not reaching the renderer. Check `BeamCone.{registered, vis, hidGame, sections, tris, verts}` in the dump; one of them is degenerate. |
+> | `>0` AND visually invisible | invisible | magenta cone visible | n/a | DOWNSTREAM-COLOR -- BeamColor was being driven to (0,0,0) somehow (ColorR/G/B fades stuck at 0, ApplyColor not firing). Check `Drive.dimmerCurrent` and the per-push log line tag in `Rebus.LogBeamCone 1` output for the BeamColor value the push wrote. |
+> | `>0` AND visually invisible | visible | n/a | n/a | UPSTREAM-DIMMER -- the v1.0.125 push is healthy AND the cone CAN render; the live DMX pipeline isn't driving Dimmer high enough for the per-tick math to produce a non-zero BeamIntensity. Check `Drive.dimmerCurrent` (probably very low) + `Drive.gate` (probably 0 due to ShutterMode=Closed or Strobe) in the dump. |
+>
+> ### What v1.0.126 changes (exhaustive)
+>
+> 1. **`Source/RebusVisualiser/Public/RebusFixtureActor.h`** — four new public per-fixture methods (`DumpBeamDiagForDebug`, `ForceBeamForDebug`, `SetBeamDebugTintForDebug`, `SetBeamConeWireframeForDebug`) + accessor `IsBeamDebugTintActive`. Two new private members: `bBeamDebugTintActive` (sticky-override flag for the magenta tint) + `PreWireframeBeamMaterial` (saved slot-0 material so the wireframe-debug command can restore cleanly). All with multi-line doc-comments explaining the operator-facing contract.
+> 2. **`Source/RebusVisualiser/Private/RebusFixtureActor.cpp`** — four new method implementations (`DumpBeamDiagForDebug` ~150 lines, `ForceBeamForDebug` ~30 lines, `SetBeamDebugTintForDebug` ~50 lines, `SetBeamConeWireframeForDebug` ~40 lines). One 4-line sticky-override gate at the top of `RefreshBeamEmissive` that returns early when `bBeamDebugTintActive` is true (additive only — the v1.0.125 pointer-divergence fix below the gate is byte-identical when the gate is inactive). Spawn log version tag `SPAWNED v1.0.125` -> `SPAWNED v1.0.126` with new `diagAvailable=1` flag. `LogBeamCone[...] v1.0.125` -> `v1.0.126`.
+> 3. **`Source/RebusVisualiser/Private/RebusVisualiser.cpp`** — four new IConsoleCommand registrations (`Rebus.DiagBeam`, `Rebus.ForceBeam`, `Rebus.BeamDebugTint`, `Rebus.BeamConeWireframe`) wired through the shared `WalkRebusFixtures` template lambda. Four new handler functions in the anonymous namespace. Matching teardown in `ShutdownModule`. `Rebus.ForceBeamMasterRegen` log line updated to point at the v1.0.126 runbook.
+> 4. **`Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp`** — startup-banner triage text `if pluginVersion != v1.0.125` -> `v1.0.126`.
+> 5. **`RebusVisualiser.uplugin`** — `VersionName` `1.0.125` -> `1.0.126` (top-centre watermark + startup banner will read `v1.0.126` on next launch).
+> 6. **`README.md`** — this v1.0.126 release block.
+>
+> Material-revision-coupled strings stay at 121 (v1.0.126 does NOT change `M_RebusBeam` or the Python baker -- no re-bake required).
+>
+> ### What v1.0.126 does NOT change
+>
+> - **No `M_RebusBeam` change.** The Python `build_rebus_base_level.py` is untouched; the on-disk master + the `BeamMaterialRevision` sentinel stay at 121. No re-bake required.
+> - **No v1.0.125 wiring change.** The `RefreshBeamEmissive` defensive double-push to BOTH the cone slot-0 MID + cached BeamMID is preserved verbatim. The new sticky-override gate sits ABOVE the v1.0.125 logic and only suppresses pushes when the operator has explicitly engaged the magenta tint; when the gate is inactive (the default) every byte of v1.0.125 behaviour is preserved.
+> - **No v1.0.124 / v1.0.123 / v1.0.122 / v1.0.117 / v1.0.111 change.** `BuildBeamCone` is unchanged (SetMobility-before-Register, sibling-of-SpotLight-under-FixtureRoot, MarkRenderStateDirty after section + material). `DriveBeamConeFromSpotLight`'s per-tick `SetRelativeTransform` mirror is unchanged. `RefreshBeamConeCullingFlags` is unchanged. The light-space depth-mask SceneCapture pair is unchanged.
+> - **No new CVar.** Four new console COMMANDS only (`Rebus.DiagBeam`, `Rebus.ForceBeam`, `Rebus.BeamDebugTint`, `Rebus.BeamConeWireframe`). `Rebus.LogBeamCone` + `Rebus.LogBeamConeIntervalSec` from v1.0.124 are reused (no CVar churn).
+> - **No portal-side change.** The diagnostic commands run entirely in-process via the engine console (`~` -> type command). The portal does not need to push anything new to use the toolkit.
+
 > **v1.0.125 — fix `BeamCone` STILL INVISIBLE on shipped v1.0.124 binaries even though the v1.0.124 `Rebus.LogBeamCone 1` dump reports every fixture's BeamCone is geometrically + materially perfect (`attachParent=SceneComponent(FixtureRoot)`, `mobility=Movable`, `vis=1`, `slot0Class=MaterialInstanceDynamic`, `slot0Name=MID_M_RebusBeam_0`, `beamMID=OK`, `beamMIDParent=M_RebusBeam`, `dot(spot,cone)=1.000`). User report context: spotlights ARE firing (4 white circular floor pools visible on the ground proving the IES + SpotLight chain is correct), but the volumetric `M_RebusBeam` cone shafts are NOT visible despite ~30 `SetFixtureIntensity` descriptors driving the spotlights up. v1.0.125 root-causes the symptom to a latent `BeamMID`-vs-cone-slot-0 pointer-divergence hazard in `RefreshBeamEmissive`: the per-push body wrote `BeamIntensity` + `BeamColor` ONLY onto the cached `BeamMID` UPROPERTY, never onto the cone's live slot-0 material. If ANY code path replaces the cone's slot-0 MID with a different `UMaterialInstanceDynamic` (a fresh MID from a stale-master refresh, a re-bake `RefreshBeamMaterialBindings` call, a hot-reload edge case that survives `BuildBeamCone`) WITHOUT updating the cached pointer, the push lands on the GHOST MID and the visible MID stays at the authored `M_RebusBeam` default `BeamIntensity = 0.0` (line ~1020 of `build_rebus_base_level.py`). With the raymarch HLSL outputting `BeamColor.rgb * BeamIntensity * coverage`, `BeamIntensity = 0` → the shaft is BLACK → additive blend → the shaft is INVISIBLE — exactly the v1.0.125 user symptom — while `SpotLight->SetIntensity(Cd * Dimmer * Gate)` (which uses the SAME `Dimmer.Current`) drives the visible floor pool correctly. v1.0.125 collapses the push onto the SET of `{ConeSlot0MID, BeamMID}`, so a divergent state CANNOT leave the visible MID with stale-default scalars, AND extends the diagnostic to read back the live `BeamIntensity` + `BeamColor` from BOTH MIDs so a divergence is provable from a single log line.**
 >
 > ### Symptom (verbatim user report + v1.0.124 diagnostic evidence)

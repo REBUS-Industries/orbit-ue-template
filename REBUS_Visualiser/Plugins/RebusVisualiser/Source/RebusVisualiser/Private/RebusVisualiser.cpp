@@ -90,6 +90,24 @@ namespace
 	IConsoleCommand* GShowVersionCommand = nullptr;
 	IConsoleCommand* GVersionWatermarkYCommand = nullptr;
 
+	// v1.0.126 -- BeamCone-invisible diagnostic toolkit. Four commands authored
+	// in lockstep so the operator can run them in sequence to prove or disprove
+	// EVERY remaining hypothesis for an invisible BeamCone in one runtime
+	// session without re-baking or re-saving anything:
+	//   * `Rebus.DiagBeam`            -- exhaustive per-fixture dump (see
+	//                                     `ARebusFixtureActor::DumpBeamDiagForDebug`).
+	//   * `Rebus.ForceBeam <intensity>` -- push BeamIntensity + BeamColor=(1,1,1,1)
+	//                                     to every fixture (bypasses DMX pipeline).
+	//   * `Rebus.BeamDebugTint <0|1>` -- pin BeamColor=(1,0,1,1) + BeamIntensity=100
+	//                                     on every fixture; suppress RefreshBeamEmissive.
+	//   * `Rebus.BeamConeWireframe <0|1>` -- swap slot-0 to nullptr (engine falls
+	//                                     back to opaque grey WorldGridMaterial).
+	// See the v1.0.126 README release block for the full triage tree.
+	IConsoleCommand* GDiagBeamCommand = nullptr;
+	IConsoleCommand* GForceBeamCommand = nullptr;
+	IConsoleCommand* GBeamDebugTintCommand = nullptr;
+	IConsoleCommand* GBeamConeWireframeCommand = nullptr;
+
 	// Forward decl -- defined further down with the other arg parsers; the v1.0.73 anti-ghost
 	// handler below uses it before its in-file definition.
 	bool ParseBoolArg(const TArray<FString>& Args, bool bDefault);
@@ -671,7 +689,10 @@ namespace
 				 "is a `UMaterialInstanceDynamic` parented to `M_RebusBeam`. If verify "
 				 "FAILED (LOUD `Error` log one line above), check the OutputLog for a "
 				 "Python traceback and attach Saved/Logs/REBUS_Visualiser.log to a "
-				 "v1.0.125+ bug report."),
+				 "v1.0.126+ bug report. v1.0.126 ALSO ships `Rebus.DiagBeam` / `Rebus.ForceBeam` "
+				 "/ `Rebus.BeamDebugTint` / `Rebus.BeamConeWireframe` -- run them in that order "
+				 "(see the v1.0.126 README runbook) for the next layer of triage when the cone "
+				 "is still invisible against a clean v1.0.125+ master."),
 			Worlds, Succeeded);
 	}
 
@@ -721,6 +742,232 @@ namespace
 			// `RebusExpectedBeamMaterialRevision` (`RebusVisualiserSubsystem.cpp`)
 			// + `REBUS_BEAM_MATERIAL_REVISION` (`build_rebus_base_level.py`).
 			Worlds, TotalFixtures, 121, 121);
+	}
+
+	// v1.0.126 -- shared per-world walker for the four BeamCone-invisible
+	// diagnostic commands. Iterates every Game/PIE/Editor world and invokes
+	// `Visitor(ARebusFixtureActor&)` on each spawned fixture. Returns the
+	// total fixture count. Single chokepoint so the four handlers below all
+	// share the same world-traversal semantics (and so a future scoping
+	// change -- e.g. add a fixtureId filter -- only has to touch one place).
+	template <typename FnT>
+	int32 WalkRebusFixtures(FnT&& Visitor)
+	{
+		if (!GEngine) return 0;
+		int32 Total = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World) continue;
+			const bool bRelevant =
+				Ctx.WorldType == EWorldType::Game ||
+				Ctx.WorldType == EWorldType::PIE ||
+				Ctx.WorldType == EWorldType::Editor;
+			if (!bRelevant) continue;
+			for (TActorIterator<ARebusFixtureActor> It(World); It; ++It)
+			{
+				if (ARebusFixtureActor* F = *It)
+				{
+					Visitor(*F);
+					++Total;
+				}
+			}
+		}
+		return Total;
+	}
+
+	// v1.0.126 -- `Rebus.DiagBeam` exhaustive per-fixture BeamCone diagnostic
+	// command. Prints ONE world-level engine + view CVar header line (the
+	// state that gates additive translucent rendering globally), then walks
+	// every spawned ARebusFixtureActor and invokes the v1.0.126
+	// `DumpBeamDiagForDebug` chokepoint per fixture. Designed under the
+	// explicit assumption that the operator only gets ONE chance to run it:
+	// every known failure axis for an invisible BeamCone is surfaced in one
+	// log block. See the v1.0.126 README runbook for the triage tree.
+	void HandleDiagBeamCommand(const TArray<FString>& Args)
+	{
+		const FString Filter = (Args.Num() > 0) ? Args[0] : FString();
+
+		// World-level engine + view CVars that gate additive translucent
+		// rendering globally. Printed ONCE before the per-fixture lines
+		// (these are not per-fixture state, so duplicating them per-line
+		// would be noise without information). Includes the v1.0.117
+		// `r.AllowOcclusionQueries` / `r.VolumetricFog` that
+		// `Rebus.DumpBeamCulling` already surfaces, PLUS the v1.0.126
+		// additions the brief asked for (anti-aliasing method, screen
+		// percentage, translucency velocity, Lumen reflections).
+		auto CVarInt = [](const TCHAR* Name) -> int32
+		{
+			IConsoleVariable* CV = IConsoleManager::Get().FindConsoleVariable(Name);
+			return CV ? CV->GetInt() : -1;
+		};
+		auto CVarFloat = [](const TCHAR* Name) -> float
+		{
+			IConsoleVariable* CV = IConsoleManager::Get().FindConsoleVariable(Name);
+			return CV ? CV->GetFloat() : -1.f;
+		};
+
+		// Plugin version + binary build for the operator-triage row.
+		const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("RebusVisualiser"));
+		const FString PluginVer = Plugin.IsValid()
+			? Plugin->GetDescriptor().VersionName
+			: FString(TEXT("?.?.?"));
+
+		const int32 AAMethod = CVarInt(TEXT("r.AntiAliasingMethod"));
+		const TCHAR* AAName = TEXT("Unknown");
+		switch (AAMethod)
+		{
+		case 0: AAName = TEXT("None"); break;
+		case 1: AAName = TEXT("FXAA"); break;
+		case 2: AAName = TEXT("TAA"); break;
+		case 3: AAName = TEXT("MSAA"); break;
+		case 4: AAName = TEXT("TSR"); break;
+		default: break;
+		}
+
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("===== Rebus.DiagBeam v1.0.126 begin -- pluginVersion=v%s filter='%s' (empty => "
+				 "every fixture). Engine={r.VolumetricFog=%d r.AllowOcclusionQueries=%d "
+				 "r.AntiAliasingMethod=%d(%s) r.ScreenPercentage=%.1f r.Lumen.Reflections=%d "
+				 "r.Lumen.ScreenProbeGather.Temporal=%d r.Translucency.Velocity=%d "
+				 "r.LightFunctionAtlas.Enabled=%d r.LightFunctionQuality=%d r.TSR.History.UpdateRate=%.3f "
+				 "r.Tonemapper.Quality=%d r.DefaultFeature.Bloom=%d r.DefaultFeature.AutoExposure=%d "
+				 "r.EyeAdaptationQuality=%d r.CustomDepth=%d} ====="),
+			*PluginVer, *Filter,
+			CVarInt(TEXT("r.VolumetricFog")),
+			CVarInt(TEXT("r.AllowOcclusionQueries")),
+			AAMethod, AAName,
+			CVarFloat(TEXT("r.ScreenPercentage")),
+			CVarInt(TEXT("r.Lumen.Reflections")),
+			CVarInt(TEXT("r.Lumen.ScreenProbeGather.Temporal")),
+			CVarInt(TEXT("r.Translucency.Velocity")),
+			CVarInt(TEXT("r.LightFunctionAtlas.Enabled")),
+			CVarInt(TEXT("r.LightFunctionQuality")),
+			CVarFloat(TEXT("r.TSR.History.UpdateRate")),
+			CVarInt(TEXT("r.Tonemapper.Quality")),
+			CVarInt(TEXT("r.DefaultFeature.Bloom")),
+			CVarInt(TEXT("r.DefaultFeature.AutoExposure")),
+			CVarInt(TEXT("r.EyeAdaptationQuality")),
+			CVarInt(TEXT("r.CustomDepth")));
+
+		int32 Matched = 0;
+		const int32 Total = WalkRebusFixtures([&Filter, &Matched](ARebusFixtureActor& F)
+		{
+			if (!Filter.IsEmpty() && !F.GetFixtureId().Equals(Filter, ESearchCase::IgnoreCase))
+			{
+				return;
+			}
+			F.DumpBeamDiagForDebug(TEXT("Rebus.DiagBeam"));
+			++Matched;
+		});
+
+		if (Filter.IsEmpty())
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("===== Rebus.DiagBeam v1.0.126 end -- dumped %d/%d fixture(s) (no filter). "
+					 "Next steps (the v1.0.126 runbook): if any fixture's `MIDReadback={BeamIntensity=0.0000 "
+					 "...}` AND `Drive={dimmerCurrent>0}` => run `Rebus.ForceBeam 50` to bypass the DMX "
+					 "pipeline and prove the cone CAN render at all; if ForceBeam succeeds the failure "
+					 "is upstream of BeamIntensity. If MIDReadback reports >0 and the cone is STILL "
+					 "invisible => run `Rebus.BeamDebugTint 1` for the magenta-impossible-to-miss test; "
+					 "if still invisible run `Rebus.BeamConeWireframe 1` for the geometry-alive test. "
+					 "See the README v1.0.126 release block for the full triage tree."),
+				Matched, Total);
+		}
+		else if (Matched == 0)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("===== Rebus.DiagBeam v1.0.126 end -- filter '%s' matched NO fixtures "
+					 "(scanned %d total across every Game/PIE/Editor world; check the Speckle "
+					 "node id -- same key SetFixture* uses)."),
+				*Filter, Total);
+		}
+		else
+		{
+			UE_LOG(LogRebusVisualiser, Log,
+				TEXT("===== Rebus.DiagBeam v1.0.126 end -- dumped %d matching fixture(s) "
+					 "(filter '%s', scanned %d total)."),
+				Matched, *Filter, Total);
+		}
+	}
+
+	// v1.0.126 -- `Rebus.ForceBeam <intensity>` (default 50.0) per-fixture
+	// override that pushes BeamIntensity + BeamColor=(1,1,1,1) onto every
+	// fixture's slot-0 MID (the v1.0.125 defensive double-push shape). The
+	// brief contract: prove whether the issue is upstream (intensity pipeline)
+	// or downstream (material / render). See the v1.0.126 README runbook.
+	void HandleForceBeamCommand(const TArray<FString>& Args)
+	{
+		float Intensity = 50.f;
+		if (Args.Num() > 0)
+		{
+			Intensity = FCString::Atof(*Args[0]);
+		}
+		Intensity = FMath::Clamp(Intensity, 0.f, 10000.f);
+
+		int32 Pushed = 0;
+		const int32 Total = WalkRebusFixtures([Intensity, &Pushed](ARebusFixtureActor& F)
+		{
+			Pushed += F.ForceBeamForDebug(Intensity);
+		});
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.ForceBeam %.4f: pushed onto %d/%d fixture(s) (bypassed DMX pipeline -- "
+				 "BeamColor=(1,1,1,1), BeamIntensity=%.4f on BOTH cone-slot-0 MID AND cached "
+				 "BeamMID). If you NOW see bright white cones the v1.0.125 fix is healthy and "
+				 "the missing-cone failure was UPSTREAM of BeamIntensity (Dimmer.Current==0, "
+				 "Gate==0, ApplyDimmer not firing, etc). If you STILL see nothing run "
+				 "`Rebus.BeamDebugTint 1` then `Rebus.BeamConeWireframe 1` -- the failure is "
+				 "DOWNSTREAM (material/render/view/post-process)."),
+			Intensity, Pushed, Total, Intensity);
+	}
+
+	// v1.0.126 -- `Rebus.BeamDebugTint <0|1>` (default 1) sticky-override
+	// toggle that pins BeamColor=(1,0,1,1) magenta + BeamIntensity=100 on
+	// every fixture and SUPPRESSES RefreshBeamEmissive's per-tick pushes
+	// until the operator flips it off. See the v1.0.126 README runbook.
+	void HandleBeamDebugTintCommand(const TArray<FString>& Args)
+	{
+		const bool bEnable = ParseBoolArg(Args, true);
+		int32 Affected = 0;
+		const int32 Total = WalkRebusFixtures([bEnable, &Affected](ARebusFixtureActor& F)
+		{
+			Affected += F.SetBeamDebugTintForDebug(bEnable);
+		});
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.BeamDebugTint %d: applied to %d/%d fixture(s) (%s magenta override + "
+				 "RefreshBeamEmissive suppression). If you do NOT see a bright magenta cone "
+				 "on at least one fixture the failure is DOWNSTREAM of BeamColor + "
+				 "BeamIntensity (material domain wrong, blend mode wrong, additive translucents "
+				 "hidden by view-mode, camera outside the cone, fog overdraw saturating, "
+				 "post-process unbound-volume blowing out the emissive). Flip with "
+				 "`Rebus.BeamDebugTint 0` to restore."),
+			bEnable ? 1 : 0, Affected, Total,
+			bEnable ? TEXT("engaged") : TEXT("cleared"));
+	}
+
+	// v1.0.126 -- `Rebus.BeamConeWireframe <0|1>` (default 1) per-fixture
+	// material-swap that swaps slot-0 to nullptr so UE falls back to the
+	// opaque grey WorldGridMaterial -- the SMOKING-GUN test for "is the
+	// BeamCone geometry actually being submitted to the renderer at all?".
+	// See the v1.0.126 README runbook.
+	void HandleBeamConeWireframeCommand(const TArray<FString>& Args)
+	{
+		const bool bEnable = ParseBoolArg(Args, true);
+		int32 Affected = 0;
+		const int32 Total = WalkRebusFixtures([bEnable, &Affected](ARebusFixtureActor& F)
+		{
+			Affected += F.SetBeamConeWireframeForDebug(bEnable);
+		});
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.BeamConeWireframe %d: applied to %d/%d fixture(s) (%s opaque-grey "
+				 "WorldGridMaterial fallback). If you do NOT see grey cones the BeamCone "
+				 "geometry is not reaching the renderer (BeamCone null, scene proxy never "
+				 "registered, BoundsScale degenerate, attached to a hidden parent, etc -- "
+				 "triage with the v1.0.126 `Rebus.DiagBeam` dump). If you DO see grey cones "
+				 "the geometry is alive and the entire missing-cone failure is on the "
+				 "material side. Flip with `Rebus.BeamConeWireframe 0` to restore."),
+			bEnable ? 1 : 0, Affected, Total,
+			bEnable ? TEXT("engaged") : TEXT("cleared"));
 	}
 
 	// v1.0.121 -- `Rebus.ForceIesProfileBake` operator command. Mirrors
@@ -2396,6 +2643,92 @@ void FRebusVisualiserModule::StartupModule()
 			 "auto-purge, the Python regen is editor-only). Usage: Rebus.DumpBeamMasterVersion"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpBeamMasterVersionCommand),
 		ECVF_Default);
+
+	// v1.0.126 -- BeamCone-invisible diagnostic toolkit. The four commands
+	// below let the operator prove or disprove EVERY remaining hypothesis
+	// for an invisible BeamCone in one runtime session WITHOUT requiring
+	// them to rebuild or re-bake anything beyond a DLL reload. The intended
+	// run order is `Rebus.DiagBeam` -> `Rebus.ForceBeam 50` -> `Rebus.Beam
+	// DebugTint 1` -> `Rebus.BeamConeWireframe 1`; see the v1.0.126 README
+	// release block for the full triage tree mapping each result combination
+	// to a verdict on where the failure lives.
+	GDiagBeamCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.DiagBeam"),
+		TEXT("v1.0.126 -- EXHAUSTIVE per-fixture BeamCone diagnostic. Prints one world-level "
+			 "engine + view CVar header line (the state that gates additive translucent "
+			 "rendering globally: r.VolumetricFog, r.AntiAliasingMethod, r.Lumen.Reflections, "
+			 "r.Translucency.Velocity, r.ScreenPercentage, r.LightFunctionAtlas.Enabled, r.Tone"
+			 "mapper.Quality, r.DefaultFeature.Bloom/AutoExposure, r.EyeAdaptationQuality, "
+			 "r.CustomDepth), THEN walks every spawned ARebusFixtureActor and dumps one line "
+			 "per fixture covering EVERY known failure axis for an invisible BeamCone: "
+			 "BeamCone existence + registration + visibility gates (registered/vis/hidGame/"
+			 "castShadow/mobility/attachParent/boundsScale/translucencySort/renderMain/"
+			 "renderDepth/customDepth), geometry inventory (sections/tris/verts/localBoundsRadius/"
+			 "localBoundsBoxExtent), world + relative transforms (so the v1.0.124 per-tick mirror "
+			 "is provable), material slot 0 (class/name/path) + cached BeamMID divergence "
+			 "(midPtr/coneSlot0Ptr/same -- the v1.0.125 hypothesis 5 check), live MID parameter "
+			 "readback (BeamIntensity/BeamColor/BeamSharpness/BeamFalloff/BeamDensity/StepCount/"
+			 "BeamLength/LensRadius/FarRadius/BeamShadowMaskEnabled/MatRevision -- EVERY scalar/"
+			 "vector that gates the raymarch HLSL output), SpotLight cross-check (intensity in cd, "
+			 "VolumetricScatteringIntensity, dot(spot,cone)), live drive state (dimmerCurrent/"
+			 "shutterMode/gate/meshBeamUserScale/maxBeam), parent-material domain/blend/shading/"
+			 "twoSided. With no arg dumps every fixture; with a fixtureId (Speckle node id, "
+			 "same key SetFixture* uses) dumps just that one. Usage: Rebus.DiagBeam [fixtureId]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDiagBeamCommand),
+		ECVF_Default);
+
+	GForceBeamCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.ForceBeam"),
+		TEXT("v1.0.126 -- BYPASS the normal DMX-driven BeamIntensity pipeline and push a fixed "
+			 "BeamIntensity value + opaque white BeamColor onto every fixture's slot-0 MID AND "
+			 "cached BeamMID (the v1.0.125 defensive double-push shape). Proves whether the "
+			 "issue is UPSTREAM (the intensity pipeline -- Dimmer.Current==0, Gate==0, "
+			 "ApplyDimmer not firing, RefreshBeamEmissive not reaching the visible MID) or "
+			 "DOWNSTREAM (material / render / view / post-process). If you NOW see bright "
+			 "white cones the failure was UPSTREAM. If you STILL see nothing run "
+			 "`Rebus.BeamDebugTint 1` then `Rebus.BeamConeWireframe 1` to nail down which "
+			 "DOWNSTREAM layer. Logs one line per fixture with the live read-back so the "
+			 "operator can paste the result. Default arg = 50.0 (the value normally hit at "
+			 "Dimmer.Current=1.0, MeshBeamUserScale=1.0, Gate=1.0, RebusMeshBeamMaxIntensity=50.0). "
+			 "Clamped to [0, 10000]. Usage: Rebus.ForceBeam [intensity]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleForceBeamCommand),
+		ECVF_Default);
+
+	GBeamDebugTintCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.BeamDebugTint"),
+		TEXT("v1.0.126 -- per-fixture STICKY override that pins BeamColor=(1,0,1,1) opaque "
+			 "magenta + BeamIntensity=100 AND suppresses RefreshBeamEmissive's per-tick pushes. "
+			 "Goal: make the cone IMPOSSIBLE to miss visually if any rendering path is alive "
+			 "at all -- magenta is the brightest, most distinguishable colour against any "
+			 "stage scene, and BeamIntensity=100 is ~2x the normal-max drive value. If you "
+			 "flip this on and the cone is STILL invisible, the failure is DOWNSTREAM of "
+			 "BeamColor + BeamIntensity (material domain wrong, blend mode wrong, additive "
+			 "translucents hidden by view-mode, camera outside the cone, fog overdraw "
+			 "saturating, post-process unbound-volume blowing out the emissive). Bypasses "
+			 "the normal DMX pipeline -- the next `SetFixtureIntensity` / per-tick fade "
+			 "WILL NOT overwrite the magenta until you flip the override OFF with `Rebus.Beam"
+			 "DebugTint 0`. Flip OFF and the next RefreshBeamEmissive tick restores the live "
+			 "drive state (no explicit restore push needed). Usage: Rebus.BeamDebugTint [0|1]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleBeamDebugTintCommand),
+		ECVF_Default);
+
+	GBeamConeWireframeCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.BeamConeWireframe"),
+		TEXT("v1.0.126 -- per-fixture SMOKING-GUN geometry test. On enable swaps the BeamCone's "
+			 "slot-0 material to nullptr -- UE falls back to the opaque grey WorldGridMaterial "
+			 "(checker pattern visible from EVERY angle, NOT additive, NOT translucent). "
+			 "If you NOW see grey-checker cones the BeamCone geometry IS being submitted to "
+			 "the renderer and the entire missing-cone failure is on the MATERIAL side "
+			 "(M_RebusBeam authored wrong, BeamMID not parented to M_RebusBeam, parameter "
+			 "defaults wrong, additive blend mode broken). If you see NOTHING the geometry is "
+			 "not reaching the renderer (BeamCone null, scene proxy never registered, "
+			 "BoundsScale degenerate, attached to a hidden parent, bHiddenInGame=1 -- triage "
+			 "with the v1.0.126 `Rebus.DiagBeam` dump). On disable restores the captured "
+			 "pre-debug slot-0 material cleanly (no respawn needed) AND fires one fresh "
+			 "RefreshBeamEmissive so the restored MID gets the live drive state immediately. "
+			 "Usage: Rebus.BeamConeWireframe [0|1]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleBeamConeWireframeCommand),
+		ECVF_Default);
 }
 
 void FRebusVisualiserModule::ShutdownModule()
@@ -2564,6 +2897,27 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GVersionWatermarkYCommand);
 		GVersionWatermarkYCommand = nullptr;
+	}
+	// v1.0.126 -- BeamCone-invisible diagnostic toolkit teardown.
+	if (GDiagBeamCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GDiagBeamCommand);
+		GDiagBeamCommand = nullptr;
+	}
+	if (GForceBeamCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GForceBeamCommand);
+		GForceBeamCommand = nullptr;
+	}
+	if (GBeamDebugTintCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GBeamDebugTintCommand);
+		GBeamDebugTintCommand = nullptr;
+	}
+	if (GBeamConeWireframeCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GBeamConeWireframeCommand);
+		GBeamConeWireframeCommand = nullptr;
 	}
 	// v1.0.73 / v1.0.78: restore both CVar packs to their snapshotted values so a hot-reload
 	// of the module doesn't leak a permanent override into the engine session. Both packs

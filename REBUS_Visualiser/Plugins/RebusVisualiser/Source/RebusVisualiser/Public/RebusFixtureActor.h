@@ -656,6 +656,128 @@ public:
 	// `GRebusLogBeamConeNextSec` throttle).
 	void DumpBeamConeStateForDebug(const TCHAR* CallSite) const;
 
+	// v1.0.126 -- EXHAUSTIVE one-line BeamCone diagnostic consumed by the new
+	// `Rebus.DiagBeam` console command. Designed under the explicit assumption
+	// that the operator only gets ONE chance to run it: every known failure
+	// axis for an invisible BeamCone is surfaced in a single line so a paste
+	// of one fixture's output is enough to triage. Fields (one block each,
+	// pipe-delimited so the line stays grep-friendly):
+	//   * Identity: fixtureId, displayName, actor name, actor world location.
+	//   * BeamCone existence + registration + visibility gates: ptr, IsRegistered,
+	//     IsVisible, bHiddenInGame, owner->IsHidden, mobility, CastShadow,
+	//     bRenderInMainPass, bRenderInDepthPass, bRenderCustomDepth, BoundsScale,
+	//     TranslucencySortPriority.
+	//   * BeamCone geometry: GetNumSections, total triangle count, total vertex
+	//     count, local-bounds sphere radius, local-bounds box extent. A
+	//     `triCount=0` or `verts=0` here is the smoking gun for hypothesis
+	//     "BuildBeamCone created the component but UpdateBeamConeGeometry's
+	//     CreateMeshSection failed silently".
+	//   * BeamCone transforms: world location + world rotation + world forward
+	//     (so the operator can confirm the v1.0.124 per-tick mirror landed),
+	//     relative location + relative rotation, attach parent name.
+	//   * Material: slot-0 class + asset name, BeamMID ptr, BeamMID parent,
+	//     midPtr / coneSlot0Ptr / same (v1.0.125 divergence test repeated here
+	//     so a one-stop dump line covers both v1.0.125 + v1.0.126 hypotheses).
+	//   * Live MID parameter readback on the cone's visible slot-0 MID:
+	//     BeamIntensity, BeamColor (rgba), BeamSharpness, BeamFalloff,
+	//     BeamDensity, StepCount, BeamLength, LensRadius, FarRadius,
+	//     BeamShadowMaskEnabled, BeamMaterialRevision. These are the EVERY
+	//     scalar/vector that gates the raymarch HLSL output -- a zero in any
+	//     non-trivial slot here is a one-line root-cause.
+	//   * SpotLight cross-check: SpotLight->Intensity (cd), Dimmer.Current,
+	//     ShutterMode, computed Gate (the same gate RefreshBeamEmissive folds
+	//     into BeamIntensity). When SpotLight->Intensity > 0 AND BeamIntensity
+	//     == 0 the push pipeline is broken between Dimmer and the cone MID.
+	//   * Gate / mode state: bMeshBeamEnabled, bUsingEpicBeam,
+	//     bPreferProceduralBeam, bBeamDebugTintActive (v1.0.126).
+	// Engine + view CVars are printed ONCE in the `Rebus.DiagBeam` command
+	// handler (they're world-level state, not per-fixture), not in this
+	// per-fixture line.
+	//
+	// Public so the file-scope `Rebus.DiagBeam` handler (registered in
+	// `RebusVisualiser.cpp`) can call it on every fixture without poking the
+	// private members directly. Idempotent / cheap (one log line, no
+	// per-frame work). Companion to v1.0.125's `DumpBeamConeStateForDebug` --
+	// the v1.0.126 dump is a SUPERSET: same fields, extended with the missing
+	// hypothesis-coverage diagnostics the v1.0.125 ship missed.
+	void DumpBeamDiagForDebug(const TCHAR* CallSite) const;
+
+	// v1.0.126 -- `Rebus.ForceBeam <intensity>` per-fixture chokepoint. Pushes
+	// `BeamIntensity = NewIntensity` AND `BeamColor = (1,1,1,1)` (opaque white)
+	// onto BOTH the cone's live slot-0 MID AND the cached BeamMID UPROPERTY --
+	// the same defensive double-push shape v1.0.125 added to RefreshBeamEmissive
+	// -- so neither MID-divergence nor a stale-cache regression can leave the
+	// visible MID with stale-default scalars. Bypasses the normal DMX-driven
+	// `Dimmer * MeshBeamUserScale * Gate * RebusMeshBeamMaxIntensity` math
+	// entirely: if the cone is invisible AFTER this push lands `BeamIntensity =
+	// NewIntensity > 0` (verified by the read-back log line), the failure is
+	// DOWNSTREAM of `BeamIntensity` (camera frustum, view-mode override hiding
+	// additive translucents, fog overdraw, post-process unbound-volume blowing
+	// out the emissive, material domain / blend mode / two-sided / shading
+	// model issue with the on-disk master). If the cone IS visible after this
+	// push, the failure is UPSTREAM of `BeamIntensity` (the normal push
+	// pipeline isn't reaching the MID; the v1.0.125 fix didn't engage; the
+	// fixture's `Dimmer.Current` is stuck at 0; etc). Returns 1 on a
+	// successful push, 0 when neither MID resolved (the pre-BuildBeamCone
+	// state -- the cone hasn't been built yet OR the M_RebusBeam load failed
+	// in BuildBeamCone). Logs one line per fixture with the live read-back so
+	// the operator can paste the result. Does NOT engage `bBeamDebugTintActive`
+	// (this is a one-shot push, not a sticky override -- the next
+	// RefreshBeamEmissive tick will reset it from the live DMX state). Public
+	// so the file-scope `Rebus.ForceBeam` handler can drive it from the console.
+	int32 ForceBeamForDebug(float NewIntensity);
+
+	// v1.0.126 -- `Rebus.BeamDebugTint <0|1>` per-fixture chokepoint. On enable,
+	// pushes `BeamColor = (1, 0, 1, 1)` (opaque magenta) + `BeamIntensity =
+	// 100.0` onto BOTH the cone slot-0 MID AND the cached BeamMID, AND sets
+	// the sticky `bBeamDebugTintActive` flag so RefreshBeamEmissive's per-tick
+	// pushes (driven by Dimmer / ColorR/G/B / Gate) are SUPPRESSED -- otherwise
+	// the next `SetFixtureIntensity` or per-tick fade would overwrite the
+	// magenta. On disable, clears the sticky flag so the next RefreshBeamEmissive
+	// tick restores normal operation (no explicit restore push needed -- any of
+	// SetFixtureColor / SetFixtureIntensity / SetFixtureShutter / ApplyDimmer /
+	// the per-tick fade-driven RefreshBeamEmissive will re-push the correct
+	// live state within one frame). Goal: make the cone IMPOSSIBLE to miss
+	// visually IF any rendering path is alive at all -- magenta is the
+	// brightest, most distinguishable colour against any stage scene, and
+	// `BeamIntensity = 100` is ~100x the typical drive value (`RebusMeshBeamMax
+	// Intensity = 50` * Dimmer in [0,1]). If you flip this on and the cone is
+	// STILL invisible, the failure is DOWNSTREAM of BeamColor + BeamIntensity
+	// (same triage tree as ForceBeamForDebug above). Returns 1 on successful
+	// push, 0 in the pre-BuildBeamCone state. Public for the console handler.
+	int32 SetBeamDebugTintForDebug(bool bEnable);
+
+	// v1.0.126 -- `Rebus.BeamConeWireframe <0|1>` per-fixture chokepoint. On
+	// enable, swaps the BeamCone's slot-0 material to `nullptr` -- UE's
+	// engine-default behaviour for a primitive with no slot-0 material is to
+	// render the `WorldGridMaterial` fallback (an opaque grey checker visible
+	// from EVERY angle, NOT additive, NOT translucent). This is the SMOKING-
+	// GUN test for "is the BeamCone geometry actually being submitted to the
+	// renderer at all?" -- if you flip this on and you suddenly see a grey
+	// CHECKER cone, the geometry is alive and the entire failure is on the
+	// material side. If you see NOTHING, the geometry isn't reaching the
+	// renderer (BeamCone is null, scene proxy never registered, BoundsScale
+	// is degenerate, attached to a hidden parent, etc -- triage with the
+	// v1.0.126 `Rebus.DiagBeam` dump). The pre-debug slot-0 material is
+	// captured into the `PreWireframeBeamMaterial` UPROPERTY before the swap
+	// so the disable path can restore it cleanly (rather than having to
+	// re-issue BuildBeamCone or re-create the MID from scratch). On disable,
+	// restores the captured material and clears the saved pointer. Returns 1
+	// on successful swap, 0 when BeamCone is null (pre-BuildBeamCone state).
+	// Note that this command bypasses RefreshBeamEmissive entirely -- the per-
+	// tick BeamIntensity/BeamColor pushes still land on whatever MID slot-0
+	// reports, which is nullptr during the wireframe debug -- so per-tick
+	// pushes silently skip the cone (RefreshBeamEmissive's `if (ConeSlot0MID)`
+	// guard handles it) and only push onto the cached BeamMID. Restore via
+	// `Rebus.BeamConeWireframe 0` to re-attach the saved MID + resume the
+	// normal additive raymarch path. Public for the console handler.
+	int32 SetBeamConeWireframeForDebug(bool bEnable);
+
+	// v1.0.126 -- accessor for `Rebus.DiagBeam` to surface the sticky debug
+	// tint state on the per-fixture diagnostic line (so the operator can see
+	// at a glance whether RefreshBeamEmissive is being suppressed).
+	bool IsBeamDebugTintActive() const { return bBeamDebugTintActive; }
+
 	// v1.0.119 -- on-spawn self-heal probe: read back the live `BeamMaterial
 	// Revision` scalar from `BeamMID` and, when it does NOT match the running
 	// binary's expected revision (RebusExpectedBeamMaterialRevision baked into
@@ -1016,6 +1138,23 @@ private:
 	// the master (the runtime LoadObject-by-path is not a cook dependency on its own).
 	UPROPERTY() TObjectPtr<UProceduralMeshComponent> BeamCone = nullptr;
 	UPROPERTY() TObjectPtr<class UMaterialInstanceDynamic> BeamMID = nullptr;
+
+	// v1.0.126 -- `Rebus.BeamDebugTint` sticky-override flag. When true,
+	// RefreshBeamEmissive returns early WITHOUT pushing anything onto the
+	// MID(s) -- the magenta tint pushed by `SetBeamDebugTintForDebug(true)`
+	// stays on the visible cone until the operator flips the override off
+	// with `Rebus.BeamDebugTint 0`. See the public-header doc-comment on
+	// `SetBeamDebugTintForDebug` for the operator-facing contract.
+	bool bBeamDebugTintActive = false;
+
+	// v1.0.126 -- `Rebus.BeamConeWireframe` saved-material slot. Captures the
+	// BeamCone's slot-0 UMaterialInterface pointer at the moment
+	// `SetBeamConeWireframeForDebug(true)` is invoked so the matching
+	// `SetBeamConeWireframeForDebug(false)` call can restore the visible
+	// material cleanly. Null in the steady state. UPROPERTY so the captured
+	// material survives GC. See the public-header doc-comment on
+	// `SetBeamConeWireframeForDebug` for the operator-facing contract.
+	UPROPERTY() TObjectPtr<class UMaterialInterface> PreWireframeBeamMaterial = nullptr;
 	UPROPERTY() TObjectPtr<UMaterialInterface> BeamMaterial = nullptr;
 
 	// v1.0.111 -- per-fixture light-space depth-mask pair (the "shadow map for the beam").
