@@ -594,6 +594,145 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **v1.0.125 — fix `BeamCone` STILL INVISIBLE on shipped v1.0.124 binaries even though the v1.0.124 `Rebus.LogBeamCone 1` dump reports every fixture's BeamCone is geometrically + materially perfect (`attachParent=SceneComponent(FixtureRoot)`, `mobility=Movable`, `vis=1`, `slot0Class=MaterialInstanceDynamic`, `slot0Name=MID_M_RebusBeam_0`, `beamMID=OK`, `beamMIDParent=M_RebusBeam`, `dot(spot,cone)=1.000`). User report context: spotlights ARE firing (4 white circular floor pools visible on the ground proving the IES + SpotLight chain is correct), but the volumetric `M_RebusBeam` cone shafts are NOT visible despite ~30 `SetFixtureIntensity` descriptors driving the spotlights up. v1.0.125 root-causes the symptom to a latent `BeamMID`-vs-cone-slot-0 pointer-divergence hazard in `RefreshBeamEmissive`: the per-push body wrote `BeamIntensity` + `BeamColor` ONLY onto the cached `BeamMID` UPROPERTY, never onto the cone's live slot-0 material. If ANY code path replaces the cone's slot-0 MID with a different `UMaterialInstanceDynamic` (a fresh MID from a stale-master refresh, a re-bake `RefreshBeamMaterialBindings` call, a hot-reload edge case that survives `BuildBeamCone`) WITHOUT updating the cached pointer, the push lands on the GHOST MID and the visible MID stays at the authored `M_RebusBeam` default `BeamIntensity = 0.0` (line ~1020 of `build_rebus_base_level.py`). With the raymarch HLSL outputting `BeamColor.rgb * BeamIntensity * coverage`, `BeamIntensity = 0` → the shaft is BLACK → additive blend → the shaft is INVISIBLE — exactly the v1.0.125 user symptom — while `SpotLight->SetIntensity(Cd * Dimmer * Gate)` (which uses the SAME `Dimmer.Current`) drives the visible floor pool correctly. v1.0.125 collapses the push onto the SET of `{ConeSlot0MID, BeamMID}`, so a divergent state CANNOT leave the visible MID with stale-default scalars, AND extends the diagnostic to read back the live `BeamIntensity` + `BeamColor` from BOTH MIDs so a divergence is provable from a single log line.**
+>
+> ### Symptom (verbatim user report + v1.0.124 diagnostic evidence)
+>
+> User flipped `Rebus.LogBeamCone 1` after sending ~30 `SetFixtureIntensity` descriptors against a 7-fixture truss; each active fixture printed:
+>
+> ```
+> Fixture 54E648DF-...-...-...-... beam: SPAWNED v1.0.124 matOk=1 baseRadius=9.00cm farRadius=2457.7cm length=6000cm halfAngle=22.5deg BeamIntensity=0.00 occlusion=depthtest+depthfade meshBeams=1 (src=lensDiameter) coneFwd=(-0.000,-0.000,1.000) spotFwd=(-0.000,-0.000,1.000) mobilityOrderFixed=1 attachedTo=FixtureRoot
+> [Rebus] LogBeamCone[BuildBeamCone] v1.0.124 fixtureId=... | BeamCone={attachParent=SceneComponent(FixtureRoot) mobility=Movable vis=1 hidGame=0 sections=1 boundsScale=5.00 translucencySort=-10} | Material={slot0Class=MaterialInstanceDynamic slot0Name=MID_M_RebusBeam_0 beamMID=OK beamMIDParent=M_RebusBeam} | Geometry={lengthCm=6000 baseRadiusCm=9.00 farRadiusCm=2457.7 outerHalfDeg=22.50 matchHalfDeg=22.27 coneScale=1.000} | Cone={worldLoc=(-222.3,12.7,502.4) worldFwd=(-1.000,0.000,0.000) ...} | Spot={...} dot(spot,cone)=1.000 | Gates={bMeshBeamEnabled=1 bUsingEpicBeam=0 bPreferProcedural=1}
+> Fixture ... mesh beam ENABLED (shadowHero=1 wantsShadow=0 fogScatter=0.00).
+> ```
+>
+> After a `Rebus.LogBeamCone 1` CVar push the steady-state lines reported `worldFwd=(0,0,-1)` (cone correctly pointing down to match the down-tilted SpotLight), `dot(spot,cone)=1.000` (cone +X exactly matches spot +X), `vis=1`, `mobility=Movable` — every v1.0.124 invariant holds. SpotLight floor pools were visible, so `SpotLight->SetIntensity(Cd * Dimmer.Current * Gate)` was firing > 0, which means `Dimmer.Current > 0`. But ZERO visible volumetric cone shafts — the `M_RebusBeam` raymarched shafts that should rise from each lens to the floor were missing on every fixture.
+>
+> The v1.0.124 diagnostic confirmed every cone-LEVEL invariant (geometry, material assignment, transform), but it never reported the BeamMID's LIVE `BeamIntensity` scalar. The user's hypothesis: `RefreshBeamEmissive`'s `BeamMID->SetScalarParameterValue("BeamIntensity", ...)` push was either not happening, pushing 0.0, pushing to the wrong MID, or behind a stale gate.
+>
+> ### Root cause (v1.0.125 — `BeamMID`-vs-cone-slot-0 pointer-divergence hazard)
+>
+> `ARebusFixtureActor::RefreshBeamEmissive` looked like this pre-v1.0.125 (unchanged since the v1.0.33 procedural-beam rewrite):
+>
+> ```
+> void ARebusFixtureActor::RefreshBeamEmissive()
+> {
+>     if (!BeamMID) return;
+>     // ...gate + colour resolve...
+>     BeamMID->SetVectorParameterValue(TEXT("BeamColor"), Linear);
+>     BeamMID->SetScalarParameterValue(TEXT("BeamIntensity"),
+>         RebusMeshBeamMaxIntensity * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate * MeshBeamUserScale);
+> }
+> ```
+>
+> The function pushes to the cached `BeamMID` UPROPERTY pointer. In the steady-state spawn path that's the same MID as `BeamCone->GetMaterial(0)` because `BuildBeamCone` does `BeamMID = UMaterialInstanceDynamic::Create(Mat, this)` immediately followed by `BeamCone->SetMaterial(0, BeamMID)`. But this invariant can drift:
+>
+> 1. **`URebusVisualiserSubsystem::RefreshAllSpawnedFixtureBeamMIDs` → `ARebusFixtureActor::RefreshBeamMaterialBindings`** explicitly calls `BeamMID->ClearParameterValues()` to drop operator-pinned overrides after a stale-master regen. After `ClearParameterValues`, `BeamIntensity` reads back at the master's authored default `0.0` (set in `build_rebus_base_level.py::_build_beam_master` line ~1020: `intensity = _scalar("BeamIntensity", 0.0, -140)`). The helper then re-pushes `BeamSharpness`/`BeamDensity`/`BeamFalloff` (radial) + `BeamOrigin`/`BeamDir` (spatial) + the v1.0.111 shadow-mask params, but does NOT re-call `RefreshBeamEmissive` — so `BeamColor` + `BeamIntensity` stay at master defaults until the NEXT `SetFixtureIntensity` / `SetFixtureColor` / `SetFixtureShutter` / `ApplyDimmer` tick. Any such drop window during which the operator sees the cone with `BeamIntensity = 0` reproduces the v1.0.125 symptom.
+> 2. **Any future code path** (a `Rebus.BeamRebuildMaster` operator rescue, a hot-reload edge case, a `LoadScene` mid-session rebuild) that creates a new MID and assigns it to `BeamCone->SetMaterial(0, NewMID)` WITHOUT also updating the `BeamMID` UPROPERTY would leave the cached pointer pointing at the OLD MID. The OLD MID still receives `RefreshBeamEmissive` pushes; the NEW MID (now visible on the cone) stays at the parent material's authored defaults forever. This is the literal "pushing to the ghost MID" failure mode.
+> 3. **A subtle interaction with `BeamCone->DestroyComponent()` + `NewObject<UProceduralMeshComponent>` in `BuildBeamCone`'s v1.0.124 re-Setup defence**: if the actor's `BeamMID` UPROPERTY survives the destroy (it is parented to `this`, not to the destroyed cone) AND the subsequent `BuildBeamCone` builds a fresh BeamMID, there's a brief window where the OLD `BeamMID` is still GC-pinned by the UPROPERTY while the NEW BeamMID is the slot-0 material. Any `RefreshBeamEmissive` call in that window pushes to the old MID; the new MID's defaults stay live.
+>
+> In every case the FAILURE MODE is the same: `BeamCone->GetMaterial(0)` returns a `UMaterialInstanceDynamic` parented to `M_RebusBeam` (the v1.0.124 diagnostic confirms this) — but its `BeamIntensity` scalar reads back at `0.0` because nothing has pushed onto it. The shader samples `BeamColor.rgb * BeamIntensity * coverage = (1,1,1) * 0 * coverage = (0,0,0)`, the additive blend draws nothing, and the cone is invisible.
+>
+> Why this only surfaced in the v1.0.124 user session: pre-v1.0.124 the cone was geometrically wrong (v1.0.117..v1.0.121 `dot(spot,cone)=-1` orientation bug; v1.0.122 SetMobility-Static invisibility; v1.0.123 same), so a `BeamIntensity = 0` cone would not have been visible regardless. v1.0.124 was the first build where every per-cone invariant landed correctly — surfacing the per-MID-push invariant as the next-in-line failure.
+>
+> ### The fix (`Source/RebusVisualiser/Private/RebusFixtureActor.cpp::RefreshBeamEmissive`)
+>
+> Collapse the push onto BOTH the cone's live slot-0 MID AND the cached BeamMID UPROPERTY whenever they differ. A divergent state still leaves both MIDs with the correct scalars; an aligned state pushes once (the helper de-duplicates).
+>
+> ```
+> UMaterialInstanceDynamic* ConeSlot0MID = nullptr;
+> if (BeamCone)
+> {
+>     ConeSlot0MID = Cast<UMaterialInstanceDynamic>(BeamCone->GetMaterial(0));
+> }
+> // Push onto the visible MID first, then onto BeamMID iff distinct.
+> if (ConeSlot0MID)
+> {
+>     ConeSlot0MID->SetVectorParameterValue(TEXT("BeamColor"), Linear);
+>     ConeSlot0MID->SetScalarParameterValue(TEXT("BeamIntensity"), DriveBeamIntensity);
+> }
+> if (BeamMID && BeamMID != ConeSlot0MID)
+> {
+>     BeamMID->SetVectorParameterValue(TEXT("BeamColor"), Linear);
+>     BeamMID->SetScalarParameterValue(TEXT("BeamIntensity"), DriveBeamIntensity);
+> }
+> ```
+>
+> The helper returns silently when BOTH pointers are null (the pre-`BuildBeamCone` state OR the rare M_RebusBeam-load-failed branch) — `BuildBeamCone`'s own `RefreshBeamEmissive` call at the tail of the spawn sequence remains the chokepoint that seeds initial state once the MID + cone exist.
+>
+> ### New diagnostic (LogBeamCone-gated per-push log)
+>
+> Added inside `RefreshBeamEmissive`, gated behind the existing `Rebus.LogBeamCone 1` CVar, the line shape the operator brief asked for verbatim:
+>
+> ```
+> [Rebus] LogBeamCone[SetFixtureIntensity] fixtureId=<id> spotIntensity=<X>
+>   beamMIDIntensity=<Y> (pushed param='BeamIntensity' value=<Z>)
+>   midPtr=<0xPPPP> coneSlot0Ptr=<0xQQQQ> same=<0|1> pushCount=<1|2>
+>   dimmerCurrent=<D> gate=<G> meshBeamUserScale=<S> maxBeam=<M>
+> ```
+>
+> - `spotIntensity` — `SpotLight->Intensity` read live. Non-zero means `SpotLight->SetIntensity` is firing (the floor pool path) and `Dimmer.Current > 0`.
+> - `beamMIDIntensity` — live readback off whichever MID is the VISIBLE one (`ConeSlot0MID` when present, else `BeamMID`). Proves what the shader actually samples, not just what we asked to push.
+> - `pushed param='BeamIntensity' value=<Z>` — what `RefreshBeamEmissive` computed for this push (`RebusMeshBeamMaxIntensity * Dimmer.Current * Gate * MeshBeamUserScale`).
+> - `midPtr` / `coneSlot0Ptr` / `same` — the smoking-gun for hypothesis 5 (pointer divergence). `same=0` post-v1.0.125 means the defensive double-push fix is doing useful work.
+> - `pushCount` — `1` (aligned) or `2` (divergent, fix engaged).
+>
+> Tag is `[SetFixtureIntensity]` because the operator-visible failure surface that motivated this diagnostic was a `SetFixtureIntensity` push not reaching the visible MID; the same line fires for every `RefreshBeamEmissive` caller (`ApplyColor`, `ApplyShutter`, `ApplyBeamVolumetrics`, Tick-driven fades), which is the right behaviour — they all push the same `BeamIntensity` scalar onto the BeamMID so any of them can surface the same divergence bug.
+>
+> ### Extended `Rebus.LogBeamCone` per-tick dump
+>
+> `DumpBeamConeStateForDebug` now reads back the live `BeamIntensity` + `BeamColor` from BOTH the cached `BeamMID` UPROPERTY AND the cone's live slot-0 MID, plus reports the pointer comparison directly. The new fields in the dump line:
+>
+> ```
+> Material={slot0Class=... slot0Name=... beamMID=OK beamMIDParent=M_RebusBeam
+>           midPtr=<0xPPPP> coneSlot0Ptr=<0xQQQQ> same=<0|1>}
+> Intensity={spotIntensity=<X> beamMIDIntensity=<Y> slot0MIDIntensity=<Z>
+>            beamMIDColor=(r,g,b) slot0MIDColor=(r,g,b)
+>            dimmerCurrent=<D> meshBeamUserScale=<S> maxBeam=<M>}
+> ```
+>
+> Operator interpretation:
+> - `beamMIDIntensity == slot0MIDIntensity > 0` AND `same=1` → healthy. Cone IS rendering; if it still looks invisible, the cause is downstream (camera position, fog density, view-mode override).
+> - `beamMIDIntensity > 0` AND `slot0MIDIntensity == 0` AND `same=0` → hypothesis 5 (pointer divergence, the v1.0.125 root cause). The defensive double-push fix engages on the next `RefreshBeamEmissive` call. Look for the post-fix per-push log line to confirm `pushCount=2`.
+> - `beamMIDIntensity == 0` AND `slot0MIDIntensity == 0` → `RefreshBeamEmissive` hasn't run since the last `ClearParameterValues` (probably a stale-master regen mid-session). Send any `SetFixtureIntensity` / `SetFixtureColor` to kick the seed; check the next dump.
+> - `dimmerCurrent == 0` → no `SetFixtureIntensity` has driven the dimmer up; nothing to push. Driver-side issue, not visualiser-side.
+>
+> ### Verification (post-fix)
+>
+> Read by inspection of the change + a full local `Build.bat REBUS_VisualiserEditor Win64 Development` compile:
+>
+> - **Build:** changes confined to `RebusFixtureActor.cpp` (`RefreshBeamEmissive` body + `DumpBeamConeStateForDebug` body), `RebusVisualiserSubsystem.cpp` (startup-banner triage version bump), `RebusVisualiser.cpp` (`Rebus.ForceBeamMasterRegen` success-log bug-report-ask version bump), `RebusVisualiser.uplugin` (`VersionName` `1.0.124` → `1.0.125`), and this README. No header changes (no new methods exposed; the helper logic + readbacks are local to the function bodies).
+> - **No regression of v1.0.122 / v1.0.123 / v1.0.124 fixes:** `BeamCone` is still a sibling of `SpotLight` under `FixtureRoot` (v1.0.123 attachment unchanged), still mirrors `SpotLight->GetRelativeTransform()` every tick (v1.0.123 driver unchanged), still has `SetMobility(Movable)` BEFORE `RegisterComponent` (v1.0.124 PRIMARY ROOT-CAUSE FIX preserved), still gets the explicit `MarkRenderStateDirty()` after section + material assignments (v1.0.124 BELT-AND-BRACES preserved). v1.0.125 is purely a per-push wiring fix on top.
+> - **No `M_RebusBeam` re-bake.** The v1.0.121-baked master is preserved byte-identical. `REBUS_BEAM_MATERIAL_REVISION` stays at 121, `RebusExpectedBeamMaterialRevision` stays at 121, on-disk byte-identical. The bug is wiring, not material.
+> - **No portal-side change.** The wire descriptor for `SetFixtureIntensity` is unchanged; the failure surface was internal to `RefreshBeamEmissive`'s push contract.
+>
+> ### User action required
+>
+> 1. **Restart the editor / `-game` session** so the new `UnrealEditor-RebusVisualiser.dll` is loaded. The startup banner will read `v1.0.125`. NO `M_RebusBeam` re-bake, NO scene re-save, NO portal-side change.
+> 2. **The visible cone shaft will render on the very first `SetFixtureIntensity` push of the new session.** SpotLight floor pools were already correct; the cone now joins them.
+> 3. **If the cone is still invisible on v1.0.125** (the should-be-impossible case), run `Rebus.LogBeamCone 1` and look at the new per-push line: if `pushCount=2` is reported and `slot0MIDIntensity > 0` but the cone is STILL invisible, the failure is downstream of `BeamIntensity` (camera position outside the cone's view frustum, fog overdraw saturating the cone, view-mode override hiding additive translucents, post-process unbound-volume blowing out the emissive). Send a screenshot + the v1.0.125 dump output and we can triage from there.
+>
+> ### What v1.0.125 does NOT change
+>
+> - **No v1.0.124 `BuildBeamCone` change.** `SetMobility(Movable)` is STILL set BEFORE `RegisterComponent`. The pre-existing `BeamCone->DestroyComponent()` defensive teardown is preserved. The explicit `AttachToComponent(FixtureRoot, KeepRelativeTransform)` belt-and-braces is preserved. The post-build `MarkRenderStateDirty()` is preserved.
+> - **No v1.0.123 attachment change.** `BeamCone` is still a sibling of `SpotLight` under `FixtureRoot`. `DriveBeamConeFromSpotLight` still mirrors the SpotLight's relative transform per tick.
+> - **No `M_RebusBeam` re-bake.** `REBUS_BEAM_MATERIAL_REVISION` stays at 121, the on-disk `.uasset` is byte-identical.
+> - **No new CVar.** `Rebus.LogBeamCone` + `Rebus.LogBeamConeIntervalSec` from v1.0.124 are reused — the per-push diagnostic + the extended dump readbacks are both gated behind the existing CVar (no new operator-facing config surface).
+> - **No header change.** `RebusFixtureActor.h` is untouched; the `BeamMID` UPROPERTY + `BeamCone` UPROPERTY + `RefreshBeamEmissive` declaration + `DumpBeamConeStateForDebug` declaration are all unchanged (the readback logic is local to the function bodies).
+> - **No `BeamMID` UPROPERTY change.** The cached pointer stays — the defensive fix is additive (push to BOTH MIDs when distinct, not REPLACE the cached pointer). This means callers that read scalars off `BeamMID` directly (the v1.0.119 self-heal probe, the v1.0.117 `DumpBeamCulling` readback, the v1.0.111 `DumpBeamShadowMask` helper) continue to work against the same pointer they've always used.
+> - **No regression of the v1.0.124 `Rebus.LogBeamCone` CVar contract.** The default is still `0` (silent). The unconditional post-spawn dump in `BuildBeamCone` STILL prints once per fixture at `Log` level. The per-tick rate-limited dump still fires once per fixture per `Rebus.LogBeamConeIntervalSec`. v1.0.125 just adds new fields to the existing dump shape AND adds the new per-push log line inside `RefreshBeamEmissive`.
+> - **No version-coupled string churn beyond:** `if pluginVersion != v1.0.124` → `v1.0.125` in the startup-banner triage block + `v1.0.124+ bug report` → `v1.0.125+ bug report` ask in `Rebus.ForceBeamMasterRegen` + `RebusVisualiser.uplugin` `VersionName` 1.0.124 → 1.0.125 (top-centre watermark + startup banner will read `v1.0.125` on next launch) + the `LogBeamCone[...]` dump tag `v1.0.124` → `v1.0.125` + the spawn log `SPAWNED v1.0.124` → `SPAWNED v1.0.125` (and a new `midBothPushed=1` tag at the end of that line to surface the v1.0.125 defensive double-push contract). Material-revision-coupled strings stay at 121.
+>
+> ### What v1.0.125 DOES change (exhaustive)
+>
+> 1. **`Source/RebusVisualiser/Private/RebusFixtureActor.cpp::RefreshBeamEmissive`** — body rewritten to resolve `ConeSlot0MID = Cast<UMaterialInstanceDynamic>(BeamCone->GetMaterial(0))` live every push, then push `BeamColor` + `BeamIntensity` onto `ConeSlot0MID` FIRST and onto `BeamMID` iff distinct (`pushCount=1` for the aligned case, `2` for the divergent case). New `Rebus.LogBeamCone`-gated per-push log line `[Rebus] LogBeamCone[SetFixtureIntensity] fixtureId=... spotIntensity=... beamMIDIntensity=... (pushed param='BeamIntensity' value=...) midPtr=... coneSlot0Ptr=... same=...` reporting the live readback off the visible MID + the pointer comparison.
+> 2. **`Source/RebusVisualiser/Private/RebusFixtureActor.cpp::DumpBeamConeStateForDebug`** — extended to read back `BeamIntensity` + `BeamColor` from BOTH the cached `BeamMID` AND the cone's live slot-0 MID (cast through `Cast<UMaterialInstanceDynamic>(BeamCone->GetMaterial(0))`), plus the `midPtr`/`coneSlot0Ptr`/`same` pointer comparison. New `Material={... midPtr=... coneSlot0Ptr=... same=...}` + `Intensity={spotIntensity=... beamMIDIntensity=... slot0MIDIntensity=... beamMIDColor=(...) slot0MIDColor=(...) dimmerCurrent=... meshBeamUserScale=... maxBeam=...}` blocks added to the existing dump line. Version tag `v1.0.124` → `v1.0.125`.
+> 3. **`Source/RebusVisualiser/Private/RebusFixtureActor.cpp` spawn log** — `Fixture %s beam: SPAWNED v1.0.124 ...` → `... SPAWNED v1.0.125 ...` with a new `midBothPushed=1` tag at the end surfacing the v1.0.125 defensive double-push contract.
+> 4. **`Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp`** — startup-banner triage text `if pluginVersion != v1.0.124` → `v1.0.125`.
+> 5. **`Source/RebusVisualiser/Private/RebusVisualiser.cpp`** — `Rebus.ForceBeamMasterRegen` success log `v1.0.124+ bug report` → `v1.0.125+ bug report`.
+> 6. **`RebusVisualiser.uplugin`** — `"VersionName": "1.0.124"` → `"1.0.125"`.
+> 7. **`README.md`** — this v1.0.125 release block.
+
 > **v1.0.124 — fix `BeamCone` STILL INVISIBLE on shipped v1.0.123 binaries (the v1.0.123 hypothesis was wrong; v1.0.124 ships the actual root-cause fix). User report (verbatim): "I dont think the beams are orientated wrong, 4 fixtures are on with no beams showing." On a 7-fixture truss with 4 active fixtures, ALL 4 SpotLights were firing correctly (visible floor pools + IES profiles working) but ZERO `BeamCone` meshes were visible. v1.0.123 attributed the v1.0.122 invisibility to a UE 5.7 "primitive-child-under-light-parent" proxy refresh quirk and re-parented the cone back to `FixtureRoot`; that fix shipped, the user reloaded the binary, and the symptom persisted on every fixture. v1.0.124 root-causes the actual bug to a per-fixture `SetMobility` ordering error in `BuildBeamCone` that has been latent since v1.0.34 but only surfaced after v1.0.122 dropped the per-tick `SetWorldLocationAndRotation` write that was masking it.**
 >
 > ### Symptom (verbatim user report)

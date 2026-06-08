@@ -3156,7 +3156,7 @@ void ARebusFixtureActor::BuildBeamCone()
 	const FVector ConeFwd = BeamConeRest.GetRotation().RotateVector(FVector::ForwardVector);
 	const FVector SpotFwd = BeamRestTransform.GetRotation().RotateVector(FVector::ForwardVector);
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s beam: SPAWNED v1.0.124 matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s) coneFwd=(%.3f,%.3f,%.3f) spotFwd=(%.3f,%.3f,%.3f) mobilityOrderFixed=1 attachedTo=FixtureRoot"),
+		TEXT("Fixture %s beam: SPAWNED v1.0.125 matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s) coneFwd=(%.3f,%.3f,%.3f) spotFwd=(%.3f,%.3f,%.3f) mobilityOrderFixed=1 attachedTo=FixtureRoot midBothPushed=1"),
 		*FixtureId, BeamBaseRadiusUnreal, BeamConeLastFarRadius, BeamLengthUnreal, OuterHalf,
 		CurIntensity, bMeshBeamEnabled ? 1 : 0, DiamSrc,
 		ConeFwd.X, ConeFwd.Y, ConeFwd.Z, SpotFwd.X, SpotFwd.Y, SpotFwd.Z);
@@ -4168,14 +4168,65 @@ void ARebusFixtureActor::DumpBeamConeStateForDebug(const TCHAR* CallSite) const
 	const FString Slot0Class = Slot0 ? Slot0->GetClass()->GetName() : FString(TEXT("<null>"));
 	const FString Slot0Name = Slot0 ? Slot0->GetName() : FString(TEXT("<null>"));
 
+	// v1.0.125 -- live BeamIntensity + BeamColor readback off BOTH the cached
+	// BeamMID UPROPERTY and the cone's live slot-0 MID. This closes the
+	// diagnostic gap that motivated the v1.0.125 "cone geometrically perfect
+	// but invisible" investigation: pre-v1.0.125 the dump confirmed BeamMID
+	// existed + parent==M_RebusBeam but never reported what the SHADER would
+	// actually sample. With these readbacks:
+	//   * `beamMIDIntensity` == the value RefreshBeamEmissive last pushed onto
+	//     the cached BeamMID. If this is 0.0 AFTER many `SetFixtureIntensity`
+	//     descriptors arrived, the push isn't reaching this MID at all
+	//     (RefreshBeamEmissive guard tripped, OR ApplyDimmer never called
+	//     RefreshIntensity, OR ClearParameterValues was called after the push).
+	//   * `slot0MIDIntensity` == the value the shader actually samples. If
+	//     this DIFFERS from `beamMIDIntensity`, hypothesis 5 is live (the
+	//     cached BeamMID UPROPERTY and the cone's slot 0 MID are different
+	//     UObjects -- the cached pointer is stale and the visible MID never
+	//     received the push). v1.0.125's RefreshBeamEmissive defensive fix
+	//     resolves this by pushing onto BOTH, so a still-divergent state here
+	//     post-v1.0.125 means BOTH pointers are valid but the cone's slot 0
+	//     was swapped in between Tick and the next RefreshBeamEmissive call.
+	//   * `same` == 1 when the two pointers are identical (the healthy case).
+	UMaterialInstanceDynamic* const ConeSlot0MID = Cast<UMaterialInstanceDynamic>(Slot0);
+	// Collapse the TObjectPtr<> UPROPERTY to a raw pointer for variadic `%p`
+	// formatting and unambiguous pointer comparison -- pre-v1.0.125 this was
+	// implicit (UE_LOG saw the TObjectPtr directly and tripped MSVC's C4840
+	// "non-portable use of class as argument to variadic function" warning-as-
+	// error on the v1.0.125 first build).
+	UMaterialInstanceDynamic* const BeamMIDRaw = BeamMID.Get();
+	float BeamMIDIntensity = -1.f, Slot0MIDIntensity = -1.f;
+	FLinearColor BeamMIDColor(0.f, 0.f, 0.f, 0.f);
+	FLinearColor Slot0MIDColor(0.f, 0.f, 0.f, 0.f);
+	if (BeamMIDRaw)
+	{
+		BeamMIDRaw->GetScalarParameterValue(
+			FMaterialParameterInfo(TEXT("BeamIntensity")), BeamMIDIntensity);
+		BeamMIDRaw->GetVectorParameterValue(
+			FMaterialParameterInfo(TEXT("BeamColor")), BeamMIDColor);
+	}
+	if (ConeSlot0MID)
+	{
+		ConeSlot0MID->GetScalarParameterValue(
+			FMaterialParameterInfo(TEXT("BeamIntensity")), Slot0MIDIntensity);
+		ConeSlot0MID->GetVectorParameterValue(
+			FMaterialParameterInfo(TEXT("BeamColor")), Slot0MIDColor);
+	}
+	const int32 MidPtrSame = (BeamMIDRaw != nullptr && BeamMIDRaw == ConeSlot0MID) ? 1 : 0;
+	const float SpotIntensityNow = SpotLight ? SpotLight->Intensity : -1.f;
+
 	const float OuterHalfDeg = ResolveOuterHalfDeg();
 	const float MatchHalfDeg = ResolveBeamFootprintMatchHalfDeg();
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("[Rebus] LogBeamCone[%s] v1.0.124 fixtureId=%s | "
+		TEXT("[Rebus] LogBeamCone[%s] v1.0.125 fixtureId=%s | "
 			 "BeamCone={attachParent=%s mobility=%s vis=%d hidGame=%d sections=%d "
 			 "boundsScale=%.2f translucencySort=%d} | "
-			 "Material={slot0Class=%s slot0Name=%s beamMID=%s beamMIDParent=%s} | "
+			 "Material={slot0Class=%s slot0Name=%s beamMID=%s beamMIDParent=%s "
+			 "midPtr=%p coneSlot0Ptr=%p same=%d} | "
+			 "Intensity={spotIntensity=%.2f beamMIDIntensity=%.4f slot0MIDIntensity=%.4f "
+			 "beamMIDColor=(%.3f,%.3f,%.3f) slot0MIDColor=(%.3f,%.3f,%.3f) "
+			 "dimmerCurrent=%.3f meshBeamUserScale=%.2f maxBeam=%.2f} | "
 			 "Geometry={lengthCm=%.0f baseRadiusCm=%.2f farRadiusCm=%.1f outerHalfDeg=%.2f matchHalfDeg=%.2f coneScale=%.3f} | "
 			 "Cone={worldLoc=(%.1f,%.1f,%.1f) worldFwd=(%.3f,%.3f,%.3f) "
 			 "relLoc=(%.1f,%.1f,%.1f) relRot=(P=%.1f Y=%.1f R=%.1f) relScale=(%.3f,%.3f,%.3f)} | "
@@ -4189,8 +4240,15 @@ void ARebusFixtureActor::DumpBeamConeStateForDebug(const TCHAR* CallSite) const
 		BeamCone->BoundsScale,
 		BeamCone->TranslucencySortPriority,
 		*Slot0Class, *Slot0Name,
-		BeamMID ? TEXT("OK") : TEXT("<null>"),
-		(BeamMID && BeamMID->Parent) ? *BeamMID->Parent->GetName() : TEXT("<null>"),
+		BeamMIDRaw ? TEXT("OK") : TEXT("<null>"),
+		(BeamMIDRaw && BeamMIDRaw->Parent) ? *BeamMIDRaw->Parent->GetName() : TEXT("<null>"),
+		(void*)BeamMIDRaw, (void*)ConeSlot0MID, MidPtrSame,
+		SpotIntensityNow, BeamMIDIntensity, Slot0MIDIntensity,
+		BeamMIDColor.R, BeamMIDColor.G, BeamMIDColor.B,
+		Slot0MIDColor.R, Slot0MIDColor.G, Slot0MIDColor.B,
+		FMath::Clamp(Dimmer.Current, 0.f, 1.f),
+		MeshBeamUserScale,
+		RebusMeshBeamMaxIntensity,
 		BeamLengthUnreal, BeamBaseRadiusUnreal, BeamConeLastFarRadius,
 		OuterHalfDeg, MatchHalfDeg,
 		FMath::Max(0.05f, BeamConeRadiusScale),
@@ -4297,9 +4355,24 @@ void ARebusFixtureActor::SelfHealBeamMaterialRevisionIfMismatched()
 
 void ARebusFixtureActor::RefreshBeamEmissive()
 {
-	if (!BeamMID) return;
-
-	// Same shutter-gate the SpotLight uses, so the beam strobes/blacks-out in lockstep.
+	// v1.0.125 PRIMARY ROOT-CAUSE FIX FOR THE v1.0.124..v1.0.125 "cone geometrically
+	// perfect but BeamIntensity stuck at 0" SYMPTOM. The pre-v1.0.125 body pushed
+	// BeamColor + BeamIntensity ONLY onto the cached `BeamMID` UPROPERTY. If a code
+	// path EVER replaces the cone's slot-0 material with a different
+	// `UMaterialInstanceDynamic` (e.g. a stale-master refresh that creates a fresh
+	// MID, a hot-reload edge case that survives a `BuildBeamCone` re-call, or any
+	// future material-rebind path) WITHOUT also updating the cached `BeamMID`
+	// pointer, those writes land on the GHOST MID and the visible MID stays at the
+	// authored M_RebusBeam defaults (`BeamIntensity=0.0`, see `_build_beam_master`
+	// in `Content/Python/build_rebus_base_level.py` line ~1020 -- `intensity =
+	// _scalar("BeamIntensity", 0.0, -140)`). With `BeamColor.rgb * BeamIntensity *
+	// coverage` as the emissive output (raymarch HLSL, build_rebus_base_level.py
+	// line ~890), `BeamIntensity = 0` -> shaft is BLACK -> additive blend -> shaft
+	// is INVISIBLE while SpotLight->SetIntensity (which uses the SAME Dimmer.Current
+	// + Gate) drives the visible floor pool correctly. v1.0.125 collapses the push
+	// onto the SET of {cached BeamMID, cone's live slot-0 MID}, so neither pointer
+	// divergence nor a stale-cache regression can leave the visible MID with
+	// stale-default scalars.
 	float Gate = 1.f;
 	switch (ShutterMode)
 	{
@@ -4312,9 +4385,96 @@ void ARebusFixtureActor::RefreshBeamEmissive()
 		FMath::Clamp(ColorR.Current, 0.f, 1.f),
 		FMath::Clamp(ColorG.Current, 0.f, 1.f),
 		FMath::Clamp(ColorB.Current, 0.f, 1.f), 1.f);
-	BeamMID->SetVectorParameterValue(TEXT("BeamColor"), Linear);
-	BeamMID->SetScalarParameterValue(TEXT("BeamIntensity"),
-		RebusMeshBeamMaxIntensity * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate * MeshBeamUserScale);
+	const float DriveBeamIntensity =
+		RebusMeshBeamMaxIntensity * FMath::Clamp(Dimmer.Current, 0.f, 1.f) * Gate * MeshBeamUserScale;
+
+	// v1.0.125 -- resolve the LIVE slot-0 MID off the cone every push so any
+	// future BeamMID-vs-slot0 divergence is corrected at push time (rather than
+	// after a manual operator-rescue re-bake). Falls back to the cached BeamMID
+	// when the cone is null OR slot 0 isn't a MID (the pre-BuildBeamCone state,
+	// or the M_RebusBeam-load-failed branch in BuildBeamCone).
+	UMaterialInstanceDynamic* ConeSlot0MID = nullptr;
+	if (BeamCone)
+	{
+		ConeSlot0MID = Cast<UMaterialInstanceDynamic>(BeamCone->GetMaterial(0));
+	}
+	// `BeamMIDRaw` collapses the TObjectPtr<> UPROPERTY to a raw pointer once
+	// for downstream pointer equality / null comparison / variadic `%p` --
+	// MSVC's C4840 ("non-portable use of class as argument to variadic
+	// function") trips the unity build otherwise.
+	UMaterialInstanceDynamic* const BeamMIDRaw = BeamMID.Get();
+	const bool bMidPtrSame = (BeamMIDRaw != nullptr) && (BeamMIDRaw == ConeSlot0MID);
+
+	// Push onto the cone's live slot-0 MID (the visible one) first, then onto
+	// the cached BeamMID iff distinct, so a divergent state still leaves BOTH
+	// MIDs with the correct scalars (the readback dump in
+	// `DumpBeamConeStateForDebug` reads from BOTH and surfaces the divergence
+	// independently). Early-out when both pointers resolve to null -- this is
+	// the pre-BuildBeamCone path and is benign (the seed push in
+	// BuildBeamCone covers it once the cone is up).
+	int32 PushCount = 0;
+	if (ConeSlot0MID)
+	{
+		ConeSlot0MID->SetVectorParameterValue(TEXT("BeamColor"), Linear);
+		ConeSlot0MID->SetScalarParameterValue(TEXT("BeamIntensity"), DriveBeamIntensity);
+		++PushCount;
+	}
+	if (BeamMIDRaw && BeamMIDRaw != ConeSlot0MID)
+	{
+		BeamMIDRaw->SetVectorParameterValue(TEXT("BeamColor"), Linear);
+		BeamMIDRaw->SetScalarParameterValue(TEXT("BeamIntensity"), DriveBeamIntensity);
+		++PushCount;
+	}
+	if (PushCount == 0)
+	{
+		// Pre-BuildBeamCone state OR the rare M_RebusBeam-load-failed branch.
+		// Skip silently here -- BuildBeamCone's own RefreshBeamEmissive call
+		// at the tail of the spawn sequence is the chokepoint that seeds the
+		// initial state once the MID + cone exist.
+		return;
+	}
+
+	// v1.0.125 -- `Rebus.LogBeamCone`-gated per-push diagnostic. The format
+	// matches the operator brief exactly: `[Rebus] LogBeamCone[SetFixtureIntensity]
+	// fixtureId=... spotIntensity=... beamMIDIntensity=... (pushed param='BeamIntensity'
+	// value=...) midPtr=... coneSlot0Ptr=... same=1|0`. The tag is
+	// `[SetFixtureIntensity]` because the operator-visible failure surface that
+	// motivated this diagnostic was a SetFixtureIntensity push not reaching the
+	// visible MID; the same line fires for any RefreshBeamEmissive caller
+	// (ApplyColor, ApplyShutter, ApplyBeamVolumetrics, Tick-driven fades), which
+	// is the right behaviour -- they all push the same BeamIntensity scalar onto
+	// the BeamMID, so any of them can surface the same MID-divergence bug. Silent
+	// when `Rebus.LogBeamCone 0` (the default).
+	if (GRebusLogBeamCone != 0)
+	{
+		// Live readback off whichever MID is the visible one -- this proves
+		// the value the shader actually samples, not just what we asked to push.
+		float BeamIntensityReadback = -1.f;
+		UMaterialInstanceDynamic* const ReadbackMID = ConeSlot0MID ? ConeSlot0MID : BeamMIDRaw;
+		if (ReadbackMID)
+		{
+			ReadbackMID->GetScalarParameterValue(
+				FMaterialParameterInfo(TEXT("BeamIntensity")), BeamIntensityReadback);
+		}
+		const float SpotIntensityNow = SpotLight ? SpotLight->Intensity : -1.f;
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("[Rebus] LogBeamCone[SetFixtureIntensity] fixtureId=%s spotIntensity=%.2f "
+				 "beamMIDIntensity=%.4f (pushed param='BeamIntensity' value=%.4f) "
+				 "midPtr=%p coneSlot0Ptr=%p same=%d pushCount=%d dimmerCurrent=%.3f "
+				 "gate=%.1f meshBeamUserScale=%.2f maxBeam=%.2f"),
+			*FixtureId,
+			SpotIntensityNow,
+			BeamIntensityReadback,
+			DriveBeamIntensity,
+			(void*)BeamMIDRaw,
+			(void*)ConeSlot0MID,
+			bMidPtrSame ? 1 : 0,
+			PushCount,
+			FMath::Clamp(Dimmer.Current, 0.f, 1.f),
+			Gate,
+			MeshBeamUserScale,
+			RebusMeshBeamMaxIntensity);
+	}
 
 	// v1.0.43: when Epic's DMX beam is the live path, push the same colour/dimmer/gate onto it too.
 	if (bUsingEpicBeam)
