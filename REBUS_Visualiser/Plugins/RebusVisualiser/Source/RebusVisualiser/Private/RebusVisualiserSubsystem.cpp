@@ -226,7 +226,7 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 			BeamMasterRegenAttempts,
 			*LastBeamMasterRegenResult,
 			LastBeamMasterRegenDetectedAfter,
-			TEXT(" -- Operator triage: if pluginVersion != v1.0.127 the C++ binary "
+			TEXT(" -- Operator triage: if pluginVersion != v1.0.128 the C++ binary "
 				 "is stale (`git pull` without rebuild); if beamMasterVerdict != "
 				 "v1.0.121+ the on-disk M_RebusBeam.uasset is stale -- in a real "
 				 "editor OR commandlet session the v1.0.112+ auto-purge SHOULD fire "
@@ -2794,7 +2794,20 @@ namespace
 	// master graph itself is UNCHANGED in v1.0.120 (no shader / parameter changes);
 	// the bump exists purely to invalidate cached masters from the broken v1.0.119
 	// window so the next editor-session bake re-stamps them at the new revision.
-	constexpr int32 RebusExpectedBeamMaterialRevision = 121;
+	// v1.0.128 -- bumped 121 -> 122 alongside the v1.0.128 beam-side gobo plumbing
+	// rebake. The Python `_build_beam_master` graph in `build_rebus_base_level.py`
+	// gained `GoboTexture` (TextureObjectParameter) + `GoboEnable` (Scalar) +
+	// per-step planar gobo modulation inside `_BEAM_RAYMARCH_HLSL` to fix the
+	// v1.0.128 issue 1 "gobo selected but no pattern in the volumetric beam shaft"
+	// report. Until a commandlet bake refreshes the on-disk `M_RebusBeam.uasset`
+	// the v1.0.119 `SelfHealBeamMaterialRevisionIfMismatched` probe at the tail
+	// of `BuildBeamCone` will fire a warning per fixture spawn (the existing
+	// auto-purge / commandlet path documented in the v1.0.121 README). The new
+	// C++ `RefreshBeamGoboParams()` push silently no-ops against the stale
+	// master because `SetTextureParameterValue("GoboTexture", ...)` simply has
+	// no effect when the parameter doesn't exist on the parent -- so the
+	// pre-v1.0.128 visual is preserved exactly until the rebake lands.
+	constexpr int32 RebusExpectedBeamMaterialRevision = 122;
 	const TCHAR* GBeamMaterialRevisionScalar = TEXT("BeamMaterialRevision");
 
 	// v1.0.119 -- file-scope cache for the on-disk `M_RebusBeam` master pointer

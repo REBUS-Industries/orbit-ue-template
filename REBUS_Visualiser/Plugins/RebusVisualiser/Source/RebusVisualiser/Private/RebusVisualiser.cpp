@@ -826,7 +826,7 @@ namespace
 		}
 
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("===== Rebus.DiagBeam v1.0.127 begin -- pluginVersion=v%s filter='%s' (empty => "
+			TEXT("===== Rebus.DiagBeam v1.0.128 begin -- pluginVersion=v%s filter='%s' (empty => "
 				 "every fixture). Engine={r.VolumetricFog=%d r.AllowOcclusionQueries=%d "
 				 "r.AntiAliasingMethod=%d(%s) r.ScreenPercentage=%.1f r.Lumen.Reflections=%d "
 				 "r.Lumen.ScreenProbeGather.Temporal=%d r.Translucency.Velocity=%d "
@@ -864,7 +864,7 @@ namespace
 		if (Filter.IsEmpty())
 		{
 			UE_LOG(LogRebusVisualiser, Log,
-				TEXT("===== Rebus.DiagBeam v1.0.127 end -- dumped %d/%d fixture(s) (no filter). "
+				TEXT("===== Rebus.DiagBeam v1.0.128 end -- dumped %d/%d fixture(s) (no filter). "
 					 "Next steps (the v1.0.126 runbook): if any fixture's `MIDReadback={BeamIntensity=0.0000 "
 					 "...}` AND `Drive={dimmerCurrent>0}` => run `Rebus.ForceBeam 50` to bypass the DMX "
 					 "pipeline and prove the cone CAN render at all; if ForceBeam succeeds the failure "
@@ -877,7 +877,7 @@ namespace
 		else if (Matched == 0)
 		{
 			UE_LOG(LogRebusVisualiser, Warning,
-				TEXT("===== Rebus.DiagBeam v1.0.127 end -- filter '%s' matched NO fixtures "
+				TEXT("===== Rebus.DiagBeam v1.0.128 end -- filter '%s' matched NO fixtures "
 					 "(scanned %d total across every Game/PIE/Editor world; check the Speckle "
 					 "node id -- same key SetFixture* uses)."),
 				*Filter, Total);
@@ -885,7 +885,7 @@ namespace
 		else
 		{
 			UE_LOG(LogRebusVisualiser, Log,
-				TEXT("===== Rebus.DiagBeam v1.0.127 end -- dumped %d matching fixture(s) "
+				TEXT("===== Rebus.DiagBeam v1.0.128 end -- dumped %d matching fixture(s) "
 					 "(filter '%s', scanned %d total)."),
 				Matched, *Filter, Total);
 		}

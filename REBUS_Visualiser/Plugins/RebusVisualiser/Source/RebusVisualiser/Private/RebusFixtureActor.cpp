@@ -125,7 +125,14 @@ namespace
 	constexpr float RebusBeamFalloff = 1.6f;
 	// v1.0.40: floor for the beam base (lens) radius so the shaft starts from a visible disc of the
 	// lens diameter rather than a near-point when a fixture reports an unrealistically tiny lens.
-	constexpr float RebusBeamLensRadiusFloorCm = 3.f;
+	// v1.0.128 -- raised 3.0 -> 5.0 as the belt-and-braces safety net to match the
+	// v1.0.128 `BeamStartRadius` UPROPERTY default (5.0cm = median moving-head lens
+	// radius). Pre-v1.0.128 this was the primary fallback when photometrics was
+	// missing and 3.0cm visibly under-sized the cone narrow ring against the
+	// fixture body chassis on the user's session (Issue 2). The PRIMARY fallback
+	// is now the `BeamStartRadius` UPROPERTY (`ARebusFixtureActor.h`); this
+	// constant survives as the second-level safety floor only.
+	constexpr float RebusBeamLensRadiusFloorCm = 5.f;
 
 	// v1.0.117 -- raised 3.0 -> 5.0 as part of the v1.0.117 "the user reports the SAME
 	// pan-edge clipping after v1.0.111/112/113 -- AND `Rebus.BeamShadowMask 0` does NOT
@@ -1955,6 +1962,62 @@ void ARebusFixtureActor::BuildMeshes(const FRebusMeshBundle& Meshes)
 		}
 
 		// Decode Speckle faces into a triangle index list (fan-triangulate polygons).
+		//
+		// v1.0.128 Issue 3 ROOT-CAUSE FIX -- the fixture chassis was rendering with
+		// INVERTED normals on the user's session (the screenshot showed the middle
+		// fixture's housing/chassis "lit on the faces that should be in shadow" -- a
+		// classic inverted-normals signature: the spotlight-facing bottom of the
+		// chassis appeared dark while the back-facing top appeared lit because the
+		// engine was rendering only the back face with normals pointing INWARD).
+		// The cause lives in `RebusCoords::PointYUpMetersToUnreal` (`Plugins/Rebus
+		// Visualiser/Source/RebusVisualiser/Public/RebusCoordinates.h:47`): the
+		// portal sends mesh vertices in RH Y-up metres (per the file's doc-comment)
+		// and the conversion maps `(x, y, z)` -> `(x, z, y) * 100`. This is a basis
+		// swap between the Y and Z axes -- an ODD permutation with determinant -1 --
+		// which FLIPS handedness from RH (source) to LH (Unreal). A CCW-wound
+		// triangle in RH source space becomes CW-wound after the basis swap and
+		// reads as back-facing under Unreal's LH front-face convention; the
+		// per-vertex normal computed below via `cross(B-A, C-A)` then points
+		// INWARD (cross-product also flips sign under a handedness inversion).
+		// Net visual effect: the "outside" face of every imported chassis mesh is
+		// invisible (back-face culled when the material is single-sided) OR is
+		// visible but lit by the wrong-direction normal (when the material is
+		// two-sided -- the v1.0.71 black-satin body uses /Engine/BasicShapes/
+		// BasicShapeMaterial which is single-sided, so the user sees the
+		// SECOND-most-visible face, which is the back face of the mesh's
+		// opposite side -- exactly the "wrong side lit" symptom).
+		//
+		// Pre-v1.0.128 this bug was MASKED on most fixtures by the v1.0.65 default-
+		// on `bDriveOrbitModel` binding: the Orbit-imported fixture geometry
+		// (handled by OrbitConnector's import path) renders OVERLAID on top of the
+		// control-channel proxies built here, so the visible surface the user sees
+		// is the OrbitConnector-imported one (which gets its handedness right via
+		// glTFRuntime's import). Only fixtures WITHOUT an Orbit binding (the
+		// middle fixture on the v1.0.128 screenshot) show through to the broken
+		// control-channel proxy -- which is why the bug only manifested visually
+		// after the v1.0.65+ Orbit binding became the primary visual path and a
+		// fixture-by-fixture audit caught the un-bound case.
+		//
+		// The fix is mathematically equivalent to either (a) flipping the basis
+		// transform from `(x, z, y)` to a handedness-preserving even permutation,
+		// or (b) flipping the triangle winding after the basis swap so the normal
+		// computation below produces an outward normal. (a) would change the
+		// world placement of every vertex (breaking every cached transform / rest
+		// pose / motion solve in RebusMotion); (b) is purely a triangle-winding
+		// reorder, no positional change, and is the minimal correct fix the
+		// v1.0.128 brief asks for. We swap `Ia` <-> `Ib` in the fan-triangulation
+		// emit, which sends each triangle's vertices in `(I0, Ib, Ia)` order
+		// instead of `(I0, Ia, Ib)`; the cross-product normal below
+		// (`cross(B-A, C-A)` with B=Ib, C=Ia) flips sign and now points OUTWARD,
+		// matching the LH Unreal front-face convention.
+		//
+		// This is unconditional: every mesh that flows through `RebusCoords::
+		// PointYUpMetersToUnreal` has its handedness flipped by construction,
+		// so flipping the winding back is the universal correct compensation
+		// for every fixture mesh-blob the portal ships. If a future portal-side
+		// pipeline changes the source-space handedness, change the convention
+		// at the `RebusCoords::PointYUpMetersToUnreal` level and revert this
+		// winding swap in lockstep -- they are paired.
 		TArray<int32> Triangles;
 		for (int32 i = 0; i < Mesh.Faces.Num();)
 		{
@@ -1971,8 +2034,12 @@ void ARebusFixtureActor::BuildMeshes(const FRebusMeshBundle& Meshes)
 				if (Positions.IsValidIndex(I0) && Positions.IsValidIndex(Ia) && Positions.IsValidIndex(Ib))
 				{
 					Triangles.Add(I0);
-					Triangles.Add(Ia);
+					// v1.0.128 Issue 3 -- swap Ib/Ia (was Ia/Ib) so the triangle
+					// winding flips to correct the handedness inversion in
+					// `PointYUpMetersToUnreal`'s Y<->Z basis swap. See the
+					// long-form root-cause doc-comment above this loop.
 					Triangles.Add(Ib);
+					Triangles.Add(Ia);
 				}
 			}
 			i += Count;
@@ -2959,14 +3026,56 @@ void ARebusFixtureActor::BuildBeamCone()
 		BeamConeRadiusScale = FMath::Max(0.05f, CVar->GetFloat());
 	}
 
-	// Base radius = the lens radius (same resolver as the SpotLight SourceRadius + lens disc so the
-	// cone starts exactly at the lens). When no lens size is resolvable, fall back to a small
-	// visible base so the shaft still originates from a finite disc rather than a mathematical apex.
+	// v1.0.128 Issue 2 ROOT-CAUSE FIX -- the visible cone's narrow (apex / lens-side)
+	// ring radius was reading 3cm on fixtures whose photometric lensDiameter wasn't
+	// populated by the portal (the pre-v1.0.128 fallback `RebusBeamLensRadiusFloorCm
+	// = 3.f`), leaving a visible gap-ring between the cone's narrow end and the
+	// fixture body chassis that the user reported as "the wide-base radius at the
+	// lens is a noticeable mismatch with the actual physical lens aperture on the
+	// fixture mesh". Typical moving-head fixtures have ~80..180mm physical lens
+	// apertures = 4..9cm radius; the 3cm floor underestimated this for the entire
+	// product class. v1.0.128 plumbs a per-fixture `BeamStartRadius` UPROPERTY
+	// (default 5.0cm = median lens radius across the GDTF library set the portal
+	// ships) as the resolved fallback (preferred over the legacy constant floor;
+	// the constant is now a SAFETY-NET-ONLY 5cm second-level floor, no longer the
+	// primary fallback) AND as a per-fixture editor override an operator can tune
+	// per fixture from the Details panel for unusually large optics (CMY blade
+	// systems) or unusually narrow ones (LED zoom-wash heads). Resolution
+	// precedence (highest-confidence to lowest):
+	//   1. `photometrics.lensDiameter / 2` from the GDTF profile -- the canonical
+	//      truth when the portal payload populates it. Clamped to >= `BeamStart
+	//      Radius` so the operator's chosen floor is NEVER underrun by a stale /
+	//      mis-imported library entry (matches the v1.0.117 "operator override
+	//      never silently regresses" policy).
+	//   2. `BeamStartRadius` UPROPERTY (default 5.0cm) -- the v1.0.128 primary
+	//      fallback when photometrics is missing. EditAnywhere so per-fixture
+	//      overrides are possible without touching the library data.
+	//   3. `RebusBeamLensRadiusFloorCm` (5.0cm in v1.0.128, raised from the
+	//      pre-v1.0.128 3.0cm) -- belt-and-braces safety net if the UPROPERTY
+	//      is somehow clamped to zero (the UPROPERTY ClampMin is 0.5cm so this
+	//      branch should never fire under normal operation).
+	// The cone-mesh procedural-section authoring in `UpdateBeamConeGeometry` reads
+	// this resolved `BeamBaseRadiusUnreal` as `RB` and writes the near-ring at
+	// `Positions.Add(FVector(0, RB*cos, RB*sin))` -- so a v1.0.128 fix here
+	// propagates through the entire cone visual without touching the procedural
+	// authoring code.
 	const TCHAR* DiamSrc = TEXT("none");
 	const double DiamMeters = ResolveLensDiameterMeters(DiamSrc);
-	BeamBaseRadiusUnreal = (DiamMeters > KINDA_SMALL_NUMBER)
-		? FMath::Max((float)(DiamMeters * 0.5 * RebusCoords::METERS_TO_UNREAL), RebusBeamLensRadiusFloorCm)
-		: RebusBeamLensRadiusFloorCm;
+	const float OperatorFloor = FMath::Max(BeamStartRadius, RebusBeamLensRadiusFloorCm);
+	if (DiamMeters > KINDA_SMALL_NUMBER)
+	{
+		BeamBaseRadiusUnreal = FMath::Max(
+			(float)(DiamMeters * 0.5 * RebusCoords::METERS_TO_UNREAL),
+			OperatorFloor);
+	}
+	else
+	{
+		BeamBaseRadiusUnreal = OperatorFloor;
+		// Update DiamSrc so the spawn log line (further down in BuildBeamCone) makes
+		// it obvious to the operator that the v1.0.128 BeamStartRadius UPROPERTY
+		// floor was the active source rather than a missing-photometrics underrun.
+		DiamSrc = TEXT("BeamStartRadius");
+	}
 
 	// Length = the SpotLight throw (AttenuationRadius) so the shaft matches the light's reach.
 	BeamLengthUnreal = SpotLight ? SpotLight->AttenuationRadius : 6000.f;
@@ -3147,6 +3256,14 @@ void ARebusFixtureActor::BuildBeamCone()
 	RefreshBeamConeCullingFlags();
 	RefreshBeamEmissive();
 	RefreshBeamSpatialParams();   // seed world BeamOrigin/BeamDir (RefreshMotion re-pushes per frame)
+	// v1.0.128 Issue 1 -- seed the beam-side gobo plumbing immediately after the
+	// MID is created so a fresh-spawn fixture whose `bGoboActive` is already true
+	// (e.g. a respawn mid-show with a gobo already loaded) comes up with the
+	// pattern modulating the visible cone shaft on frame zero, not blank-then-
+	// flash on the first ApplyGobo / OnGoboRTUpdate tick. See the v1.0.128
+	// `RefreshBeamGoboParams` doc-comment for the full call-site list + the
+	// stale-master safety contract.
+	RefreshBeamGoboParams();
 
 	// v1.0.111 -- light-space depth-mask shadow path. Spawn the per-fixture
 	// SceneCapture2D + RT pair AFTER BeamMID has been created (so the new helper can
@@ -3167,10 +3284,11 @@ void ARebusFixtureActor::BuildBeamCone()
 	const FVector ConeFwd = BeamConeRest.GetRotation().RotateVector(FVector::ForwardVector);
 	const FVector SpotFwd = BeamRestTransform.GetRotation().RotateVector(FVector::ForwardVector);
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s beam: SPAWNED v1.0.127 matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s) coneFwd=(%.3f,%.3f,%.3f) spotFwd=(%.3f,%.3f,%.3f) mobilityOrderFixed=1 attachedTo=FixtureRoot midBothPushed=1 diagAvailable=1 coneMeshExtrusionAxis=-X"),
+		TEXT("Fixture %s beam: SPAWNED v1.0.128 matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s) coneFwd=(%.3f,%.3f,%.3f) spotFwd=(%.3f,%.3f,%.3f) mobilityOrderFixed=1 attachedTo=FixtureRoot midBothPushed=1 diagAvailable=1 coneMeshExtrusionAxis=-X beamStartRadius=%.2fcm goboPlumbing=v1.0.128 windingFlipped=v1.0.128"),
 		*FixtureId, BeamBaseRadiusUnreal, BeamConeLastFarRadius, BeamLengthUnreal, OuterHalf,
 		CurIntensity, bMeshBeamEnabled ? 1 : 0, DiamSrc,
-		ConeFwd.X, ConeFwd.Y, ConeFwd.Z, SpotFwd.X, SpotFwd.Y, SpotFwd.Z);
+		ConeFwd.X, ConeFwd.Y, ConeFwd.Z, SpotFwd.X, SpotFwd.Y, SpotFwd.Z,
+		BeamStartRadius);
 	// v1.0.124 -- unconditional post-build BeamCone diagnostic dump. Single line
 	// per fixture spawn at Log level; no rate-limiting (we want this in EVERY log,
 	// regardless of `Rebus.LogBeamCone`, so the operator can verify the v1.0.124
@@ -4284,7 +4402,7 @@ void ARebusFixtureActor::DumpBeamConeStateForDebug(const TCHAR* CallSite) const
 	const float MatchHalfDeg = ResolveBeamFootprintMatchHalfDeg();
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("[Rebus] LogBeamCone[%s] v1.0.127 fixtureId=%s | "
+		TEXT("[Rebus] LogBeamCone[%s] v1.0.128 fixtureId=%s | "
 			 "BeamCone={attachParent=%s mobility=%s vis=%d hidGame=%d sections=%d "
 			 "boundsScale=%.2f translucencySort=%d} | "
 			 "Material={slot0Class=%s slot0Name=%s beamMID=%s beamMIDParent=%s "
@@ -4349,7 +4467,7 @@ void ARebusFixtureActor::DumpBeamDiagForDebug(const TCHAR* CallSite) const
 	if (!BeamCone)
 	{
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("[Rebus] DiagBeam[%s] v1.0.127 fixtureId=%s displayName='%s' actor=%s "
+			TEXT("[Rebus] DiagBeam[%s] v1.0.128 fixtureId=%s displayName='%s' actor=%s "
 				 "actorLoc=(%.1f,%.1f,%.1f) ownerHidden=%d BeamCone=<null> -- BuildBeamCone "
 				 "either has not been called yet OR the M_RebusBeam load failed (look for "
 				 "`Fixture %s beam: SKIP (M_RebusBeam failed to load ...)` warning above "
@@ -4461,6 +4579,18 @@ void ARebusFixtureActor::DumpBeamDiagForDebug(const TCHAR* CallSite) const
 	const bool bHasMaskEnabled = MidScalar(TEXT("BeamShadowMaskEnabled"), MidShadowMaskEnabled);
 	const bool bHasMatRev      = MidScalar(TEXT("BeamMaterialRevision"), MidMaterialRevision);
 
+	// v1.0.128 Issue 1 diagnostic -- read back the gobo enable scalar AND the
+	// per-fixture gobo state so the operator can confirm the v1.0.128 beam-side
+	// gobo plumbing actually landed on the visible MID. `MISSING` here means the
+	// on-disk master pre-dates the v1.0.128 rebake (revision 121 or earlier); a
+	// numeric value confirms the master is at revision 122+ AND the C++ push
+	// fired. The bGoboActive / GoboRT / currentGoboIndex fields surface the
+	// upstream state so a fixture that's NOT showing a gobo inside the cone
+	// can be triaged in one paste: stale master vs. no gobo loaded vs. push
+	// pipeline broken.
+	float MidGoboEnable = 0.f;
+	const bool bHasGoboEnable = MidScalar(TEXT("GoboEnable"), MidGoboEnable);
+
 	auto FmtScalar = [](bool bHas, float Val, int32 Prec) -> FString
 	{
 		if (!bHas) return FString(TEXT("MISSING"));
@@ -4483,6 +4613,7 @@ void ARebusFixtureActor::DumpBeamDiagForDebug(const TCHAR* CallSite) const
 	const FString FarRadiusStr = FmtScalar(bHasFarRadius, MidFarRadius, 1);
 	const FString MaskEnStr    = FmtScalar(bHasMaskEnabled,MidShadowMaskEnabled,2);
 	const FString MatRevStr    = FmtScalar(bHasMatRev,    MidMaterialRevision,0);
+	const FString GoboEnableStr= FmtScalar(bHasGoboEnable, MidGoboEnable,        2);
 	const FString ColorStr     = bHasColor
 		? FString::Printf(TEXT("(%.3f,%.3f,%.3f,%.3f)"), MidColor.R, MidColor.G, MidColor.B, MidColor.A)
 		: FString(TEXT("MISSING"));
@@ -4548,8 +4679,18 @@ void ARebusFixtureActor::DumpBeamDiagForDebug(const TCHAR* CallSite) const
 		bMatTwoSided = ParentMatIface->IsTwoSided() ? 1 : 0;
 	}
 
+	// v1.0.128 Issue 1 diagnostic -- per-fixture gobo upstream-state. Pairs with
+	// `MIDReadback.GoboEnable` below to triage "gobo selected on portal but no
+	// pattern inside the beam shaft": bGoboActive=1 + GoboRT!=null + GoboEnable=1.00
+	// is the healthy state (the cone shaft modulation should land; if it doesn't,
+	// the master is stale and MatRevision will read <122 below).
+	const void* GoboRTPtr = GoboRT.Get();
+	const void* CurrentGoboTexPtr = CurrentGoboTexture.Get();
+	const FString CurrentGoboTexName = CurrentGoboTexture
+		? CurrentGoboTexture->GetName() : FString(TEXT("<null>"));
+
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("[Rebus] DiagBeam[%s] v1.0.127 fixtureId=%s displayName='%s' actor=%s "
+		TEXT("[Rebus] DiagBeam[%s] v1.0.128 fixtureId=%s displayName='%s' actor=%s "
 			 "actorLoc=(%.1f,%.1f,%.1f) ownerHidden=%d | "
 			 "BeamCone={registered=%d vis=%d hidGame=%d castShadow=%d mobility=%s attachParent=%s "
 			 "boundsScale=%.2f translucencySort=%d renderMain=%d renderDepth=%d customDepth=%d} | "
@@ -4561,10 +4702,12 @@ void ARebusFixtureActor::DumpBeamDiagForDebug(const TCHAR* CallSite) const
 			 "Material={slot0Class=%s slot0Name=%s slot0Path=%s isMID=%d beamMID=%s beamMIDParentPath=%s "
 			 "midPtr=%p coneSlot0Ptr=%p same=%d domain=%s blend=%s shading=%s twoSided=%d} | "
 			 "MIDReadback={BeamIntensity=%s BeamColor=%s BeamSharpness=%s BeamFalloff=%s BeamDensity=%s "
-			 "StepCount=%s BeamLength=%s LensRadius=%s FarRadius=%s ShadowMaskEnabled=%s MatRevision=%s} | "
+			 "StepCount=%s BeamLength=%s LensRadius=%s FarRadius=%s ShadowMaskEnabled=%s MatRevision=%s "
+			 "GoboEnable=%s} | "
 			 "Drive={dimmerCurrent=%.3f shutterMode=%s(%d) shutterPhase=%.3f gate=%.1f "
 			 "meshBeamUserScale=%.2f maxBeam=%.2f} | "
-			 "Gates={bMeshBeamEnabled=%d bUsingEpicBeam=%d bPreferProcedural=%d bBeamDebugTintActive=%d}"),
+			 "Gates={bMeshBeamEnabled=%d bUsingEpicBeam=%d bPreferProcedural=%d bBeamDebugTintActive=%d} | "
+			 "Gobo={bGoboActive=%d goboIndex=%d goboWheel=%d srcTex=%s(%p) goboRT=%p}"),
 		Site, *FixtureId, *DisplayName, *ActorName,
 		ActorLoc.X, ActorLoc.Y, ActorLoc.Z, bOwnerHidden ? 1 : 0,
 		bRegistered ? 1 : 0, bVisible ? 1 : 0, bHiddenInGame ? 1 : 0, bCastShadow ? 1 : 0,
@@ -4593,10 +4736,13 @@ void ARebusFixtureActor::DumpBeamDiagForDebug(const TCHAR* CallSite) const
 		MaterialDomainStr, BlendModeStr, ShadingModelStr, bMatTwoSided,
 		*IntensityStr, *ColorStr, *SharpnessStr, *FalloffStr, *DensityStr,
 		*StepCountStr, *BeamLengthStr, *LensRadiusStr, *FarRadiusStr, *MaskEnStr, *MatRevStr,
+		*GoboEnableStr,
 		DimmerCurrent, ShutterModeStr, ShutterModeInt, ShutterPhase, GateNow,
 		MeshBeamUserScale, RebusMeshBeamMaxIntensity,
 		bMeshBeamEnabled ? 1 : 0, bUsingEpicBeam ? 1 : 0,
-		bPreferProceduralBeam ? 1 : 0, bBeamDebugTintActive ? 1 : 0);
+		bPreferProceduralBeam ? 1 : 0, bBeamDebugTintActive ? 1 : 0,
+		bGoboActive ? 1 : 0, CurrentGoboIndex, CurrentGoboWheelIndex,
+		*CurrentGoboTexName, CurrentGoboTexPtr, GoboRTPtr);
 }
 
 int32 ARebusFixtureActor::ForceBeamForDebug(float NewIntensity)
@@ -5028,6 +5174,79 @@ void ARebusFixtureActor::RefreshBeamEmissive()
 	{
 		UpdateEpicBeamParams();
 	}
+}
+
+void ARebusFixtureActor::RefreshBeamGoboParams()
+{
+	// v1.0.128 Issue 1 -- beam-side gobo projection plumbing. See the public-
+	// header doc-comment on `RefreshBeamGoboParams` for the operator contract
+	// and call-site list. Defensive double-push (v1.0.125 pattern): resolve the
+	// LIVE cone slot-0 MID every call AND fall back to the cached `BeamMID`
+	// UPROPERTY; push onto BOTH iff distinct so neither pointer divergence
+	// nor a stale-cache regression can leave the visible MID with stale-
+	// default scalars. Silently no-ops when both pointers resolve to null
+	// (the pre-`BuildBeamCone` state, or the rare `M_RebusBeam`-load-failed
+	// branch -- the seed call from `BuildBeamCone` tail handles fresh-spawn
+	// fixtures once the MID + cone exist).
+	//
+	// A `SetTextureParameterValue` against a parameter the parent master does
+	// NOT declare is a benign no-op on UE 5.7's `UMaterialInstanceDynamic`
+	// (the engine resolves the parameter info, fails to find it, and silently
+	// returns without setting anything) -- so a fixture whose cached on-disk
+	// `M_RebusBeam.uasset` pre-dates the v1.0.128 rebake (revision 121 or
+	// earlier, missing `GoboTexture` + `GoboEnable`) gets the same pre-v1.0.128
+	// visual: cone visible, no gobo modulation. The v1.0.119 self-heal probe
+	// (`SelfHealBeamMaterialRevisionIfMismatched` at the tail of
+	// `BuildBeamCone`) will fire a warning per fixture on a stale master so
+	// the operator sees the auto-purge / commandlet bake path documented in
+	// README v1.0.121.
+
+	// v1.0.102: GoboRT is a UCanvasRenderTarget2D -> UTextureRenderTarget2D ->
+	// UTexture, so we can push it through the texture param API; the
+	// per-fixture cookie redraw chain (OnGoboRTUpdate) owns the bitmap
+	// contents. Cast to the base `UTexture*` here so the param push doesn't
+	// require any header awareness of the RT subtype.
+	UTexture* GoboPattern = Cast<UTexture>(GoboRT.Get());
+	const float GoboEnableScalar = (bGoboActive && GoboPattern != nullptr) ? 1.f : 0.f;
+
+	UMaterialInstanceDynamic* ConeSlot0MID = nullptr;
+	if (BeamCone)
+	{
+		ConeSlot0MID = Cast<UMaterialInstanceDynamic>(BeamCone->GetMaterial(0));
+	}
+	UMaterialInstanceDynamic* const BeamMIDRaw = BeamMID.Get();
+
+	int32 PushCount = 0;
+	if (ConeSlot0MID)
+	{
+		if (GoboPattern)
+		{
+			ConeSlot0MID->SetTextureParameterValue(TEXT("GoboTexture"), GoboPattern);
+		}
+		ConeSlot0MID->SetScalarParameterValue(TEXT("GoboEnable"), GoboEnableScalar);
+		++PushCount;
+	}
+	if (BeamMIDRaw && BeamMIDRaw != ConeSlot0MID)
+	{
+		if (GoboPattern)
+		{
+			BeamMIDRaw->SetTextureParameterValue(TEXT("GoboTexture"), GoboPattern);
+		}
+		BeamMIDRaw->SetScalarParameterValue(TEXT("GoboEnable"), GoboEnableScalar);
+		++PushCount;
+	}
+
+	// v1.0.128 -- one Verbose log line per push so the operator can confirm the
+	// plumbing fired without spamming the per-tick log under steady-state. Use
+	// Verbose so the line is silent at default verbosity; opt in via
+	// `LogRebusVisualiser Verbose` to surface the chain when triaging a gobo
+	// regression.
+	UE_LOG(LogRebusVisualiser, Verbose,
+		TEXT("Fixture %s beam gobo: bGoboActive=%d GoboRT=%p enable=%.1f pushCount=%d "
+			 "midPtr=%p coneSlot0Ptr=%p same=%d"),
+		*FixtureId, bGoboActive ? 1 : 0, (void*)GoboPattern, GoboEnableScalar,
+		PushCount, (void*)BeamMIDRaw, (void*)ConeSlot0MID,
+		(BeamMIDRaw != nullptr && BeamMIDRaw == ConeSlot0MID) ? 1 : 0);
 }
 
 void ARebusFixtureActor::RefreshBeamSpatialParams()
@@ -7077,6 +7296,16 @@ void ARebusFixtureActor::OnGoboRTUpdate(UCanvas* Canvas, int32 Width, int32 Heig
 	// got redrawn -- cheap (few SetParameter calls) and removes a class of "lens drifts
 	// behind the cone by 1 frame" failure modes.
 	RefreshLensEmissive();
+
+	// v1.0.128 Issue 1 -- same rationale extended to the beam-side gobo plumbing.
+	// The procedural M_RebusBeam cone MID also caches the `GoboTexture` pointer
+	// once (via the v1.0.128 `RefreshBeamGoboParams` push), so the cone shaft
+	// reads the freshly-rotated RT contents automatically on the next frame --
+	// but the `GoboEnable` scalar must stay in sync with `bGoboActive` in case
+	// a shutter / clear / re-load fired during the same Tick. Cheap defensive
+	// re-push (one scalar + one texture set per MID; bounded by the two MIDs
+	// in the v1.0.125 double-push).
+	RefreshBeamGoboParams();
 }
 
 void ARebusFixtureActor::EnsureIrisMaskTexture(float Iris01)
@@ -7227,6 +7456,16 @@ void ARebusFixtureActor::ApplyCurrentGoboToEpicBeam()
 	// Kept as a tail-call so every existing caller (UpdateEpicBeamParams, ApplyGoboTextureFromBytes,
 	// ClearGoboToOpen) updates both the cone AND the lit-pool gobo in one shot.
 	ApplyCurrentGoboToLightFn();
+
+	// v1.0.128 Issue 1 -- push the same gobo state onto the procedural M_RebusBeam
+	// cone MID (the visible volumetric shaft when `bPreferProceduralBeam=1`, the
+	// default since v1.0.106). Single source of truth: the cone-shaft sampling,
+	// the M_Light_Master cookie sampling, and the M_RebusFixtureLens emissive
+	// sampling all read the SAME per-fixture `GoboRT`, so the gobo silhouette
+	// reads consistently across the cone shaft, the lit floor pool, and the lens
+	// face. See `RefreshBeamGoboParams` doc-comment for the v1.0.125-style
+	// double-push contract.
+	RefreshBeamGoboParams();
 }
 
 void ARebusFixtureActor::ApplyCurrentGoboToLightFn()

@@ -777,6 +777,20 @@ float maskTan     = max(BeamShadowMaskTanHalfFov, 0.001);
 float3 lFwd       = normalize(BeamLightFwd.xyz);
 float3 lRight     = normalize(BeamLightRight.xyz);
 float3 lUp        = normalize(BeamLightUp.xyz);
+
+// v1.0.128 -- beam-side gobo projection plumbing. See the master-param doc-comment
+// in `_build_beam_master` for the operator contract. `goboEnable > 0.5` is the
+// per-fixture gate (C++ pushes `1` while `bGoboActive` is true, `0` on clear).
+// `GoboTexture` is the per-fixture `GoboRT` cookie render-target (default white
+// when unbound -> sampling reads 1.0 -> no density modulation, the beam reads
+// identical to pre-v1.0.128). The projection basis is the SAME light-local
+// axes the depth-mask uses (`lRight` / `lUp`) so the gobo image on the floor
+// pool (M_Light_Master cookie, also driven by `GoboRT` from C++) and the gobo
+// image inside the cone-shaft sample EXACTLY the same source texture at
+// EXACTLY the same UV for any sample on the floor surface -- the two reads
+// have to agree along the rays connecting the lens to the lit footprint or the
+// shaft pattern visually peels off the cookie pattern as the camera moves.
+float goboEnable  = GoboEnable;
 [loop]
 for (int i = 0; i < MAXSTEPS; ++i)
 {
@@ -878,7 +892,54 @@ for (int i = 0; i < MAXSTEPS; ++i)
                 }
             }
 
-            float d = BeamDensity * core * widthNorm * srcAtten * nf * softOcc * shadowVis;
+            // v1.0.128 -- beam-side gobo projection (issue 1). The cone-mesh shaft
+            // shares its perpendicular UV basis with the SpotLight cookie's
+            // M_Light_Master sampling: at every raymarch step we project the sample's
+            // perpendicular offset (relative to the cone axis) onto the SpotLight's
+            // local right/up axes (lRight / lUp, the same pushed vectors the
+            // depth-mask uses), normalise by the local cone radius at this axial
+            // position, and map to a [0..1] UV pair. Sampling the gobo texture at
+            // that UV gives a per-step transmittance multiplier (1 = fully open,
+            // 0 = fully blocked) so the visible shaft modulates with the same
+            // pattern projected on the lit floor. `goboEnable > 0.5` gates the
+            // sampling out cleanly when no gobo is active (the per-step branch
+            // keeps cost zero); the default-white texture on the master fall-
+            // back means an unbound `GoboTexture` reads as 1.0 (no modulation).
+            float goboMix = 1.0;
+            [branch]
+            if (goboEnable > 0.5)
+            {
+                // Project perpendicular offset into light-local right/up axes.
+                // `perp` is already perpendicular to the cone axis (= rel - axial * bd);
+                // dot it against the SpotLight's pushed right/up gives the
+                // transverse U / V offset. Normalise by the local cone radius so
+                // the UV at the cone wall is +-1 and the centre of the cone is
+                // (0,0) -- matches the cookie's centred-disc convention.
+                float u = (radiusAt > 0.001) ? (dot(perp, lRight) / radiusAt) : 0.0;
+                float v = (radiusAt > 0.001) ? (dot(perp, lUp)    / radiusAt) : 0.0;
+                // Map [-1..+1] -> [0..1] UV. V is flipped so the gobo orientation
+                // matches the cookie (M_Light_Master inverts V too via the
+                // standard UE SceneCapture-y-down convention).
+                float2 goboUV = float2(u * 0.5 + 0.5, -v * 0.5 + 0.5);
+                // Clamp to [0..1] so out-of-cone samples (which the rN<1.5 guard
+                // above already mostly handles) don't wrap-sample garbage; the
+                // texture's wrap mode is engine-default but explicit clamp here
+                // documents the intent.
+                goboUV = saturate(goboUV);
+                float3 goboRGB = Texture2DSample(
+                    GoboTexture, GoboTextureSampler, goboUV).rgb;
+                // Treat the gobo as a monochrome transmittance mask: the rec.709
+                // luma of the sample tells us how much light passes through. A
+                // pure-white sample reads 1.0 (no modulation, beam unaffected);
+                // a pure-black sample reads 0.0 (full block, this raymarch step
+                // contributes zero density). Coloured gobos contribute their
+                // tinted value -- the resulting beam shaft picks up the gobo
+                // colour modulation faithfully because BeamDensity is scalar
+                // and the tint comes through downstream via `col` composition.
+                goboMix = dot(goboRGB, float3(0.299, 0.587, 0.114));
+            }
+
+            float d = BeamDensity * core * widthNorm * srcAtten * nf * softOcc * shadowVis * goboMix;
             float a = 1.0 - exp(-d * dt);
             trans *= (1.0 - a);
         }
@@ -1091,6 +1152,48 @@ def _build_beam_master(mat):
         # a null default, and the per-fixture C++ push wires the real RT on spawn.
         pass
 
+    # v1.0.128 -- BEAM-SIDE GOBO PROJECTION. Issue 1 of the v1.0.128 brief: when DMX
+    # selects a gobo the user sees the gobo silhouette projected on the floor pool
+    # (via the SpotLight's M_Light_Master cookie path) and on the lens face (via
+    # M_RebusFixtureLens' v1.0.102 emissive layer) -- but NOT inside the visible
+    # volumetric beam shaft. Pre-v1.0.128 the procedural cone material (this master)
+    # had no gobo sampler at all, so a fixture running `bPreferProceduralBeam=1`
+    # (the default since v1.0.106) showed the gobo on the floor + lens but the
+    # raymarched additive shaft stayed unmodulated -- visually the cookie pattern
+    # appeared on the lit pool but the beam between the fixture and the pool was
+    # uniformly bright. v1.0.128 adds:
+    #   * `GoboTexture` (TextureObjectParameter, default white) -- per-fixture cookie
+    #     bitmap (the same `GoboRT` per-fixture render target the M_Light_Master
+    #     cookie path samples, so cone shaft + floor pool show the same pattern in
+    #     lockstep).
+    #   * `GoboEnable` (Scalar, default 0.0) -- per-fixture enable gate (driven by
+    #     C++ `bGoboActive` + `Rebus.LensFollowGobo` style global toggle). 0 ->
+    #     shader skips the sampling entirely (the `[branch]` keeps cost zero); 1
+    #     -> per-raymarch-step density is modulated by the gobo sample.
+    # Sampled in `_BEAM_RAYMARCH_HLSL` via a planar projection: at every raymarch
+    # step the perpendicular component of the sample position (relative to the
+    # cone's local axis through the apex) is normalised against the local cone
+    # radius to produce a [-1, +1] UV pair, sample the gobo texture there, and
+    # multiply the per-step density. The projection is planar (= the gobo lives
+    # in a transverse plane at the lens, extruded down the beam) which matches
+    # the cookie's behaviour on the floor pool when the projection lands flat
+    # (vertical projection cone onto a flat floor) -- they trace the same UV
+    # math from the lens out. See the v1.0.128 README release block for the
+    # full derivation. Default texture white-square so the un-bound state
+    # (`GoboEnable=0` OR no texture pushed) collapses to "fully transmissive",
+    # matching the pre-v1.0.128 visual exactly when no gobo is active.
+    gobo_tex_obj = mel.create_material_expression(mat, unreal.MaterialExpressionTextureObjectParameter, -1100, 1460)
+    gobo_tex_obj.set_editor_property("parameter_name", "GoboTexture")
+    try:
+        if default_white is not None:
+            gobo_tex_obj.set_editor_property("texture", default_white)
+    except Exception:
+        # Same best-effort posture as BeamShadowMaskRT above; the C++ push
+        # wires the real per-fixture GoboRT on every gobo apply.
+        pass
+
+    gobo_enable = _scalar("GoboEnable", 0.0, 1540)
+
     # ---- Scene/view inputs (engine nodes) ----
     campos = mel.create_material_expression(mat, unreal.MaterialExpressionCameraPositionWS, -1100, 680)
     pixelpos = mel.create_material_expression(mat, unreal.MaterialExpressionWorldPosition, -1100, 760)
@@ -1117,6 +1220,13 @@ def _build_beam_master(mat):
         "BeamShadowMaskFarCm", "BeamShadowMaskTanHalfFov", "BeamShadowMaskDebug",
         "BeamLightFwd", "BeamLightRight", "BeamLightUp",
         "BeamShadowMaskRT",
+        # v1.0.128 -- beam-side gobo projection. Same texture-object + scalar
+        # plumbing shape as `BeamShadowMaskRT` / `BeamShadowMaskEnabled` above;
+        # the engine auto-generates `SamplerState GoboTextureSampler` for the
+        # `Texture2DSample(GoboTexture, GoboTextureSampler, uv)` call inside
+        # `_BEAM_RAYMARCH_HLSL`. See the master-param doc-comment above for the
+        # projection contract.
+        "GoboTexture", "GoboEnable",
     ]
     custom_inputs = []
     for n in input_names:
@@ -1135,6 +1245,8 @@ def _build_beam_master(mat):
         "BeamShadowMaskTanHalfFov": mask_tan, "BeamShadowMaskDebug": mask_debug,
         "BeamLightFwd": beamlightfwd, "BeamLightRight": beamlightright, "BeamLightUp": beamlightup,
         "BeamShadowMaskRT": mask_rt,
+        # v1.0.128 -- beam-side gobo projection (issue 1).
+        "GoboTexture": gobo_tex_obj, "GoboEnable": gobo_enable,
     }
     for n in input_names:
         mel.connect_material_expressions(src_for[n], "", custom, n)
@@ -1159,7 +1271,7 @@ def _build_beam_master(mat):
     mel.recompile_material(mat)
 
 
-REBUS_BEAM_MATERIAL_REVISION = 121
+REBUS_BEAM_MATERIAL_REVISION = 122
 """v1.0.117 -- sentinel revision baked into the on-disk M_RebusBeam master via the
 `BeamMaterialRevision` scalar parameter. Bumped by every release that touches the
 master so the v1.0.112 auto-purge probe in
@@ -1215,6 +1327,37 @@ revision bump invalidates every pre-v1.0.121 cooked master so the first
 commandlet bake against an existing checkout produces a fresh .uasset at
 the new sentinel. The master GRAPH itself is unchanged in v1.0.121; only
 the sentinel + the gate.
+
+v1.0.128 -- bumped 121 -> 122. UNLIKE v1.0.120 / v1.0.121 (sentinel-only
+bumps), v1.0.128 ACTUALLY changes the master graph -- adds the v1.0.128
+beam-side gobo projection plumbing: `GoboTexture` (TextureObjectParameter,
+default white) + `GoboEnable` (Scalar, default 0.0) parameters wired into
+the `_BEAM_RAYMARCH_HLSL` Custom node, with a per-step planar projection
+that modulates the raymarch density by the gobo sample in the SpotLight's
+local right/up axes (same basis as the v1.0.111 depth-mask). Fixes the
+"gobo selected via DMX but no pattern visible inside the volumetric beam
+shaft" symptom (issue 1 of the v1.0.128 brief): pre-v1.0.128 the procedural
+cone master had no gobo sampler at all, so a fixture running the default
+`bPreferProceduralBeam=1` (since v1.0.106) showed the cookie on the lit
+floor pool (M_Light_Master's MF_DMXGobo) + on the lens face
+(M_RebusFixtureLens' v1.0.102 emissive layer) but the volumetric shaft
+between the lens and the floor stayed uniformly bright. v1.0.128 adds the
+same `GoboRT` per-fixture render target the cookie path samples as the
+texture source, projected planarly through the cone interior so the shaft
+modulation matches the floor pattern in lockstep. C++ side: new
+`RefreshBeamGoboParams()` method pushes `GoboTexture` + `GoboEnable` onto
+BOTH the cone slot-0 MID AND the cached `BeamMID` (the v1.0.125 double-
+push pattern) from every gobo-state apply site (`ApplyCurrentGoboToEpic
+Beam` tail, `ClearGoboToOpen`, `OnGoboRTUpdate`, `BuildBeamCone` seed).
+The bump invalidates every pre-v1.0.128 cooked master so the v1.0.112
+auto-purge probe recognises them as stale and the (commandlet-driven)
+regen produces a current master with the gobo plumbing baked in. Until
+that bake runs the on-disk master will report `BeamMaterialRevision=121`
+and the C++ `SelfHealBeamMaterialRevisionIfMismatched` will log a warning
+on every fixture spawn (the existing post-spawn self-heal probe, see
+v1.0.119); the gobo push itself silently no-ops against the stale master
+because the parameter doesn't exist -- pre-v1.0.128 behaviour preserved
+exactly (cone visible, no gobo modulation) until the rebake lands.
 """
 
 
@@ -1257,9 +1400,20 @@ def _beam_master_has_shadow_mask(master):
         # v1.0.117 -- the revision sentinel must exist AND read the expected value
         # below for the master to count as "matching".
         "BeamMaterialRevision",
+        # v1.0.128 -- beam-side gobo enable scalar. Missing here means the master
+        # pre-dates the v1.0.128 gobo-plumbing rebake -- the C++ push will silently
+        # no-op against the stale parameter contract and the volumetric beam shaft
+        # will read uniformly bright (the pre-v1.0.128 visual). Probe failure here
+        # routes through the same auto-purge / commandlet bake path the v1.0.111
+        # shadow-mask plumbing uses.
+        "GoboEnable",
     }
     required_vectors = {"BeamLightFwd", "BeamLightRight", "BeamLightUp"}
-    required_textures = {"BeamShadowMaskRT"}
+    required_textures = {
+        "BeamShadowMaskRT",
+        # v1.0.128 -- beam-side gobo texture parameter (per-fixture cookie RT).
+        "GoboTexture",
+    }
     if not (required_scalars.issubset(scalar_names)
             and required_vectors.issubset(vector_names)
             and required_textures.issubset(texture_names)):

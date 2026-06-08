@@ -364,6 +364,45 @@ public:
 	// NOT touched -- these knobs only reshape the radial Gaussian / axial falloff inside the
 	// existing cone volume.
 	void RefreshBeamRadialParams();
+	// v1.0.128 -- push the v1.0.128 beam-side gobo plumbing onto the cone MID(s).
+	// Issue 1 of the v1.0.128 brief: the procedural `M_RebusBeam` cone-mesh master
+	// gained `GoboTexture` (TextureObjectParameter) + `GoboEnable` (Scalar) params
+	// in `_build_beam_master` (Python) and a planar-projection per-step modulation
+	// inside `_BEAM_RAYMARCH_HLSL`, so the visible volumetric shaft now carries the
+	// gobo silhouette in lockstep with the SpotLight cookie (M_Light_Master) floor
+	// projection. This C++ helper pushes:
+	//   * `GoboTexture` = `GoboRT` (the per-fixture cookie render-target, the same
+	//     `UCanvasRenderTarget2D` the M_Light_Master cookie samples; both reads
+	//     hit the same texture so the cone-shaft pattern coincides with the lit
+	//     floor pattern at the lens-to-floor projection rays).
+	//   * `GoboEnable` = 1.0 when `bGoboActive` is true (any non-Open gobo is
+	//     loaded), 0.0 otherwise -- the shader's `[branch]` skips the entire
+	//     planar-projection block on disable, keeping per-pixel cost zero.
+	// Defensive double-push (v1.0.125 pattern): resolves the LIVE cone slot-0 MID
+	// every call AND falls back to the cached `BeamMID` UPROPERTY; pushes onto
+	// BOTH iff distinct, so neither pointer divergence nor a stale-cache
+	// regression can leave the visible MID with stale-default scalars. Silently
+	// no-ops when both pointers resolve to null (the pre-`BuildBeamCone` state,
+	// or the rare `M_RebusBeam`-load-failed branch); silently no-ops on a master
+	// that pre-dates the v1.0.128 rebake too (a `Set*ParameterValue` against a
+	// non-existent parameter is a noop on UE 5.7, so pre-bake fixtures preserve
+	// pre-v1.0.128 visual exactly until the commandlet bake refreshes the
+	// `.uasset` to revision 122). Called from:
+	//   * `BuildBeamCone` tail (seed state for a fresh-spawn fixture so the cone
+	//     comes up with the operator's current gobo loaded, not blank-then-flash).
+	//   * `ApplyCurrentGoboToEpicBeam` tail (every gobo selection / re-selection
+	//     funnels through this; both EpicBeamMID and the procedural BeamMID
+	//     receive the same source texture).
+	//   * `ClearGoboToOpen` (every "no gobo" / "open hole" path zeroes the enable
+	//     scalar so the cone reverts to uniform brightness).
+	//   * `OnGoboRTUpdate` (the per-tick canvas redraw kicks a re-push so the MID
+	//     always points at the freshly-drawn RT, defending against any race where
+	//     the RT pointer changes between binding and rendering).
+	// Public so the v1.0.126 diagnostic toolkit + the file-scope CVar sinks for
+	// `Rebus.LensFollowGobo` (and any future `Rebus.BeamGoboEnable` style global
+	// toggle) can iterate fixtures without poking the private MID pointers.
+	void RefreshBeamGoboParams();
+
 	// v1.0.111 -- push the light-space depth-mask scalars + axis params + render-target
 	// reference onto this fixture's BeamMID so the M_RebusBeam Custom HLSL shadow-mask
 	// sampling block reads the operator's current `Rebus.BeamShadowMask*` CVar values AND
@@ -1227,6 +1266,36 @@ private:
 	// the editor-property exposure is purely for per-instance overrides in the Details panel.
 	UPROPERTY(EditAnywhere, Category = "Rebus|Beam")
 	float BeamConeRadiusScale = 1.0f;
+
+	// v1.0.128 -- per-fixture override for the cone-mesh NEAR-RING (apex-side) radius
+	// in Unreal centimetres. Issue 2 of the v1.0.128 brief: the visible cone's apex
+	// radius (the ring at the lens face, x=0 in the procedural cone authored
+	// `UpdateBeamConeGeometry`) was reading too small for typical moving-head
+	// fixtures (pre-v1.0.128 it was either the `photometrics.lensDiameter / 2`
+	// resolved by `ResolveLensDiameterMeters` -- often missing from a portal payload
+	// for older library entries -- OR the hard-coded `RebusBeamLensRadiusFloorCm =
+	// 3.0f` fallback floor, both of which underestimated the actual physical lens
+	// aperture of the fixture mesh on the user's session: typical moving-head
+	// fixtures have ~80..180mm lens diameters = 4..9cm radius, so the 3cm floor
+	// left a visible gap-ring between the cone's narrow end and the fixture body
+	// chassis). v1.0.128 plumbs this UPROPERTY as the resolved fallback (preferred
+	// over the legacy 3cm constant floor; the constant is now the secondary safety
+	// net at 5cm rather than the primary fallback) and as a per-fixture override
+	// when an operator wants to tighten or widen a specific fixture's cone apex
+	// without touching the photometric profile. Resolution precedence in
+	// `BuildBeamCone`: `photometrics.lensDiameter / 2` (preferred when present
+	// AND > BeamStartRadius -- never SHRINK below the operator's chosen floor)
+	// -> `BeamStartRadius` UPROPERTY (default 5.0cm) -> `RebusBeamLensRadius
+	// FloorCm` (secondary belt-and-braces floor). Default 5.0cm matches the
+	// median lens radius across the GDTF library set the portal ships; operators
+	// can raise per fixture in the Details panel for unusually large optics
+	// (CMY blade systems often run 12+cm) or lower for narrow-aperture profile
+	// fixtures (LED zoom-wash heads run ~4cm). Kept EditAnywhere only (not
+	// BlueprintReadWrite) because this UPROPERTY lives in the `private:` block
+	// further down -- UHT rejects BP-write on private members (same constraint
+	// as `BeamConeRadiusScale` above).
+	UPROPERTY(EditAnywhere, Category = "Rebus|Beam", meta = (ClampMin = "0.5", UIMin = "0.5", UIMax = "30.0", Units = "Centimeters"))
+	float BeamStartRadius = 5.0f;
 
 	// v1.0.106 -- per-fixture preference for the procedural `M_RebusBeam` cone over Epic's
 	// `MI_Beam` canvas. Default true so a fresh-spawn fixture inherits the v1.0.106
