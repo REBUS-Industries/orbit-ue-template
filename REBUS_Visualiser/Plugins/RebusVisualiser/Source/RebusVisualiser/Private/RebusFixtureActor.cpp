@@ -3840,13 +3840,13 @@ void ARebusFixtureActor::DumpBeamCullingStateForDebug() const
 		// needing a separate `Rebus.DumpBeamMasterVersion` run.
 		URebusVisualiserSubsystem::GetCachedBeamMasterDisplayName(),
 		URebusVisualiserSubsystem::GetBeamMasterLoadCount(),
-		// 120 -- the v1.0.120 floor. Hard-coded here intentionally so the
+		// 121 -- the v1.0.121 floor. Hard-coded here intentionally so the
 		// dump remains a pure read with no subsystem-instance round-trip;
 		// must be bumped in lockstep with `RebusExpectedBeamMaterialRevision`
 		// (in `RebusVisualiserSubsystem.cpp`) and `REBUS_BEAM_MATERIAL_REVISION`
-		// (in `Content/Python/build_rebus_base_level.py`). The v1.0.120
+		// (in `Content/Python/build_rebus_base_level.py`). The v1.0.121
 		// release block in README documents the bump cadence.
-		120);
+		121);
 }
 
 void ARebusFixtureActor::DumpBeamMaterialHealthForDebug(int32 ExpectedRevision,
@@ -3939,10 +3939,17 @@ void ARebusFixtureActor::SelfHealBeamMaterialRevisionIfMismatched()
 	// per-fixture warning here would be spam (one log line per spawned
 	// fixture). The cone still renders off whatever master is on disk via
 	// `BuildBeamCone`'s existing path (just without the v1.0.111 depth-mask
-	// shadowing the stale master may pre-date). See README v1.0.120 release
-	// block for the operator offline-bake workflow.
+	// shadowing the stale master may pre-date). See README v1.0.121 release
+	// block for the commandlet-driven offline-bake workflow.
+	//
+	// v1.0.121 -- relaxed: commandlet sessions ARE now allowed through. The
+	// gate matches `URebusVisualiserSubsystem::CanRegenBeamMasterInProcess()`
+	// (one-liner: `GIsEditor && !IsRunningGame()`), so per-fixture self-heal
+	// fires correctly during the bake commandlet too (which is the right
+	// behaviour -- the commandlet bake regen also wants the per-fixture
+	// rebind to land). The `-game` block is preserved verbatim.
 #if WITH_EDITOR
-	const bool bCanRegenInProcess = GIsEditor && !IsRunningGame() && !IsRunningCommandlet();
+	const bool bCanRegenInProcess = GIsEditor && !IsRunningGame();
 #else
 	const bool bCanRegenInProcess = false;
 #endif
@@ -5486,11 +5493,70 @@ void ARebusFixtureActor::SelectIesForZoom()
 		ZoomDmx = FMath::Clamp((int32)FMath::RoundToInt(T * 255.0), 0, 255);
 	}
 
-	// 1) Prefer an inline iesText profile pushed via RegisterFixtureIes (no REST fetch). Build
-	//    the UTextureLightProfile straight from the cached .ies bytes (same RebusIes path the
-	//    URL fetch uses). On a build failure we fall through to the URL path below.
+	// v1.0.121 -- new priority order for IES selection:
+	//   (0) pre-baked /Game/REBUS/IES/<sanitized id>.uasset (preferred -- works in -game
+	//       because the asset is cooked content; doesn't need the editor-only
+	//       IESConverter.h),
+	//   (1) inline IES bytes pushed via RegisterFixtureIes -- v1.0.91 path via
+	//       RebusIes::BuildLightProfile (only works in editor / -game-with-editor-data; in
+	//       packaged / -game without editor data, BuildLightProfile logs "IESConverter.h
+	//       not available" and returns nullptr, falling through to the synthesized cone),
+	//   (2) URL fetch (signed iesUrl/iesProfileUrl) -- v1.0.91 path,
+	//   (3) synthesized cone.
 	if (const FRebusInlineIesProfile* Inline = SelectInlineIes(ZoomDmx))
 	{
+		// (0) Pre-baked asset lookup first. If the bake commandlet has produced a
+		// pre-baked `/Game/REBUS/IES/<sanitized profileId>.uasset` for THIS
+		// profileId, load it via the v1.0.121 shared cache and use it directly --
+		// bypassing the editor-only runtime conversion entirely. The cache is a
+		// session-wide singleton (`URebusVisualiserSubsystem::GetCachedIesProfile`)
+		// so subsequent fixture spawns for the same profileId hit the cached
+		// pointer and the LoadObject only fires once per profile per session
+		// (mirrors the v1.0.119 beam-master cache contract).
+		const FString SanitizedId = URebusVisualiserSubsystem::SanitizeIesProfileName(Inline->ProfileId);
+		const FName ProfileNameKey(*SanitizedId);
+		if (UTextureLightProfile* PreBaked = URebusVisualiserSubsystem::GetCachedIesProfile(ProfileNameKey))
+		{
+			if (bActiveIesInline && CurrentIesZoomDmx == Inline->ZoomDmx && ActiveIesProfile == PreBaked)
+			{
+				return; // this pre-baked profile is already loaded for this zoomDmx
+			}
+			ActiveIesProfile = PreBaked;
+			SpotLight->SetIESTexture(PreBaked);
+			// Same brightness contract as the v1.0.91 runtime path: portal owns
+			// SPATIAL distribution, peak candela folds into SpotLight->Intensity.
+			SpotLight->bUseIESBrightness = false;
+			SpotLight->IESBrightnessScale = 1.f;
+			SpotLight->MarkRenderStateDirty();
+			bActiveIesInline = true;
+			CurrentIesZoomDmx = Inline->ZoomDmx;
+			// The pre-baked UTextureLightProfile carries the candela max in its
+			// `Brightness` x `TextureMultiplier` fields (the editor's import
+			// pipeline writes them from the .ies file's Multiplier x candela peak,
+			// matching the v1.0.91 runtime `BuildLightProfile`'s OutCandelaMax).
+			const float Brightness = PreBaked->Brightness;
+			const float Multiplier = PreBaked->TextureMultiplier;
+			IesCandelaMax = FMath::Max(0.f, Brightness * Multiplier);
+			ActiveIesProfileId = FString::Printf(TEXT("%s (pre-baked v1.0.121)"), *Inline->ProfileId);
+			RefreshIntensity();
+			UE_LOG(LogRebusVisualiser, Verbose,
+				TEXT("Fixture %s IES applied: profile=%s zoomDmx=%d candelaMax=%.0f intensityUnits=Candelas finalIntensity=%.0f (source=prebaked /Game/REBUS/IES/%s)"),
+				*FixtureId, *Inline->ProfileId, Inline->ZoomDmx,
+				IesCandelaMax, SpotLight->Intensity, *SanitizedId);
+			return;
+		}
+
+		// (1) Pre-baked asset MISS -- fall back to the v1.0.91 runtime path.
+		// In editor / -game-with-editor-data this still works (IESConverter is
+		// available); in packaged / -game without editor data this logs the
+		// "IESConverter.h not available" warning + falls through to the cone.
+		// v1.0.121 capture path: if we're in editor / commandlet mode, the
+		// RegisterFixtureIes handler in URebusVisualiserSubsystem already wrote
+		// the .ies bytes to Saved/REBUS/IES_Inbox/<sanitized id>.ies when this
+		// profile was first received, so the next commandlet bake will pick it
+		// up automatically. In -game mode that capture didn't run; the operator
+		// needs to start the visualiser in editor / commandlet mode once to
+		// capture, then re-bake. See README v1.0.121 release block.
 		if (bActiveIesInline && CurrentIesZoomDmx == Inline->ZoomDmx && ActiveIesProfile)
 		{
 			return; // this inline entry is already loaded
@@ -5514,14 +5580,24 @@ void ARebusFixtureActor::SelectIesForZoom()
 			ActiveIesProfileId = Inline->ProfileId;
 			RefreshIntensity();
 			UE_LOG(LogRebusVisualiser, Verbose,
-				TEXT("Fixture %s IES applied: profile=%s zoomDmx=%d candelaMax=%.0f intensityUnits=Candelas finalIntensity=%.0f (source=inline)"),
+				TEXT("Fixture %s IES applied: profile=%s zoomDmx=%d candelaMax=%.0f intensityUnits=Candelas finalIntensity=%.0f (source=inline-runtime, no pre-baked /Game/REBUS/IES/%s available -- run the v1.0.121 commandlet bake to remove the runtime IESConverter dependency)"),
 				*FixtureId, *Inline->ProfileId, Inline->ZoomDmx,
-				IesCandelaMax, SpotLight->Intensity);
+				IesCandelaMax, SpotLight->Intensity, *SanitizedId);
 			return;
 		}
 		UE_LOG(LogRebusVisualiser, Warning,
-			TEXT("Fixture %s: inline IES profile '%s' failed to build; falling back to URL/cone."),
-			*FixtureId, *Inline->ProfileId);
+			TEXT("Fixture %s: IES profile '%s' has NO pre-baked asset at "
+				 "/Game/REBUS/IES/%s AND the runtime fallback "
+				 "(RebusIes::BuildLightProfile) failed (IESConverter.h is editor-only -- "
+				 "this is the standard -game path). To fix: drive the v1.0.121 commandlet "
+				 "bake `UnrealEditor-Cmd.exe REBUS_Visualiser.uproject -run=PythonScript "
+				 "-Script=\"import build_rebus_base_level as b; "
+				 "b.ensure_ies_profiles(force=True)\" -unattended -nop4 -nosplash -stdout "
+				 "-FullStdOutLogOutput`. The capture path under Saved/REBUS/IES_Inbox/ "
+				 "should already have the source bytes (written by the v1.0.121 "
+				 "RegisterFixtureIes handler the last time this profile was received in "
+				 "editor / commandlet mode). Falling back to URL fetch / synthesized cone."),
+			*FixtureId, *Inline->ProfileId, *SanitizedId);
 	}
 
 	// 2) Fall back to a signed iesUrl/iesProfileUrl fetch (REST relative redirect or absolute

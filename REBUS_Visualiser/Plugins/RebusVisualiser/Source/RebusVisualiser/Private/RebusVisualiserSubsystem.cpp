@@ -34,6 +34,12 @@
 #include "Misc/FileHelper.h"
 #include "Misc/SecureHash.h"
 #include "Misc/PackageName.h"
+#include "Misc/Paths.h"
+#include "HAL/PlatformFileManager.h"
+// v1.0.121 -- IES pre-bake cache uses `UTextureLightProfile` (the engine's IES
+// runtime asset). Header lives at `Engine/Source/Runtime/Engine/Classes/Engine/
+// TextureLightProfile.h`, declared `ENGINE_API`; no separate Build.cs dependency.
+#include "Engine/TextureLightProfile.h"
 #include "UObject/UObjectGlobals.h" // FCoreUObjectDelegates::PostLoadMapWithWorld
 #include "Engine/PostProcessVolume.h"
 #include "Engine/ExponentialHeightFog.h"
@@ -220,20 +226,23 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 			BeamMasterRegenAttempts,
 			*LastBeamMasterRegenResult,
 			LastBeamMasterRegenDetectedAfter,
-			TEXT(" -- Operator triage: if pluginVersion != v1.0.120 the C++ binary "
+			TEXT(" -- Operator triage: if pluginVersion != v1.0.121 the C++ binary "
 				 "is stale (`git pull` without rebuild); if beamMasterVerdict != "
-				 "v1.0.120+ the on-disk M_RebusBeam.uasset is stale -- in a real "
-				 "editor session the v1.0.112+ auto-purge SHOULD fire one log line "
-				 "above to regen it (run `Rebus.DumpBeamMasterVersion` to confirm), "
-				 "BUT in -game / -server / commandlet mode the v1.0.120 stop-the-"
+				 "v1.0.121+ the on-disk M_RebusBeam.uasset is stale -- in a real "
+				 "editor OR commandlet session the v1.0.112+ auto-purge SHOULD fire "
+				 "one log line above to regen it (run `Rebus.DumpBeamMasterVersion` "
+				 "to confirm), BUT in -game / -server mode the v1.0.121 stop-the-"
 				 "bleeding gate aborts the regen (would otherwise crash, see v1.0.119 "
-				 "regression) -- expect a `[Rebus] v1.0.120 SKIPPING beam-master "
+				 "regression) -- expect a `[Rebus] v1.0.121 SKIPPING beam-master "
 				 "stale-probe auto-purge` warning instead, in which case the stale "
 				 "master is used as-is (cone still renders, just without the v1.0.111 "
-				 "depth-mask shadowing). To refresh: launch the editor manually (no "
-				 "-game flag), run `Rebus.ForceBeamMasterRegen` in the editor "
-				 "console, Save All, and commit the regenerated .uasset (see v1.0.120 "
-				 "README release block for the operator offline-bake workflow). If "
+				 "depth-mask shadowing). To refresh: drive the v1.0.121 commandlet "
+				 "bake from a shell: `UnrealEditor-Cmd.exe REBUS_Visualiser.uproject "
+				 "-run=PythonScript -Script=\"import build_rebus_base_level as b; "
+				 "b.ensure_beam_material(force=True); b.ensure_ies_profiles(force=True)\" "
+				 "-unattended -nop4 -nosplash -stdout -FullStdOutLogOutput`, then "
+				 "commit the regenerated Content/REBUS/Materials/M_RebusBeam.uasset + "
+				 "Content/REBUS/IES/*.uasset (see v1.0.121 README release block). If "
 				 "beamMasterLoadCount > 2 the v1.0.119 cache audit missed a per-tick "
 				 "`LoadObject` site -- grep the codebase for `LoadObject` against "
 				 "`M_RebusBeam` and route it through `GetCachedBeamMaster()`. Pair "
@@ -1139,11 +1148,36 @@ void URebusVisualiserSubsystem::HandleSceneDefinition(const FString& Type, const
 		}
 
 		const int32 NumProfiles = Finalized.Profiles.Num();
+
+		// v1.0.121 -- inline IES capture path. For every finalized profile, try to
+		// persist the raw .ies bytes to `<ProjectSaved>/REBUS/IES_Inbox/<sanitized
+		// profileId>.ies` so the next offline commandlet bake (which CAN call the
+		// editor-only IESConverter via the engine's import factory) converts them
+		// into `/Game/REBUS/IES/<sanitized profileId>.uasset` for the next -game
+		// run. The helper is internally gated by `GIsEditor && !IsRunningGame()`
+		// so this loop is a silent no-op under the standard PRISM Pixel Streaming
+		// `-game` orchestrator launch -- the runtime inline-cache path
+		// (`InlineIesCache` / `RebusIes::BuildLightProfile`) is still populated
+		// above and drives whatever fallback the fixture actor's `SelectIesForZoom`
+		// can muster (synthesized cone in -game where IESConverter is absent;
+		// real conversion in editor / commandlet for the test path). One log
+		// line per captured profile, written inside the helper.
+		int32 CapturedToInbox = 0;
+		for (const FRebusInlineIesProfile& Captured : Finalized.Profiles)
+		{
+			if (URebusVisualiserSubsystem::TryWriteInlineIesToInbox(
+					Captured.ProfileId, Captured.Bytes))
+			{
+				++CapturedToInbox;
+			}
+		}
+
 		InlineIesCache.Add(LibraryId, MoveTemp(Finalized));
 
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("RegisterFixtureIes '%s' complete: %d inline IES profile(s), %d total bytes."),
-			*LibraryId, NumProfiles, TotalBytes);
+			TEXT("RegisterFixtureIes '%s' complete: %d inline IES profile(s), %d total bytes, "
+				 "%d captured to v1.0.121 Saved/REBUS/IES_Inbox/ (0 in -game mode by design)."),
+			*LibraryId, NumProfiles, TotalBytes, CapturedToInbox);
 
 		// Re-apply to already-spawned fixtures so the affected libraryId gets its true IES now
 		// (consistent with the meshes path; SpawnAllFixtures re-broadcasts the handshake).
@@ -2724,6 +2758,18 @@ namespace
 	// V117Plus verdict would otherwise stay STALE relative to the new V119 floor, and
 	// the regen will now actually succeed because the Python import works).
 	//
+	//
+	// v1.0.121 -- bumped 120 -> 121 as part of the commandlet-driven offline-bake
+	// release. v1.0.120 left the master STALE on disk because the only valid bake
+	// host was an interactive editor session and the user (rightly) refused to
+	// bake by hand; v1.0.121 relaxes the C++ + Python editor-runtime gate to also
+	// allow commandlets (`-run=PythonScript ...`), so the bake can be driven
+	// unattended from a shell. The revision bump invalidates every pre-v1.0.121
+	// cooked master so the first commandlet bake against an existing checkout
+	// produces a fresh .uasset at the new sentinel. Master GRAPH unchanged in
+	// v1.0.121; only the sentinel + the gate semantics. See README v1.0.121
+	// release block for the commandlet invocation + the IES pre-bake companion.
+	//
 	// v1.0.120 -- bumped 119 -> 120 as part of the stop-the-bleeding release. v1.0.119
 	// shipped an auto-regen path that CRASHED the editor binary when the project was
 	// launched with `-game` (the standard PRISM Pixel Streaming orchestrator command
@@ -2748,7 +2794,7 @@ namespace
 	// master graph itself is UNCHANGED in v1.0.120 (no shader / parameter changes);
 	// the bump exists purely to invalidate cached masters from the broken v1.0.119
 	// window so the next editor-session bake re-stamps them at the new revision.
-	constexpr int32 RebusExpectedBeamMaterialRevision = 120;
+	constexpr int32 RebusExpectedBeamMaterialRevision = 121;
 	const TCHAR* GBeamMaterialRevisionScalar = TEXT("BeamMaterialRevision");
 
 	// v1.0.119 -- file-scope cache for the on-disk `M_RebusBeam` master pointer
@@ -2774,14 +2820,14 @@ namespace
 	const TCHAR* GBeamMasterCachedDisplayName = TEXT("<null>");
 
 	// v1.0.120 -- STOP-THE-BLEEDING editor-runtime gate. Returns true ONLY when the
-	// running UE process is a real editor session capable of invoking editor-only
-	// Python (EditorScriptingUtilities / EditorAssetLibrary / MaterialEditingLibrary
-	// / AssetToolsHelpers). v1.0.119's auto-regen called these APIs unconditionally
-	// from `URebusVisualiserSubsystem::ProbeAndAutoPurgeStaleBeamMaster` ->
-	// `RebuildAndVerifyBeamMaster` -> `GEngine->Exec("py import build_rebus_base_
-	// level; build_rebus_base_level.ensure_beam_material(force=True)")`, which in
-	// `-game` mode (the standard PRISM Pixel Streaming orchestrator launches the
-	// editor binary with `-game -PixelStreamingURL=...`) dereferenced uninitialised
+	// running UE process is an editor-or-commandlet session capable of invoking
+	// editor-only Python (EditorScriptingUtilities / EditorAssetLibrary /
+	// MaterialEditingLibrary / AssetToolsHelpers). v1.0.119's auto-regen called these
+	// APIs unconditionally from `URebusVisualiserSubsystem::ProbeAndAutoPurgeStale
+	// BeamMaster` -> `RebuildAndVerifyBeamMaster` -> `GEngine->Exec("py import
+	// build_rebus_base_level; build_rebus_base_level.ensure_beam_material(force=True)")`,
+	// which in `-game` mode (the standard PRISM Pixel Streaming orchestrator launches
+	// the editor binary with `-game -PixelStreamingURL=...`) dereferenced uninitialised
 	// editor subsystem state and CRASHED with EXCEPTION_ACCESS_VIOLATION on the
 	// `EditorScriptingUtilities.dll` frame.
 	//
@@ -2789,19 +2835,30 @@ namespace
 	// editor and editor subsystems are initialised" (`Engine/Source/Runtime/Core/Public/
 	// CoreGlobals.h`); `IsRunningGame()` returns true for `-game` mode launches even
 	// of the editor binary (`Engine/Source/Runtime/Core/Public/Misc/CoreMiscDefines.h`
-	// inline helper, reads `FApp::IsGame()`); `IsRunningCommandlet()` returns true
-	// for `-run=...` commandlet launches (same header). Editor-only Python ONLY
-	// safely runs when all three are: GIsEditor=true, IsRunningGame=false,
-	// IsRunningCommandlet=false.
+	// inline helper, reads `FApp::IsGame()`). Editor-only Python safely runs whenever
+	// GIsEditor=true AND IsRunningGame=false -- which covers BOTH the interactive
+	// editor AND headless commandlets (`-run=PythonScript ...`). Commandlets are
+	// editor processes too (`GIsEditor=true` and the editor subsystems ARE
+	// initialised), and they are the canonical way to drive an unattended bake from
+	// CI / a shell -- exactly the v1.0.121 workflow.
+	//
+	// v1.0.121 -- the gate originally also blocked commandlets (`!IsRunningCommandlet()`)
+	// because the v1.0.120 stop-the-bleeding pass only proved the editor-interactive
+	// case worked. The v1.0.121 commandlet-driven offline bake REQUIRES commandlets
+	// to be allowed (that is how we drive `ensure_beam_material(force=True)` +
+	// `ensure_ies_profiles(force=True)` from a shell). Verified via test runs of
+	// `UnrealEditor-Cmd.exe ... -run=PythonScript -Script=...` against the v1.0.121
+	// builder. The `-game` block stays in place -- that is the path that crashed.
 	//
 	// Mirrors the Python-side guard in `build_rebus_base_level.py::_is_editor_runtime()`
-	// (which checks `unreal.SystemLibrary.is_editor()`) -- belt-and-braces so even
-	// if a future code path accidentally calls into Python in `-game` mode the
-	// Python returns cleanly without crashing on editor-only API access.
+	// (which checks `unreal.SystemLibrary.is_editor()`, true in both editor sessions
+	// and commandlets) -- belt-and-braces so even if a future code path accidentally
+	// calls into Python in `-game` mode the Python returns cleanly without crashing
+	// on editor-only API access.
 	bool CanRegenBeamMasterInProcess()
 	{
 #if WITH_EDITOR
-		return GIsEditor && !IsRunningGame() && !IsRunningCommandlet();
+		return GIsEditor && !IsRunningGame();
 #else
 		return false;
 #endif
@@ -2877,6 +2934,227 @@ void URebusVisualiserSubsystem::InvalidateBeamMasterCache()
 	GBeamMasterCachedDisplayName = TEXT("<null>");
 }
 
+namespace
+{
+	// v1.0.121 -- pre-baked IES profile cache. Same architecture as the v1.0.119
+	// beam-master cache (file-scope TMap, TWeakObjectPtr so a forced GC self-
+	// invalidates, single LoadObject per name per session). The portal pushes
+	// IES profile ids per fixture library at runtime; the bake commandlet
+	// produces `/Game/REBUS/IES/<SanitizeIesProfileName(id)>` for every known id;
+	// the runtime cache resolves the package path via LoadObject<UTextureLight
+	// Profile> on first miss and stores the resolved pointer. Cache hits do
+	// NOT bump `GIesProfileLoadCount` (same contract the beam-master cache
+	// uses) so the counter cleanly reports how many LoadObject calls have
+	// actually fired.
+	TMap<FName, TWeakObjectPtr<UTextureLightProfile>> GIesProfileCache;
+	int32 GIesProfileLoadCount = 0;
+}
+
+FString URebusVisualiserSubsystem::SanitizeIesProfileName(const FString& ProfileId)
+{
+	// v1.0.121 -- mirrors `build_rebus_base_level._sanitize_ies_profile_name`
+	// EXACTLY so the bake-time asset path and the runtime LoadObject path
+	// agree byte-for-byte on the asset name. Algorithm: replace every
+	// character NOT in [A-Za-z0-9_-] with underscore, collapse consecutive
+	// underscores, strip leading/trailing underscore/hyphen. Empty ->
+	// "ies_profile" fallback.
+	if (ProfileId.IsEmpty())
+	{
+		return TEXT("ies_profile");
+	}
+
+	FString Out;
+	Out.Reserve(ProfileId.Len());
+	for (TCHAR Ch : ProfileId)
+	{
+		const bool bIsAlpha = (Ch >= TEXT('A') && Ch <= TEXT('Z')) ||
+			(Ch >= TEXT('a') && Ch <= TEXT('z'));
+		const bool bIsDigit = (Ch >= TEXT('0') && Ch <= TEXT('9'));
+		const bool bIsKept = bIsAlpha || bIsDigit || Ch == TEXT('_') || Ch == TEXT('-');
+		Out.AppendChar(bIsKept ? Ch : TEXT('_'));
+	}
+
+	// Collapse consecutive underscores.
+	FString Collapsed;
+	Collapsed.Reserve(Out.Len());
+	TCHAR Prev = 0;
+	for (TCHAR Ch : Out)
+	{
+		if (Ch == TEXT('_') && Prev == TEXT('_'))
+		{
+			continue;
+		}
+		Collapsed.AppendChar(Ch);
+		Prev = Ch;
+	}
+
+	// Strip leading + trailing underscore/hyphen.
+	int32 Start = 0;
+	while (Start < Collapsed.Len() &&
+		(Collapsed[Start] == TEXT('_') || Collapsed[Start] == TEXT('-')))
+	{
+		++Start;
+	}
+	int32 End = Collapsed.Len();
+	while (End > Start &&
+		(Collapsed[End - 1] == TEXT('_') || Collapsed[End - 1] == TEXT('-')))
+	{
+		--End;
+	}
+	const FString Trimmed = Collapsed.Mid(Start, End - Start);
+	return Trimmed.IsEmpty() ? FString(TEXT("ies_profile")) : Trimmed;
+}
+
+UTextureLightProfile* URebusVisualiserSubsystem::GetCachedIesProfile(FName ProfileName)
+{
+	// v1.0.121 -- single chokepoint resolver for `/Game/REBUS/IES/<name>`.
+	// Mirrors `GetCachedBeamMaster`'s shape so the same audit story holds.
+	// Cache hit: zero LoadObject traffic, returns the cached pointer.
+	if (ProfileName.IsNone())
+	{
+		return nullptr;
+	}
+	if (TWeakObjectPtr<UTextureLightProfile>* Found = GIesProfileCache.Find(ProfileName))
+	{
+		if (UTextureLightProfile* Cached = Found->Get())
+		{
+			return Cached;
+		}
+		// Stale weak ptr (asset GC'd); fall through to a fresh load.
+		GIesProfileCache.Remove(ProfileName);
+	}
+
+	// Compose the long package path. We DO NOT re-sanitize here -- the caller is
+	// responsible for passing the already-sanitized name as the FName key (the
+	// IES descriptor handler / the SelectIesForZoom site both pass through
+	// `SanitizeIesProfileName(rawProfileId)` before keying). Doing the sanitize
+	// here too would double-mutate names that contain valid underscores.
+	const FString PackagePath = FString::Printf(
+		TEXT("/Game/REBUS/IES/%s.%s"), *ProfileName.ToString(), *ProfileName.ToString());
+
+	UTextureLightProfile* Loaded = LoadObject<UTextureLightProfile>(nullptr, *PackagePath);
+	GIesProfileLoadCount++;
+	if (Loaded)
+	{
+		GIesProfileCache.Add(ProfileName, Loaded);
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("[Rebus] v1.0.121 IesProfile CACHE LOAD #%d -- '%s' resolved + cached "
+				 "(subsequent SelectIesForZoom / probe / dump calls will hit the cache; "
+				 "if this counter ever exceeds 2 per pre-baked profile per session, the "
+				 "v1.0.121 audit missed a per-tick LoadObject call site)."),
+			GIesProfileLoadCount, *PackagePath);
+	}
+	else
+	{
+		// Not finding a pre-baked asset is EXPECTED in two scenarios: (1) the
+		// portal pushed an IES id we never baked (operator needs to drop the
+		// .ies into Content/REBUS/IES/Source/ + re-bake), (2) the bake never
+		// ran on this checkout (fresh clone). Either way the caller falls
+		// through to the runtime / synthesized-cone fallback path. Log Verbose
+		// so the line is queryable but doesn't spam the default log level.
+		UE_LOG(LogRebusVisualiser, Verbose,
+			TEXT("[Rebus] v1.0.121 IesProfile CACHE LOAD #%d -- MISS for '%s' "
+				 "(no pre-baked asset at that path). Caller falls back to runtime / "
+				 "synthesized cone."),
+			GIesProfileLoadCount, *PackagePath);
+	}
+	return Loaded;
+}
+
+void URebusVisualiserSubsystem::InvalidateIesProfileCache()
+{
+	// v1.0.121 -- called by the Rebus.ForceIesProfileBake console command (and
+	// any future explicit operator path) so the next `GetCachedIesProfile`
+	// call re-loads freshly-baked assets from disk instead of returning the
+	// pre-bake pointer.
+	GIesProfileCache.Reset();
+}
+
+int32 URebusVisualiserSubsystem::GetIesProfileLoadCount()
+{
+	return GIesProfileLoadCount;
+}
+
+bool URebusVisualiserSubsystem::TryWriteInlineIesToInbox(const FString& ProfileId,
+	const TArray<uint8>& Bytes)
+{
+	// v1.0.121 -- inline IES capture path. The portal pushes raw .ies bytes
+	// over the data channel via RegisterFixtureIes; in editor / commandlet
+	// mode (the v1.0.121 gate), this helper persists the bytes to
+	// `<ProjectSaved>/REBUS/IES_Inbox/<sanitized id>.ies` so the next bake
+	// commandlet has source files to convert. Silent no-op in `-game` mode
+	// (writing into Saved/ from the wrong runtime context risks racing the
+	// orchestrator).
+	if (ProfileId.IsEmpty() || Bytes.Num() == 0)
+	{
+		return false;
+	}
+
+#if WITH_EDITOR
+	const bool bCanCaptureInProcess = GIsEditor && !IsRunningGame();
+#else
+	const bool bCanCaptureInProcess = false;
+#endif
+	if (!bCanCaptureInProcess)
+	{
+		return false;
+	}
+
+	const FString SafeName = SanitizeIesProfileName(ProfileId);
+	const FString InboxDir = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("REBUS"), TEXT("IES_Inbox"));
+	const FString InboxFile = FPaths::Combine(InboxDir, SafeName + TEXT(".ies"));
+
+	IPlatformFile& PF = FPlatformFileManager::Get().GetPlatformFile();
+	if (!PF.DirectoryExists(*InboxDir))
+	{
+		if (!PF.CreateDirectoryTree(*InboxDir))
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("[Rebus] v1.0.121 inline IES capture: could not create directory %s "
+					 "-- profile '%s' will not be captured for offline bake."),
+				*InboxDir, *ProfileId);
+			return false;
+		}
+	}
+
+	// Skip the write if the file already exists at byte-identical content so a
+	// repeated portal handshake (same profile pushed across reconnect) doesn't
+	// uselessly thrash disk. Read-and-compare is cheap (IES files are small,
+	// tens of KB at most).
+	TArray<uint8> Existing;
+	if (PF.FileExists(*InboxFile) && FFileHelper::LoadFileToArray(Existing, *InboxFile))
+	{
+		if (Existing.Num() == Bytes.Num() &&
+			FMemory::Memcmp(Existing.GetData(), Bytes.GetData(), Bytes.Num()) == 0)
+		{
+			// Already captured -- nothing to do.
+			return true;
+		}
+	}
+
+	const bool bOk = FFileHelper::SaveArrayToFile(Bytes, *InboxFile);
+	if (bOk)
+	{
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("[Rebus] v1.0.121 inline IES captured: profile '%s' -> %s (%d bytes). "
+				 "Run `Rebus.ForceIesProfileBake` (or the commandlet `UnrealEditor-Cmd.exe "
+				 "REBUS_Visualiser.uproject -run=PythonScript -Script=\"import "
+				 "build_rebus_base_level as b; b.ensure_ies_profiles(force=True)\"`) to "
+				 "convert the inbox into pre-baked /Game/REBUS/IES/*.uasset assets."),
+			*ProfileId, *InboxFile, Bytes.Num());
+	}
+	else
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("[Rebus] v1.0.121 inline IES capture FAILED: profile '%s' -> %s "
+				 "(SaveArrayToFile returned false; check disk space / write permissions). "
+				 "The runtime path will still try `RebusIes::BuildLightProfile` on this "
+				 "fixture, which falls back to the synthesized cone in -game."),
+			*ProfileId, *InboxFile);
+	}
+	return bOk;
+}
+
 int32 URebusVisualiserSubsystem::GetBeamMasterLoadCount()
 {
 	return GBeamMasterLoadCount;
@@ -2895,8 +3173,8 @@ const TCHAR* URebusVisualiserSubsystem::BeamMasterVersionLabel(EBeamMasterVersio
 		case EBeamMasterVersion::PreV96:         return TEXT("pre-v1.0.96 (cone-only, no shadow contract)");
 		case EBeamMasterVersion::V96ThroughV109: return TEXT("v1.0.96..v1.0.109 (HAS OBSOLETE -- screen-space trace cooked in)");
 		case EBeamMasterVersion::V110:           return TEXT("v1.0.110 (clean slate, no shadow path)");
-		case EBeamMasterVersion::V111Plus:       return TEXT("v1.0.111..v1.0.119 (PRE-v1.0.120 -- stale revision; v1.0.119 regen would have crashed in -game mode so the v1.0.120 gate prevents the auto-regen entirely -- see v1.0.120 README for the operator offline-bake workflow)");
-		case EBeamMasterVersion::V117Plus:       return TEXT("v1.0.120+ (current expected revision)");
+		case EBeamMasterVersion::V111Plus:       return TEXT("v1.0.111..v1.0.120 (PRE-v1.0.121 -- stale revision; the v1.0.121 commandlet-driven offline bake produces a current master in one shell command -- see v1.0.121 README release block)");
+		case EBeamMasterVersion::V117Plus:       return TEXT("v1.0.121+ (current expected revision)");
 		default:                                 return TEXT("UNKNOWN");
 	}
 }
@@ -3162,20 +3440,21 @@ void URebusVisualiserSubsystem::ProbeAndAutoPurgeStaleBeamMaster()
 		{
 			bLoggedGameModeProbeSkip = true;
 			UE_LOG(LogRebusVisualiser, Warning,
-				TEXT("[Rebus] v1.0.120 SKIPPING beam-master stale-probe auto-purge: this "
-					 "UE session is in -game / -server / commandlet mode (GIsEditor=%d "
-					 "IsRunningGame=%d IsRunningCommandlet=%d), so editor-only Python "
-					 "(EditorScriptingUtilities / EditorAssetLibrary / MaterialEditing"
-					 "Library / AssetToolsHelpers) cannot run without crashing the "
-					 "process (v1.0.119 hit EXCEPTION_ACCESS_VIOLATION here). The on-"
-					 "disk M_RebusBeam.uasset will be used as-is for this session. To "
-					 "regenerate: launch the editor manually (no -game flag), open "
-					 "REBUS_Visualiser.uproject, run `Rebus.ForceBeamMasterRegen` in "
-					 "the editor console, `Save All`, and commit the regenerated "
-					 "Content/REBUS/Materials/M_RebusBeam.uasset (+ .uexp) to source "
-					 "control. Future -game sessions will then load the pre-baked "
-					 "master without needing this rebuild. This warning is logged ONCE "
-					 "per session (no spam)."),
+				TEXT("[Rebus] v1.0.121 SKIPPING beam-master stale-probe auto-purge: this "
+					 "UE session is in -game / -server mode (GIsEditor=%d IsRunningGame=%d "
+					 "IsRunningCommandlet=%d), so editor-only Python (EditorScriptingUtilities "
+					 "/ EditorAssetLibrary / MaterialEditingLibrary / AssetToolsHelpers) "
+					 "cannot run without crashing the process (v1.0.119 hit "
+					 "EXCEPTION_ACCESS_VIOLATION here). The on-disk M_RebusBeam.uasset "
+					 "will be used as-is for this session. To regenerate: drive the v1.0.121 "
+					 "bake commandlet `UnrealEditor-Cmd.exe REBUS_Visualiser.uproject "
+					 "-run=PythonScript -Script=\"import build_rebus_base_level as b; "
+					 "b.ensure_beam_material(force=True); b.ensure_ies_profiles(force=True)\" "
+					 "-unattended -nop4 -nosplash -stdout -FullStdOutLogOutput` and commit "
+					 "the regenerated Content/REBUS/Materials/M_RebusBeam.uasset (+ .uexp) "
+					 "to source control. Future -game sessions will then load the pre-baked "
+					 "master without needing this rebuild. This warning is logged ONCE per "
+					 "session (no spam)."),
 				GIsEditor ? 1 : 0,
 				IsRunningGame() ? 1 : 0,
 				IsRunningCommandlet() ? 1 : 0);
@@ -3340,19 +3619,21 @@ bool URebusVisualiserSubsystem::RebuildAndVerifyBeamMaster(bool bForceEvenIfCurr
 		LastBeamMasterRegenResult = TEXT("fail-non-editor-runtime");
 		LastBeamMasterRegenDetectedAfter = -1;
 		UE_LOG(LogRebusVisualiser, Warning,
-			TEXT("[Rebus] v1.0.120 ABORTING beam-master auto-regen (RebuildAndVerify"
-				 "BeamMaster): this UE session is in -game / -server / commandlet mode "
-				 "(GIsEditor=%d IsRunningGame=%d IsRunningCommandlet=%d bForceEven"
-				 "IfCurrent=%d) and editor-only Python (EditorScriptingUtilities / "
-				 "EditorAssetLibrary / MaterialEditingLibrary / AssetToolsHelpers) would "
-				 "crash the process if invoked here -- v1.0.119 hit EXCEPTION_ACCESS_"
-				 "VIOLATION on this exact code path. The stale on-disk M_RebusBeam.uasset "
-				 "will be used as-is for this session. To regenerate: launch the editor "
-				 "manually (no -game flag), open REBUS_Visualiser.uproject, run `Rebus."
-				 "ForceBeamMasterRegen` in the editor console, `Save All`, then commit "
-				 "the regenerated Content/REBUS/Materials/M_RebusBeam.uasset (+ .uexp) "
-				 "to source control. Future -game sessions will then load the pre-baked "
-				 "material without needing this rebuild."),
+			TEXT("[Rebus] v1.0.121 ABORTING beam-master auto-regen (RebuildAndVerify"
+				 "BeamMaster): this UE session is in -game / -server mode (GIsEditor=%d "
+				 "IsRunningGame=%d IsRunningCommandlet=%d bForceEvenIfCurrent=%d) and "
+				 "editor-only Python (EditorScriptingUtilities / EditorAssetLibrary / "
+				 "MaterialEditingLibrary / AssetToolsHelpers) would crash the process if "
+				 "invoked here -- v1.0.119 hit EXCEPTION_ACCESS_VIOLATION on this exact "
+				 "code path. The stale on-disk M_RebusBeam.uasset will be used as-is for "
+				 "this session. To regenerate: drive the v1.0.121 bake commandlet "
+				 "`UnrealEditor-Cmd.exe REBUS_Visualiser.uproject -run=PythonScript "
+				 "-Script=\"import build_rebus_base_level as b; b.ensure_beam_material("
+				 "force=True); b.ensure_ies_profiles(force=True)\" -unattended -nop4 "
+				 "-nosplash -stdout -FullStdOutLogOutput` and commit the regenerated "
+				 "Content/REBUS/Materials/M_RebusBeam.uasset (+ .uexp) to source control. "
+				 "Future -game sessions will then load the pre-baked material without "
+				 "needing this rebuild."),
 			GIsEditor ? 1 : 0,
 			IsRunningGame() ? 1 : 0,
 			IsRunningCommandlet() ? 1 : 0,

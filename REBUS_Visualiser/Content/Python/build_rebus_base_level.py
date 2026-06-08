@@ -18,23 +18,28 @@ truly empty level -- this script just bakes them in as the default.
 
 Run it from the editor:
     Tools > Execute Python Script... > build_rebus_base_level.py
-or headless (the pattern PRISM already uses for the importer):
-    UnrealEditor REBUS_Visualiser.uproject -run=pythonscript -script="build_rebus_base_level.py"
+or headless (the v1.0.121 commandlet pattern -- this is the canonical bake driver):
+    UnrealEditor-Cmd.exe REBUS_Visualiser.uproject -run=PythonScript ^
+        -Script="import build_rebus_base_level as b; b.ensure_beam_material(force=True); b.ensure_ies_profiles(force=True)" ^
+        -unattended -nop4 -nosplash -stdout -FullStdOutLogOutput
 
 After it runs, point GameDefaultMap / EditorStartupMap at /Game/REBUS/Maps/BaseLevel
 (already wired in Config/DefaultEngine.ini).
 """
 
+import os
+import re
+
 import unreal
 
 
 # v1.0.120 STOP-THE-BLEEDING editor-runtime guard. Every public entry point in
-# this module (ensure_beam_material, ensure_ground_materials, ensure_lens_material,
-# ensure_fixture_lens_material, ensure_orbit_imported_material, build,
-# ensure_base_level) calls editor-only Unreal Python APIs that live in the
+# this module (ensure_beam_material, ensure_ies_profiles, ensure_ground_materials,
+# ensure_lens_material, ensure_fixture_lens_material, ensure_orbit_imported_material,
+# build, ensure_base_level) calls editor-only Unreal Python APIs that live in the
 # `EditorScriptingUtilities` module (unreal.EditorAssetLibrary.*,
 # unreal.MaterialEditingLibrary.*, unreal.AssetToolsHelpers.get_asset_tools()).
-# These APIs ONLY function inside a real editor session. When the editor binary
+# These APIs ONLY function inside an editor-class process. When the editor binary
 # is launched in -game mode (the standard PRISM Pixel Streaming orchestrator
 # command line: `UnrealEditor-Cmd.exe ... -game -PixelStreamingURL=...`), the
 # editor subsystems are NOT initialised; calling EditorAssetLibrary in this
@@ -46,27 +51,53 @@ import unreal
 #     UnrealEditor-CoreUObject.dll
 #     UnrealEditor-PythonScriptPlugin.dll
 #     python311.dll
-# `unreal.SystemLibrary.is_editor()` is a UFUNCTION that delegates to the C++
-# `GIsEditor` global -- the engine-authoritative flag for "this process is
-# the editor and editor subsystems are initialised". When -game is on the
-# command line, GIsEditor flips to false and this returns false too, so the
-# guard correctly bails before any EditorAssetLibrary call.
+# v1.0.121 CORRECTION (post-bake-attempt-1 empirical probe).
 #
-# Pairs with the C++-side gate in `URebusVisualiserSubsystem::CanRegen
-# BeamMasterInProcess()` (`RebusVisualiserSubsystem.cpp`, anonymous namespace
-# file scope) -- belt-and-braces so even if a future call path accidentally
-# fires `py ensure_beam_material(...)` from -game mode the Python returns
-# cleanly with a `log_warning` instead of crashing.
+# The v1.0.120 guard called `unreal.SystemLibrary.is_editor()`. That symbol
+# DOES NOT EXIST on `SystemLibrary` in UE 5.7's `unreal` Python bindings
+# (verified: `dir(unreal.SystemLibrary)` does not contain `is_editor`, only
+# `is_dedicated_server`, `is_server`, `is_standalone`, `is_split_screen`,
+# `is_unattended`, etc. -- all of which require a `world_context_object`
+# parameter Python doesn't have in a commandlet context). The v1.0.120 call
+# raised `AttributeError("type object 'SystemLibrary' has no attribute
+# 'is_editor'")`, was swallowed by the `except Exception` clause, and returned
+# False every time -- meaning the v1.0.120 "stop-the-bleeding" guard has been
+# unconditionally aborting EVERY entry point (editor-interactive, commandlet,
+# -game, all of it) since v1.0.120 shipped. That's why both v1.0.120 and the
+# v1.0.121 first-attempt commandlet bake immediately reported the abort.
+#
+# The CORRECT API in UE 5.7 is the module-level `unreal.is_editor()`. That
+# returns True for editor-interactive sessions AND for commandlets (both have
+# `GIsEditor=true`), and False for `-game` / dedicated-server / Standalone
+# runtime. Empirically verified in this engine build:
+#   * Commandlet (`-run=PythonScript ...`) -> `unreal.is_editor() == True`
+#   * Editor-interactive -> True (by construction)
+#   * `-game` -> False
+#
+# This mirrors the C++-side gate `URebusVisualiserSubsystem::
+# CanRegenBeamMasterInProcess()` (`RebusVisualiserSubsystem.cpp`, anonymous
+# namespace: `GIsEditor && !IsRunningGame()` -- v1.0.121 dropped the
+# `!IsRunningCommandlet()` clause specifically so this commandlet bake path
+# could land). With the right API, both editor and commandlet pass; `-game` is
+# blocked. Belt-and-braces with the C++ gate keeps the v1.0.119 stack-frame-
+# perfect crash impossible regardless of entry point.
 def _is_editor_runtime():
     try:
-        # unreal.SystemLibrary.is_editor() reads C++ GIsEditor. Returns False
-        # under -game / -server / commandlet modes even when launched against
-        # the editor binary; True only in a real editor session.
-        return bool(unreal.SystemLibrary.is_editor())
+        is_editor_fn = getattr(unreal, "is_editor", None)
+        if is_editor_fn is None:
+            # Future engine where the module-level helper moves -- best-effort
+            # fallback via the editor subsystem (returns None in -game / -server
+            # where editor subsystems are not registered).
+            try:
+                subsys = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem)
+                return subsys is not None
+            except Exception:  # noqa: BLE001
+                return False
+        return bool(is_editor_fn())
     except Exception:  # noqa: BLE001
-        # Best-effort -- if the SystemLibrary symbol moves in a future engine
-        # version, treat as "not editor" so we never crash. The caller logs a
-        # warning + returns the same way as the explicit-False path.
+        # Best-effort -- if the unreal binding moves in a future engine version,
+        # treat as "not editor" so we never crash. The caller logs a warning +
+        # returns the same way as the explicit-False path.
         return False
 
 
@@ -132,6 +163,55 @@ BEAM_PATH = MATERIALS_DIR + "/M_RebusBeam"
 # is the always-on path that covers the v1.0.99-introduced thin-geometry shadow-flip
 # regression without requiring any operator action. See the v1.0.104 README block.
 ORBIT_IMPORTED_PATH = MATERIALS_DIR + "/M_RebusOrbitImported"
+
+# v1.0.121 -- pre-baked IES profile asset family. `IESConverter.h` (the engine's runtime
+# IES->UTextureLightProfile builder) is editor-only, so the v1.0.120 runtime path through
+# `RebusIes::BuildLightProfile` would log
+#     IESConverter.h not available in this engine build; cannot load IES at runtime.
+#     Falling back to the synthesized cone.
+# under any -game launch -- which is the standard PRISM Pixel Streaming orchestrator
+# command line. v1.0.121 mirrors the M_RebusBeam pre-bake pattern for IES: the
+# editor / commandlet bake converts every .ies file on disk into a UTextureLightProfile
+# .uasset; the runtime just LoadObject<UTextureLightProfile> the pre-baked asset by name.
+# Layout:
+#   * IES_SOURCE_DIR        -- on-disk folder of source `.ies` files the bake walks. Add
+#                              new profiles here (committed to git) to make them available.
+#   * IES_INBOX_DIR_SAVED   -- absolute-disk capture folder under <ProjectSaved>/REBUS/
+#                              IES_Inbox/. The runtime IES descriptor handler
+#                              (`URebusVisualiserSubsystem::RegisterFixtureIes`) writes
+#                              inline-pushed IES bytes here when running in editor /
+#                              commandlet mode (gated by the same `GIsEditor &&
+#                              !IsRunningGame()` check), so the NEXT commandlet bake
+#                              picks them up automatically. Operator workflow:
+#                                1. Run the visualiser in editor / commandlet mode
+#                                   with the portal connected -- captures the inline
+#                                   IES bytes the portal pushes per fixture library.
+#                                2. Re-run the v1.0.121 bake commandlet -- bakes the
+#                                   captured .ies files into /Game/REBUS/IES/.
+#                                3. Commit the produced .uasset files.
+#                              The capture path is NOT enabled in -game mode (would
+#                              write into the wrong runtime context); the inline IES
+#                              cache still drives the v1.0.91 runtime BuildLightProfile
+#                              path in -game even when no pre-baked asset exists (same
+#                              behaviour as v1.0.120, just with the additional pre-baked
+#                              priority).
+#   * IES_PACKAGE_DIR       -- /Game/-rooted package path under which the baked
+#                              UTextureLightProfile assets live. The C++ runtime cache
+#                              `URebusVisualiserSubsystem::GetCachedIesProfile(FName)`
+#                              composes `IES_PACKAGE_DIR + "/" + SanitizeIesProfileName(id)`
+#                              and LoadObject<UTextureLightProfile>'s the result.
+#   * REBUS_IES_PROFILE_REVISION -- bake-cadence sentinel written as the metadata tag
+#                              `IesProfileRevision` on every baked asset (visible in
+#                              the editor's asset metadata + the on-disk
+#                              .uasset). Bump in lockstep with REBUS_BEAM_MATERIAL_REVISION
+#                              so a v1.0.121 deployment can audit "every baked IES profile
+#                              is at the current revision" with one expression. Lives at
+#                              the same numerical value as the beam revision so the
+#                              operator only has to remember one number.
+IES_PACKAGE_DIR = "/Game/REBUS/IES"
+IES_SOURCE_DIR = "REBUS_Visualiser/Content/REBUS/IES/Source"
+IES_INBOX_DIR_SAVED = "REBUS/IES_Inbox"  # joined under <ProjectSaved> at bake time
+REBUS_IES_PROFILE_REVISION = 121
 
 # Portal-controllable ground surface presets: name -> (ColorA, ColorB, Roughness).
 # These drive the procedural M_RebusGround master (no imported image textures needed);
@@ -1079,7 +1159,7 @@ def _build_beam_master(mat):
     mel.recompile_material(mat)
 
 
-REBUS_BEAM_MATERIAL_REVISION = 120
+REBUS_BEAM_MATERIAL_REVISION = 121
 """v1.0.117 -- sentinel revision baked into the on-disk M_RebusBeam master via the
 `BeamMaterialRevision` scalar parameter. Bumped by every release that touches the
 master so the v1.0.112 auto-purge probe in
@@ -1122,6 +1202,19 @@ v1.0.120 release block). The master graph itself is UNCHANGED in v1.0.120
 (no shader / parameter changes); the bump exists purely to invalidate cached
 masters from the broken v1.0.119 window so the next editor-session bake re-
 stamps them at the new revision.
+
+v1.0.121 -- bumped 120 -> 121 alongside the commandlet-driven offline bake.
+v1.0.120 left the master STALE on disk because the only valid bake host was
+an interactive editor session and the user (correctly) refused to bake by
+hand. v1.0.121 relaxes the C++ + Python gates to also allow COMMANDLETS
+(`-run=PythonScript ...`), so the bake can be driven end-to-end from CI / a
+shell via `UnrealEditor-Cmd.exe REBUS_Visualiser.uproject -run=PythonScript
+-Script="import build_rebus_base_level as b; b.ensure_beam_material(force
+=True); b.ensure_ies_profiles(force=True)" -unattended -nop4 -nosplash`. The
+revision bump invalidates every pre-v1.0.121 cooked master so the first
+commandlet bake against an existing checkout produces a fresh .uasset at
+the new sentinel. The master GRAPH itself is unchanged in v1.0.121; only
+the sentinel + the gate.
 """
 
 
@@ -1214,18 +1307,19 @@ def ensure_beam_material(force=False):
     if not _is_editor_runtime():
         unreal.log_warning(
             "RebusBaseLevel: ensure_beam_material(force={}) ABORTING -- not in an editor "
-            "runtime (unreal.SystemLibrary.is_editor() == False; likely -game / -server "
-            "/ commandlet mode). Editor-only asset APIs (EditorAssetLibrary / "
-            "MaterialEditingLibrary / AssetToolsHelpers) would crash the process with "
-            "EXCEPTION_ACCESS_VIOLATION here -- exactly the v1.0.119 user-reported "
-            "crash. The on-disk /Game/REBUS/Materials/M_RebusBeam.uasset (if present) "
-            "will be used as-is by the runtime. To regenerate: launch the editor "
-            "manually (no -game flag), open REBUS_Visualiser.uproject, run Tools > "
-            "Execute Python Script > build_rebus_base_level.ensure_beam_material(force"
-            "=True) OR `Rebus.ForceBeamMasterRegen` in the editor console, then Save "
-            "All and commit the regenerated .uasset (+ .uexp) to source control. "
-            "Future -game sessions will then load the pre-baked master without needing "
-            "this rebuild.".format(force))
+            "runtime (`unreal.is_editor() == False`; -game / -server / Standalone "
+            "mode). Editor-only asset APIs (EditorAssetLibrary / "
+            "MaterialEditingLibrary / AssetToolsHelpers) would crash the process "
+            "with EXCEPTION_ACCESS_VIOLATION here -- exactly the v1.0.119 user-"
+            "reported crash. The on-disk /Game/REBUS/Materials/M_RebusBeam.uasset "
+            "(if present) will be used as-is by the runtime. To regenerate: drive "
+            "the v1.0.121 commandlet bake "
+            "`UnrealEditor-Cmd.exe REBUS_Visualiser.uproject -run=PythonScript "
+            "-Script=\"import build_rebus_base_level as b; b.ensure_beam_material("
+            "force=True); b.ensure_ies_profiles(force=True)\" -unattended -nop4 "
+            "-nosplash -stdout -FullStdOutLogOutput` from a shell, then commit the "
+            "regenerated .uasset (+ .uexp) to source control. Future -game sessions "
+            "will then load the pre-baked master without needing this rebuild.".format(force))
         return False
 
     tools = unreal.AssetToolsHelpers.get_asset_tools()
@@ -1252,6 +1346,293 @@ def ensure_beam_material(force=False):
 
     unreal.log("RebusBaseLevel: beam material ensured.")
     return True
+
+
+# ---------------------------------------------------------------------------------------
+# v1.0.121 -- IES profile pre-bake. Walks IES_SOURCE_DIR + the runtime capture
+# inbox (Saved/REBUS/IES_Inbox/), converts every .ies file into a
+# UTextureLightProfile .uasset under /Game/REBUS/IES/, and tags each baked asset
+# with the v1.0.121 IesProfileRevision metadata so the runtime cache can verify
+# (and a future bump can invalidate). Mirrors `ensure_beam_material`: idempotent
+# by default (skip when the asset is already on disk AND at the current
+# revision), force=True deletes + re-imports.
+# ---------------------------------------------------------------------------------------
+
+def _sanitize_ies_profile_name(profile_id):
+    """Sanitize an arbitrary profile id (UUID, free-form display name, file
+    basename) into a UE-asset-safe name. Keeps [A-Za-z0-9_-]; everything else
+    becomes underscore. Matches the C++ `SanitizeIesProfileName` helper in
+    `RebusVisualiserSubsystem.cpp` so the bake-time path and the runtime
+    LoadObject<UTextureLightProfile> path agree byte-exact on the asset name.
+
+    Falls back to "ies_profile" when the result would be empty (extremely
+    short / all-punctuation ids).
+    """
+    if not profile_id:
+        return "ies_profile"
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", str(profile_id))
+    # Collapse consecutive underscores so a UUID that turned into "abc__def" reads
+    # cleanly; idempotent against names that are already collapsed.
+    safe = re.sub(r"_+", "_", safe).strip("_-")
+    return safe or "ies_profile"
+
+
+def _ies_package_path(profile_name):
+    """Compose the /Game-rooted package path for a baked IES profile asset."""
+    return "{}/{}".format(IES_PACKAGE_DIR, profile_name)
+
+
+def _saved_inbox_dir():
+    """Resolve the absolute disk path of the inline-IES capture inbox at runtime.
+    Uses `unreal.Paths.project_saved_dir()` so the path is whatever Saved/ the
+    running project resolved (works whether the bake commandlet was launched
+    from the workspace repo, the PRISM deployment dir, or a CI scratch).
+    Returns None on best-effort failure so the caller can skip the inbox walk
+    silently (logged).
+    """
+    try:
+        saved = unreal.Paths.project_saved_dir()
+    except Exception:  # noqa: BLE001
+        return None
+    if not saved:
+        return None
+    return os.path.normpath(os.path.join(saved, IES_INBOX_DIR_SAVED))
+
+
+def _list_ies_source_files(workspace_root_hint=None):
+    """Return a list of absolute paths to every `.ies` file the bake should
+    consider. Walks IES_SOURCE_DIR (committed source) and the Saved inbox
+    (runtime captures). The source folder is relative to the project root --
+    we use `unreal.Paths.project_dir()` at runtime (since the bake commandlet
+    might be running against the workspace OR a deployment dir), with an
+    optional `workspace_root_hint` override for headless callers that know
+    better.
+
+    Returns a list of (absolute_disk_path, profile_id) tuples. `profile_id` is
+    the basename without `.ies` (and gets sanitized downstream into the asset
+    name) -- the source folder convention is to name files by the portal's
+    profile id (e.g. `96d62ffd-faf6-4bf5-a551-c4c774aa066c.ies`) so the runtime
+    cache hits on the same id the portal pushes via RegisterFixtureIes.
+    """
+    out = []
+
+    # Source dir (committed)
+    try:
+        project_dir = workspace_root_hint or unreal.Paths.project_dir()
+    except Exception:  # noqa: BLE001
+        project_dir = workspace_root_hint or ""
+    if project_dir:
+        # IES_SOURCE_DIR is repo-relative (rooted at the workspace root, ABOVE the
+        # project's `REBUS_Visualiser/` folder). Try both layouts: repo-root + the
+        # explicit prefix, and project-root with the trailing slice (Content/REBUS/
+        # IES/Source) so the convention works from either reference frame.
+        candidates = []
+        # Project-relative form (canonical for a commandlet bake against an
+        # in-place .uproject): <ProjectDir>/Content/REBUS/IES/Source
+        candidates.append(os.path.normpath(
+            os.path.join(project_dir, "Content", "REBUS", "IES", "Source")))
+        # Workspace-relative form (repo root): <ProjectDir>/../IES_SOURCE_DIR
+        candidates.append(os.path.normpath(
+            os.path.join(project_dir, "..", IES_SOURCE_DIR)))
+        # Bare absolute hint
+        candidates.append(os.path.normpath(IES_SOURCE_DIR))
+        for src_dir in candidates:
+            if not os.path.isdir(src_dir):
+                continue
+            for fname in sorted(os.listdir(src_dir)):
+                if fname.lower().endswith(".ies"):
+                    abs_path = os.path.join(src_dir, fname)
+                    pid = os.path.splitext(fname)[0]
+                    out.append((abs_path, pid))
+            break  # only the first existing candidate; don't double-bake
+
+    # Saved inbox (runtime captures from the IES descriptor handler).
+    inbox_dir = _saved_inbox_dir()
+    if inbox_dir and os.path.isdir(inbox_dir):
+        for fname in sorted(os.listdir(inbox_dir)):
+            if fname.lower().endswith(".ies"):
+                abs_path = os.path.join(inbox_dir, fname)
+                pid = os.path.splitext(fname)[0]
+                out.append((abs_path, pid))
+
+    return out
+
+
+def _import_one_ies(src_abs_path, profile_id):
+    """Drive the engine's IES factory to import `src_abs_path` into
+    `/Game/REBUS/IES/<sanitized profile_id>` as a UTextureLightProfile asset.
+    Uses `unreal.AssetImportTask` so the import goes through the SAME path the
+    editor's Import button uses (no need to manually build a factory + walk
+    asset registry). Idempotent in conjunction with the caller's existing-asset
+    delete/skip pre-pass; the task is always set to `replace_existing=True` for
+    forced re-imports.
+
+    Returns the created/updated UObject (UTextureLightProfile) on success, None
+    on failure (logged).
+    """
+    safe_name = _sanitize_ies_profile_name(profile_id)
+    package_path = _ies_package_path(safe_name)
+
+    task = unreal.AssetImportTask()
+    task.filename = src_abs_path
+    task.destination_path = IES_PACKAGE_DIR
+    task.destination_name = safe_name
+    task.automated = True
+    task.save = True
+    task.replace_existing = True
+
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+    try:
+        tools.import_asset_tasks([task])
+    except Exception as exc:  # noqa: BLE001
+        unreal.log_warning(
+            "RebusBaseLevel v1.0.121: import_asset_tasks failed for IES '{}' ({}): {}".format(
+                profile_id, src_abs_path, exc))
+        return None
+
+    # The task carries `imported_object_paths` after a successful import; resolve
+    # the asset via EditorAssetLibrary so we can write the revision metadata tag.
+    asset = unreal.EditorAssetLibrary.load_asset(package_path)
+    if not asset:
+        unreal.log_warning(
+            "RebusBaseLevel v1.0.121: IES import for '{}' produced no asset at {} "
+            "(check that the .ies file is well-formed: {}).".format(
+                profile_id, package_path, src_abs_path))
+        return None
+
+    # v1.0.121 revision tag -- writable user metadata on the asset's package, queryable
+    # at runtime via the asset registry. A future bump invalidates everything baked
+    # under this revision automatically (the C++ cache reads + compares).
+    try:
+        unreal.EditorAssetLibrary.set_metadata_tag(
+            asset, "IesProfileRevision", str(REBUS_IES_PROFILE_REVISION))
+        unreal.EditorAssetLibrary.set_metadata_tag(
+            asset, "IesSourcePath", src_abs_path)
+        unreal.EditorAssetLibrary.save_loaded_asset(asset)
+    except Exception as exc:  # noqa: BLE001
+        unreal.log_warning(
+            "RebusBaseLevel v1.0.121: could not write IesProfileRevision metadata "
+            "tag on {} ({}); asset is still usable, just lacks the bake-revision "
+            "sentinel.".format(package_path, exc))
+    return asset
+
+
+def _ies_asset_is_current(profile_name):
+    """True iff /Game/REBUS/IES/<profile_name> exists AND its IesProfileRevision
+    metadata tag matches REBUS_IES_PROFILE_REVISION. Used by the non-force
+    idempotent path so a steady-state bake skips already-current assets.
+    """
+    pkg = _ies_package_path(profile_name)
+    if not unreal.EditorAssetLibrary.does_asset_exist(pkg):
+        return False
+    try:
+        asset = unreal.EditorAssetLibrary.load_asset(pkg)
+        if not asset:
+            return False
+        rev = unreal.EditorAssetLibrary.get_metadata_tag(asset, "IesProfileRevision")
+        if rev is None or rev == "":
+            return False
+        return int(rev) == REBUS_IES_PROFILE_REVISION
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def ensure_ies_profiles(force=False):
+    """Bake every available `.ies` file into a `/Game/REBUS/IES/<sanitized id>`
+    UTextureLightProfile asset. Mirrors `ensure_beam_material`:
+      * Same v1.0.120 editor-runtime guard (`_is_editor_runtime`) -- no-op + warn
+        in -game / -server.
+      * Idempotent by default (force=False) -- skips assets already at the
+        current revision; bakes anything missing or stale.
+      * force=True deletes existing baked assets first and re-imports them all,
+        re-stamping the revision tag.
+
+    Source files come from two folders:
+      1. `REBUS_Visualiser/Content/REBUS/IES/Source/` (committed source files,
+         the canonical place to add new profiles). Add files named `<profile id
+         from portal>.ies` here.
+      2. `<ProjectSaved>/REBUS/IES_Inbox/` (runtime captures written by the C++
+         `RegisterFixtureIes` handler when running in editor / commandlet mode
+         -- so a one-time visualiser session with the portal connected captures
+         every inline-pushed profile, then the bake commandlet picks them up).
+
+    Returns the list of (profile_id, package_path) tuples actually baked
+    (skipped-current entries are NOT in the list). Empty list on full-skip or
+    when no source files are present.
+    """
+    if not _is_editor_runtime():
+        unreal.log_warning(
+            "RebusBaseLevel: ensure_ies_profiles(force={}) ABORTING -- not in an editor "
+            "runtime (`unreal.is_editor() == False`; -game / -server / Standalone mode). "
+            "Editor-only asset APIs (AssetImportTask / EditorAssetLibrary) would crash "
+            "the process with EXCEPTION_ACCESS_VIOLATION here. Already-baked IES assets "
+            "under /Game/REBUS/IES/ (if present) will be used as-is by the runtime; any "
+            "profile id without a pre-baked asset falls back to the synthesized cone. "
+            "To regenerate: drive the v1.0.121 commandlet bake `UnrealEditor-Cmd.exe "
+            "REBUS_Visualiser.uproject -run=PythonScript -Script=\"import "
+            "build_rebus_base_level as b; b.ensure_beam_material(force=True); "
+            "b.ensure_ies_profiles(force=True)\" -unattended -nop4 -nosplash -stdout "
+            "-FullStdOutLogOutput`.".format(force))
+        return []
+
+    sources = _list_ies_source_files()
+    if not sources:
+        unreal.log_warning(
+            "RebusBaseLevel v1.0.121: no source IES files found under "
+            "REBUS_Visualiser/Content/REBUS/IES/Source/ or Saved/REBUS/IES_Inbox/. "
+            "If you expected profiles to be present, either (a) commit source .ies "
+            "files to Content/REBUS/IES/Source/, OR (b) run the visualiser once in "
+            "editor / commandlet mode with the portal connected so the v1.0.121 "
+            "inline-IES capture path writes captured profiles to the Saved inbox, "
+            "then re-run this bake. Nothing to do.")
+        return []
+
+    baked = []
+    # Pre-pass: in force mode wipe existing IES assets so deletes happen before
+    # re-imports (mirrors the M_RebusBeam.uasset force-delete pattern).
+    seen_safe_names = set()
+    if force:
+        for _src, pid in sources:
+            safe = _sanitize_ies_profile_name(pid)
+            if safe in seen_safe_names:
+                continue
+            seen_safe_names.add(safe)
+            pkg = _ies_package_path(safe)
+            if unreal.EditorAssetLibrary.does_asset_exist(pkg):
+                try:
+                    unreal.EditorAssetLibrary.delete_asset(pkg)
+                except Exception as exc:  # noqa: BLE001
+                    unreal.log_warning(
+                        "RebusBaseLevel v1.0.121: could not delete stale IES "
+                        "asset {} ({}); the re-import will try to overwrite "
+                        "in place.".format(pkg, exc))
+
+    seen_safe_names = set()
+    for src_abs_path, pid in sources:
+        safe = _sanitize_ies_profile_name(pid)
+        if safe in seen_safe_names:
+            # The same id appeared in both Source/ AND IES_Inbox/. Prefer the
+            # FIRST entry encountered (Source folder is walked first, so a
+            # committed source wins over a captured inbox copy).
+            continue
+        seen_safe_names.add(safe)
+
+        pkg = _ies_package_path(safe)
+        if not force and _ies_asset_is_current(safe):
+            # Already at the current revision; skip.
+            continue
+
+        asset = _import_one_ies(src_abs_path, pid)
+        if asset is None:
+            continue
+        baked.append((pid, pkg))
+
+    unreal.log(
+        "RebusBaseLevel v1.0.121: IES profiles ensured ({} source files seen, {} "
+        "baked at revision {}). Profiles: {}".format(
+            len(sources), len(baked), REBUS_IES_PROFILE_REVISION,
+            ", ".join(_sanitize_ies_profile_name(pid) for pid, _ in baked) or "(none)"))
+    return baked
 
 
 # ---------------------------------------------------------------------------------------
@@ -1768,6 +2149,9 @@ def build():
     # v1.0.104 two-sided opaque master operators can re-parent Orbit-imported materials
     # to so thin geometry renders both sides (see ORBIT_IMPORTED_PATH doc + README v1.0.104).
     ensure_orbit_imported_material(force=True)
+    # v1.0.121 -- pre-bake every IES profile under /Game/REBUS/IES/ so the -game
+    # runtime doesn't depend on the editor-only IESConverter.h at fixture spawn.
+    ensure_ies_profiles(force=True)
     # v1.0.95 migration -- see the helper docstring + README v1.0.95.
     _cleanup_internal_beam_assets()
 
@@ -1800,6 +2184,8 @@ def ensure_base_level():
     ensure_fixture_lens_material()
     # v1.0.104 Orbit-imported two-sided opaque master self-heal.
     ensure_orbit_imported_material()
+    # v1.0.121 IES profile self-heal (idempotent on missing/stale; no-op on current).
+    ensure_ies_profiles()
     # v1.0.95 migration -- see the helper docstring + README v1.0.95.
     _cleanup_internal_beam_assets()
 

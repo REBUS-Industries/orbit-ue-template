@@ -34,6 +34,7 @@ class UMaterialInstanceDynamic;
 class UPrimitiveComponent;
 class UCanvas;
 class APlayerController;
+class UTextureLightProfile;
 
 UCLASS()
 class REBUSVISUALISER_API URebusVisualiserSubsystem : public UGameInstanceSubsystem
@@ -454,26 +455,25 @@ public:
 		// the three `BeamLight*` vectors). The v1.0.111-era state but with NO
 		// `BeamMaterialRevision` sentinel scalar OR with a sentinel that
 		// reports a value OLDER than `RebusExpectedBeamMaterialRevision`
-		// (currently 120 -- v1.0.120 bumped from 119 as part of the stop-
-		// the-bleeding release that gates the auto-regen behind an editor-
-		// runtime check, see the constexpr doc-comment in
-		// `RebusVisualiserSubsystem.cpp` for the v1.0.119 `-game` mode
-		// crash diagnosis the v1.0.120 gate fixes). Stale wrt v1.0.120+ --
-		// the master is missing either the v1.0.117 `disable_depth_test=true`
-		// flag (so the cone is still writing to the depth pass) AND/OR was
-		// baked through the broken v1.0.117/v1.0.118 Python import path
-		// AND/OR was last baked under v1.0.119 (revision 119) before the
-		// v1.0.120 bump. In `-game` mode the v1.0.120 gate skips auto-regen
-		// (would crash), so the stale master is used as-is until an editor-
-		// session offline bake re-stamps it.
+		// (currently 121 -- v1.0.121 bumped from 120 as part of the
+		// commandlet-driven offline-bake release that relaxed the editor-
+		// runtime gate to allow commandlets, so the offline bake can be
+		// driven from CI / a shell). Stale wrt v1.0.121+ -- the master is
+		// missing either the v1.0.117 `disable_depth_test=true` flag (so
+		// the cone is still writing to the depth pass) AND/OR was baked
+		// through the broken v1.0.117/v1.0.118 Python import path AND/OR
+		// was last baked under v1.0.119 / v1.0.120 (revision 119 / 120)
+		// before the v1.0.121 bump. In `-game` mode the v1.0.121 gate
+		// skips auto-regen (would crash), so the stale master is used
+		// as-is until an editor or commandlet bake re-stamps it.
 		V111Plus,
-		// v1.0.120+ -- has the full v1.0.111 contract AND the
+		// v1.0.121+ -- has the full v1.0.111 contract AND the
 		// `BeamMaterialRevision` scalar reads the current expected revision
 		// (`RebusExpectedBeamMaterialRevision` in
-		// `RebusVisualiserSubsystem.cpp`, currently 120). Current; no
+		// `RebusVisualiserSubsystem.cpp`, currently 121). Current; no
 		// migration needed. (Enum value name preserved as `V117Plus` for
 		// backwards compatibility with any code paths that reference it by
-		// name; the LABEL string is now "v1.0.120+" -- see `BeamMasterVersionLabel`.)
+		// name; the LABEL string is now "v1.0.121+" -- see `BeamMasterVersionLabel`.)
 		V117Plus,
 	};
 
@@ -566,6 +566,34 @@ public:
 	static void InvalidateBeamMasterCache();
 	static int32 GetBeamMasterLoadCount();
 	static const TCHAR* GetCachedBeamMasterDisplayName();
+
+	// v1.0.121 -- pre-baked IES profile cache. Mirrors the v1.0.119 beam-master cache
+	// pattern (TWeakObjectPtr keyed by FName, single-load-per-name guarantee). The
+	// caller passes the portal-supplied profile id; this resolves
+	// `/Game/REBUS/IES/<SanitizeIesProfileName(name)>` via LoadObject<UTextureLight
+	// Profile> on first miss and caches the resolved pointer for the rest of the
+	// session. Returns nullptr when no pre-baked asset is present (caller falls back
+	// to the synthesized cone OR -- in editor / commandlet -- the v1.0.91
+	// `RebusIes::BuildLightProfile` runtime path).
+	//
+	// SanitizeIesProfileName: returns a UE-asset-safe form of the profile id
+	// matching `_sanitize_ies_profile_name` in `build_rebus_base_level.py`
+	// (replace non-`[A-Za-z0-9_-]` with underscore, collapse, strip). Exposed so
+	// the IES descriptor handler can use it for the capture-inbox filename too.
+	//
+	// TryWriteInlineIesToInbox: v1.0.121 capture path. When a portal-pushed inline
+	// IES profile is received in editor / commandlet mode (gated by the same
+	// `GIsEditor && !IsRunningGame()` check the bake regen uses) and no pre-baked
+	// asset for that id exists yet, persist the raw .ies bytes to
+	// `<ProjectSaved>/REBUS/IES_Inbox/<SanitizeIesProfileName(id)>.ies` so the
+	// next commandlet bake picks them up. Silent no-op in `-game` (the runtime
+	// context is wrong to be writing into Saved/). Returns true on a successful
+	// write (or when the inbox file already exists at byte-identical content).
+	static UTextureLightProfile* GetCachedIesProfile(FName ProfileName);
+	static void InvalidateIesProfileCache();
+	static int32 GetIesProfileLoadCount();
+	static FString SanitizeIesProfileName(const FString& ProfileId);
+	static bool TryWriteInlineIesToInbox(const FString& ProfileId, const TArray<uint8>& Bytes);
 
 	// v1.0.119 -- "force regen the M_RebusBeam master + verify the on-disk asset
 	// actually flipped to the expected revision" entry point for the

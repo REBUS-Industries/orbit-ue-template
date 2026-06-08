@@ -19,6 +19,13 @@
 #include "Interfaces/IPluginManager.h"
 #include "Modules/ModuleManager.h"
 #include "Misc/CoreDelegates.h"
+// v1.0.121 -- HandleForceIesProfileBakeCommand flushes async asset compile after
+// the Python regen so the post-regen LoadObject through `GetCachedIesProfile`
+// doesn't race the IES import. `FAssetCompilingManager` ships inside the Engine
+// module (declared `ENGINE_API`); no separate Build.cs dependency.
+#if WITH_EDITOR
+#include "AssetCompilingManager.h"
+#endif
 
 DEFINE_LOG_CATEGORY(LogRebusVisualiser);
 
@@ -69,6 +76,12 @@ namespace
 	// into `URebusVisualiserSubsystem::DumpBeamMaterialHealthForAllFixtures()`
 	// which forwards to each `ARebusFixtureActor::DumpBeamMaterialHealthForDebug`.
 	IConsoleCommand* GDumpBeamMaterialHealthCommand = nullptr;
+	// v1.0.121 -- operator command that drives the Python `ensure_ies_profiles
+	// (force=True)` bake from the editor / commandlet console without having
+	// to assemble the full commandlet invocation. Mirrors `Rebus.ForceBeamMaster
+	// Regen` semantics (force-regen + cache invalidate). Same editor-runtime
+	// gate as the beam-master regen -- silent no-op in -game.
+	IConsoleCommand* GForceIesProfileBakeCommand = nullptr;
 	// v1.0.107 -- top-centre version watermark overlay (UDebugDrawService("Foreground")
 	// canvas draw). Two commands: the visibility toggle (with a `status` arg that
 	// prints the live state + cached version string + Y-margin) and the top-edge
@@ -653,12 +666,12 @@ namespace
 		UE_LOG(LogRebusVisualiser, Log,
 			TEXT("Rebus.ForceBeamMasterRegen: probed %d world(s), %d regen+verify call(s) "
 				 "returned success. NEXT-STEP: run `Rebus.DumpBeamCulling` to confirm "
-				 "BeamMaterialRevision=120 (NOT MISSING) for every fixture, AND "
+				 "BeamMaterialRevision=121 (NOT MISSING) for every fixture, AND "
 				 "`Rebus.DumpBeamMaterialHealth` to confirm every cone's MaterialSlot0 "
 				 "is a `UMaterialInstanceDynamic` parented to `M_RebusBeam`. If verify "
 				 "FAILED (LOUD `Error` log one line above), check the OutputLog for a "
 				 "Python traceback and attach Saved/Logs/REBUS_Visualiser.log to a "
-				 "v1.0.120+ bug report."),
+				 "v1.0.121+ bug report."),
 			Worlds, Succeeded);
 	}
 
@@ -704,10 +717,94 @@ namespace
 				 "`Material` instead of MID, or slot0Asset=`WorldGridMaterial`/`DefaultMaterial`, "
 				 "or midRevision<expected) is a v1.0.117 grey-cone fallback case -- run "
 				 "`Rebus.ForceBeamMasterRegen` to recover."),
-			// v1.0.120 -- bumped 119, 119 -> 120, 120 in lockstep with
+			// v1.0.121 -- bumped 120, 120 -> 121, 121 in lockstep with
 			// `RebusExpectedBeamMaterialRevision` (`RebusVisualiserSubsystem.cpp`)
 			// + `REBUS_BEAM_MATERIAL_REVISION` (`build_rebus_base_level.py`).
-			Worlds, TotalFixtures, 120, 120);
+			Worlds, TotalFixtures, 121, 121);
+	}
+
+	// v1.0.121 -- `Rebus.ForceIesProfileBake` operator command. Mirrors
+	// `Rebus.ForceBeamMasterRegen` shape: it (1) invalidates the v1.0.121 IES
+	// profile cache so subsequent LoadObject calls pick up freshly-baked
+	// `/Game/REBUS/IES/*.uasset` files, (2) drives the Python
+	// `ensure_ies_profiles(force=True)` regen via GEngine->Exec("py ..."), (3)
+	// flushes async compile so the post-regen LoadObject doesn't race the
+	// asset import. Editor / commandlet only (the Python regen is gated on
+	// `_is_editor_runtime`; the C++ gate is the same `GIsEditor && !IsRunningGame`
+	// check the beam-master regen uses).
+	void HandleForceIesProfileBakeCommand(const TArray<FString>& /*Args*/)
+	{
+		if (!GEngine)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.ForceIesProfileBake: GEngine null -- module not fully initialised; no-op."));
+			return;
+		}
+
+#if WITH_EDITOR
+		const bool bCanRegenInProcess = GIsEditor && !IsRunningGame();
+#else
+		const bool bCanRegenInProcess = false;
+#endif
+		if (!bCanRegenInProcess)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.ForceIesProfileBake: ABORTING -- this UE session is in -game / "
+					 "-server mode (GIsEditor=%d IsRunningGame=%d IsRunningCommandlet=%d), "
+					 "so editor-only Python (AssetImportTask / EditorAssetLibrary) would "
+					 "crash the process if invoked here. Drive the bake from a separate "
+					 "commandlet instead: `UnrealEditor-Cmd.exe REBUS_Visualiser.uproject "
+					 "-run=PythonScript -Script=\"import build_rebus_base_level as b; "
+					 "b.ensure_ies_profiles(force=True)\" -unattended -nop4 -nosplash "
+					 "-stdout -FullStdOutLogOutput`."),
+				GIsEditor ? 1 : 0,
+				IsRunningGame() ? 1 : 0,
+				IsRunningCommandlet() ? 1 : 0);
+			return;
+		}
+
+		if (!FModuleManager::Get().IsModuleLoaded(TEXT("PythonScriptPlugin")))
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("Rebus.ForceIesProfileBake: PythonScriptPlugin not loaded; cannot "
+					 "invoke `ensure_ies_profiles(force=True)`. Enable the plugin (it's a "
+					 "hard dependency of REBUS_Visualiser) and restart."));
+			return;
+		}
+
+		URebusVisualiserSubsystem::InvalidateIesProfileCache();
+
+		UWorld* World = nullptr;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* W = Ctx.World();
+			if (!W) continue;
+			if (Ctx.WorldType == EWorldType::Editor) { World = W; break; }
+			if (Ctx.WorldType == EWorldType::Game || Ctx.WorldType == EWorldType::PIE)
+			{
+				if (!World) World = W;
+			}
+		}
+
+		const TCHAR* PyCmd = TEXT("py import build_rebus_base_level; build_rebus_base_level.ensure_ies_profiles(force=True)");
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.ForceIesProfileBake: invoking `%s` -- expect a `RebusBaseLevel "
+				 "v1.0.121: IES profiles ensured` log on the next line(s)."),
+			PyCmd);
+		const bool bExecOk = GEngine->Exec(World, PyCmd, *GLog);
+
+#if WITH_EDITOR
+		FAssetCompilingManager::Get().FinishAllCompilation();
+#endif
+		URebusVisualiserSubsystem::InvalidateIesProfileCache();
+
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.ForceIesProfileBake: complete (py Exec returned %s, IES cache "
+				 "invalidated). NEXT-STEP: trigger a fixture re-spawn (LoadScene from the "
+				 "portal, or `ClearScene` then `LoadScene`) so SelectIesForZoom re-routes "
+				 "through the v1.0.121 pre-baked cache. Commit any new `Content/REBUS/IES/"
+				 "*.uasset` files produced by the bake."),
+			bExecOk ? TEXT("OK") : TEXT("FAILED"));
 	}
 
 	// v1.0.79 helpers: pluck the live cinematic camera pawn from any game/PIE world. There's
@@ -2251,9 +2348,32 @@ void FRebusVisualiserModule::StartupModule()
 			 "created from -- MISSING / older-than-expected means the v1.0.117 grey-cone "
 			 "fallback case), and the subsystem-wide cached-master pointer state. Healthy "
 			 "shape: slot0Class=`MaterialInstanceDynamic`, midParentName=`M_RebusBeam`, "
-			 "midRevision=120. Anything else -- run `Rebus.ForceBeamMasterRegen` to recover. "
+			 "midRevision=121. Anything else -- run `Rebus.ForceBeamMasterRegen` to recover. "
 			 "Walks every Game/PIE/Editor world. Usage: Rebus.DumpBeamMaterialHealth"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleDumpBeamMaterialHealthCommand),
+		ECVF_Default);
+
+	// v1.0.121 -- editor / commandlet operator command to force-bake every
+	// IES profile under `/Game/REBUS/IES/`. Drives the same Python
+	// `ensure_ies_profiles(force=True)` regen the commandlet bake invocation
+	// uses, then flushes async compile + invalidates the v1.0.121 cache so
+	// the next fixture spawn re-routes through the freshly-baked assets.
+	// Same `GIsEditor && !IsRunningGame()` gate the beam-master regen uses.
+	GForceIesProfileBakeCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.ForceIesProfileBake"),
+		TEXT("v1.0.121 -- force-bake every IES profile (source .ies files under "
+			 "Content/REBUS/IES/Source/ + any captured inbox files under Saved/REBUS/"
+			 "IES_Inbox/) into pre-baked /Game/REBUS/IES/<sanitized id>.uasset assets. "
+			 "Mirrors `Rebus.ForceBeamMasterRegen` shape: (1) invalidates the v1.0.121 "
+			 "IES profile cache, (2) runs the Python `ensure_ies_profiles(force=True)` "
+			 "regen, (3) flushes async compile, (4) re-invalidates the cache so the "
+			 "next SelectIesForZoom call loads fresh. Editor / commandlet only (the "
+			 "Python regen path is gated behind WITH_EDITOR + the v1.0.121 editor-"
+			 "runtime gate -- silent abort in -game). Use this when the portal pushes "
+			 "an IES profile id the runtime doesn't have a pre-baked asset for: the "
+			 "v1.0.121 capture path persists the inline bytes to Saved/REBUS/IES_Inbox/, "
+			 "then THIS command bakes them. Usage: Rebus.ForceIesProfileBake"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleForceIesProfileBakeCommand),
 		ECVF_Default);
 
 	GDumpBeamMasterVersionCommand = IConsoleManager::Get().RegisterConsoleCommand(
@@ -2424,6 +2544,11 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GForceBeamMasterRegenCommand);
 		GForceBeamMasterRegenCommand = nullptr;
+	}
+	if (GForceIesProfileBakeCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GForceIesProfileBakeCommand);
+		GForceIesProfileBakeCommand = nullptr;
 	}
 	if (GDumpBeamMaterialHealthCommand)
 	{
