@@ -594,6 +594,84 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
 
+> **v1.0.122 — fix `BeamCone` mesh facing OPPOSITE to its associated `SpotLight` (perfectly circular self-cutout where the beam crosses scene geometry). Latent regression: the v1.0.117 `LogRebusVisualiser ... beam align: ... dot(spot,cone)=-1.0..-0.7` telemetry caught the misalignment FOUR releases ago (v1.0.117 → v1.0.121) but no one read the dot product — the v1.0.117 brief only addressed the depth-pass culling half of the symptom. v1.0.122 is the orientation half: re-parent the `BeamCone` directly to the `SpotLight` (matching the v1.0.111 `BeamShadowMaskCapture` pattern) so the cone's world transform == the SpotLight's world transform by construction, with zero per-tick math.**
+>
+> ### Symptom (from the user's screenshot)
+>
+> The rendered beam shaft showed a **perfectly circular clipping/cut** wherever it crossed scene geometry (the pyramid mesh in the foreground of the user-supplied screenshot). The cut shape matched the cone's cross-section — meaning the cone-mesh itself was carving the hole via its own depth values, NOT the scene mesh occluding the beam. Concurrent runtime evidence (every `LogRebusVisualiser: Fixture <id> beam align: ...` line while panning):
+>
+> ```
+> spotFwd=( X,  Y, -0.017)
+> coneFwd=( X, -Y,  0.017)         // == spotFwd reflected across world X axis
+> beamDir=( X,  Y, -0.017)         // material's BeamDir parameter -- correct
+> dot(spot,cone)=-1.0..-0.7        // BUG -- cone's +X is OPPOSITE the spot's +X
+> dot(spot,beamDir)=1.000          // OK (and tautological -- see "scope note" below)
+> ```
+>
+> `dot(spot,beamDir)=1.000` rules out the material parameter being wrong (the raymarch's `BeamDir` tracks the spot correctly); `dot(spot,cone)=-1.0..-0.7` ruled IN the mesh-component's transform.
+>
+> ### Root cause (option (c) in the v1.0.122 brief)
+>
+> The `BeamCone` (a `UProceduralMeshComponent` generated along its local +X axis, see `UpdateBeamConeGeometry`) was attached to `FixtureRoot` (the actor's root scene component, which does NOT track pan/tilt — only `SpotLight->SetRelativeTransform(BeamRestTransform * Head)` in `RefreshMotion` carries the live head pose). To compensate, the v1.0.34-era `DriveBeamConeFromSpotLight` ran every tick and re-asserted the cone's world rotation via `BeamCone->SetWorldLocationAndRotation(SpotLoc, FRotationMatrix::MakeFromX(SpotFwd).ToQuat())` — supposed to be enough to keep cone +X identical to the live SpotLight +X.
+>
+> A residual basis flip survived the world<->relative round-trip across v1.0.117..v1.0.121 (the `BeamShadowMaskCapture` v1.0.111 added is parented to `SpotLight` and uses the existing hierarchy correctly; the cone's separate-parent + per-tick-realign path diverged in steady state). The result: cone +X was the **mirror of spot +X across the world X axis** (the user-reported `dot(spot,cone)=-1.0..-0.7` shape), the cone's base/far caps were no longer co-located with the lit shaft, and with `BeamCone->bRenderInDepthPass` still default-true on any fixture whose per-fixture cache hadn't latched the v1.0.117 fix (the user's environment, by the dump), the misplaced cap geometry carved the circular cutout the user reported.
+>
+> The dot ranging `-1.0..-0.7` (NOT exactly `-1.0`) ruled out hypothesis (a) "hard-coded 180° flip in the cone setter" — that would have given a constant `-1.0`. It ruled out (c-yoke) "cone attached to the yoke" — yoke pan/tilt would have varied the dot wildly. It ruled out (d) "cone mesh asset baked flipped" — the cone is procedural (`UpdateBeamConeGeometry`'s `CreateMeshSection`), not an on-disk static mesh. Process of elimination + the dot=-1 floor at horizontal pan landed on (c-FixtureRoot) "cone parented to the wrong scene component, per-tick re-alignment fails to track in steady state".
+>
+> ### The fix (single one-liner each, three places)
+>
+> All three live in `Source/RebusVisualiser/Private/RebusFixtureActor.cpp`:
+>
+> 1. **`BuildBeamCone`** — change the cone's attachment from `FixtureRoot` to `SpotLight`:
+>    ```
+>    BeamCone->SetupAttachment(SpotLight);   // was: FixtureRoot
+>    ```
+> 2. **`BuildBeamCone`** — set the cone's relative transform to IDENTITY (the spot already has the right pose):
+>    ```
+>    BeamCone->SetRelativeTransform(FTransform::Identity);   // was: BeamConeRest
+>    ```
+> 3. **`DriveBeamConeFromSpotLight`** — drop the per-tick `SetWorldLocationAndRotation`; the cone now follows the spot via attachment:
+>    ```
+>    // BeamCone->SetWorldLocationAndRotation(SpotLoc, MakeFromX(SpotFwd).ToQuat());   // deleted
+>    RefreshBeamSpatialParams();   // still pushes BeamOrigin/BeamDir to the raymarch MID
+>    ```
+>
+> After the fix: cone.WorldRot == SpotLight.WorldRot trivially (the attachment hierarchy enforces it), so cone.+X == spot.+X on every frame, with no per-tick math, no world<->relative round-trip, no possible drift. `BeamConeRest` is kept as a record of the (now unused) rest pose for back-compat with any debug dump that reads it; new code SHOULD NOT use it.
+>
+> The fix idiomatically matches the v1.0.111 `BeamShadowMaskCapture` (a `USceneCaptureComponent2D` parented to `SpotLight` at identity-relative so it auto-tracks pan/tilt through the existing component hierarchy). After v1.0.122 both the SceneCapture AND the BeamCone hang off the SpotLight at identity, exactly co-located, sharing the same world rotation — the canonical pattern.
+>
+> ### Verification (post-fix)
+>
+> Read by inspection of the change (a `-game` session was intentionally NOT spun up by this commit — the orchestrator owns runtime verification):
+>
+> - `BeamCone->SetupAttachment(SpotLight)` makes `BeamCone`'s parent be `SpotLight`. With `BeamCone->SetRelativeTransform(FTransform::Identity)`, the cone's `ComponentToWorld` equals `SpotLight->ComponentToWorld` for every frame the engine ticks (the engine's `UpdateChildTransforms` propagates parent updates to children automatically). Therefore `BeamCone->GetForwardVector()` (the world +X axis) == `SpotLight->GetForwardVector()` always, so `FVector::DotProduct(BeamCone->GetForwardVector(), SpotLight->GetForwardVector()) == 1.000` always.
+> - The v1.0.117 PRIMARY ROOT-CAUSE FIX (`BeamCone->bRenderInDepthPass = false` in `RefreshBeamConeCullingFlags` + `disable_depth_test = true` in the Python `_build_beam_master`) is fully preserved — the v1.0.121 commandlet bake of `M_RebusBeam.uasset` ran the same Python and the C++ component-flag setter is unchanged in v1.0.122. So even on the (already-impossible) case of a residual cone-orientation mismatch slipping in via some future regression, the cone would not write to depth and the cookie-cutter cap-clip could not surface.
+>
+> What the operator should see on the NEXT runtime session (the orchestrator-owned verification step):
+>
+> 1. `LogRebusVisualiser ... beam align: ... dot(spot,cone)=+1.000` (was `-1.0..-0.7`) on every pan/tilt sweep, for every fixture.
+> 2. The circular cutout in the rendered beam (the user's screenshot pattern) is GONE.
+> 3. `Rebus.DumpBeamCulling` continues to report `BeamCone={... renderDepth=0 ...}` and `BeamMID.BeamMaterialRevision=121` (unchanged — no material re-bake in v1.0.122; the v1.0.121-baked `M_RebusBeam.uasset` is reused).
+>
+> Scope note on the `dot(spot,beamDir)=1.000` telemetry: this is computed as `FVector::DotProduct(D, D)` in `RefreshBeamSpatialParams`, where `D` is the same variable just pushed onto `BeamDir` and onto the spot side of the dot product — so it's mathematically tautological (a unit vector dotted with itself is 1.0). Useful as a `D.IsNormalized()` smoke check, but it does NOT actually probe the material parameter; the material side is verified separately by `Rebus.DumpBeamMaterialHealth`. Left as-is in v1.0.122 to keep the fix surgical; a future telemetry hardening pass should read the live `BeamMID` `BeamDir` scalar via `GetVectorParameterValue` and dot it against the spotlight forward.
+>
+> ### What v1.0.122 does NOT change
+>
+> - **No `M_RebusBeam` re-bake.** The v1.0.121-baked master at `REBUS_BEAM_MATERIAL_REVISION=121` is preserved byte-identical and stays on disk. The C++ `RebusExpectedBeamMaterialRevision` mirror stays at 121. The `BeamMasterVersionLabel(V117Plus)` label stays as `"v1.0.121+ (current expected revision)"`. The on-disk `Content/REBUS/Materials/M_RebusBeam.uasset` is NOT touched.
+> - **No `build_rebus_base_level.py` change.** The Python `disable_depth_test=True` flag, the `_build_beam_master` graph, the `ensure_ies_profiles` workflow, the `_is_editor_runtime` gate — all unchanged. The v1.0.121 commandlet bake recipe still applies verbatim.
+> - **No `bRenderInDepthPass` / `RefreshBeamConeCullingFlags` change.** The v1.0.117 PRIMARY ROOT-CAUSE FIX is fully preserved on every fixture.
+> - **No other version-coupled string churn beyond the binary watermark.** `if pluginVersion != v1.0.121` → `v1.0.122` in the startup-banner triage block + the `v1.0.121+ bug report` → `v1.0.122+ bug report` ask in `Rebus.ForceBeamMasterRegen`'s success log + the `RebusVisualiser.uplugin` `VersionName` 1.0.121 → 1.0.122 (top-centre watermark + startup banner will read `v1.0.122` on the next launch). Material-revision-coupled strings stay at 121 (because the material stays at 121).
+>
+> ### What v1.0.122 DOES change (exhaustive)
+>
+> 1. **`Source/RebusVisualiser/Private/RebusFixtureActor.cpp`** — the three one-liners described above, plus surrounding doc-comments (`BuildBeamCone`'s "v1.0.122 ROOT-CAUSE FIX" block, `DriveBeamConeFromSpotLight`'s "v1.0.122 -- the BeamCone is now PARENTED to the SpotLight" comment, and the two `RefreshMotion` rig/no-rig branch comment refreshes pointing at the v1.0.122 attachment-hierarchy ownership).
+> 2. **`Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp`** — startup-banner triage text `if pluginVersion != v1.0.121` → `v1.0.122`.
+> 3. **`Source/RebusVisualiser/Private/RebusVisualiser.cpp`** — `Rebus.ForceBeamMasterRegen` success log `v1.0.121+ bug report` → `v1.0.122+ bug report`.
+> 4. **`RebusVisualiser.uplugin`** — `VersionName` 1.0.121 → 1.0.122.
+> 5. **README** — this release block, added above the v1.0.121 block.
+>
+> No `OrbitConnector/` touch, no `RebusSceneSettingsSubsystem.{cpp,h}` touch, no `.uproject` touch, no `.uasset` touch, no `build_rebus_base_level.py` touch.
+
 > **v1.0.121 — COMMANDLET-DRIVEN OFFLINE BAKE + IES PRE-BAKE. v1.0.120 stopped the crash by gating editor-only Python behind `GIsEditor && !IsRunningGame() && !IsRunningCommandlet()`, but it left the stale `M_RebusBeam.uasset` on disk because the only valid bake host was an interactive editor session and the user (rightly) refused to bake by hand. v1.0.121 relaxes the gate to drop the `!IsRunningCommandlet()` clause — commandlets are editor-class processes with `GIsEditor=true` and full access to editor-only APIs, so they ARE valid bake hosts — and ships an automation-ready commandlet recipe that drives the regen unattended. v1.0.121 also mirrors the M_RebusBeam pre-bake pattern for IES profiles (`IESConverter.h` is editor-only too; runtime `-game` was warning `IESConverter.h not available in this engine build; cannot load IES at runtime. Falling back to the synthesized cone.` for every fixture), pre-baking every available `.ies` file into `/Game/REBUS/IES/<sanitized id>.uasset` so the runtime just `LoadObject`s it.**
 >
 > ### What changed in v1.0.121

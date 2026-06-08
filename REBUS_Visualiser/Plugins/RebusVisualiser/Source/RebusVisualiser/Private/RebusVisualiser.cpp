@@ -671,7 +671,7 @@ namespace
 				 "is a `UMaterialInstanceDynamic` parented to `M_RebusBeam`. If verify "
 				 "FAILED (LOUD `Error` log one line above), check the OutputLog for a "
 				 "Python traceback and attach Saved/Logs/REBUS_Visualiser.log to a "
-				 "v1.0.121+ bug report."),
+				 "v1.0.122+ bug report."),
 			Worlds, Succeeded);
 	}
 
