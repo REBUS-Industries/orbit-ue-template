@@ -11,6 +11,54 @@ from `/meshes`, places + drives the lights, and talks the data channel — it do
 `OrbitConnector` to be present (in a packaged PRISM build, OrbitConnector still imports the
 full ORBIT geometry; this plugin owns the *fixture* lifecycle and control regardless).
 
+> **v1.0.130 — portal-hosted floor surface bundles + Nanite displacement floor.** The user asked for the four floor surfaces (Concrete / Grass / Sand / Tarmac) to be Megascans-quality assets, tile correctly at 1 m² physical scale, and render with Nanite displacement. The first cut tried Fab direct-pull from `https://fab.com/s/<slug>` URLs but the user explicitly rejected that direction mid-flight ("im concerned that pulling direct from Fab wont work as it will ask for a login. We might need to add the textures to our portal storage/database in which the UE project can pull from") because the Fab editor plug-in (a) requires an interactive `Window > Fab` login to download, and (b) exposes ZERO Python-callable methods — verified at the source level: no `unreal.FabSubsystem`, no `BlueprintCallable` UFUNCTIONs in `Engine/Plugins/Fab/Source/Fab/Public/`, only the `Fab.{ShowSettings,Login,Logout,ClearCache,SetEnvironment,TEDS.MyFolderIntegration}` console commands which can't drive a per-listing automated download workflow. v1.0.130 routes the four surface bundles through the SAME portal HTTP path the rest of the plugin already uses (`PortalUrl` from `[RebusVisualiser]` `DefaultGame.ini` or `-PortalUrl=` launch token; `x-api-key` auth header; `FRebusRestClient` shape) so the portal team uploads the four bundles ONCE and every UE client picks them up via the existing config — no per-developer Fab login. The floor master `M_RebusFloor_Nanite` (Python-authored, Nanite-tessellation-ready) parents the four user-authored child MIs at `/Game/REBUS/Materials/{Concrete,Grass,Sand,Tarmac}` (preserved from v1.0.129; their Parent reassigned to a per-surface MI at `/Game/REBUS/Surfaces/<name>/MI_<name>` which in turn parents to `M_RebusFloor_Nanite` so any operator-side per-MI overrides survive the swap), and the floor mesh is now Nanite-enabled (`/Game/REBUS/Meshes/SM_RebusFloor_Nanite` — a 100 cm × 100 cm Nanite-quad scaled 2000× to a 2 km plane). Two new console commands tune the displacement at runtime: `Rebus.FloorDisplacement <0|1>` (instant flat A/B without re-cooking) and `Rebus.FloorDisplacementStrength <cm>` (default 2.0 cm, matches the Python builder's `FLOOR_DISPLACEMENT_STRENGTH_CM`). Tiling is exactly 1 m² per texture repeat in world space (the master uses `WorldPosition.xy / (TilingMeters * 100 cm)` UVs, with `FLOOR_TILE_SIZE_METERS = 1.0` driving the default; the existing v1.0.86 `Rebus.SetGroundTiling <metres>` console command continues to retune at runtime). All v1.0.122–v1.0.129 invariants intact: BeamCone sibling attachment + per-tick relative mirror + `SetMobility`-before-`Register` ordering, live-MID double-push pattern, four diagnostic commands, `M_RebusBeam` revision 122 (untouched), v1.0.129 BaseLevel self-heal + `Rebus.FloorSurface` console command. Strictly additive: one new C++ class (`URebusSurfaceFetcher`), one new master material (`M_RebusFloor_Nanite` rev 130), one new Nanite mesh (`SM_RebusFloor_Nanite`), one new `/Game/REBUS/Surfaces/` package root, two new console commands, two new `SceneState` slots (`FloorDisplacement`, `FloorDisplacementStrength`), three new Python helpers (`ensure_floor_nanite_material`, `_ensure_floor_nanite_mesh`, `ensure_portal_surfaces`), one new `.gitignore` entry (`Content/Fab/`), one bumped `VersionName`, two new `r.Nanite.{AllowTessellation,Tessellation}=1` CVars in `[SystemSettings]`. The build does NOT fail when the portal isn't yet hosting the bundles: the fetcher degrades gracefully through cached files (status `OfflineCached`) or — if no cache exists either — leaves the v1.0.129 child MIs at their existing parents (status `OfflineNoCache`) and logs a single LOUD warning naming the portal-side action item. Operator action: do nothing until the portal team hosts the bundles at the contract below; once they're live, `Rebus.FloorSurface Concrete` (or run `build_rebus_base_level.ensure_portal_surfaces(force=True)` from `Tools > Execute Python Script`) wires them in.
+
+> ### Portal-side contract (the v1.0.130 backend dev needs to implement this)
+>
+> Two endpoints per surface, both gated on the existing `x-api-key` auth scheme:
+>
+> ```
+> GET <PortalUrl>/assets/surfaces/<name>/manifest.json
+>     -> { "revision": <int>,
+>          "files": [
+>            { "name": "T_<name>_B.png",   "sha256": "<hex>", "size": <bytes> },
+>            { "name": "T_<name>_N.png",   "sha256": "<hex>", "size": <bytes> },
+>            { "name": "T_<name>_ORM.png", "sha256": "<hex>", "size": <bytes> },
+>            { "name": "T_<name>_H.png",   "sha256": "<hex>", "size": <bytes> }
+>          ]
+>        }
+>
+> GET <PortalUrl>/assets/surfaces/<name>/<filename>
+>     -> raw bytes (PNG / EXR / DDS — UE's stock texture factory chain
+>        handles all three through `import_asset_tasks`).
+> ```
+>
+> `<name>` is one of `concrete`, `grass`, `sand`, `tarmac` (lowercase). The `name` suffix on each file (`_B`, `_N`, `_ORM`, `_H`) is what tells the importer which role the texture plays — BaseColor / Normal / ORM / Height. Bumping `revision` invalidates every cached file even when the SHA matches (operator-friendly knob for "force everyone to re-download next time the editor opens"). Cache lives under `%LOCALAPPDATA%\Rebus\SurfaceCache\<name>\` on Windows (`FPlatformProcess::UserSettingsDir() / "Rebus/SurfaceCache" / <name>`) — per-machine, never committed. SHA256 + size mismatch on download discards the bytes (the partial bundle is NEVER promoted to "cache-clean" until every file validates). Diagnostic helper: `py unreal.RebusSurfaceFetcher.dump_cache_status()` from the editor Python REPL prints the cache root + per-surface cached revisions.
+>
+> ### Asset paths (v1.0.130-authored — `_resolve_floor_surface_material` now resolves through the portal-fetched MI parent before the v1.0.129 user-authored child)
+>
+> ```
+> /Game/REBUS/Materials/M_RebusFloor_Nanite          (master — Python-authored, rev 130)
+> /Game/REBUS/Meshes/SM_RebusFloor_Nanite            (Nanite-enabled floor quad — auto-built)
+> /Game/REBUS/Surfaces/<Name>/MI_<Name>              (per-surface MI parent; parent = M_RebusFloor_Nanite)
+> /Game/REBUS/Surfaces/<Name>/Textures/T_<Name>_B    (BaseColor — imported from portal)
+> /Game/REBUS/Surfaces/<Name>/Textures/T_<Name>_N    (Normal     — imported, sRGB off, TC_NORMALMAP)
+> /Game/REBUS/Surfaces/<Name>/Textures/T_<Name>_ORM  (ORM        — imported, sRGB off, TC_MASKS)
+> /Game/REBUS/Surfaces/<Name>/Textures/T_<Name>_H    (Height     — imported, sRGB off, TC_GRAYSCALE)
+> /Game/REBUS/Materials/{Concrete,Grass,Sand,Tarmac} (v1.0.129 user-authored child MIs — parent reassigned)
+> ```
+>
+> ### Graceful degradation when the portal endpoints aren't live yet
+>
+> The fetcher returns one of six status codes (`Ok`, `Refreshed`, `OfflineCached`, `OfflineNoCache`, `FetchFailed`, `NotConfigured`) and the Python orchestrator (`ensure_portal_surfaces`) handles every shape:
+>
+> - **OK / Refreshed** — happy path; the per-surface MI parent is (re)written and the v1.0.129 child MI is re-parented onto it.
+> - **OfflineCached** — portal unreachable, cache hit; the MI parent is rewritten from the cached files. Logs a single Warning naming the cache mtime so the operator knows they're on a stale snapshot.
+> - **OfflineNoCache / NotConfigured** — no MI parent is created. The v1.0.129 child MI keeps its existing parent (whatever v1.0.129 left it at — typically `M_RebusGround` via `MI_RebusGround_<surface>`). Logs a LOUD Error naming the portal-side action item the backend dev needs to take.
+> - **FetchFailed** — manifest parsed OK but a per-file fetch / SHA256 mismatch happened. The partial bundle is NOT promoted; the v1.0.129 child MI keeps its existing parent until the next bake retries. Per-file failure detail in the OutputLog.
+>
+> The build never fails on any of these. The floor still draws something on first run on a brand-new operator workstation — just not the Megascans Nanite-displaced surface until the portal hosts the bundles.
+
 ## Where it lives in the project
 
 `REBUS_Visualiser/Plugins/RebusVisualiser/` and is enabled in `REBUS_Visualiser.uproject`.

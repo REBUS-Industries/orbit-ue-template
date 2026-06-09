@@ -49,6 +49,16 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// `TilingMeters` parameter -- the push is a silent no-op there until the master is
 	// regenerated via build_rebus_base_level.build().
 	Values.Add(TEXT("GroundTilingMeters"), FRebusPropertyValue::MakeNumber(1.0));
+	// v1.0.130 -- Nanite floor displacement default state. ON, 2.0 cm strength
+	// (matches the Python builder's FLOOR_DISPLACEMENT_STRENGTH_CM). The portal /
+	// `Rebus.FloorDisplacement` console command can flip / tune at runtime; the
+	// SceneState round-trip carries the live value back so the portal UI hydrates
+	// correctly on a session reconnect. Pre-v1.0.130 floor masters (legacy
+	// M_RebusGround) silently ignore the parameter push so this seed is a no-op
+	// for operators on a partial-checkout machine until they run the v1.0.130
+	// builder once.
+	Values.Add(TEXT("FloorDisplacement"), FRebusPropertyValue::MakeBool(true));
+	Values.Add(TEXT("FloorDisplacementStrength"), FRebusPropertyValue::MakeNumber(2.0));
 	Values.Add(TEXT("bShowOrigin"), FRebusPropertyValue::MakeBool(false));
 	// Hybrid cone-mesh volumetric beam is the default beam mode (v1.0.31); seed it so SceneState
 	// round-trips the control and a respawn re-asserts it via ReapplyAll.
@@ -418,6 +428,49 @@ void URebusSceneSettingsSubsystem::SetGroundTilingMeters(float Metres)
 		Clamped, Clamped);
 }
 
+void URebusSceneSettingsSubsystem::SetFloorDisplacementEnabled(bool bEnabled)
+{
+	bFloorDisplacementEnabled = bEnabled;
+	UMaterialInstanceDynamic* MID = EnsureFloorMID();
+	if (!MID)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("SetFloorDisplacementEnabled %s: no floor MID (no RebusFloor in level?). "
+			"State stored; will apply on next floor surface push."),
+			bEnabled ? TEXT("ON") : TEXT("OFF"));
+		return;
+	}
+	const float Push = bEnabled ? CachedFloorDisplacementStrength : 0.0f;
+	MID->SetScalarParameterValue(TEXT("DisplacementStrength"), Push);
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Floor Nanite displacement %s (strength=%.3f cm)."),
+		bEnabled ? TEXT("ENABLED") : TEXT("DISABLED"), Push);
+}
+
+void URebusSceneSettingsSubsystem::SetFloorDisplacementStrength(float StrengthCm)
+{
+	const float Clamped = FMath::Max(StrengthCm, 0.0f);
+	CachedFloorDisplacementStrength = Clamped;
+	if (!bFloorDisplacementEnabled)
+	{
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Floor DisplacementStrength stored = %.3f cm (currently disabled; will "
+			"apply on Rebus.FloorDisplacement 1)."), Clamped);
+		return;
+	}
+	UMaterialInstanceDynamic* MID = EnsureFloorMID();
+	if (!MID)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("SetFloorDisplacementStrength %.3f: no floor MID (no RebusFloor in level?). "
+			"Stored value; will apply on next floor surface push."), Clamped);
+		return;
+	}
+	MID->SetScalarParameterValue(TEXT("DisplacementStrength"), Clamped);
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("Floor Nanite DisplacementStrength = %.3f cm."), Clamped);
+}
+
 void URebusSceneSettingsSubsystem::SetOriginGizmo(bool bShow)
 {
 #if ENABLE_DRAW_DEBUG
@@ -675,6 +728,15 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 	else if (Name == TEXT("GroundTilingMeters"))
 	{
 		SetGroundTilingMeters(Value.AsFloat());
+	}
+	// v1.0.130 -- Nanite floor displacement on/off + strength.
+	else if (Name == TEXT("FloorDisplacement"))
+	{
+		SetFloorDisplacementEnabled(Value.bBool);
+	}
+	else if (Name == TEXT("FloorDisplacementStrength"))
+	{
+		SetFloorDisplacementStrength(Value.AsFloat());
 	}
 	// --- Debug: world-origin XYZ gizmo (orientation check) ---
 	else if (Name == TEXT("bShowOrigin"))

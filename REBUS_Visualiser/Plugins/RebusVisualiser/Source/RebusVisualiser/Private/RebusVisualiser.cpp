@@ -57,6 +57,9 @@ namespace
 	// (v1.0.86) for the legacy procedural ground -- both route through
 	// URebusSceneSettingsSubsystem so SceneState round-trips the choice.
 	IConsoleCommand* GFloorSurfaceCommand = nullptr;
+	// v1.0.130 -- Nanite floor displacement on/off + strength.
+	IConsoleCommand* GFloorDisplacementCommand = nullptr;
+	IConsoleCommand* GFloorDisplacementStrengthCommand = nullptr;
 	IConsoleCommand* GDumpFixtureIesCommand = nullptr;
 	IConsoleCommand* GRebuildBeamMaterialCommand = nullptr; // v1.0.103 -- editor-only runtime regen
 	IConsoleCommand* GOrbitCastShadowsCommand = nullptr;
@@ -1889,6 +1892,55 @@ namespace
 			*Surface, Subsystems, *Surface, *Surface);
 	}
 
+	// v1.0.130 -- Rebus.FloorDisplacement <0|1>. Enables / disables Nanite-tessellation
+	// displacement on the floor without re-cooking the master: routes through every
+	// running Game/PIE world's URebusSceneSettingsSubsystem::SetFloorDisplacementEnabled
+	// (which flips the floor MID's `DisplacementStrength` scalar between 0 and the
+	// stored value). Pre-v1.0.130 floor masters (legacy M_RebusGround) silently no-op
+	// on the parameter push -- safe even if the operator hasn't run the v1.0.130
+	// builder yet.
+	void HandleFloorDisplacementCommand(const TArray<FString>& Args)
+	{
+		if (!GEngine) return;
+		const bool bEnable = ParseBoolArg(Args, true);
+		int32 Subsystems = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+			URebusSceneSettingsSubsystem* Sce = World->GetSubsystem<URebusSceneSettingsSubsystem>();
+			if (!Sce) continue;
+			++Subsystems;
+			Sce->ApplySceneProperty(TEXT("FloorDisplacement"), FRebusPropertyValue::MakeBool(bEnable));
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.FloorDisplacement %d: pushed to %d scene-settings subsystem(s)."),
+			bEnable ? 1 : 0, Subsystems);
+	}
+
+	// v1.0.130 -- Rebus.FloorDisplacementStrength <cm>. Tunes the Nanite displacement
+	// magnitude in centimetres (default 2.0). When displacement is currently OFF the
+	// new value is stashed in the subsystem and applied on the next ENABLED toggle;
+	// when ON it pushes immediately to the floor MID.
+	void HandleFloorDisplacementStrengthCommand(const TArray<FString>& Args)
+	{
+		if (!GEngine) return;
+		const float Cm = (Args.Num() > 0) ? FCString::Atof(*Args[0]) : 2.0f;
+		int32 Subsystems = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+			URebusSceneSettingsSubsystem* Sce = World->GetSubsystem<URebusSceneSettingsSubsystem>();
+			if (!Sce) continue;
+			++Subsystems;
+			Sce->ApplySceneProperty(TEXT("FloorDisplacementStrength"), FRebusPropertyValue::MakeNumber(Cm));
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.FloorDisplacementStrength %.3f cm: pushed to %d scene-settings subsystem(s)."),
+			Cm, Subsystems);
+	}
+
 	// v1.0.85: `Rebus.OverrideTrussMaterial [0|1]` -- enable / disable the powdercoat material
 	// override on every Orbit-imported primitive NOT bound to a fixture. ON applies the truss
 	// material (loaded from /Game/REBUS/Materials/M_RebusTruss.M_RebusTruss if present, else a
@@ -2495,6 +2547,31 @@ void FRebusVisualiserModule::StartupModule()
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleFloorSurfaceCommand),
 		ECVF_Default);
 
+	// v1.0.130 -- Rebus.FloorDisplacement <0|1>
+	GFloorDisplacementCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.FloorDisplacement"),
+		TEXT("v1.0.130 -- enable / disable the floor's Nanite-tessellation "
+			 "displacement contribution at runtime (the v1.0.130 floor master "
+			 "M_RebusFloor_Nanite renders silhouette displacement off the surface "
+			 "Height texture; this command flips DisplacementStrength between 0 "
+			 "and the stored value). 0=off (instant flat A/B), 1=on (restores "
+			 "the last operator-set strength, default 2.0 cm). Pre-v1.0.130 "
+			 "floor masters silently ignore this. Usage: Rebus.FloorDisplacement [0|1]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleFloorDisplacementCommand),
+		ECVF_Default);
+
+	// v1.0.130 -- Rebus.FloorDisplacementStrength <cm>
+	GFloorDisplacementStrengthCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.FloorDisplacementStrength"),
+		TEXT("v1.0.130 -- set the floor's Nanite displacement magnitude in "
+			 "centimetres. Default 2.0 cm (matches the Python builder's "
+			 "FLOOR_DISPLACEMENT_STRENGTH_CM). Honoured immediately when "
+			 "displacement is enabled; stashed and applied on the next "
+			 "Rebus.FloorDisplacement 1 when currently disabled. "
+			 "Usage: Rebus.FloorDisplacementStrength <cm>"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleFloorDisplacementStrengthCommand),
+		ECVF_Default);
+
 	// v1.0.85 truss / set-piece powdercoat material override -- ON by default. See the
 	// HandleOverrideTrussMaterialCommand comment header for the full rationale.
 	GOverrideTrussMaterialCommand = IConsoleManager::Get().RegisterConsoleCommand(
@@ -2896,6 +2973,17 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GFloorSurfaceCommand);
 		GFloorSurfaceCommand = nullptr;
+	}
+	// v1.0.130 -- Rebus.FloorDisplacement{,Strength} teardown.
+	if (GFloorDisplacementCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GFloorDisplacementCommand);
+		GFloorDisplacementCommand = nullptr;
+	}
+	if (GFloorDisplacementStrengthCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GFloorDisplacementStrengthCommand);
+		GFloorDisplacementStrengthCommand = nullptr;
 	}
 	if (GDumpFixtureIesCommand)
 	{

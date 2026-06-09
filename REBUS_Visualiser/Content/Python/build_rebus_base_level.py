@@ -258,6 +258,149 @@ FLOOR_SURFACE_PATHS = {
 FLOOR_DEFAULT_SURFACE = "Concrete"
 
 
+# v1.0.130 -- portal-hosted surface texture manifest. Maps the four logical
+# floor surface names to their PORTAL-side relative paths (NOT direct Fab
+# share-URLs -- a v1.0.130 mid-flight course-correction from the user
+# explicitly rejected pulling from Fab directly because the Fab editor
+# plug-in requires an interactive login via the Window > Fab browser, has
+# no Python API surface (verified: zero `unreal.Fab*` symbols, no
+# `BlueprintCallable` UFUNCTIONs in `Engine/Plugins/Fab/Source/Fab/Public/`,
+# only `Fab.{ShowSettings,Login,Logout,ClearCache,SetEnvironment,TEDS.*}`
+# console commands -- none of which can drive a per-listing automated
+# download workflow), AND can not be wired into the unattended commandlet
+# bake path the rest of the v1.0.121 / v1.0.129 build pipeline uses.
+#
+# v1.0.130 instead routes the four Megascans surface bundles (Concrete,
+# Grass, Sand, Tarmac) through the SAME portal HTTP path the rest of the
+# plugin already uses for /api/ue/scene + /api/ue/fixtures + /meshes etc.
+# (see `FRebusRestClient` -- plain C++ class wrapping `FHttpModule`, base
+# URL = `PortalUrl` from `[RebusVisualiser]` `DefaultGame.ini` or the
+# `-PortalUrl=` launch token, auth = `x-api-key: <ApiKey>` from the same
+# config block). The new C++ helper `URebusSurfaceFetcher`
+# (RebusSurfaceFetcher.h/.cpp added in v1.0.130) is the single
+# UFUNCTION(BlueprintCallable) entry point Python uses to fetch the four
+# surfaces; it shares `FRebusRestClient`'s `PortalUrl` + `ApiKey` so the
+# portal team only needs to host the assets at one base URL.
+#
+# Portal-side contract (the portal team is responsible for hosting these
+# endpoints; the v1.0.130 UE-side code degrades gracefully when the portal
+# is unreachable or the assets are not yet uploaded -- see
+# `URebusSurfaceFetcher::EnsureSurfaceCached` doc-comment for the offline
+# semantics):
+#
+#   GET <PortalUrl>/assets/surfaces/<name>/manifest.json
+#       -> { "revision": <int>,
+#            "files": [
+#              { "name": "T_<name>_B.png",   "sha256": "<hex>", "size": <bytes> },
+#              { "name": "T_<name>_N.png",   "sha256": "<hex>", "size": <bytes> },
+#              { "name": "T_<name>_ORM.png", "sha256": "<hex>", "size": <bytes> },
+#              { "name": "T_<name>_H.png",   "sha256": "<hex>", "size": <bytes> }
+#            ]
+#          }
+#
+#   GET <PortalUrl>/assets/surfaces/<name>/<filename>
+#       -> raw bytes (PNG / EXR / DDS supported via UE's stock texture
+#          factory chain in `import_asset_tasks`).
+#
+# Each downloaded file is cached under
+# `<UserSettings>/Rebus/SurfaceCache/<name>/<filename>` (resolved via
+# `FPlatformProcess::UserSettingsDir()` -- on Windows this is
+# `%LOCALAPPDATA%\Rebus\SurfaceCache\<name>\`; on Linux/Mac it is the
+# platform-appropriate equivalent). The cache is per-machine, never
+# committed to git, and is invalidated by SHA256 mismatch OR manifest
+# revision bump. Offline (portal unreachable) re-uses cached files
+# verbatim; if no cache exists either, the four child MIs are left at
+# their existing (v1.0.129) parents and a single LOUD warning logs the
+# portal-side action item the operator should escalate.
+PORTAL_SURFACE_MANIFEST = {
+    "Concrete": "surfaces/concrete",
+    "Grass":    "surfaces/grass",
+    "Sand":     "surfaces/sand",
+    "Tarmac":   "surfaces/tarmac",
+}
+
+# v1.0.130 -- /Game-rooted root the four portal-fetched Megascans surface
+# bundles drop into. Each surface gets its own subfolder containing the
+# four imported textures (`T_<name>_{B,N,ORM,H}`) AND a Python-authored
+# `MI_<name>.uasset` MaterialInstance (parent = M_RebusFloor_Nanite below)
+# with the textures bound as Albedo/Normal/ORM/Height parameters. The four
+# v1.0.129 child MIs at `/Game/REBUS/Materials/{Concrete,Grass,Sand,Tarmac}
+# .uasset` get re-parented to these per-surface MIs (so any operator-side
+# overrides on the v1.0.129 child layer survive the portal-asset swap;
+# see `_wire_floor_surface_chain` for the full re-parent dance).
+PORTAL_SURFACES_DIR = "/Game/REBUS/Surfaces"
+
+# v1.0.130 -- the Nanite-displacement-aware master material the four
+# per-surface MI parents at /Game/REBUS/Surfaces/<name>/MI_<name> get
+# parented to (which the four v1.0.129 child MIs at
+# /Game/REBUS/Materials/<name> in turn parent to). See
+# `_build_floor_nanite_master` for the graph; mirrors v1.0.86's
+# M_RebusGround world-position-driven UV pattern but adds:
+#   * per-MID Nanite displacement output via the engine `Displacement`
+#     material-output node + a `Height` texture sampler driven by a
+#     `DisplacementStrength` scalar (exposed on every child MID for
+#     runtime tuning via `Rebus.FloorDisplacement{,Strength}` -- new
+#     v1.0.130 console commands).
+#   * BaseColor/Normal/ORM/Height texture-sample parameters (all default
+#     `WhiteSquareTexture` so an un-bound child MID no-ops to grey instead
+#     of crashing on a partial-checkout / portal-offline machine).
+#   * world-position-driven UVs gated by a `TilingMeters` scalar
+#     (default 1.0 -- one texture repeat per 1 m of world space, matching
+#     the user's "1m2" tiling request) so the same physical tile size
+#     reads correctly on a 2 km floor plane regardless of the actor scale.
+#
+# `REBUS_FLOOR_MATERIAL_REVISION` mirrors `REBUS_BEAM_MATERIAL_REVISION`'s
+# self-heal pattern: bumped on every release that touches the floor master
+# graph; the asset stamps it as `FloorMaterialRevision` scalar default and
+# `_floor_nanite_master_is_current` re-bakes any older master on next
+# launch (matches `_beam_master_has_shadow_mask` + `REBUS_BEAM_MATERIAL_
+# REVISION` in v1.0.117/v1.0.128).
+FLOOR_NANITE_MASTER_PATH = MATERIALS_DIR + "/M_RebusFloor_Nanite"
+REBUS_FLOOR_MATERIAL_REVISION = 130
+
+# v1.0.130 -- Nanite-enabled floor mesh the RebusFloor static-mesh actor
+# uses (replaces the engine `/Engine/BasicShapes/Plane` plane reference
+# from v1.0.86). Built by `ensure_floor_nanite_mesh()` from a single 100cm
+# x 100cm quad with UV0 mapped 0..1, Nanite enabled at the StaticMesh
+# settings level, and saved at /Game/REBUS/Meshes/SM_RebusFloor_Nanite.
+# Nanite tessellation (the engine path that turns the master's
+# Displacement output into actual silhouette displacement on the floor)
+# requires THREE conditions to engage simultaneously: (a) Nanite enabled
+# on the mesh asset, (b) the master material declares a `Displacement`
+# output, AND (c) the r.Nanite.AllowTessellation + r.Nanite.Tessellation
+# CVars are 1 -- v1.0.130 sets all three by default so the operator
+# doesn't need to toggle anything; `Rebus.FloorDisplacement 0` flips the
+# child MIDs' DisplacementStrength to 0 for an instant runtime A/B without
+# touching the CVars (so other meshes that opt-in to Nanite tessellation
+# in future continue to work).
+FLOOR_NANITE_MESH_PATH = "/Game/REBUS/Meshes/SM_RebusFloor_Nanite"
+FLOOR_MESHES_DIR = "/Game/REBUS/Meshes"
+
+# v1.0.130 -- physical tile size the floor renders the surface at, in
+# metres. 1.0 = one texture repeat per 1 m of world space (the user's
+# explicit request: "make sure that these are tiled so they scale
+# correctly (1m2)"). Drives the `TilingMeters` scalar parameter on every
+# floor MID; the master uses world-position-derived UVs (UV =
+# AbsoluteWorldPosition.xy / (TilingMeters * 100 cm)) so the tile size is
+# always physical metres regardless of the floor mesh's actor scale.
+# Change this constant to e.g. 0.5 for 50 cm tiles or 2.0 for 2 m tiles;
+# runtime operator-tuning via the existing `Rebus.SetGroundTiling
+# <metres>` console command (v1.0.86) wires through the same MID
+# parameter.
+FLOOR_TILE_SIZE_METERS = 1.0
+
+# v1.0.130 -- default Nanite displacement strength (cm) on the child MIDs.
+# Megascans surface heightmaps are typically 8-bit grey scaling 0..1 over
+# ~1-3 cm of physical relief; 2.0 cm is a visually-conservative default
+# that reads as real-world surface roughness without producing absurd
+# displaced silhouettes on the stage floor. The `Rebus.FloorDisplacement
+# Strength <cm>` console command (v1.0.130) tunes it live;
+# `Rebus.FloorDisplacement 0` disables tessellation entirely (sets
+# DisplacementStrength=0 on every MID) so the operator can A/B with/
+# without displacement without a rebake.
+FLOOR_DISPLACEMENT_STRENGTH_CM = 2.0
+
+
 def _set(obj, name, value):
     """set_editor_property that logs instead of throwing on a renamed property."""
     try:
@@ -2253,31 +2396,649 @@ def _resolve_floor_surface_material(preset):
     return mat, legacy if mat is not None else None
 
 
+# =============================================================================
+# v1.0.130 -- portal-driven floor surface pipeline
+#
+# Three responsibilities split across the helpers below:
+#
+#   1. Fetch + import the four portal-hosted surface texture bundles
+#      (Concrete / Grass / Sand / Tarmac) into /Game/REBUS/Surfaces/<name>/
+#      via the C++ URebusSurfaceFetcher subsystem (RebusSurfaceFetcher.h/.cpp,
+#      v1.0.130). The fetcher hits the same `PortalUrl` + `x-api-key` auth
+#      surface FRebusRestClient already uses for /api/ue/scene + /api/ue/
+#      fixtures + /meshes -- no Fab login, no per-developer OAuth, no
+#      separate base URL.
+#
+#   2. Author M_RebusFloor_Nanite -- the Nanite-displacement-aware master
+#      every per-surface MI parents to. World-position-driven UVs (1 m
+#      physical tiling by default), four texture parameters
+#      (BaseColorTexture / NormalTexture / ORMTexture / HeightTexture),
+#      Nanite tessellation enabled with DisplacementStrength + Center
+#      scalar parameters so `Rebus.FloorDisplacement` + `Rebus.Floor
+#      DisplacementStrength` (v1.0.130 console commands) can drive
+#      runtime tuning.
+#
+#   3. Generate /Game/REBUS/Meshes/SM_RebusFloor_Nanite -- a single quad
+#      with Nanite enabled. UV0 is mapped 0..1 across the plane (the
+#      master uses world-position UVs anyway, so the mesh UVs only matter
+#      for unrelated samplers / debug viewmodes).
+# =============================================================================
+
+
+def _portal_surface_pkg_dir(surface):
+    """/Game-rooted directory for one portal surface bundle."""
+    return "{}/{}".format(PORTAL_SURFACES_DIR, surface)
+
+
+def _portal_surface_textures_dir(surface):
+    return _portal_surface_pkg_dir(surface) + "/Textures"
+
+
+def _portal_surface_mi_path(surface):
+    return "{}/MI_{}".format(_portal_surface_pkg_dir(surface), surface)
+
+
+def _portal_role_for_filename(filename):
+    """Infer (BaseColor / Normal / ORM / Height) from a portal filename.
+
+    Matches the `T_<surface>_<role>.<ext>` convention the v1.0.130
+    PORTAL_SURFACE_MANIFEST documents -- the role suffix is the single
+    capital letter (or trio for ORM) just before the extension. Returns
+    None if the filename doesn't match the expected pattern; the caller
+    logs and skips that file.
+
+    Why we infer the role from the filename rather than asking the
+    portal manifest to label it: the four-channel PBR + height layout
+    is fixed, and forcing the manifest schema to carry per-file roles
+    would couple the portal-side spec more tightly to UE's parameter
+    naming. Inferring from the basename keeps the manifest schema as
+    a pure {name, sha256, size} list -- the simplest contract for the
+    backend dev who has to host the bundles.
+    """
+    stem = filename.rsplit(".", 1)[0]
+    parts = stem.rsplit("_", 1)
+    if len(parts) != 2:
+        return None
+    suffix = parts[1].upper()
+    table = {
+        "B":   "BaseColor",
+        "BC":  "BaseColor",
+        "ALB": "BaseColor",
+        "N":   "Normal",
+        "NRM": "Normal",
+        "ORM": "ORM",
+        "H":   "Height",
+        "DSP": "Height",
+        "HT":  "Height",
+    }
+    return table.get(suffix)
+
+
+def _floor_nanite_master_is_current(master):
+    """v1.0.130 sentinel-revision probe (parallel to _beam_master_has_shadow_mask).
+
+    Mirrors the v1.0.117 self-heal pattern from the beam master: the on-
+    disk M_RebusFloor_Nanite stamps a `FloorMaterialRevision` scalar at
+    its default value; this probe reads it back and compares against
+    REBUS_FLOOR_MATERIAL_REVISION (130). Mismatch (or missing scalar)
+    means the master pre-dates the current release and must be re-
+    authored. Best-effort: any internal exception returns False so the
+    self-heal path errs on the side of regen.
+    """
+    try:
+        info = unreal.MaterialEditingLibrary.get_scalar_parameter_names(master)
+    except Exception:  # noqa: BLE001
+        return False
+    if not any(str(n) == "FloorMaterialRevision" for n in info):
+        return False
+    try:
+        rev = unreal.MaterialEditingLibrary.get_scalar_parameter_default_value(
+            master, "FloorMaterialRevision")
+        return int(round(float(rev))) == REBUS_FLOOR_MATERIAL_REVISION
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _build_floor_nanite_master(mat):
+    """Author the v1.0.130 Nanite-displacement floor master.
+
+    See README v1.0.130 release block for the full graph derivation.
+    Headline:
+        UV         = AbsoluteWorldPosition.xy / (TilingMeters * 100 cm)
+        BaseColor  = BaseColorTexture(UV) * BaseColorTint
+        Normal     = NormalTexture(UV) [Normal sampler]
+        AO/Rough/Metallic = ORMTexture(UV).{R,G,B}
+        Displacement = (HeightTexture(UV).R - DisplacementCenter)
+                       * DisplacementStrength
+
+    Material flags: opaque, double-sided, lit, Nanite tessellation on.
+    """
+    mel = unreal.MaterialEditingLibrary
+
+    _set(mat, "material_domain", unreal.MaterialDomain.MD_SURFACE)
+    _set(mat, "shading_model",   unreal.MaterialShadingModel.MSM_DEFAULT_LIT)
+    _set(mat, "blend_mode",      unreal.BlendMode.BLEND_OPAQUE)
+    _set(mat, "two_sided",       True)
+
+    try:
+        _set(mat, "enable_tessellation", True)
+        scaling = unreal.DisplacementScaling()
+        scaling.set_editor_property("magnitude", 1.0)
+        scaling.set_editor_property("center",    0.5)
+        _set(mat, "displacement_scaling", scaling)
+    except Exception as exc:  # noqa: BLE001
+        unreal.log_warning(
+            "RebusBaseLevel v1.0.130: enable_tessellation/displacement_scaling "
+            "set failed ({}); the master still authors a Displacement pin but "
+            "tessellation will not engage until flipped manually.".format(exc))
+
+    rev = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -1500, -340)
+    rev.set_editor_property("parameter_name", "FloorMaterialRevision")
+    rev.set_editor_property("default_value", float(REBUS_FLOOR_MATERIAL_REVISION))
+
+    tiling = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -1500, -260)
+    tiling.set_editor_property("parameter_name", "TilingMeters")
+    tiling.set_editor_property("default_value", float(FLOOR_TILE_SIZE_METERS))
+
+    disp_strength = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -1500, -180)
+    disp_strength.set_editor_property("parameter_name", "DisplacementStrength")
+    disp_strength.set_editor_property("default_value", float(FLOOR_DISPLACEMENT_STRENGTH_CM))
+
+    disp_center = mel.create_material_expression(mat, unreal.MaterialExpressionScalarParameter, -1500, -100)
+    disp_center.set_editor_property("parameter_name", "DisplacementCenter")
+    disp_center.set_editor_property("default_value", 0.5)
+
+    base_tint = mel.create_material_expression(mat, unreal.MaterialExpressionVectorParameter, -1500, -20)
+    base_tint.set_editor_property("parameter_name", "BaseColorTint")
+    base_tint.set_editor_property("default_value", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
+
+    world_pos = mel.create_material_expression(mat, unreal.MaterialExpressionWorldPosition, -1500, 200)
+    xy_mask = mel.create_material_expression(mat, unreal.MaterialExpressionComponentMask, -1280, 200)
+    _set(xy_mask, "r", True)
+    _set(xy_mask, "g", True)
+    _set(xy_mask, "b", False)
+    _set(xy_mask, "a", False)
+    mel.connect_material_expressions(world_pos, "", xy_mask, "")
+
+    tiling_cm = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -1280, 100)
+    _set(tiling_cm, "const_b", 100.0)
+    mel.connect_material_expressions(tiling, "", tiling_cm, "A")
+
+    world_uvs = mel.create_material_expression(mat, unreal.MaterialExpressionDivide, -1060, 200)
+    mel.connect_material_expressions(xy_mask, "", world_uvs, "A")
+    mel.connect_material_expressions(tiling_cm, "", world_uvs, "B")
+
+    white = unreal.EditorAssetLibrary.load_asset("/Engine/EngineResources/WhiteSquareTexture")
+    default_normal = unreal.EditorAssetLibrary.load_asset("/Engine/EngineMaterials/DefaultNormal")
+    black = unreal.EditorAssetLibrary.load_asset("/Engine/EngineResources/Black")
+
+    base_tex = mel.create_material_expression(mat, unreal.MaterialExpressionTextureSampleParameter2D, -800, -100)
+    base_tex.set_editor_property("parameter_name", "BaseColorTexture")
+    if white is not None:
+        _set(base_tex, "texture", white)
+    mel.connect_material_expressions(world_uvs, "", base_tex, "Coordinates")
+
+    base_mul = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -500, -60)
+    mel.connect_material_expressions(base_tex, "", base_mul, "A")
+    mel.connect_material_expressions(base_tint, "", base_mul, "B")
+    mel.connect_material_property(base_mul, "", unreal.MaterialProperty.MP_BASE_COLOR)
+
+    normal_tex = mel.create_material_expression(mat, unreal.MaterialExpressionTextureSampleParameter2D, -800, 100)
+    normal_tex.set_editor_property("parameter_name", "NormalTexture")
+    try:
+        _set(normal_tex, "sampler_type", unreal.MaterialSamplerType.SAMPLERTYPE_NORMAL)
+    except Exception:  # noqa: BLE001
+        pass
+    if default_normal is not None:
+        _set(normal_tex, "texture", default_normal)
+    mel.connect_material_expressions(world_uvs, "", normal_tex, "Coordinates")
+    mel.connect_material_property(normal_tex, "", unreal.MaterialProperty.MP_NORMAL)
+
+    orm_tex = mel.create_material_expression(mat, unreal.MaterialExpressionTextureSampleParameter2D, -800, 300)
+    orm_tex.set_editor_property("parameter_name", "ORMTexture")
+    if white is not None:
+        _set(orm_tex, "texture", white)
+    mel.connect_material_expressions(world_uvs, "", orm_tex, "Coordinates")
+
+    mel.connect_material_property(orm_tex, "R", unreal.MaterialProperty.MP_AMBIENT_OCCLUSION)
+    mel.connect_material_property(orm_tex, "G", unreal.MaterialProperty.MP_ROUGHNESS)
+    mel.connect_material_property(orm_tex, "B", unreal.MaterialProperty.MP_METALLIC)
+
+    height_tex = mel.create_material_expression(mat, unreal.MaterialExpressionTextureSampleParameter2D, -800, 540)
+    height_tex.set_editor_property("parameter_name", "HeightTexture")
+    if black is not None:
+        _set(height_tex, "texture", black)
+    elif white is not None:
+        _set(height_tex, "texture", white)
+    mel.connect_material_expressions(world_uvs, "", height_tex, "Coordinates")
+
+    height_centered = mel.create_material_expression(mat, unreal.MaterialExpressionSubtract, -500, 540)
+    mel.connect_material_expressions(height_tex, "R", height_centered, "A")
+    mel.connect_material_expressions(disp_center, "", height_centered, "B")
+
+    height_scaled = mel.create_material_expression(mat, unreal.MaterialExpressionMultiply, -300, 540)
+    mel.connect_material_expressions(height_centered, "", height_scaled, "A")
+    mel.connect_material_expressions(disp_strength, "", height_scaled, "B")
+
+    try:
+        mel.connect_material_property(height_scaled, "", unreal.MaterialProperty.MP_DISPLACEMENT)
+    except Exception as exc:  # noqa: BLE001
+        unreal.log_warning(
+            "RebusBaseLevel v1.0.130: connect_material_property MP_DISPLACEMENT "
+            "raised ({}); displacement pin will be unwired.".format(exc))
+
+    mel.recompile_material(mat)
+
+
+def _ensure_floor_nanite_mesh(force=False):
+    """Generate /Game/REBUS/Meshes/SM_RebusFloor_Nanite as a Nanite plane.
+
+    Strategy: duplicate the engine plane (`/Engine/BasicShapes/Plane`)
+    into our /Game/REBUS/Meshes/ folder, flip its `nanite_settings.enabled`
+    to True, and save. The engine plane is a 100 cm x 100 cm two-tri
+    quad with UV0 mapped 0..1 -- exactly what the v1.0.130 master
+    expects (the master uses world-position-derived UVs anyway, so the
+    mesh UVs only matter for unrelated samplers / debug viewmodes).
+    Nanite handles all the on-render-side LOD + tessellation refinement
+    so we don't need to pre-subdivide the quad.
+
+    Returns the loaded UStaticMesh on success, None on failure (the
+    caller logs a warning + falls back to the engine plane).
+    """
+    if force and unreal.EditorAssetLibrary.does_asset_exist(FLOOR_NANITE_MESH_PATH):
+        unreal.EditorAssetLibrary.delete_asset(FLOOR_NANITE_MESH_PATH)
+
+    if not unreal.EditorAssetLibrary.does_asset_exist(FLOOR_NANITE_MESH_PATH):
+        try:
+            duplicated = unreal.EditorAssetLibrary.duplicate_asset(
+                "/Engine/BasicShapes/Plane", FLOOR_NANITE_MESH_PATH)
+        except Exception as exc:  # noqa: BLE001
+            unreal.log_warning(
+                "RebusBaseLevel v1.0.130: duplicate_asset('{}' -> '{}') raised "
+                "({}); the floor will fall back to the engine plane (Nanite "
+                "displacement will not engage on it).".format(
+                    "/Engine/BasicShapes/Plane",
+                    FLOOR_NANITE_MESH_PATH, exc))
+            return None
+        if duplicated is None:
+            unreal.log_warning(
+                "RebusBaseLevel v1.0.130: duplicate_asset returned None for '{}'; "
+                "falling back to the engine plane.".format(FLOOR_NANITE_MESH_PATH))
+            return None
+
+    mesh = unreal.EditorAssetLibrary.load_asset(FLOOR_NANITE_MESH_PATH)
+    if mesh is None:
+        return None
+
+    try:
+        nanite_settings = unreal.MeshNaniteSettings()
+        nanite_settings.set_editor_property("enabled", True)
+        try:
+            nanite_settings.set_editor_property("position_precision", -1)
+        except Exception:  # noqa: BLE001
+            pass
+        mesh.set_editor_property("nanite_settings", nanite_settings)
+    except Exception as exc:  # noqa: BLE001
+        unreal.log_warning(
+            "RebusBaseLevel v1.0.130: setting nanite_settings on '{}' raised "
+            "({}); the mesh will keep its current Nanite flag.".format(
+                FLOOR_NANITE_MESH_PATH, exc))
+
+    unreal.EditorAssetLibrary.save_loaded_asset(mesh)
+    unreal.log(
+        "RebusBaseLevel v1.0.130: SM_RebusFloor_Nanite ensured (Nanite enabled).")
+    return mesh
+
+
+def _import_portal_surface_textures(surface, cache_dir, file_names):
+    """Run UE's import_asset_tasks on every cached file for one surface.
+
+    Returns a dict mapping role ("BaseColor"/"Normal"/"ORM"/"Height") to
+    the resulting UTexture2D, or an empty dict on failure. Idempotent:
+    pre-existing target assets are returned as-is and not re-imported.
+    """
+    out = {}
+    if not file_names:
+        return out
+
+    target_dir = _portal_surface_textures_dir(surface)
+    asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+
+    tasks = []
+    role_for_basename = {}
+    for name in file_names:
+        role = _portal_role_for_filename(name)
+        if role is None:
+            unreal.log_warning(
+                "RebusBaseLevel v1.0.130: portal file '{}' for surface '{}' "
+                "has no recognisable role suffix (B/N/ORM/H); skipping.".format(
+                    name, surface))
+            continue
+        # Compose the engine-side asset name `T_<surface>_<role>`. We
+        # use the role suffix rather than the on-disk basename so the
+        # imported asset name is stable even if the portal renames the
+        # file later.
+        asset_name = "T_{}_{}".format(surface,
+            {"BaseColor": "B", "Normal": "N", "ORM": "ORM", "Height": "H"}[role])
+        target_path = "{}/{}".format(target_dir, asset_name)
+        role_for_basename[name] = (role, target_path, asset_name)
+
+        if unreal.EditorAssetLibrary.does_asset_exist(target_path):
+            existing = unreal.EditorAssetLibrary.load_asset(target_path)
+            if isinstance(existing, unreal.Texture2D):
+                out[role] = existing
+                continue
+
+        src_abs = os.path.join(cache_dir, name)
+        if not os.path.isfile(src_abs):
+            unreal.log_warning(
+                "RebusBaseLevel v1.0.130: cache file missing on disk: {}".format(src_abs))
+            continue
+
+        task = unreal.AssetImportTask()
+        task.set_editor_property("filename", src_abs)
+        task.set_editor_property("destination_path", target_dir)
+        task.set_editor_property("destination_name", asset_name)
+        task.set_editor_property("automated", True)
+        task.set_editor_property("save", True)
+        task.set_editor_property("replace_existing", True)
+        tasks.append(task)
+
+    if tasks:
+        try:
+            asset_tools.import_asset_tasks(tasks)
+        except Exception as exc:  # noqa: BLE001
+            unreal.log_error(
+                "RebusBaseLevel v1.0.130: import_asset_tasks raised ({}); "
+                "surface '{}' may have an incomplete texture set.".format(
+                    exc, surface))
+
+    for name, (role, target_path, _) in role_for_basename.items():
+        if role in out:
+            continue
+        if unreal.EditorAssetLibrary.does_asset_exist(target_path):
+            asset = unreal.EditorAssetLibrary.load_asset(target_path)
+            if isinstance(asset, unreal.Texture2D):
+                # The Normal map needs its compression / sRGB flipped to
+                # the engine's normal-map preset so the master's Normal
+                # sampler reads the right channels. Same for Height (a
+                # single-channel grey, NOT sRGB).
+                try:
+                    if role == "Normal":
+                        asset.set_editor_property("srgb", False)
+                        asset.set_editor_property(
+                            "compression_settings",
+                            unreal.TextureCompressionSettings.TC_NORMALMAP)
+                    elif role == "ORM":
+                        asset.set_editor_property("srgb", False)
+                        asset.set_editor_property(
+                            "compression_settings",
+                            unreal.TextureCompressionSettings.TC_MASKS)
+                    elif role == "Height":
+                        asset.set_editor_property("srgb", False)
+                        asset.set_editor_property(
+                            "compression_settings",
+                            unreal.TextureCompressionSettings.TC_GRAYSCALE)
+                    unreal.EditorAssetLibrary.save_loaded_asset(asset)
+                except Exception as exc:  # noqa: BLE001
+                    unreal.log_warning(
+                        "RebusBaseLevel v1.0.130: post-import settings on '{}' "
+                        "raised ({}); using engine-default texture settings.".format(
+                            target_path, exc))
+                out[role] = asset
+    return out
+
+
+def _ensure_portal_surface_mi(surface, textures_by_role):
+    """Author /Game/REBUS/Surfaces/<surface>/MI_<surface> as the
+    per-surface MI parent. Parented to M_RebusFloor_Nanite, with the
+    four imported textures bound by parameter name.
+
+    Idempotent: if the MI already exists with the right parent, the
+    texture parameters are re-pushed (a portal revision bump that swaps
+    the imported texture under the same asset path is picked up here)
+    and the MI is saved. Returns the loaded MI on success, None on
+    failure.
+    """
+    if not unreal.EditorAssetLibrary.does_asset_exist(FLOOR_NANITE_MASTER_PATH):
+        unreal.log_warning(
+            "RebusBaseLevel v1.0.130: M_RebusFloor_Nanite missing; cannot "
+            "author MI_{} (run ensure_floor_nanite_material first).".format(surface))
+        return None
+    master = unreal.EditorAssetLibrary.load_asset(FLOOR_NANITE_MASTER_PATH)
+    if master is None:
+        return None
+
+    mi_path = _portal_surface_mi_path(surface)
+    asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+    mel = unreal.MaterialEditingLibrary
+
+    if unreal.EditorAssetLibrary.does_asset_exist(mi_path):
+        mi = unreal.EditorAssetLibrary.load_asset(mi_path)
+    else:
+        mi = asset_tools.create_asset(
+            "MI_{}".format(surface), _portal_surface_pkg_dir(surface),
+            unreal.MaterialInstanceConstant,
+            unreal.MaterialInstanceConstantFactoryNew())
+
+    if mi is None:
+        return None
+
+    mel.set_material_instance_parent(mi, master)
+
+    role_to_param = {
+        "BaseColor": "BaseColorTexture",
+        "Normal":    "NormalTexture",
+        "ORM":       "ORMTexture",
+        "Height":    "HeightTexture",
+    }
+    for role, param in role_to_param.items():
+        tex = textures_by_role.get(role)
+        if tex is None:
+            continue
+        try:
+            mel.set_material_instance_texture_parameter_value(mi, param, tex)
+        except Exception as exc:  # noqa: BLE001
+            unreal.log_warning(
+                "RebusBaseLevel v1.0.130: setting '{}' on MI_{} raised ({}); "
+                "the MI will fall back to the master's default texture.".format(
+                    param, surface, exc))
+
+    mel.set_material_instance_scalar_parameter_value(
+        mi, "TilingMeters", float(FLOOR_TILE_SIZE_METERS))
+    mel.set_material_instance_scalar_parameter_value(
+        mi, "DisplacementStrength", float(FLOOR_DISPLACEMENT_STRENGTH_CM))
+    mel.set_material_instance_scalar_parameter_value(
+        mi, "DisplacementCenter", 0.5)
+
+    unreal.EditorAssetLibrary.save_loaded_asset(mi)
+    unreal.log(
+        "RebusBaseLevel v1.0.130: MI_{} authored (parent=M_RebusFloor_Nanite, "
+        "textures bound: {}).".format(
+            surface, sorted(textures_by_role.keys())))
+    return mi
+
+
+def ensure_portal_surfaces(force=False):
+    """v1.0.130 orchestrator -- fetch + import + wire the four portal-
+    hosted floor surface bundles.
+
+    For each entry in PORTAL_SURFACE_MANIFEST:
+      1. URebusSurfaceFetcher.ensure_surface_cached -> downloads
+         (or validates the cache for) the surface bundle, returns the
+         cache directory + per-file basenames + manifest revision.
+      2. _import_portal_surface_textures -> imports the four cached
+         files into /Game/REBUS/Surfaces/<name>/Textures/T_<name>_*.
+      3. _ensure_portal_surface_mi -> authors / refreshes
+         /Game/REBUS/Surfaces/<name>/MI_<name> parented to
+         M_RebusFloor_Nanite with the four textures bound.
+      4. The pre-existing /Game/REBUS/Materials/<name>.uasset child MI
+         (from v1.0.129) gets re-parented from whatever it pointed at
+         (M_RebusGround / a Fab parent / nothing) to the new
+         /Game/REBUS/Surfaces/<name>/MI_<name>. Operator-side overrides
+         on the v1.0.129 child layer survive the swap.
+
+    Graceful offline behaviour (mandated by the v1.0.130 brief): if
+    URebusSurfaceFetcher returns OfflineNoCache for every surface AND
+    the v1.0.129 child MIs already have valid parents, skip the
+    re-parent (leaving v1.0.129's choice intact) and log a single
+    warning. The build does NOT fail.
+    """
+    fetcher = getattr(unreal, "RebusSurfaceFetcher", None)
+    if fetcher is None:
+        unreal.log_error(
+            "RebusBaseLevel v1.0.130: unreal.RebusSurfaceFetcher unavailable -- "
+            "the C++ subsystem is missing or the editor was started without "
+            "the RebusVisualiser module. Skipping portal surface fetch; the "
+            "v1.0.129 child MIs keep their current parents. Action: rebuild "
+            "the plugin (Build.bat REBUS_VisualiserEditor Win64 Development).")
+        return
+
+    if force:
+        if unreal.EditorAssetLibrary.does_directory_exist(PORTAL_SURFACES_DIR):
+            unreal.EditorAssetLibrary.delete_directory(PORTAL_SURFACES_DIR)
+
+    mel = unreal.MaterialEditingLibrary
+    any_success = False
+    for surface, rel_path in PORTAL_SURFACE_MANIFEST.items():
+        try:
+            status, cache_dir, file_names, revision = fetcher.ensure_surface_cached(
+                surface, rel_path)
+        except Exception as exc:  # noqa: BLE001
+            unreal.log_error(
+                "RebusBaseLevel v1.0.130: ensure_surface_cached('{}') raised "
+                "({}); skipping surface.".format(surface, exc))
+            continue
+
+        unreal.log(
+            "RebusBaseLevel v1.0.130: portal fetch '{}' -> status={}, "
+            "revision={}, files={} (cache={}).".format(
+                surface, status, revision, list(file_names), cache_dir))
+
+        if not file_names:
+            # Either OfflineNoCache, NotConfigured, or FetchFailed before any
+            # file landed. Leave the v1.0.129 child MI's parent as-is.
+            continue
+
+        textures = _import_portal_surface_textures(surface, cache_dir, list(file_names))
+        if not textures:
+            unreal.log_warning(
+                "RebusBaseLevel v1.0.130: no textures imported for '{}' -- "
+                "skipping MI re-parent.".format(surface))
+            continue
+
+        mi = _ensure_portal_surface_mi(surface, textures)
+        if mi is None:
+            continue
+
+        # Re-parent the v1.0.129 user-authored child MI.
+        child_path = FLOOR_SURFACE_PATHS.get(surface)
+        if child_path and unreal.EditorAssetLibrary.does_asset_exist(child_path):
+            try:
+                child = unreal.EditorAssetLibrary.load_asset(child_path)
+                if child is not None:
+                    mel.set_material_instance_parent(child, mi)
+                    unreal.EditorAssetLibrary.save_loaded_asset(child)
+                    unreal.log(
+                        "RebusBaseLevel v1.0.130: re-parented '{}' -> '{}'.".format(
+                            child_path, _portal_surface_mi_path(surface)))
+            except Exception as exc:  # noqa: BLE001
+                unreal.log_warning(
+                    "RebusBaseLevel v1.0.130: re-parent of '{}' raised ({}); "
+                    "child keeps its existing parent.".format(child_path, exc))
+
+        any_success = True
+
+    if not any_success:
+        unreal.log_warning(
+            "RebusBaseLevel v1.0.130: no portal surface bundle was successfully "
+            "fetched or imported. The four /Game/REBUS/Materials/<surface> "
+            "child MIs keep their existing v1.0.129 parents (legacy "
+            "MI_RebusGround_<surface> via M_RebusGround). Once the portal team "
+            "hosts the bundles at <PortalUrl>/assets/surfaces/<name>/, run "
+            "build_rebus_base_level.ensure_portal_surfaces(force=True) to wire "
+            "them in. See README v1.0.130 release block for the portal "
+            "endpoint contract.")
+
+
+def ensure_floor_nanite_material(force=False):
+    """Author /Game/REBUS/Materials/M_RebusFloor_Nanite (v1.0.130).
+
+    Idempotent. Self-heal: if the on-disk master pre-dates the current
+    REBUS_FLOOR_MATERIAL_REVISION, force-regenerate (along with the
+    per-surface MIs that parent to it -- they're rebuilt by
+    `ensure_portal_surfaces`). Mirrors v1.0.117's beam-master self-heal.
+    """
+    tools = unreal.AssetToolsHelpers.get_asset_tools()
+
+    if not force and unreal.EditorAssetLibrary.does_asset_exist(FLOOR_NANITE_MASTER_PATH):
+        existing = unreal.EditorAssetLibrary.load_asset(FLOOR_NANITE_MASTER_PATH)
+        if existing is not None and not _floor_nanite_master_is_current(existing):
+            unreal.log_warning(
+                "RebusBaseLevel v1.0.130: pre-revision-{} M_RebusFloor_Nanite "
+                "detected; regenerating master + per-surface MIs.".format(
+                    REBUS_FLOOR_MATERIAL_REVISION))
+            force = True
+
+    if force:
+        for surface in PORTAL_SURFACE_MANIFEST:
+            mi_path = _portal_surface_mi_path(surface)
+            if unreal.EditorAssetLibrary.does_asset_exist(mi_path):
+                unreal.EditorAssetLibrary.delete_asset(mi_path)
+        if unreal.EditorAssetLibrary.does_asset_exist(FLOOR_NANITE_MASTER_PATH):
+            unreal.EditorAssetLibrary.delete_asset(FLOOR_NANITE_MASTER_PATH)
+
+    if not unreal.EditorAssetLibrary.does_asset_exist(FLOOR_NANITE_MASTER_PATH):
+        master = tools.create_asset(
+            "M_RebusFloor_Nanite", MATERIALS_DIR,
+            unreal.Material, unreal.MaterialFactoryNew())
+        _build_floor_nanite_master(master)
+        unreal.EditorAssetLibrary.save_loaded_asset(master)
+        unreal.log(
+            "RebusBaseLevel v1.0.130: M_RebusFloor_Nanite authored "
+            "(revision={}, tile={} m, displacement_strength={} cm).".format(
+                REBUS_FLOOR_MATERIAL_REVISION,
+                FLOOR_TILE_SIZE_METERS,
+                FLOOR_DISPLACEMENT_STRENGTH_CM))
+
+
 def _add_floor():
-    plane = unreal.EditorAssetLibrary.load_asset("/Engine/BasicShapes/Plane.Plane")
+    # v1.0.130 -- floor mesh is now the Python-authored Nanite-enabled
+    # SM_RebusFloor_Nanite (workstream C); fall back to the engine plane
+    # if the Nanite mesh isn't on disk yet (offline / partial-bake state)
+    # so the floor still draws and downstream actors that bind by tag
+    # (URebusSceneSettingsSubsystem) keep finding the actor.
+    plane = None
+    if unreal.EditorAssetLibrary.does_asset_exist(FLOOR_NANITE_MESH_PATH):
+        try:
+            plane = unreal.EditorAssetLibrary.load_asset(FLOOR_NANITE_MESH_PATH)
+        except Exception as exc:  # noqa: BLE001
+            unreal.log_warning(
+                "RebusBaseLevel v1.0.130: load_asset('{}') raised ({}); "
+                "falling back to /Engine/BasicShapes/Plane.".format(
+                    FLOOR_NANITE_MESH_PATH, exc))
+            plane = None
+    if plane is None:
+        plane = unreal.EditorAssetLibrary.load_asset("/Engine/BasicShapes/Plane.Plane")
+
     floor = _spawn(unreal.StaticMeshActor, unreal.Vector(0.0, 0.0, 0.0), label="RebusFloor")
     if not floor:
         return
-    # Tag so URebusSceneSettingsSubsystem can find it for GroundSurface /
-    # bGroundVisible / v1.0.129 FloorSurface.
     floor.set_editor_property("tags", ["RebusFloor"])
-    # ~2 km plane reads as an effectively infinite ground at stage scale.
     floor.set_actor_scale3d(unreal.Vector(2000.0, 2000.0, 1.0))
 
     comp = _component(floor, unreal.StaticMeshComponent)
     if comp and plane:
         comp.set_static_mesh(plane)
-        # v1.0.129 -- floor material is now the operator-authored
-        # /Game/REBUS/Materials/<FLOOR_DEFAULT_SURFACE> .uasset, with safe
-        # fallback to the legacy MI_RebusGround_<preset> if the new asset is
-        # missing (handled inside _resolve_floor_surface_material).
         mat, resolved_path = _resolve_floor_surface_material(FLOOR_DEFAULT_SURFACE)
         if mat is not None:
             comp.set_material(0, mat)
             unreal.log(
-                "RebusBaseLevel v1.0.129: floor surface set to '{}' (asset: {}).".format(
+                "RebusBaseLevel v1.0.130: floor surface set to '{}' (asset: {}).".format(
                     FLOOR_DEFAULT_SURFACE, resolved_path))
-    unreal.log("RebusBaseLevel: infinite floor plane added (default surface: {}).".format(FLOOR_DEFAULT_SURFACE))
+    unreal.log(
+        "RebusBaseLevel v1.0.130: floor placed (mesh='{}', default surface='{}').".format(
+            (plane.get_path_name() if plane else "<none>"), FLOOR_DEFAULT_SURFACE))
 
 
 def _has_floor(actor):
@@ -2474,6 +3235,15 @@ def build():
     # v1.0.121 -- pre-bake every IES profile under /Game/REBUS/IES/ so the -game
     # runtime doesn't depend on the editor-only IESConverter.h at fixture spawn.
     ensure_ies_profiles(force=True)
+    # v1.0.130 -- Nanite-displacement floor master + Nanite floor mesh +
+    # portal-fetched per-surface MIs (workstreams A/B/C). The portal
+    # fetch degrades gracefully when the portal isn't yet hosting the
+    # bundles (see ensure_portal_surfaces docstring); this is the
+    # forward path that brings every operator's machine to the new
+    # surface set automatically once the portal team uploads them.
+    ensure_floor_nanite_material(force=True)
+    _ensure_floor_nanite_mesh(force=True)
+    ensure_portal_surfaces(force=True)
     # v1.0.95 migration -- see the helper docstring + README v1.0.95.
     _cleanup_internal_beam_assets()
 
@@ -2549,6 +3319,14 @@ def ensure_base_level():
     ensure_orbit_imported_material()
     # v1.0.121 IES profile self-heal (idempotent on missing/stale; no-op on current).
     ensure_ies_profiles()
+    # v1.0.130 floor pipeline self-heal (Nanite master + mesh + portal MIs).
+    # All three are idempotent: a current master / current mesh / valid
+    # cached surface bundle all short-circuit to no-op. Portal-unreachable
+    # surfaces leave the v1.0.129 child MIs unchanged so the floor still
+    # draws something on first run on a brand-new operator workstation.
+    ensure_floor_nanite_material()
+    _ensure_floor_nanite_mesh()
+    ensure_portal_surfaces()
     # v1.0.95 migration -- see the helper docstring + README v1.0.95.
     _cleanup_internal_beam_assets()
 

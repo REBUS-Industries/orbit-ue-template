@@ -28,3 +28,9 @@ desktop.ini
 # Local CI / packaging
 dist/
 RELEASE_NOTES.md
+
+# v1.0.130 -- per-release build logs (we redirect `Build.bat` output to
+# `build-<version>.log` for diagnostics; ephemeral, never useful in
+# git history -- the in-tree README + commit message already document
+# the build outcome).
+*.log

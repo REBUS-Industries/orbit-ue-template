@@ -22,6 +22,45 @@ Content/Developers/
 # Python bytecode cache
 Content/Python/__pycache__/
 
+# v1.0.130 -- OrbitConnector plugin. In dev workspaces this directory may
+# hold only a local build stub (`OrbitConnector.uplugin` with
+# `VersionName: 0.0.0-stub` + empty `Modules: []`) plus a vendored
+# `ThirdParty/Cli/win-x64/orbit-cli.exe` so UnrealBuildTool can resolve the
+# `.uproject`-required plugin reference. The REAL OrbitConnector plugin
+# (source + binaries) is restored per-machine before a shipping
+# packaged build; neither the stub nor the real plugin belongs in this
+# repo (the stub is per-developer scaffolding; the real plugin lives in
+# its own git mirror). Excluding the whole subtree keeps both the stub
+# AND any partial real-plugin checkout from being accidentally committed.
+Plugins/OrbitConnector/
+
+# v1.0.130 -- per-machine plugin Config scratch (editor-generated
+# FilterPlugin.ini boilerplate that the UE 5.7 plugin editor drops when
+# any operator opens Edit > Plugins > Rebus Visualiser). Pure noise in
+# git: the file is empty boilerplate with no project-relevant filter
+# entries.
+Plugins/*/Config/FilterPlugin.ini
+
+# v1.0.130 -- editor-generated per-developer transient maps subtree
+# (Content/REBUS/Maps/_GENERATED/<user>/...) that the UE 5.7 editor
+# drops when the operator runs ad-hoc builder utilities. Not part of
+# the shipped BaseLevel; per-developer scratch only.
+Content/REBUS/Maps/_GENERATED/
+
+# v1.0.130 -- Fab Megascans surface payloads. The pre-v1.0.130 worker tree
+# tried Fab "Add to Project" for the floor surface bundles, which lays down
+# a sub-tree under Content/Fab/Megascans/Surfaces/<DisplayName_<slug>>/...
+# Each tier holds 4-channel 4K/8K Megascans textures (~50-200 MB per
+# surface) PLUS Megascans-authored MaterialInstance .uassets. None of that
+# belongs in git: the bundles are per-developer caches that are large,
+# binary, and irrelevant once v1.0.130 routes the surface delivery through
+# the Rebus portal (URebusSurfaceFetcher + /assets/surfaces/<name>/manifest.
+# json -- see README v1.0.130). Excluding the whole Fab/ root prevents an
+# accidental commit on a workstation where the Fab editor browser has
+# previously paid down some surface bundles. Restore on a per-machine basis
+# by re-running the Fab editor browser if anyone needs the legacy assets.
+Content/Fab/
+
 # Visual Studio / Rider / Xcode IDE files
 .vs/
 .idea/

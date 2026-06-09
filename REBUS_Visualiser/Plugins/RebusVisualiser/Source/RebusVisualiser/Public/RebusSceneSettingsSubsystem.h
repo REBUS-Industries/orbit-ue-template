@@ -82,6 +82,24 @@ private:
 	// pre-v1.0.86 master that hasn't been regenerated yet via the Python build script).
 	void SetGroundTilingMeters(float Metres);
 
+	// v1.0.130: enable/disable the floor's Nanite-displacement contribution at runtime.
+	// `Rebus.FloorDisplacement 0` flips DisplacementStrength to 0 cm on the cached floor
+	// MID (instant A/B without re-cooking the master); `Rebus.FloorDisplacement 1` restores
+	// it to the last operator-set / authored value. Pushed onto the v1.0.130
+	// M_RebusFloor_Nanite master's `DisplacementStrength` scalar parameter via the floor MID
+	// so the visible silhouette displacement collapses to flat without disturbing the rest
+	// of the PBR shading. Safe-no-ops on a pre-v1.0.130 master (legacy M_RebusGround has no
+	// DisplacementStrength parameter).
+	void SetFloorDisplacementEnabled(bool bEnabled);
+
+	// v1.0.130: set the floor's Nanite-displacement strength in cm. Pushed onto the same
+	// `DisplacementStrength` scalar above. Honoured immediately when displacement is
+	// currently enabled (bFloorDisplacementEnabled == true); when displacement is OFF the
+	// value is stored in CachedFloorDisplacementStrength so a subsequent
+	// `SetFloorDisplacementEnabled(true)` restores the new value, NOT the previous one.
+	// Defaults to 2.0 cm (matches the Python builder's FLOOR_DISPLACEMENT_STRENGTH_CM).
+	void SetFloorDisplacementStrength(float StrengthCm);
+
 	// Lazily create-or-fetch the MID wrapping the floor's current slot-0 material so per-
 	// session scalar parameters can be set without modifying the .uasset. Returns nullptr if
 	// the floor or its material is missing.
@@ -126,4 +144,19 @@ private:
 	// when SetGroundSurface swaps the underlying material so the next push wraps the new MI.
 	TWeakObjectPtr<UMaterialInstanceDynamic> CachedFloorMID;
 
+	// v1.0.130 -- last operator-set Nanite displacement strength (cm). Stored separately
+	// from the live MID so `Rebus.FloorDisplacement 0` -> `SetFloorDisplacementStrength(5)`
+	// -> `Rebus.FloorDisplacement 1` restores 5 cm (not the original 2 cm default). Default
+	// matches the Python builder's FLOOR_DISPLACEMENT_STRENGTH_CM constant; updated by
+	// SetFloorDisplacementStrength when the operator pushes a new value via the
+	// `Rebus.FloorDisplacementStrength <cm>` console command or the FloorDisplacementStrength
+	// scene property.
+	float CachedFloorDisplacementStrength = 2.0f;
+
+	// v1.0.130 -- whether the floor MID is currently expressing displacement (true) or
+	// flattened to 0 (false). Read by SetFloorDisplacementStrength to decide whether to
+	// push the new value through to the MID immediately or just stash it. Toggled by
+	// `Rebus.FloorDisplacement <0|1>` / FloorDisplacement scene property; default true
+	// so a fresh session shows displacement out of the box.
+	bool bFloorDisplacementEnabled = true;
 };
