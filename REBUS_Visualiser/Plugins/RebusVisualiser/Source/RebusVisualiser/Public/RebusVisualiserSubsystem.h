@@ -890,6 +890,30 @@ private:
 	FDelegateHandle PostLoadMapAutoPurgeHandle;
 	void OnPostLoadMapAutoPurge(UWorld* LoadedWorld);
 
+	// v1.0.129 -- one-shot guard + self-heal probe for the UE 5.7 startup-map
+	// error `LogUObjectGlobals: Warning: Failed to find world in already loaded
+	// world package /Game/REBUS/Maps/BaseLevel!`. The Python builder's
+	// idempotency check (`build_rebus_base_level.ensure_base_level`) pre-v1.0.129
+	// gated on `EditorAssetLibrary.does_asset_exist`, which is satisfied by ANY
+	// package file at the path -- including stub packages that contain no
+	// UWorld (a partial save, a redirector after a rename, a wrong-class
+	// asset). The result was a startup-time engine warning + a fall-back to an
+	// empty map + a silently-skipped repair. The Python side (v1.0.129) now
+	// validates the loaded asset is a UWorld with the matching leaf name; this
+	// C++ self-heal is defence-in-depth for the rare path where init_unreal.py
+	// didn't run (Python plug-in disabled, init script errored at import time,
+	// commandlet that doesn't load Slate). Fires from the first
+	// `PostLoadMapWithWorld` dispatch (the editor's startup-map load), probes
+	// `/Game/REBUS/Maps/BaseLevel` directly via the UObject API, and if it can't
+	// resolve to a UWorld the probe logs a clear `LogRebusVisualiser: Error:
+	// BaseLevel package contains no UWorld -- re-running build_rebus_base_level
+	// .py to repair` line and drives the Python builder via the same
+	// `GEngine->Exec("py ...")` pattern the v1.0.121 commandlet bake uses.
+	// Latches after one attempt (the bool below) so PIE start / scene switch
+	// inside one editor session never re-triggers an already-attempted repair.
+	bool bBaseLevelStubSelfHealAttempted = false;
+	void TrySelfHealBaseLevelStub(UWorld* LoadedWorld);
+
 	// (v1.0.116) `static FString ComputeBeamMasterUassetMd5()` was previously declared
 	// here in the `private:` block. It was always called from outside the class
 	// (`RebusVisualiser.cpp::HandleDumpBeamMasterVersionCommand` invokes it as

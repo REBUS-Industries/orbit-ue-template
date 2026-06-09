@@ -3284,7 +3284,7 @@ void ARebusFixtureActor::BuildBeamCone()
 	const FVector ConeFwd = BeamConeRest.GetRotation().RotateVector(FVector::ForwardVector);
 	const FVector SpotFwd = BeamRestTransform.GetRotation().RotateVector(FVector::ForwardVector);
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("Fixture %s beam: SPAWNED v1.0.128 matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s) coneFwd=(%.3f,%.3f,%.3f) spotFwd=(%.3f,%.3f,%.3f) mobilityOrderFixed=1 attachedTo=FixtureRoot midBothPushed=1 diagAvailable=1 coneMeshExtrusionAxis=-X beamStartRadius=%.2fcm goboPlumbing=v1.0.128 windingFlipped=v1.0.128"),
+		TEXT("Fixture %s beam: SPAWNED v1.0.129 matOk=1 baseRadius=%.2fcm farRadius=%.1fcm length=%.0fcm halfAngle=%.1fdeg BeamIntensity=%.2f occlusion=depthtest+depthfade meshBeams=%d (src=%s) coneFwd=(%.3f,%.3f,%.3f) spotFwd=(%.3f,%.3f,%.3f) mobilityOrderFixed=1 attachedTo=FixtureRoot midBothPushed=1 diagAvailable=1 coneMeshExtrusionAxis=-X beamStartRadius=%.2fcm goboPlumbing=v1.0.128 windingFlipped=v1.0.128 baseLevelStubSelfHeal=v1.0.129"),
 		*FixtureId, BeamBaseRadiusUnreal, BeamConeLastFarRadius, BeamLengthUnreal, OuterHalf,
 		CurIntensity, bMeshBeamEnabled ? 1 : 0, DiamSrc,
 		ConeFwd.X, ConeFwd.Y, ConeFwd.Z, SpotFwd.X, SpotFwd.Y, SpotFwd.Z,
@@ -4402,7 +4402,7 @@ void ARebusFixtureActor::DumpBeamConeStateForDebug(const TCHAR* CallSite) const
 	const float MatchHalfDeg = ResolveBeamFootprintMatchHalfDeg();
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("[Rebus] LogBeamCone[%s] v1.0.128 fixtureId=%s | "
+		TEXT("[Rebus] LogBeamCone[%s] v1.0.129 fixtureId=%s | "
 			 "BeamCone={attachParent=%s mobility=%s vis=%d hidGame=%d sections=%d "
 			 "boundsScale=%.2f translucencySort=%d} | "
 			 "Material={slot0Class=%s slot0Name=%s beamMID=%s beamMIDParent=%s "
@@ -4467,7 +4467,7 @@ void ARebusFixtureActor::DumpBeamDiagForDebug(const TCHAR* CallSite) const
 	if (!BeamCone)
 	{
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("[Rebus] DiagBeam[%s] v1.0.128 fixtureId=%s displayName='%s' actor=%s "
+			TEXT("[Rebus] DiagBeam[%s] v1.0.129 fixtureId=%s displayName='%s' actor=%s "
 				 "actorLoc=(%.1f,%.1f,%.1f) ownerHidden=%d BeamCone=<null> -- BuildBeamCone "
 				 "either has not been called yet OR the M_RebusBeam load failed (look for "
 				 "`Fixture %s beam: SKIP (M_RebusBeam failed to load ...)` warning above "
@@ -4690,7 +4690,7 @@ void ARebusFixtureActor::DumpBeamDiagForDebug(const TCHAR* CallSite) const
 		? CurrentGoboTexture->GetName() : FString(TEXT("<null>"));
 
 	UE_LOG(LogRebusVisualiser, Log,
-		TEXT("[Rebus] DiagBeam[%s] v1.0.128 fixtureId=%s displayName='%s' actor=%s "
+		TEXT("[Rebus] DiagBeam[%s] v1.0.129 fixtureId=%s displayName='%s' actor=%s "
 			 "actorLoc=(%.1f,%.1f,%.1f) ownerHidden=%d | "
 			 "BeamCone={registered=%d vis=%d hidGame=%d castShadow=%d mobility=%s attachParent=%s "
 			 "boundsScale=%.2f translucencySort=%d renderMain=%d renderDepth=%d customDepth=%d} | "

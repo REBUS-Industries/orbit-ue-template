@@ -52,6 +52,117 @@ post-process volume at launch (`EnsureSceneEnvironment`), so the stream renders 
 that was authored without them. The fog (`FogDensity`, `bVolumetricFog`, ...) and studio lights
 are then driven from the portal via `SetSceneProperty` (§9).
 
+## Troubleshooting
+
+### "Failed to find the world in already loaded world package /Game/REBUS/Maps/BaseLevel!"
+
+UE 5.7 emits this engine warning (full text: `LogUObjectGlobals: Warning: Failed to find world
+in already loaded world package /Game/REBUS/Maps/BaseLevel! See log for more details.`) when
+something — the editor's startup-map loader driven by `EditorStartupMap` in
+`Config/DefaultEngine.ini`, a Python `unreal.EditorLevelLibrary.load_level` call, an
+`EditorAssetLibrary.load_asset` against the umap path, or a low-level `LoadPackage` — opens the
+`/Game/REBUS/Maps/BaseLevel` package but `UWorld::FindWorldInPackage` cannot find a `UWorld`
+inside whose name matches the package leaf. The editor then falls back to an empty default
+map; the portal `SetSceneProperty` catalogue has no actors to drive; Pixel Streaming sessions
+stream the empty world.
+
+The warning has **four** distinct root-cause shapes. Diagnose first, then run the matching
+one-line shell fix:
+
+1. **LFS pointer not pulled.** A fresh-clone or shallow checkout left the umap as a Git LFS
+   pointer file rather than the real binary. Check the first 200 bytes — if they start with
+   `version https://git-lfs.github.com/spec/v1` it's a pointer.
+
+   ```powershell
+   $bytes = Get-Content -Path "REBUS_Visualiser\Content\REBUS\Maps\BaseLevel.umap" -Encoding Byte -TotalCount 200
+   [System.Text.Encoding]::ASCII.GetString($bytes) | Select-String "git-lfs"
+   ```
+
+   Fix: `git lfs pull`. Then restart the editor. (As of v1.0.128 this repo does NOT route `.umap`
+   through LFS — `git check-attr lfs filter -- "REBUS_Visualiser/Content/REBUS/Maps/BaseLevel.umap"`
+   reports `lfs: unspecified`, `filter: unset` — so this shape is unlikely unless a future
+   `.gitattributes` change opts the maps folder into LFS.)
+
+2. **Empty / stub package on disk (the v1.0.129 user-report shape).** The umap file exists
+   but is much smaller than a populated level (the HEAD-committed `BaseLevel.umap` is
+   ~27,700 bytes; a stub is typically <1 KB). An interrupted `save_current_level()` /
+   `SaveLoadedAsset` wrote a UE5 package header but truncated before the `UWorld` export
+   blob landed; the package loads as a valid `UPackage` containing no `UWorld`.
+
+   ```powershell
+   (Get-Item "REBUS_Visualiser\Content\REBUS\Maps\BaseLevel.umap").Length
+   # < ~5000 bytes => almost certainly a stub
+   ```
+
+   Fix (preferred — restores the v1.0.128-committed working level instantly):
+
+   ```powershell
+   git checkout -- "REBUS_Visualiser/Content/REBUS/Maps/BaseLevel.umap"
+   ```
+
+   Or rebuild from scratch via the Python builder (works even if the committed `BaseLevel.umap`
+   is also broken):
+
+   ```powershell
+   .\Build.bat REBUS_VisualiserEditor Win64 Development
+   # then open the editor and from the Output Log:
+   #   py import build_rebus_base_level; build_rebus_base_level.build()
+   # or headless:
+   .\Engine\Binaries\Win64\UnrealEditor-Cmd.exe REBUS_Visualiser.uproject `
+       -run=PythonScript `
+       -Script="import build_rebus_base_level as b; b.build()" `
+       -unattended -nop4 -nosplash -stdout -FullStdOutLogOutput
+   ```
+
+3. **`PackageName` vs `WorldName` divergence.** The umap was renamed via a low-level move or a
+   non-Content-Browser rename that didn't rewrite the inner `UWorld` UObject's name. The
+   package now contains a `UWorld` whose `GetName()` doesn't match the package leaf
+   (`BaseLevel`); `UWorld::FindWorldInPackage` returns null.
+
+   Fix: trigger the v1.0.129 defensive builder from the editor Output Log:
+
+   ```text
+   py import build_rebus_base_level; build_rebus_base_level.ensure_base_level()
+   ```
+
+   The v1.0.129 `_base_level_world_is_valid` helper detects the name mismatch and the builder
+   re-authors the level via `new_level()` + `save_current_level()`, which produces a `UWorld`
+   whose name matches the package leaf.
+
+4. **`UObjectRedirector` left by a rename, OR wrong asset class created at this path.** A
+   Content Browser rename created a redirector at `/Game/REBUS/Maps/BaseLevel`; or someone
+   accidentally created a `UDataAsset` / `UTexture` / etc. at that path. In both shapes
+   `EditorAssetLibrary.does_asset_exist` returns True but `isinstance(loaded, unreal.World)`
+   is False.
+
+   Fix: same as shape 3 — run `ensure_base_level()`. The v1.0.129 builder's `build()` tail
+   also calls `unreal.AssetToolsHelpers.get_asset_tools().fix_up_referencers_for_redirectors_in_folder(["/Game/REBUS/Maps"])`
+   to clean up any lingering redirector pairs in the Maps folder.
+
+5. **`EditorStartupMap` pointing at a different / deleted map.** Less common, but
+   `Config/DefaultEngine.ini` could have an `EditorStartupMap` setting that doesn't resolve
+   to a real package. Repair the config directly — the canonical line for this project is:
+
+   ```ini
+   [/Script/EngineSettings.GameMapsSettings]
+   GameDefaultMap=/Game/REBUS/Maps/BaseLevel.BaseLevel
+   EditorStartupMap=/Game/REBUS/Maps/BaseLevel.BaseLevel
+   ```
+
+#### How v1.0.129 prevents recurrence
+
+The pre-v1.0.129 idempotency gate (`unreal.EditorAssetLibrary.does_asset_exist`) was a pure
+"is there a package file at this path?" check — too lax. v1.0.129 promotes it to
+`_base_level_world_is_valid()`, which loads the asset and verifies it resolves to a
+`unreal.World` with the matching leaf name. On any miss (shapes 2 / 3 / 4 above) the builder
+logs `RebusBaseLevel v1.0.129: '/Game/REBUS/Maps/BaseLevel' exists on disk but does NOT
+contain a valid UWorld ...` and calls `build()` which `new_level()` + `save_current_level()`'s
+a valid umap on top of whatever was there. `init_unreal.py` runs this on every editor start;
+the C++ `URebusVisualiserSubsystem::TrySelfHealBaseLevelStub` runs it on the first
+`PostLoadMapWithWorld` for the editor session as defence-in-depth against
+`init_unreal.py` failing to run. The result: regardless of starting state, the builder
+converges on a populated `BaseLevel.umap` with fog + post-process + sun/sky + floor.
+
 ## Configuration
 
 `PortalUrl` + `x-api-key` come from the launch command line (preferred for the secret) or
@@ -593,6 +704,93 @@ are **NOT** controlled by the `RenderQuality` tiers — they stay put regardless
 >   as ~the half-angle, so feeding the doubled value made the cone ~2× too wide; the beam edge now
 >   meets the pool edge. Lower `RebusEpicBeamZoomScale` to hug the brighter IES core, raise it toward
 >   the geometric field edge. Lens/start radius (`DMX Lens Radius`) unchanged.
+
+> **v1.0.129 — new user-authored floor material set for the `RebusFloor` stage plane. The user supplied four new `UMaterial`/`UMaterialInstance` `.uasset` assets at `/Game/REBUS/Materials/{Concrete,Grass,Sand,Tarmac}` and asked for them to drive the floor instead of the legacy procedural `MI_RebusGround_<preset>` family. v1.0.129 adds a new `FLOOR_SURFACE_PATHS` lookup table at the top of `Content/Python/build_rebus_base_level.py` (mirroring the existing `GROUND_PRESETS` shape) that maps each surface name to its `/Game/REBUS/Materials/<surface>` package path, a `FLOOR_DEFAULT_SURFACE = "Concrete"` default (most neutral stage surface; matches the existing `GROUND_DEFAULT_PRESET` so a v1.0.129 rebake doesn't visually flip the default tier on a previously-baked project), and a `_resolve_floor_surface_material(preset)` helper that validates the user-authored asset exists via `unreal.EditorAssetLibrary.does_asset_exist`, falls back to the legacy `/Game/REBUS/Materials/MI_RebusGround_<preset>` procedural instance if it doesn't (so a partial-checkout clone where the four `.uasset` files were not pulled still renders a sane floor at the right tier instead of grey checker), and final-falls-back to `None` + a LOUD `unreal.log_error` if even the legacy fallback is missing (the build never aborts — the rest of the level still spawns for triage). `_add_floor()` was retargeted from `_instance_path(GROUND_DEFAULT_PRESET)` to `_resolve_floor_surface_material(FLOOR_DEFAULT_SURFACE)`; the per-asset existence probe runs at build time so an editor-OutputLog Warning surfaces immediately if any of the four user-authored assets is missing on disk. Runtime side: `URebusSceneSettingsSubsystem::SetFloorSurface(FString Surface)` (new method, parallel to the existing `SetGroundSurface` for the legacy procedural family — both are preserved) loads `/Game/REBUS/Materials/<Surface>.<Surface>` via `LoadObject<UMaterialInterface>`, applies it to the floor's slot-0 material, resets `CachedFloorMID` so the next `SetGroundTilingMeters` push wraps the fresh MI cleanly, and re-asserts the live `TilingMeters` scalar (idempotent no-op on a parameter the new MI doesn't expose). A new `FloorSurface` entry in the `ApplySceneProperty` dispatch table wires the `SetSceneProperty name="FloorSurface" value="<Concrete|Tarmac|Sand|Grass>"` portal command surface (parallel to the existing `GroundSurface`, `bGroundVisible`, `GroundTilingMeters` controls — all preserved), and a new `Rebus.FloorSurface <surface>` console command (parallel to `Rebus.SetGroundTiling`, the v1.0.86 console knob for the legacy procedural family) routes through every running Game / PIE world's `URebusSceneSettingsSubsystem::ApplySceneProperty` so the SceneState slot updates in lockstep with the live material swap (a SceneState read-back then reports the operator's choice + `ReapplyAll` re-asserts it after a portal recycle / fixture respawn). Surface name validation lives in both Python (`FLOOR_SURFACE_PATHS` keys) and C++ (the same `Known` `TSet` SetGroundSurface uses, extended with the new asset set) so a typo'd descriptor string can't trigger a load of an unintended `/Game/REBUS/Materials/*` asset. All v1.0.122–v1.0.128 BeamCone / `M_RebusBeam` / fixture-chassis-winding invariants are preserved byte-for-byte; this change is strictly additive (one new lookup table + one new Python helper + one new C++ method + one new dispatch entry + one new console command + one new VersionName slot). User action: pull the v1.0.129-ue5.7 tag, re-bake the BaseLevel via `Tools > Execute Python Script > build_rebus_base_level.py` (or the v1.0.121 commandlet recipe), reload the level (or re-open `/Game/REBUS/Maps/BaseLevel`), and the floor now renders with the user-authored `/Game/REBUS/Materials/Concrete` asset by default; switch at runtime via the new `Rebus.FloorSurface Grass` (or `Sand` / `Tarmac` / `Concrete`) console command, or push from the portal via `SetSceneProperty name="FloorSurface" value="Grass"`.**
+>
+> ### Asset paths (operator-authored — referenced by path only; v1.0.129 does NOT modify any of these `.uasset` files)
+>
+> ```
+> /Game/REBUS/Materials/Concrete   (default; matches FLOOR_DEFAULT_SURFACE)
+> /Game/REBUS/Materials/Grass
+> /Game/REBUS/Materials/Sand
+> /Game/REBUS/Materials/Tarmac
+> ```
+>
+> On-disk leaf-case must match exactly (Concrete, Grass, Sand, Tarmac — capitalised first letter) so cross-platform clones on case-sensitive filesystems load the right `.uasset`. UE asset paths are case-insensitive internally, but the git tracked filename is case-sensitive.
+>
+> ### What v1.0.129 changes (exhaustive — floor-materials slice)
+>
+> 1. **`Content/Python/build_rebus_base_level.py`** — added the `FLOOR_SURFACE_PATHS` dict (next to `GROUND_PRESETS`) mapping the four surface names to their `/Game/REBUS/Materials/<surface>` package paths, `FLOOR_DEFAULT_SURFACE = "Concrete"` constant, and the `_resolve_floor_surface_material(preset)` helper that validates the user-authored asset on disk + falls back to the legacy `MI_RebusGround_<preset>` MI + final-falls-back to None with a LOUD `log_error`. `_add_floor()` was retargeted from `_instance_path(GROUND_DEFAULT_PRESET)` to `_resolve_floor_surface_material(FLOOR_DEFAULT_SURFACE)` and now logs `RebusBaseLevel v1.0.129: floor slot-0 material set to '<path>' (FloorSurface='Concrete'; resolver=user-authored|legacy-procedural-fallback)` on the OutputLog so the operator can confirm which path engaged. Builder remains idempotent — a second run produces the same actor set + the same slot-0 material.
+> 2. **`Source/RebusVisualiser/Public/RebusSceneSettingsSubsystem.h`** — new `void SetFloorSurface(const FString& Surface)` private method declaration alongside the existing `SetGroundSurface` (private; the public surface is `ApplySceneProperty(TEXT("FloorSurface"), ...)` so SceneState round-trip + ReapplyAll re-assert stay in lockstep automatically).
+> 3. **`Source/RebusVisualiser/Private/RebusSceneSettingsSubsystem.cpp`** — implemented `SetFloorSurface`: cached-floor lookup, whitelist guard (the same four names as the Python `FLOOR_SURFACE_PATHS` keys), `LoadObject<UMaterialInterface>` of `/Game/REBUS/Materials/<Clean>.<Clean>` with fallback to `/Game/REBUS/Materials/MI_RebusGround_<Clean>.<...>`, `Comp->SetMaterial(0, Mat)` + `CachedFloorMID.Reset()` + TilingMeters re-assert via `EnsureFloorMID()` (mirrors `SetGroundSurface`'s lifecycle byte-for-byte so per-session tile size + ground-visibility toggles survive the surface swap). Added the `FloorSurface` entry in the `ApplyValue` dispatch table next to the existing `GroundSurface` branch + seeded `Values.Add(TEXT("FloorSurface"), ...)` in `Initialize()` so SceneState round-trips the default from the first reply.
+> 4. **`Source/RebusVisualiser/Private/RebusVisualiser.cpp`** — added `GFloorSurfaceCommand` global pointer, `HandleFloorSurfaceCommand(Args)` handler (mirrors `HandleSetGroundTilingCommand`'s shape: walks every running `Game`/`PIE` world, calls `ApplySceneProperty(TEXT("FloorSurface"), MakeString(Args[0] ?? "Concrete"))`), `IConsoleManager::Get().RegisterConsoleCommand(TEXT("Rebus.FloorSurface"), ..., &HandleFloorSurfaceCommand, ECVF_Default)` in `StartupModule`, and matching `UnregisterConsoleObject(GFloorSurfaceCommand)` in `ShutdownModule`. Default arg = `"Concrete"` so a bare `Rebus.FloorSurface` invocation reverts to the baked default.
+>
+> ### User action required (in order — floor-materials slice)
+>
+> 1. **Pull the v1.0.129-ue5.7 tag + verify the four `.uasset` files are present** at `REBUS_Visualiser/Content/REBUS/Materials/{Concrete,Grass,Sand,Tarmac}.uasset`. Cross-platform clones on case-sensitive filesystems must see the leaf casing exactly as listed.
+> 2. **Reload the editor / `-game` session** — the C++ DLL reload picks up the new `Rebus.FloorSurface` console command + the `FloorSurface` `SetSceneProperty` dispatch entry immediately.
+> 3. **Re-bake the BaseLevel** via `Tools > Execute Python Script > build_rebus_base_level.py` (Option A — interactive editor) OR the v1.0.121 commandlet recipe (Option B — headless). Verify the OutputLog line `RebusBaseLevel v1.0.129: floor slot-0 material set to '/Game/REBUS/Materials/Concrete' (FloorSurface='Concrete'; resolver=user-authored)`; if instead you see `resolver=legacy-procedural-fallback` the v1.0.129 user-authored `.uasset` was not pulled into your clone — check step 1.
+> 4. **Reload the level** (`/Game/REBUS/Maps/BaseLevel`) so the freshly-baked floor binds. The floor now renders with the user-authored `/Game/REBUS/Materials/Concrete` material.
+> 5. **Switch surfaces at runtime** without a re-bake — either via the new console command `Rebus.FloorSurface Grass` (or `Sand` / `Tarmac` / `Concrete`), or from the portal via `SetSceneProperty name="FloorSurface" value="Grass"`. The surface persists in `SceneState` so a portal recycle / fixture respawn re-asserts the operator's choice via `ReapplyAll`.
+
+> **v1.0.129 — fix the operator-reported UE 5.7 startup-map warning `LogUObjectGlobals: Warning: Failed to find world in already loaded world package /Game/REBUS/Maps/BaseLevel!` + harden the Python builder so the same broken-state never recurs idempotently. Root cause: the pre-v1.0.129 idempotency gate in `build_rebus_base_level.ensure_base_level` was `unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH)`, which is a pure "is there a package file at this path?" check. ANY package file satisfies it — including stub packages (a partial save aborted before the `UWorld` export was serialised; a 644-byte `.umap` left by an interrupted `save_current_level()`), redirectors left behind by a `Content Browser` rename, `UDataAsset` / wrong-class assets created at this path by mistake, and `PackageName`-vs-`WorldName` divergence (the umap was renamed but the inner `UWorld` UObject's name stayed at the old leaf). In every shape the engine's startup-map loader (driven by `EditorStartupMap=/Game/REBUS/Maps/BaseLevel.BaseLevel` in `Config/DefaultEngine.ini`) successfully reads the package off disk, runs `UWorld::FindWorldInPackage`, returns null because either no `UWorld` is inside or the world's name doesn't match the package leaf, emits the operator-visible warning, and falls back to an empty default map. The pre-v1.0.129 Python builder's `does_asset_exist` short-circuit then returned False and never repaired the stub — every editor restart re-emitted the same warning and re-fell-back to the same empty world. v1.0.129 promotes the gate from `does_asset_exist` to `_base_level_world_is_valid`, which loads the asset and confirms it resolves to a `unreal.World` with the matching leaf name; on miss the builder logs an Error line + calls `build()` which `new_level` + `save_current_level`'s a valid umap on top of whatever was there (`new_level` replaces the open world in memory; `save_current_level` writes a valid `UWorld`-containing package to disk regardless of starting state). Defence-in-depth backstop in C++: `URebusVisualiserSubsystem::OnPostLoadMapAutoPurge` now also fires a one-shot `TrySelfHealBaseLevelStub` probe on the editor's startup-map load that re-checks BaseLevel via `LoadObject<UWorld>` (with `LOAD_Quiet | LOAD_NoWarn` so the engine warning doesn't double-emit), logs `LogRebusVisualiser: Error: BaseLevel package contains no UWorld -- re-running build_rebus_base_level.py to repair`, and drives the Python builder via the same `GEngine->Exec("py ...")` pattern the v1.0.121 commandlet bake / v1.0.119 beam-master regen use. Self-heal fires for the operator even on the rare path where `init_unreal.py` didn't run (Python plug-in disabled, `init_unreal.py` errored at module-import time, headless commandlet skipped the Slate startup hook). Final cleanup in `build()`: `unreal.AssetToolsHelpers.get_asset_tools().fix_up_referencers_for_redirectors_in_folder(["/Game/REBUS/Maps"])` resolves any stale `UObjectRedirector` pairs left in the Maps folder so a subsequent load never touches a stale redirector. All v1.0.122–v1.0.128 invariants (BeamCone sibling attachment, per-tick relative mirror, SetMobility-before-Register ordering, live-MID double-push pattern, four diagnostic commands, M_RebusBeam revision 122 + GoboTexture/GoboEnable + BeamStartRadius UPROPERTY + winding-swap fix) are preserved byte-for-byte; the change is strictly additive (one new helper + a strengthened gate + one new C++ method + a redirector-fixup step + one new VersionName).**
+>
+> ### Symptom
+>
+> On editor startup (or whenever something loads `/Game/REBUS/Maps/BaseLevel`), the Output Log shows:
+>
+> ```
+> LogUObjectGlobals: Warning: Failed to find world in already loaded world package /Game/REBUS/Maps/BaseLevel! See log for more details.
+> ```
+>
+> The editor opens, but on an empty / default fallback world instead of the populated REBUS BaseLevel. Pixel Streaming sessions stream the empty world; the portal `SetSceneProperty` catalogue has no actors to drive; the floor / fog / sun-sky environment is missing.
+>
+> ### Root cause (precise)
+>
+> The pre-v1.0.129 `build_rebus_base_level.ensure_base_level()` idempotency gate was `unreal.EditorAssetLibrary.does_asset_exist("/Game/REBUS/Maps/BaseLevel")`. That returns True for ANY package file on disk at that path, irrespective of contents. Four distinct corruption shapes all manifest as the same operator-visible warning:
+>
+> 1. **Empty / stub package.** An interrupted `save_current_level()` writes a UE5 package header (the magic `0xC1832A9E` tag + the `LegacyFileVersion=-9` UE5 file version + the package summary table) but truncates before the `UWorld` export blob lands. On disk: a few-hundred-byte `.umap` that loads as a valid `UPackage` but contains no top-level `UWorld`. This is the v1.0.129 user-reported root cause (a 644-byte `BaseLevel.umap` overwrote the v1.0.128-committed 27,701-byte working level).
+> 2. **Redirector left behind by a rename.** Content Browser "Rename" on a `.umap` creates a `UObjectRedirector` at the old path. If the rename target was later deleted (or its destination package is now itself corrupt), the redirector resolves to nothing. `LoadObject<UWorld>` against the old path returns null.
+> 3. **Wrong asset class created at this path.** Someone created a `UDataAsset` / `UTexture` / etc. at `/Game/REBUS/Maps/BaseLevel` by mistake (Content Browser's "Create Asset" without picking `World`). `does_asset_exist` is True; `LoadObject<UWorld>` finds the wrong class.
+> 4. **`PackageName` vs `WorldName` divergence.** The umap was renamed via filesystem move / a low-level rename that didn't rewrite the inner `UWorld` UObject's name. The package now contains a `UWorld` named (say) `OldBaseLevel` but lives at `/Game/REBUS/Maps/BaseLevel.umap`. `UWorld::FindWorldInPackage` matches by name — `FindWorldInPackage("BaseLevel")` looks for a `UWorld` with `GetName() == "BaseLevel"` and finds the differently-named world but cannot match it, so returns null. The engine emits the same warning.
+>
+> In every shape the engine's `EditorStartupMap` loader successfully reads the package off disk, fails to find a matching `UWorld`, emits the warning, and falls back to an empty default map. The pre-v1.0.129 Python builder's `does_asset_exist` gate short-circuited and never repaired.
+>
+> ### Fix (smallest correct change)
+>
+> 1. **`Content/Python/build_rebus_base_level.py::_base_level_world_is_valid()`** — new helper that promotes the gate from "package exists" to "package resolves to a `unreal.World` with the matching leaf name". Cheap on a healthy install (one `does_asset_exist` + one `load_asset` of an already-cached level); always-correct on a broken install.
+> 2. **`Content/Python/build_rebus_base_level.py::ensure_base_level()`** — calls `_base_level_world_is_valid()` instead of `does_asset_exist`. On miss, logs `RebusBaseLevel v1.0.129: '/Game/REBUS/Maps/BaseLevel' exists on disk but does NOT contain a valid UWorld with the matching leaf name ...` and falls through to `build()`. `build()` runs `LevelEditorSubsystem.new_level()` (replaces the open world with a fresh empty `UWorld` whose name matches the package leaf) + `_populate()` (re-authors fog / post-process / sun-sky / floor) + `save_current_level()` (writes a valid umap over the stub).
+> 3. **`Content/Python/build_rebus_base_level.py::build()` tail** — calls `unreal.AssetToolsHelpers.get_asset_tools().fix_up_referencers_for_redirectors_in_folder(["/Game/REBUS/Maps"])` so any stale `UObjectRedirector` in the Maps folder is resolved + deleted (cleans up corruption shape 2 above).
+> 4. **`Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp::TrySelfHealBaseLevelStub()`** — new C++ method called once from `OnPostLoadMapAutoPurge` (the existing `PostLoadMapWithWorld` hook), gated by the new `bBaseLevelStubSelfHealAttempted` one-shot bool. Reads `EditorStartupMap` from `Config/DefaultEngine.ini`; if it points at `/Game/REBUS/Maps/BaseLevel`, attempts `LoadObject<UWorld>` with `LOAD_Quiet | LOAD_NoWarn`. On miss, logs `LogRebusVisualiser: Error: BaseLevel package contains no UWorld -- re-running build_rebus_base_level.py to repair (v1.0.129 self-heal for the UE 5.7 'Failed to find the world in already loaded world package /Game/REBUS/Maps/BaseLevel!' engine warning).` and invokes `GEngine->Exec(LoadedWorld, "py import build_rebus_base_level; build_rebus_base_level.ensure_base_level()", *GLog)`. Defence-in-depth backstop for the rare path where `init_unreal.py` didn't run (Python plug-in disabled, `init_unreal.py` errored at module-import time, commandlet skipped the Slate post-tick hook).
+> 5. **`Source/RebusVisualiser/Public/RebusVisualiserSubsystem.h`** — declares `bBaseLevelStubSelfHealAttempted` + `TrySelfHealBaseLevelStub(UWorld*)`. One-shot guard mirrors the `bBeamMasterAutoPurgeRun` shape; `UGameInstanceSubsystem` instances persist across PIE start/stop so latching after the first attempt cleanly stops re-firing on every level switch.
+> 6. **`Source/RebusVisualiser/Private/RebusVisualiserSubsystem.cpp::Initialize` startup banner triage line** — bumped `if pluginVersion != v1.0.128` → `v1.0.129`.
+> 7. **`Source/RebusVisualiser/Private/RebusVisualiser.cpp` + `RebusFixtureActor.cpp` banner / SPAWNED log strings** — `v1.0.128` → `v1.0.129`. The fixture SPAWNED log gains a `baseLevelStubSelfHeal=v1.0.129` token so the operator can confirm the running binary carries the self-heal probe.
+> 8. **`RebusVisualiser.uplugin`** — `VersionName: "1.0.128"` → `"1.0.129"`.
+>
+> ### User action to recover a current broken-state install
+>
+> Identify which corruption shape you hit by looking at the on-disk `BaseLevel.umap` size + the `git diff` against HEAD:
+>
+> ```
+> # From the project root (PowerShell)
+> (Get-Item "REBUS_Visualiser\Content\REBUS\Maps\BaseLevel.umap").Length
+> git diff --stat HEAD -- "REBUS_Visualiser/Content/REBUS/Maps/BaseLevel.umap"
+> ```
+>
+> Then follow the matching shell-one-liner in the **Troubleshooting → "Failed to find the world in already loaded world package"** block below. The recommended path for the v1.0.129 user-report scenario (644-byte stub overwrote a previously-valid umap) is **(a)** `git checkout -- "REBUS_Visualiser/Content/REBUS/Maps/BaseLevel.umap"` to restore the v1.0.128-committed working level from HEAD; **(b)** pull v1.0.129 + rebuild the C++ binaries (`Build.bat REBUS_VisualiserEditor Win64 Development`); **(c)** restart the editor. The defensive Python builder + C++ self-heal then prevent recurrence regardless of how the stub came to be on disk.
+>
+> ### Why the builder is now idempotent regardless of starting state
+>
+> The v1.0.129 gate validates the LOADED world, not the package-file presence. Concretely, on every editor startup or commandlet invocation of `ensure_base_level()`:
+>
+> - **Healthy install (umap loads as a `UWorld` named `BaseLevel`)**: `_base_level_world_is_valid()` returns True; the function returns False (no work needed); editor opens BaseLevel normally.
+> - **Missing umap**: `does_asset_exist` returns False; `_base_level_world_is_valid` short-circuits to False; the function logs `RebusBaseLevel: '...' missing; generating it.` and calls `build()` which authors the level from scratch.
+> - **Stub umap (corruption shape 1)**: `does_asset_exist` returns True, `_base_level_world_is_valid` sees `load_asset` return None (or a non-`unreal.World`); the function logs the v1.0.129 Error line and calls `build()` which `new_level` + `save_current_level`'s a fresh umap on top of the stub.
+> - **Redirector (shape 2)**: `load_asset` returns a `UObjectRedirector`; `isinstance(loaded, unreal.World)` is False; rebuild path fires; `fix_up_referencers_for_redirectors_in_folder` cleans up the stale redirector after the new save.
+> - **Wrong class (shape 3)**: same — `isinstance(loaded, unreal.World)` is False → rebuild → save replaces the wrong-class asset with a valid umap.
+> - **PackageName/WorldName divergence (shape 4)**: `load_asset` returns a `UWorld` BUT `loaded.get_name() != "BaseLevel"`; rebuild → `new_level` creates a world named correctly + `save_current_level` writes a converged package.
+>
+> In every shape the builder converges on the same end-state: `/Game/REBUS/Maps/BaseLevel.umap` is a valid umap containing a `UWorld` named `BaseLevel` with fog + post-process + sun-sky + floor authored in. The C++ `TrySelfHealBaseLevelStub` is the final safety net for the path where `init_unreal.py` itself failed to import / run.
 
 > **v1.0.128 — three follow-on fixes after v1.0.127's BeamCone orientation flip restored visibility: (1) gobo selected on the portal but NO gobo pattern rendered inside the volumetric `BeamCone` shaft; (2) the cone's wide-base ring at the lens did NOT match the physical lens aperture on the fixture mesh, leaving a visible gap/overlap ring; (3) the middle un-Orbit-bound fixture on the user's screenshot rendered its chassis with shading on the WRONG face (light bleeding through onto the faces that should be in shadow, classic inverted-normals signature). All three landed in a single coherent ship — v1.0.122 sibling attachment, v1.0.123 per-tick relative mirror, v1.0.124 SetMobility-before-Register, v1.0.125 RefreshBeamEmissive double-push pattern, v1.0.126 four-command diagnostic toolkit, and v1.0.127 -X cone extrusion ALL preserved byte-for-byte. Issue 1 required a `M_RebusBeam` master rebake (revision 121 -> 122) because the master pre-v1.0.128 had no gobo sampler inside the raymarch loop — the brand-new `GoboTexture` texture parameter + `GoboEnable` scalar were added to the master in `Content/Python/build_rebus_base_level.py::_build_beam_master` so the existing `_BEAM_RAYMARCH_HLSL` body can sample the gobo planar-projected from the cone apex per raymarch step, modulating density by the gobo's luma. The C++ side adds a new `RefreshBeamGoboParams()` chokepoint that follows the v1.0.125 double-push pattern (resolves the LIVE `UMaterialInstanceDynamic` from `BeamCone->GetMaterial(0)` AND falls back to the cached `BeamMID`, then writes `GoboTexture=GoboRT` + `GoboEnable=bGoboActive` onto BOTH iff distinct). The push fires from THREE call sites: the seed at the tail of `BuildBeamCone` (so a fresh-spawn fixture is gobo-ready before its first frame), the tail of `ApplyCurrentGoboToEpicBeam` (so a `SetFixtureGobo` -> non-Open selection flows to the cone in lockstep with the Epic-beam path), and inside `OnGoboRTUpdate` (so the per-tick `GoboRT` canvas redraw kicks a re-push and the cone shaft never reads a stale-frame cookie). Issue 2 adds a per-fixture `BeamStartRadius` UPROPERTY (default 5.0cm = median moving-head lens radius; clamped [0.5..30.0] cm) that becomes the new PRIMARY fallback for the procedural cone's near-ring radius (`BeamBaseRadiusUnreal`) when the portal `photometrics.LensDiameter` is missing OR is smaller than the operator-chosen radius — the existing `RebusBeamLensRadiusFloorCm` second-level safety floor was simultaneously raised 3.0cm -> 5.0cm so it matches the new UPROPERTY default. The cone authoring at `UpdateBeamConeGeometry` was ALREADY a frustum (base ring at `x=0` with radius `RB`, far ring at `x=-L` with radius `RF`, side wall interpolating linearly between RB and RF — established in v1.0.34 and preserved through v1.0.127); no mesh-topology change was needed, only the source value for `BeamBaseRadiusUnreal`. Issue 3 root-causes the wrong-side shading to `RebusCoords::PointYUpMetersToUnreal` (`Public/RebusCoordinates.h:47`): the portal sends mesh vertices in RH Y-up metres and the conversion remaps `(x,y,z) -> (x,z,y)*100`, an ODD basis permutation with determinant -1 that FLIPS handedness from RH source to LH Unreal. A CCW-wound triangle in source space becomes CW in Unreal and reads back-facing under the LH front-face convention; the per-vertex normal computed via `cross(B-A, C-A)` then points INWARD (cross product also flips sign under handedness inversion). The minimal correct fix is `BuildMeshes`-side: swap `Ia` <-> `Ib` in the fan-triangulation emit so each triangle goes out as `(I0, Ib, Ia)` instead of `(I0, Ia, Ib)`; the cross-product normal flips sign and now points OUTWARD, matching the LH front-face convention. No basis-transform change (which would break every cached transform / motion solve / RebusMotion rest pose) — a pure index-order reorder, paired with the existing odd-permutation convention. Pre-v1.0.128 this bug was MASKED on most fixtures by the v1.0.65 default-on `bDriveOrbitModel` binding (Orbit-imported geometry rides ON TOP of the control-channel proxy mesh via glTFRuntime's correctly-oriented import); only fixtures without an Orbit binding (the middle fixture on the user's screenshot) show through to the broken control-channel proxy.**
 >

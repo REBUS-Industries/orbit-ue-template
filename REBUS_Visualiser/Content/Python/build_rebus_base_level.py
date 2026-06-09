@@ -227,6 +227,37 @@ GROUND_PRESETS = {
 GROUND_DEFAULT_PRESET = "Concrete"
 
 
+# v1.0.129 -- the OPERATOR-AUTHORED floor material presets the user dropped into
+# /Game/REBUS/Materials/ (one .uasset per surface, file names matched exactly so
+# git's case-sensitive filename layer + UE's case-insensitive package layer stay
+# in lockstep on cross-platform clones). These are the AUTHORITATIVE floor
+# materials applied to the RebusFloor static mesh at build time and re-applied
+# at runtime by `Rebus.FloorSurface <surface>` / SetSceneProperty
+# name="FloorSurface" (see URebusSceneSettingsSubsystem::SetFloorSurface in
+# the C++ plugin source).
+#
+# These are SEPARATE from the legacy procedural GROUND_PRESETS / MI_RebusGround_*
+# family above, which v1.0.86 generates from the M_RebusGround master. The legacy
+# family is preserved byte-for-byte (still authored, still wired to the existing
+# Rebus.GroundSurface command + SetSceneProperty name="GroundSurface" path) so
+# any saved scene state / portal recipe that names the legacy presets keeps
+# working. v1.0.129 adds the new family alongside it; the operator picks which
+# surface to apply via FLOOR_DEFAULT_SURFACE (build time) or the new console
+# command (runtime).
+#
+# Default = "Concrete" because (a) the user-authored Concrete asset is the most
+# neutral / studio-grade surface for a stage visualiser, and (b) it matches
+# GROUND_DEFAULT_PRESET so a v1.0.128 -> v1.0.129 rebake doesn't flip the
+# visible default tier on existing scenes.
+FLOOR_SURFACE_PATHS = {
+    "Concrete": MATERIALS_DIR + "/Concrete",
+    "Grass":    MATERIALS_DIR + "/Grass",
+    "Sand":     MATERIALS_DIR + "/Sand",
+    "Tarmac":   MATERIALS_DIR + "/Tarmac",
+}
+FLOOR_DEFAULT_SURFACE = "Concrete"
+
+
 def _set(obj, name, value):
     """set_editor_property that logs instead of throwing on a renamed property."""
     try:
@@ -2163,12 +2194,72 @@ def ensure_ground_materials(force=False):
     unreal.log("RebusBaseLevel: ground materials ensured ({} presets, v1.0.86 world tiling).".format(len(GROUND_PRESETS)))
 
 
+def _resolve_floor_surface_material(preset):
+    """Return (UMaterialInterface, asset_path) for the requested v1.0.129 surface.
+
+    v1.0.129 PRIMARY PATH -- look up `preset` in FLOOR_SURFACE_PATHS and
+    EditorAssetLibrary.does_asset_exist+load_asset the operator-authored
+    /Game/REBUS/Materials/<Preset> .uasset. Returns it on hit; the four .uasset
+    files the user shipped (Concrete / Grass / Sand / Tarmac) ARE the
+    authoritative floor surfaces.
+
+    v1.0.129 FALLBACK PATH -- if the user-authored asset is missing (partial-
+    checkout clone, brand-new operator workstation, asset deleted by accident),
+    fall back to the legacy procedural MI_RebusGround_<Preset> instance that
+    v1.0.86 generates from the M_RebusGround master. This keeps the build
+    idempotent and non-catastrophic on partial-state machines -- the visible
+    surface still tracks the requested preset, it's just the v1.0.85 procedural
+    flavour instead of the v1.0.129 user-authored one. Logs a Warning so the
+    operator sees they need to re-pull the .uasset files.
+
+    Unknown preset -> default to FLOOR_DEFAULT_SURFACE and recurse (single
+    level: the default is always in the table). This guards against operator
+    typos in `Rebus.FloorSurface <typo>` without aborting the call.
+    """
+    if preset not in FLOOR_SURFACE_PATHS:
+        unreal.log_warning(
+            "RebusBaseLevel v1.0.129: unknown floor surface '{}' (valid: {}); "
+            "falling back to default '{}'.".format(
+                preset, sorted(FLOOR_SURFACE_PATHS.keys()), FLOOR_DEFAULT_SURFACE))
+        preset = FLOOR_DEFAULT_SURFACE
+
+    primary = FLOOR_SURFACE_PATHS[preset]
+    if unreal.EditorAssetLibrary.does_asset_exist(primary):
+        try:
+            mat = unreal.EditorAssetLibrary.load_asset(primary)
+        except Exception as exc:  # noqa: BLE001
+            mat = None
+            unreal.log_warning(
+                "RebusBaseLevel v1.0.129: load_asset('{}') raised ({}); "
+                "falling back to legacy MI_RebusGround_{}.".format(
+                    primary, exc, preset))
+        if mat is not None:
+            return mat, primary
+
+    legacy = _instance_path(preset)
+    unreal.log_warning(
+        "RebusBaseLevel v1.0.129: user-authored floor material '{}' not found "
+        "(re-pull missing /Game/REBUS/Materials/{}.uasset to enable the new "
+        "surface); falling back to legacy procedural '{}'.".format(
+            primary, preset, legacy))
+    try:
+        mat = unreal.EditorAssetLibrary.load_asset(legacy)
+    except Exception as exc:  # noqa: BLE001
+        mat = None
+        unreal.log_warning(
+            "RebusBaseLevel v1.0.129: legacy fallback load_asset('{}') also "
+            "raised ({}); floor will use the engine default material.".format(
+                legacy, exc))
+    return mat, legacy if mat is not None else None
+
+
 def _add_floor():
     plane = unreal.EditorAssetLibrary.load_asset("/Engine/BasicShapes/Plane.Plane")
     floor = _spawn(unreal.StaticMeshActor, unreal.Vector(0.0, 0.0, 0.0), label="RebusFloor")
     if not floor:
         return
-    # Tag so URebusSceneSettingsSubsystem can find it for GroundSurface / bGroundVisible.
+    # Tag so URebusSceneSettingsSubsystem can find it for GroundSurface /
+    # bGroundVisible / v1.0.129 FloorSurface.
     floor.set_editor_property("tags", ["RebusFloor"])
     # ~2 km plane reads as an effectively infinite ground at stage scale.
     floor.set_actor_scale3d(unreal.Vector(2000.0, 2000.0, 1.0))
@@ -2176,10 +2267,17 @@ def _add_floor():
     comp = _component(floor, unreal.StaticMeshComponent)
     if comp and plane:
         comp.set_static_mesh(plane)
-        mic = unreal.EditorAssetLibrary.load_asset(_instance_path(GROUND_DEFAULT_PRESET))
-        if mic:
-            comp.set_material(0, mic)
-    unreal.log("RebusBaseLevel: infinite floor plane added (default surface: {}).".format(GROUND_DEFAULT_PRESET))
+        # v1.0.129 -- floor material is now the operator-authored
+        # /Game/REBUS/Materials/<FLOOR_DEFAULT_SURFACE> .uasset, with safe
+        # fallback to the legacy MI_RebusGround_<preset> if the new asset is
+        # missing (handled inside _resolve_floor_surface_material).
+        mat, resolved_path = _resolve_floor_surface_material(FLOOR_DEFAULT_SURFACE)
+        if mat is not None:
+            comp.set_material(0, mat)
+            unreal.log(
+                "RebusBaseLevel v1.0.129: floor surface set to '{}' (asset: {}).".format(
+                    FLOOR_DEFAULT_SURFACE, resolved_path))
+    unreal.log("RebusBaseLevel: infinite floor plane added (default surface: {}).".format(FLOOR_DEFAULT_SURFACE))
 
 
 def _has_floor(actor):
@@ -2273,6 +2371,66 @@ def _populate():
             unreal.log_error("RebusBaseLevel: {} failed ({})".format(step.__name__, exc))
 
 
+def _base_level_world_is_valid():
+    """True iff /Game/REBUS/Maps/BaseLevel resolves to a UWorld with the matching name.
+
+    The pre-v1.0.129 idempotency gate in ensure_base_level() used
+    `unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH)` -- which
+    returns True for ANY package file on disk at that path, regardless of what's
+    inside. That is too lax: a stub package containing no UWorld (a partial save
+    aborted before the world export was written; a `new_level()` followed by an
+    interrupted `save_current_level()`; a redirector left behind by a rename;
+    a wrong-class asset accidentally created at that path) satisfies
+    `does_asset_exist` but causes UE 5.7's startup-map loader to emit
+    `LogUObjectGlobals: Warning: Failed to find world in already loaded world
+    package /Game/REBUS/Maps/BaseLevel!` and fall back to an empty map. The
+    Python builder would then short-circuit and never repair the stub.
+
+    v1.0.129 promotes the gate from "package exists" to "package resolves to a
+    UWorld with the expected leaf name". Anything else -- missing package,
+    package present but contains no UWorld (the v1.0.129 user-reported root
+    cause), redirector / wrong class, PackageName-vs-WorldName divergence
+    (umap renamed without rewriting the inner UWorld's name) -- returns False
+    so the caller deletes the stub and re-authors from scratch via build().
+
+    Returns False on any internal Python exception so the caller errs on the
+    side of repair; the subsequent build() is itself idempotent and safe to
+    re-run, even when no stub is actually present.
+    """
+    if not unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH):
+        return False
+    try:
+        loaded = unreal.EditorAssetLibrary.load_asset(LEVEL_PACKAGE_PATH)
+    except Exception as exc:  # noqa: BLE001
+        unreal.log_warning(
+            "RebusBaseLevel: load_asset('{}') raised ({}); treating as broken "
+            "and rebuilding.".format(LEVEL_PACKAGE_PATH, exc))
+        return False
+    # The package may be a UObjectRedirector (umap was renamed/moved and only
+    # the redirector remains), a UDataAsset created by mistake at this path, or
+    # None when the package is loadable but contains no top-level asset (the
+    # v1.0.129 stub case -- a 644-byte truncated save with a package header but
+    # no UWorld export blob, which UE 5.7's load_asset surfaces as None).
+    if loaded is None:
+        return False
+    try:
+        is_world = isinstance(loaded, unreal.World)
+    except Exception:  # noqa: BLE001
+        is_world = False
+    if not is_world:
+        return False
+    # PackageName-vs-WorldName divergence: the umap was renamed via Content
+    # Browser but the inner UWorld's UObject name stayed at the old leaf. UE's
+    # FindWorldInPackage matches by name, so divergence emits the same "Failed
+    # to find world" warning even though there IS a UWorld inside. Re-author
+    # to converge the names.
+    try:
+        leaf = LEVEL_PACKAGE_PATH.rsplit("/", 1)[-1]
+        return loaded.get_name() == leaf
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def build():
     """Force-(re)create the base level from scratch and save it.
 
@@ -2291,6 +2449,16 @@ def build():
     v1.0.119 converts every line in BOTH functions to 4-space indentation
     (matching every other function in this module) so the import succeeds. See
     the v1.0.119 README release block for the full diagnosis + fix.
+
+    v1.0.129 NOTE -- if a stub / wrong-class / redirector asset is already
+    sitting at LEVEL_PACKAGE_PATH (the v1.0.129 root cause: the package loads
+    but contains no UWorld), `les.new_level()` below will replace the open
+    world with a fresh empty UWorld and `save_current_level()` will write a
+    valid umap on top of the stub. No explicit delete is needed because the
+    save-current-level path overwrites the package file in place. As a final
+    cleanup, `fix_up_referencers_for_redirectors_in_folder` resolves any
+    redirector pairs left over in `/Game/REBUS/Maps/` so subsequent loads
+    never touch a stale redirector.
     """
     # A full bake always overwrites the generated materials (no confirmation dialog);
     # safe because new_level below replaces the open level, so nothing references the
@@ -2312,6 +2480,9 @@ def build():
     les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
 
     # Create a fresh, empty level (replaces whatever is open) and make it current.
+    # Overwrites any existing package at this path including v1.0.129 stubs that
+    # contain no UWorld -- new_level + save_current_level always produce a valid
+    # umap with a UWorld of the matching leaf name.
     les.new_level(LEVEL_PACKAGE_PATH)
 
     _populate()
@@ -2319,16 +2490,54 @@ def build():
     les.save_current_level()
     unreal.log("RebusBaseLevel: saved {}".format(LEVEL_PACKAGE_PATH))
 
+    # v1.0.129 -- resolve any UObjectRedirector pairs that may have been left in
+    # the Maps folder by an earlier rename / move. Without this, a redirector
+    # at /Game/REBUS/Maps/BaseLevel that ALSO satisfies does_asset_exist would
+    # keep re-triggering the "world not found" warning even though the actual
+    # UWorld now lives at the resolved target path. Best-effort: a missing
+    # AssetTools API on a future engine drop is treated as a soft warning, not
+    # an abort -- the just-written valid umap is the primary fix anyway.
+    try:
+        asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+        asset_tools.fix_up_referencers_for_redirectors_in_folder(["/Game/REBUS/Maps"])
+        unreal.log(
+            "RebusBaseLevel v1.0.129: fix_up_referencers_for_redirectors_in_folder"
+            "('/Game/REBUS/Maps') ran -- any stale Map redirectors have been resolved.")
+    except Exception as exc:  # noqa: BLE001
+        unreal.log_warning(
+            "RebusBaseLevel v1.0.129: fix_up_referencers_for_redirectors_in_folder "
+            "raised ({}); the just-written umap is still valid -- this only matters "
+            "if a prior rename left a redirector in /Game/REBUS/Maps/.".format(exc))
+
 
 def ensure_base_level():
-    """Generate the base level only if it does not already exist.
+    """Generate the base level only if it is missing OR contains no valid UWorld.
 
-    Returns True if it had to build the level, False if it was already present.
-    This is the idempotent entry point the startup hook (init_unreal.py) uses so
-    opening the project always lands on a populated stage without clobbering an
+    Returns True if it had to build/rebuild the level, False if the existing
+    asset already resolved to a UWorld with the matching leaf name. This is the
+    idempotent entry point the startup hook (init_unreal.py) uses so opening
+    the project always lands on a populated stage without clobbering an
     existing BaseLevel on every launch.
 
     v1.0.119 NOTE -- see `build()`'s docstring; same tabs/spaces fix lives here.
+
+    v1.0.129 ROOT-CAUSE FIX -- the pre-v1.0.129 gate was
+    `unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH)`, which is
+    a pure "file at this path?" check. A package file CAN exist on disk while
+    containing no UWorld -- a stub left by an interrupted save, a redirector
+    after a rename, a wrong-class asset created by mistake. UE 5.7's startup-
+    map loader then emits the operator-confusing warning
+    `LogUObjectGlobals: Warning: Failed to find world in already loaded world
+    package /Game/REBUS/Maps/BaseLevel!` and falls back to an empty map; the
+    pre-v1.0.129 builder short-circuited and never repaired it.
+
+    v1.0.129 promotes the gate to `_base_level_world_is_valid()`, which loads
+    the asset and verifies it resolves to a `unreal.World` with the matching
+    leaf name. On miss, it logs an Error line (so the operator sees the repair
+    happening) and calls `build()` which `new_level` + `save_current_level`'s
+    a valid umap on top of whatever was there -- making the builder idempotent
+    regardless of starting state. See the v1.0.129 README release block for the
+    four corruption-shape scenarios this covers.
     """
     # Ground + lens materials self-heal independently of the map (cheap if already present).
     ensure_ground_materials()
@@ -2343,9 +2552,25 @@ def ensure_base_level():
     # v1.0.95 migration -- see the helper docstring + README v1.0.95.
     _cleanup_internal_beam_assets()
 
-    if unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH):
+    if _base_level_world_is_valid():
         return False
-    unreal.log("RebusBaseLevel: '{}' missing; generating it.".format(LEVEL_PACKAGE_PATH))
+
+    # The gate above already distinguishes "missing" from "present-but-broken"
+    # via `does_asset_exist`; reuse the same probe here so the log line makes
+    # the operator's diagnosis explicit.
+    if unreal.EditorAssetLibrary.does_asset_exist(LEVEL_PACKAGE_PATH):
+        unreal.log_error(
+            "RebusBaseLevel v1.0.129: '{}' exists on disk but does NOT contain a "
+            "valid UWorld with the matching leaf name (stub package / redirector "
+            "/ wrong asset class / PackageName-vs-WorldName divergence). This is "
+            "the root cause of the UE 5.7 'Failed to find the world in already "
+            "loaded world package' engine warning. Rebuilding the level in place "
+            "via new_level + save_current_level so the package always converges "
+            "to a valid umap; see README v1.0.129 + Troubleshooting block.".format(
+                LEVEL_PACKAGE_PATH))
+    else:
+        unreal.log(
+            "RebusBaseLevel: '{}' missing; generating it.".format(LEVEL_PACKAGE_PATH))
     build()
     return True
 

@@ -33,6 +33,14 @@ void URebusSceneSettingsSubsystem::Initialize(FSubsystemCollectionBase& Collecti
 	// round-trips the ground controls before the portal pushes its first value.
 	Values.Add(TEXT("GroundSurface"), FRebusPropertyValue::MakeString(TEXT("Concrete")));
 	Values.Add(TEXT("bGroundVisible"), FRebusPropertyValue::MakeBool(true));
+	// v1.0.129 -- seed the new operator-AUTHORED FloorSurface property so SceneState
+	// round-trips it from the first reply, and ReapplyAll re-asserts the live
+	// material after every (re)spawn. Keep the default in sync with the Python
+	// builder's FLOOR_DEFAULT_SURFACE ("Concrete") so a build() + a clean
+	// editor launch land on the same visible surface; if the operator picks a
+	// different surface via Rebus.FloorSurface / SetSceneProperty the choice
+	// flows into Values + survives a portal recycle through this same map.
+	Values.Add(TEXT("FloorSurface"), FRebusPropertyValue::MakeString(TEXT("Concrete")));
 	// v1.0.86: floor textures tile at 1 m per repeat by default. The C++ runtime pushes this
 	// scalar to the floor MID after the ground material is (re)applied; the v1.0.86 ground
 	// master uses it to drive WorldPosition-derived UVs (UV = WorldPosition.xy / (TilingMeters
@@ -274,6 +282,99 @@ void URebusSceneSettingsSubsystem::SetGroundSurface(const FString& Preset)
 		}
 	}
 	UE_LOG(LogRebusVisualiser, Log, TEXT("Ground surface set to '%s' (TilingMeters reasserted on MID)."), *Clean);
+}
+
+void URebusSceneSettingsSubsystem::SetFloorSurface(const FString& Surface)
+{
+	// v1.0.129 -- swap the floor slot-0 material to the user-AUTHORED
+	// /Game/REBUS/Materials/<Surface> asset (the four .uasset files the operator
+	// dropped in at v1.0.129). Mirrors SetGroundSurface's shape so the
+	// CachedFloor + CachedFloorMID lifecycle stays consistent between the
+	// legacy procedural path and the new authored path. Falls back to the
+	// legacy /Game/REBUS/Materials/MI_RebusGround_<Surface> when the authored
+	// asset can't be loaded, so a partial-checkout clone (the four authored
+	// .uasset files not pulled) still produces a sane visible floor at the
+	// requested tier instead of a grey checker.
+	AStaticMeshActor* Floor = GetFloor();
+	if (!Floor)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("SetFloorSurface '%s': no RebusFloor in level; cannot apply (re-run "
+				 "build_rebus_base_level.py or load /Game/REBUS/Maps/BaseLevel)."),
+			*Surface);
+		return;
+	}
+	UStaticMeshComponent* Comp = Floor->GetStaticMeshComponent();
+	if (!Comp) return;
+
+	// Whitelist the four v1.0.129 surfaces so an arbitrary portal-descriptor
+	// string can't trigger a load of an unintended asset (matches
+	// FLOOR_SURFACE_PATHS in build_rebus_base_level.py + the Python
+	// FLOOR_DEFAULT_SURFACE fallback shape).
+	const FString Clean = Surface.TrimStartAndEnd();
+	static const TSet<FString> Known = { TEXT("Concrete"), TEXT("Tarmac"), TEXT("Sand"), TEXT("Grass") };
+	if (!Known.Contains(Clean))
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("FloorSurface '%s' is not a known v1.0.129 surface (valid: Concrete | "
+				 "Tarmac | Sand | Grass); ignoring."),
+			*Clean);
+		return;
+	}
+
+	// Primary: /Game/REBUS/Materials/<Clean>.<Clean> -- the user-authored asset.
+	const FString PrimaryPath = FString::Printf(
+		TEXT("/Game/REBUS/Materials/%s.%s"), *Clean, *Clean);
+	UMaterialInterface* Mat = LoadObject<UMaterialInterface>(nullptr, *PrimaryPath);
+	FString ResolvedPath = PrimaryPath;
+	if (!Mat)
+	{
+		// Fallback: /Game/REBUS/Materials/MI_RebusGround_<Clean>.<...> -- the
+		// legacy procedural instance ensure_ground_materials() generates. The
+		// build never fails out; a final grey-checker render is preferable to
+		// silently leaving the previous surface AND losing the SceneState
+		// round-trip alignment.
+		const FString FallbackPath = FString::Printf(
+			TEXT("/Game/REBUS/Materials/MI_RebusGround_%s.MI_RebusGround_%s"), *Clean, *Clean);
+		Mat = LoadObject<UMaterialInterface>(nullptr, *FallbackPath);
+		ResolvedPath = FallbackPath;
+		if (!Mat)
+		{
+			UE_LOG(LogRebusVisualiser, Warning,
+				TEXT("SetFloorSurface '%s': neither v1.0.129 authored asset '%s' "
+					 "nor legacy fallback '%s' could be loaded; floor unchanged."),
+				*Clean, *PrimaryPath, *FallbackPath);
+			return;
+		}
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("SetFloorSurface '%s': v1.0.129 authored asset '%s' missing; "
+				 "applied legacy fallback '%s' instead. Pull the user-authored "
+				 ".uasset to /Game/REBUS/Materials/%s to get the operator-chosen "
+				 "look."),
+			*Clean, *PrimaryPath, *FallbackPath, *Clean);
+	}
+
+	// Mirror SetGroundSurface's lifecycle: apply MI, drop the cached MID so the
+	// next SetGroundTilingMeters push wraps the new MI cleanly, then re-assert
+	// the current TilingMeters scalar (idempotent no-op on a parameter the new
+	// MI doesn't expose).
+	Comp->SetMaterial(0, Mat);
+	CachedFloorMID.Reset();
+	if (UMaterialInstanceDynamic* MID = EnsureFloorMID())
+	{
+		if (const FRebusPropertyValue* TileVal = Values.Find(TEXT("GroundTilingMeters")))
+		{
+			MID->SetScalarParameterValue(TEXT("TilingMeters"), FMath::Max(TileVal->AsFloat(), 0.01f));
+		}
+	}
+
+	// Update the SceneState slot so a SceneState reply / ReapplyAll re-asserts
+	// the operator's choice across a portal recycle / fixture respawn.
+	Values.Add(TEXT("FloorSurface"), FRebusPropertyValue::MakeString(Clean));
+
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("v1.0.129 floor surface set to '%s' (resolved=%s)."),
+		*Clean, *ResolvedPath);
 }
 
 UMaterialInstanceDynamic* URebusSceneSettingsSubsystem::EnsureFloorMID()
@@ -547,6 +648,15 @@ bool URebusSceneSettingsSubsystem::ApplySceneProperty(const FString& Name, const
 	else if (Name == TEXT("GroundSurface"))
 	{
 		SetGroundSurface(Value.String);
+	}
+	// v1.0.129 -- the operator-AUTHORED floor surface set: swaps the floor
+	// slot-0 material to /Game/REBUS/Materials/<value> (Concrete / Grass /
+	// Sand / Tarmac). Parallel to GroundSurface above (which still drives the
+	// legacy procedural MI_RebusGround_<preset> path for back-compat). See
+	// the v1.0.129 README release block for the user action / asset paths.
+	else if (Name == TEXT("FloorSurface"))
+	{
+		SetFloorSurface(Value.String);
 	}
 	else if (Name == TEXT("bGroundVisible"))
 	{

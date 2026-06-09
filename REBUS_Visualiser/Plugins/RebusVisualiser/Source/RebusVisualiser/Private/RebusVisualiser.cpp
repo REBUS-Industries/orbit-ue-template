@@ -51,6 +51,12 @@ namespace
 	IConsoleCommand* GAAModeCommand = nullptr;
 	IConsoleCommand* GOverrideTrussMaterialCommand = nullptr;
 	IConsoleCommand* GSetGroundTilingCommand = nullptr;
+	// v1.0.129 -- `Rebus.FloorSurface <Concrete|Tarmac|Sand|Grass>` swaps the
+	// RebusFloor static-mesh slot-0 material to the operator-AUTHORED asset at
+	// /Game/REBUS/Materials/<surface>. Parallel to `Rebus.SetGroundTiling`
+	// (v1.0.86) for the legacy procedural ground -- both route through
+	// URebusSceneSettingsSubsystem so SceneState round-trips the choice.
+	IConsoleCommand* GFloorSurfaceCommand = nullptr;
 	IConsoleCommand* GDumpFixtureIesCommand = nullptr;
 	IConsoleCommand* GRebuildBeamMaterialCommand = nullptr; // v1.0.103 -- editor-only runtime regen
 	IConsoleCommand* GOrbitCastShadowsCommand = nullptr;
@@ -826,7 +832,7 @@ namespace
 		}
 
 		UE_LOG(LogRebusVisualiser, Log,
-			TEXT("===== Rebus.DiagBeam v1.0.128 begin -- pluginVersion=v%s filter='%s' (empty => "
+			TEXT("===== Rebus.DiagBeam v1.0.129 begin -- pluginVersion=v%s filter='%s' (empty => "
 				 "every fixture). Engine={r.VolumetricFog=%d r.AllowOcclusionQueries=%d "
 				 "r.AntiAliasingMethod=%d(%s) r.ScreenPercentage=%.1f r.Lumen.Reflections=%d "
 				 "r.Lumen.ScreenProbeGather.Temporal=%d r.Translucency.Velocity=%d "
@@ -864,7 +870,7 @@ namespace
 		if (Filter.IsEmpty())
 		{
 			UE_LOG(LogRebusVisualiser, Log,
-				TEXT("===== Rebus.DiagBeam v1.0.128 end -- dumped %d/%d fixture(s) (no filter). "
+				TEXT("===== Rebus.DiagBeam v1.0.129 end -- dumped %d/%d fixture(s) (no filter). "
 					 "Next steps (the v1.0.126 runbook): if any fixture's `MIDReadback={BeamIntensity=0.0000 "
 					 "...}` AND `Drive={dimmerCurrent>0}` => run `Rebus.ForceBeam 50` to bypass the DMX "
 					 "pipeline and prove the cone CAN render at all; if ForceBeam succeeds the failure "
@@ -877,7 +883,7 @@ namespace
 		else if (Matched == 0)
 		{
 			UE_LOG(LogRebusVisualiser, Warning,
-				TEXT("===== Rebus.DiagBeam v1.0.128 end -- filter '%s' matched NO fixtures "
+				TEXT("===== Rebus.DiagBeam v1.0.129 end -- filter '%s' matched NO fixtures "
 					 "(scanned %d total across every Game/PIE/Editor world; check the Speckle "
 					 "node id -- same key SetFixture* uses)."),
 				*Filter, Total);
@@ -885,7 +891,7 @@ namespace
 		else
 		{
 			UE_LOG(LogRebusVisualiser, Log,
-				TEXT("===== Rebus.DiagBeam v1.0.128 end -- dumped %d matching fixture(s) "
+				TEXT("===== Rebus.DiagBeam v1.0.129 end -- dumped %d matching fixture(s) "
 					 "(filter '%s', scanned %d total)."),
 				Matched, *Filter, Total);
 		}
@@ -1848,6 +1854,41 @@ namespace
 			TEXT("Rebus.SetGroundTiling %.3f: pushed to %d scene-settings subsystem(s)."), Metres, Subsystems);
 	}
 
+	// v1.0.129 -- `Rebus.FloorSurface <Concrete|Tarmac|Sand|Grass>` swap the
+	// RebusFloor static-mesh slot-0 material to the user-AUTHORED asset at
+	// /Game/REBUS/Materials/<surface>. Routes through every running Game / PIE
+	// world's URebusSceneSettingsSubsystem::ApplySceneProperty so the SceneState
+	// FloorSurface slot updates in lockstep with the live material swap (a
+	// portal SceneState read-back then reports the operator's choice + a
+	// ReapplyAll re-asserts it after a fixture respawn). The actual material
+	// load + slot-0 swap + CachedFloorMID reset all live in SetFloorSurface;
+	// this console handler is a thin per-world dispatcher in the
+	// `HandleSetGroundTilingCommand` shape -- the only difference being the
+	// catalogue name + the default (no arg => default to "Concrete" so the
+	// command never throws on a stray invocation, matching the Python
+	// FLOOR_DEFAULT_SURFACE). Silent no-op in -game when no subsystem is
+	// registered (the same as every other Rebus.* command).
+	void HandleFloorSurfaceCommand(const TArray<FString>& Args)
+	{
+		if (!GEngine) return;
+		const FString Surface = (Args.Num() > 0) ? Args[0] : FString(TEXT("Concrete"));
+		int32 Subsystems = 0;
+		for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Ctx.World();
+			if (!World || (Ctx.WorldType != EWorldType::Game && Ctx.WorldType != EWorldType::PIE)) continue;
+			URebusSceneSettingsSubsystem* Sce = World->GetSubsystem<URebusSceneSettingsSubsystem>();
+			if (!Sce) continue;
+			++Subsystems;
+			Sce->ApplySceneProperty(TEXT("FloorSurface"), FRebusPropertyValue::MakeString(Surface));
+		}
+		UE_LOG(LogRebusVisualiser, Log,
+			TEXT("Rebus.FloorSurface '%s': pushed to %d scene-settings subsystem(s) "
+				 "(v1.0.129 user-authored /Game/REBUS/Materials/%s; legacy "
+				 "MI_RebusGround_%s fallback if missing)."),
+			*Surface, Subsystems, *Surface, *Surface);
+	}
+
 	// v1.0.85: `Rebus.OverrideTrussMaterial [0|1]` -- enable / disable the powdercoat material
 	// override on every Orbit-imported primitive NOT bound to a fixture. ON applies the truss
 	// material (loaded from /Game/REBUS/Materials/M_RebusTruss.M_RebusTruss if present, else a
@@ -2427,6 +2468,33 @@ void FRebusVisualiserModule::StartupModule()
 		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleSetGroundTilingCommand),
 		ECVF_Default);
 
+	// v1.0.129 -- per-session operator-AUTHORED floor surface swap (Concrete /
+	// Tarmac / Sand / Grass), backing the new /Game/REBUS/Materials/<surface>
+	// .uasset assets the user dropped in at v1.0.129. Routes through
+	// URebusSceneSettingsSubsystem::ApplySceneProperty so SceneState +
+	// ReapplyAll keep the operator's choice persistent across a portal
+	// recycle / fixture respawn. Default arg = "Concrete" (matches the Python
+	// builder's FLOOR_DEFAULT_SURFACE so a no-arg invocation reverts to the
+	// baked default). The command is a NEW v1.0.129 surface; the legacy
+	// `SetSceneProperty name="GroundSurface"` portal control is still wired
+	// and continues to drive the procedural MI_RebusGround_<preset> family
+	// untouched.
+	GFloorSurfaceCommand = IConsoleManager::Get().RegisterConsoleCommand(
+		TEXT("Rebus.FloorSurface"),
+		TEXT("v1.0.129 -- swap the RebusFloor static-mesh slot-0 material to the "
+			 "user-authored /Game/REBUS/Materials/<surface>.uasset. Valid: "
+			 "Concrete | Tarmac | Sand | Grass (case-sensitive in the on-disk "
+			 "asset name; the C++ Whitelist match is case-sensitive too). On "
+			 "missing asset (partial-checkout clone) falls back to the legacy "
+			 "procedural MI_RebusGround_<surface> instance so the floor still "
+			 "renders at the requested tier. Updates SceneState in lockstep so "
+			 "a SceneState read-back reports the operator's choice + ReapplyAll "
+			 "re-asserts it after a portal recycle. Default (no arg) restores "
+			 "Concrete (matches build_rebus_base_level.FLOOR_DEFAULT_SURFACE). "
+			 "Usage: Rebus.FloorSurface [Concrete|Tarmac|Sand|Grass]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&HandleFloorSurfaceCommand),
+		ECVF_Default);
+
 	// v1.0.85 truss / set-piece powdercoat material override -- ON by default. See the
 	// HandleOverrideTrussMaterialCommand comment header for the full rationale.
 	GOverrideTrussMaterialCommand = IConsoleManager::Get().RegisterConsoleCommand(
@@ -2822,6 +2890,12 @@ void FRebusVisualiserModule::ShutdownModule()
 	{
 		IConsoleManager::Get().UnregisterConsoleObject(GSetGroundTilingCommand);
 		GSetGroundTilingCommand = nullptr;
+	}
+	// v1.0.129 -- Rebus.FloorSurface teardown.
+	if (GFloorSurfaceCommand)
+	{
+		IConsoleManager::Get().UnregisterConsoleObject(GFloorSurfaceCommand);
+		GFloorSurfaceCommand = nullptr;
 	}
 	if (GDumpFixtureIesCommand)
 	{

@@ -226,7 +226,7 @@ void URebusVisualiserSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 			BeamMasterRegenAttempts,
 			*LastBeamMasterRegenResult,
 			LastBeamMasterRegenDetectedAfter,
-			TEXT(" -- Operator triage: if pluginVersion != v1.0.128 the C++ binary "
+			TEXT(" -- Operator triage: if pluginVersion != v1.0.129 the C++ binary "
 				 "is stale (`git pull` without rebuild); if beamMasterVerdict != "
 				 "v1.0.121+ the on-disk M_RebusBeam.uasset is stale -- in a real "
 				 "editor OR commandlet session the v1.0.112+ auto-purge SHOULD fire "
@@ -322,7 +322,7 @@ void URebusVisualiserSubsystem::Deinitialize()
 	Super::Deinitialize();
 }
 
-void URebusVisualiserSubsystem::OnPostLoadMapAutoPurge(UWorld* /*LoadedWorld*/)
+void URebusVisualiserSubsystem::OnPostLoadMapAutoPurge(UWorld* LoadedWorld)
 {
 	// v1.0.113 -- re-fire the v1.0.112 stale-master probe after every level load.
 	// The v1.0.112 `bBeamMasterAutoPurgeRun` one-shot bool was per-subsystem-
@@ -337,6 +337,132 @@ void URebusVisualiserSubsystem::OnPostLoadMapAutoPurge(UWorld* /*LoadedWorld*/)
 	// a one-liner), so re-firing on every map load is safe.
 	bBeamMasterAutoPurgeRun = false;
 	ProbeAndAutoPurgeStaleBeamMaster();
+
+	// v1.0.129 -- piggyback the BaseLevel-stub self-heal probe on the very first
+	// `PostLoadMapWithWorld` dispatch (the editor's startup-map load). One-shot
+	// guarded inside `TrySelfHealBaseLevelStub` so a PIE start / scene switch
+	// later in the session never re-triggers it. See the header doc-comment on
+	// `bBaseLevelStubSelfHealAttempted` + the v1.0.129 README block for the full
+	// shape (defence-in-depth backstop to the Python builder's v1.0.129 gate).
+	TrySelfHealBaseLevelStub(LoadedWorld);
+}
+
+void URebusVisualiserSubsystem::TrySelfHealBaseLevelStub(UWorld* LoadedWorld)
+{
+#if WITH_EDITOR
+	// One-shot guard. `UGameInstanceSubsystem` instances persist across PIE
+	// start/stop within one editor session, so latching this bool after the
+	// first attempt is the natural way to keep the (potentially expensive)
+	// Python rebuild from re-firing on every level switch. Mirrors the
+	// `bBeamMasterAutoPurgeRun` shape, but WITHOUT the v1.0.113 reset hook --
+	// the BaseLevel repair only meaningfully runs once per session, because
+	// after the first repair the package on disk is valid and any subsequent
+	// PostLoadMapWithWorld observes a healthy BaseLevel.
+	if (bBaseLevelStubSelfHealAttempted)
+	{
+		return;
+	}
+	bBaseLevelStubSelfHealAttempted = true;
+
+	// Only meaningful in interactive editor sessions. `-game` runtime + cooked
+	// commandlets cannot run the editor-only Python regen path the repair
+	// drives (the v1.0.120 stop-the-bleeding gate would abort the bake anyway).
+	// Mirrors the C++ gate `CanRegenBeamMasterInProcess` uses so policy stays
+	// consistent across the v1.0.121 commandlet bake / v1.0.119 beam regen /
+	// v1.0.129 BaseLevel repair paths.
+	if (!GIsEditor || IsRunningGame() || IsRunningDedicatedServer() || IsRunningCommandlet())
+	{
+		return;
+	}
+
+	// Read the configured `EditorStartupMap` from `Config/DefaultEngine.ini`.
+	// If the project doesn't have one (or it points to a map this plug-in
+	// doesn't own), the BaseLevel repair has nothing to do.
+	FString StartupMap;
+	if (!GConfig || !GConfig->GetString(
+			TEXT("/Script/EngineSettings.GameMapsSettings"),
+			TEXT("EditorStartupMap"), StartupMap, GEngineIni)
+		|| StartupMap.IsEmpty())
+	{
+		return;
+	}
+
+	// Normalise `/Game/.../X.X` -> `/Game/.../X` (the long package name) so we
+	// can both string-compare against the BaseLevel canonical path AND feed it
+	// straight to `LoadObject<UWorld>` (which wants the dotted form re-derived).
+	FString PackageName = StartupMap;
+	int32 DotIdx = INDEX_NONE;
+	if (PackageName.FindLastChar(TEXT('.'), DotIdx))
+	{
+		PackageName.LeftInline(DotIdx);
+	}
+	if (!PackageName.Equals(TEXT("/Game/REBUS/Maps/BaseLevel"), ESearchCase::IgnoreCase))
+	{
+		return;
+	}
+
+	// Re-derive the dotted "PackageName.AssetName" object path. UE 5.7's
+	// `LoadObject` returns null when the package loads but contains no UObject
+	// of the requested class -- which is exactly the v1.0.129 stub case the
+	// startup loader's "Failed to find world in already loaded world package"
+	// warning surfaces. `LOAD_Quiet | LOAD_NoWarn` suppresses re-emitting the
+	// engine warning on this verification pass.
+	const FString LeafName = FPaths::GetBaseFilename(PackageName);
+	const FString ObjectPath = PackageName + TEXT(".") + LeafName;
+
+	UWorld* Probed = LoadObject<UWorld>(
+		nullptr, *ObjectPath, nullptr, LOAD_Quiet | LOAD_NoWarn);
+	if (Probed != nullptr)
+	{
+		UE_LOG(LogRebusVisualiser, Verbose,
+			TEXT("v1.0.129 BaseLevel self-heal probe: '%s' resolves to UWorld '%s' "
+				 "-- no repair needed."),
+			*ObjectPath, *Probed->GetName());
+		return;
+	}
+
+	// The package either doesn't exist on disk, contains no UWorld, contains a
+	// UWorld whose name diverged from the package leaf, or is a redirector to
+	// a deleted target. In every shape the operator-visible symptom is the
+	// same UE 5.7 startup warning + an empty fallback map. Log the diagnostic
+	// the brief asks for and drive the Python builder via the same `py` Exec
+	// pattern the v1.0.121 commandlet bake / v1.0.119 beam-master regen use.
+	UE_LOG(LogRebusVisualiser, Error,
+		TEXT("BaseLevel package contains no UWorld -- re-running build_rebus_base_level.py "
+			 "to repair (v1.0.129 self-heal for the UE 5.7 'Failed to find the world in "
+			 "already loaded world package /Game/REBUS/Maps/BaseLevel!' engine warning). "
+			 "EditorStartupMap='%s' resolved to a stub / wrong-class / missing-UWorld "
+			 "package; the loaded fallback world is '%s'. See README v1.0.129 + "
+			 "Troubleshooting block for the four corruption-shape scenarios this covers."),
+		*StartupMap,
+		(LoadedWorld && LoadedWorld->GetOutermost())
+			? *LoadedWorld->GetOutermost()->GetName() : TEXT("<null>"));
+
+	if (!GEngine)
+	{
+		UE_LOG(LogRebusVisualiser, Warning,
+			TEXT("v1.0.129 BaseLevel self-heal: GEngine is null at PostLoadMapWithWorld "
+				 "time (very early init race); skipping the `py` Exec. The Python "
+				 "init_unreal.py startup hook should pick up the same repair on the "
+				 "next editor restart -- the gate is the same `_base_level_world_is_valid`."));
+		return;
+	}
+
+	const TCHAR* PyCmd = TEXT(
+		"py import build_rebus_base_level; build_rebus_base_level.ensure_base_level()");
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("v1.0.129 BaseLevel self-heal: invoking `%s` -- expect a `RebusBaseLevel "
+			 "v1.0.129: '...' exists on disk but does NOT contain a valid UWorld ...` "
+			 "log block on the next line(s), followed by `RebusBaseLevel: saved /Game/REBUS/"
+			 "Maps/BaseLevel`. After it completes, manually re-open /Game/REBUS/Maps/"
+			 "BaseLevel from the Content Browser (or restart the editor) to load the "
+			 "repaired world -- the current open world is the engine's fallback."),
+		PyCmd);
+	const bool bExecOk = GEngine->Exec(LoadedWorld, PyCmd, *GLog);
+	UE_LOG(LogRebusVisualiser, Log,
+		TEXT("v1.0.129 BaseLevel self-heal: `%s` exec returned %s."),
+		PyCmd, bExecOk ? TEXT("OK") : TEXT("FAILED -- see PythonScriptPlugin warnings above"));
+#endif // WITH_EDITOR
 }
 
 // v1.0.107 -- single chokepoint for the version-watermark visibility toggle.

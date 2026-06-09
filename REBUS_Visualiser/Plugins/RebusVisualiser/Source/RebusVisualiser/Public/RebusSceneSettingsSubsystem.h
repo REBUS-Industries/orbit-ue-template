@@ -60,6 +60,20 @@ private:
 	// .uasset; the cached MID is reused by SetGroundTilingMeters.
 	void SetGroundSurface(const FString& Preset);
 
+	// v1.0.129 -- swap the floor plane's material to the operator-AUTHORED asset
+	// /Game/REBUS/Materials/<Surface> (the four .uasset files the user dropped in
+	// at v1.0.129: Concrete / Grass / Sand / Tarmac). This is the AUTHORITATIVE
+	// runtime entry point for SetSceneProperty name="FloorSurface" AND the
+	// `Rebus.FloorSurface <surface>` console command -- both route through
+	// ApplySceneProperty above, so the SceneState slot updates in lockstep with
+	// the live material swap. Falls back to the legacy
+	// `/Game/REBUS/Materials/MI_RebusGround_<Surface>` procedural instance if the
+	// user-authored asset can't be loaded (e.g. partial-checkout clone). Mirrors
+	// the v1.0.86 SetGroundSurface() shape: applies the MI, resets CachedFloorMID,
+	// then re-asserts the current TilingMeters scalar so the per-session knob
+	// survives the surface swap.
+	void SetFloorSurface(const FString& Surface);
+
 	// v1.0.86: set the floor texture's physical tile size. With the v1.0.86 ground master,
 	// `TilingMeters = 1.0` means one texture repeat per 1 m of world space (so a 2 km floor
 	// plane shows 2000 repeats per side instead of one stretched repeat). Lower => finer
